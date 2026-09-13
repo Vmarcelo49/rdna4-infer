@@ -94,6 +94,100 @@ Stats compare(const std::vector<float> &a, const std::vector<float> &b) {
   return s;
 }
 
+
+// Bench mode: for each type, matvec the LARGEST usable tensor over ALL its
+// rows, timed with hipEvents. Decode is memory-bandwidth bound, so the
+// reported GB/s is the number that matters (weights are re-read per token).
+int run_bench(rdna4::GgufLoader &ld) {
+  double total_bytes = 0, total_sec = 0;
+  static double bw_by_type[16] = {0};
+  for (int i = 0; i < 16; ++i) bw_by_type[i] = 0;
+  std::printf("%-9s %-24s %10s %10s %8s %10s\n", "type", "tensor", "rows", "cols", "GB/s", "ms");
+  for (const TypeCase &tc : kCases) {
+    rdna4::MatvecShape shape{};
+    if (!rdna4::matvec_shape((int)tc.dt, shape)) continue;
+
+    std::size_t best = std::size_t(-1);
+    std::uint64_t best_bytes = 0;
+    for (std::size_t i = 0; i < ld.n_tensors(); ++i) {
+      if (ld.dtype(i) != tc.dt) continue;
+      const auto &d = ld.meta().tensors[i].dims;
+      if (d.size() != 2 || d[1] % shape.qk != 0 || d[0] <= 0) continue;
+      if (ld.tensor_bytes(i) > best_bytes) { best_bytes = ld.tensor_bytes(i); best = i; }
+    }
+    if (best == std::size_t(-1)) {
+      std::printf("%-9s (absent)\n", tc.name);
+      continue;
+    }
+    const auto &info = ld.meta().tensors[best];
+    const int64_t ncols = info.dims[1], nrows = info.dims[0];
+
+    std::vector<std::uint8_t> w;
+    std::string err;
+    if (!ld.load_tensor(best, w, err)) { std::fprintf(stderr, "%s: %s\n", tc.name, err.c_str()); continue; }
+
+    std::vector<float> x;
+    fill_x(x, ncols, 999u);
+    void *d_w = nullptr; rdna4::block_q8_1 *d_a = nullptr; float *d_y = nullptr; float *d_x = nullptr;
+    hipMalloc(&d_w, w.size());
+    hipMalloc(&d_a, (std::size_t)(ncols / QK8_1) * sizeof(rdna4::block_q8_1));
+    hipMalloc(&d_y, (std::size_t)nrows * sizeof(float));
+    hipMalloc(&d_x, (std::size_t)ncols * sizeof(float));
+    hipMemcpy(d_w, w.data(), w.size(), hipMemcpyHostToDevice);
+    hipMemcpy(d_x, x.data(), (std::size_t)ncols * sizeof(float), hipMemcpyHostToDevice);
+    rdna4::quantize_q8_1_kernel<<<(unsigned)((ncols / QK8_1 + 3) / 4), 128>>>(d_x, d_a, ncols / QK8_1);
+
+    const int iters = 10;
+    for (int i = 0; i < 3; ++i) {  // warmup
+      rdna4::matvec_launch((int)tc.dt, d_w, d_a, d_y, nrows, ncols, nullptr);
+    }
+    hipEvent_t e0, e1;
+    hipEventCreate(&e0); hipEventCreate(&e1);
+    hipEventRecord(e0, nullptr);
+    for (int i = 0; i < iters; ++i) {
+      rdna4::matvec_launch((int)tc.dt, d_w, d_a, d_y, nrows, ncols, nullptr);
+    }
+    hipEventRecord(e1, nullptr);
+    hipEventSynchronize(e1);
+    float ms = 0;
+    hipEventElapsedTime(&ms, e0, e1);
+    ms /= iters;
+    hipEventDestroy(e0); hipEventDestroy(e1);
+
+    const double gbs = (double)w.size() / (ms * 1e-3) / 1e9;
+    bw_by_type[(int)tc.dt] = gbs;
+    total_bytes += (double)w.size();
+    total_sec += ms * 1e-3;
+    std::printf("%-9s %-24s %10lld %10lld %8.1f %10.3f\n", tc.name, info.name.c_str(),
+                (long long)nrows, (long long)ncols, gbs, ms);
+    hipFree(d_w); hipFree(d_a); hipFree(d_y); hipFree(d_x);
+  }
+  std::printf("\nbench total: %.2f GB of weights, %.2f ms -> %.1f GB/s aggregate\n",
+              total_bytes / 1e9, total_sec * 1e3, total_bytes / total_sec / 1e9);
+
+  // Decode estimate: one token reads every quantized weight once, so
+  //   t_decode ~= sum over tensors of (bytes / measured bandwidth[type]).
+  // Attention/GDN/norm/KV work is NOT included -> this is an upper bound.
+  double est_sec = 0;
+  double model_bytes = 0;
+  int skipped = 0;
+  for (std::size_t i = 0; i < ld.n_tensors(); ++i) {
+    const auto dt = ld.dtype(i);
+    rdna4::MatvecShape shape{};
+    if (!rdna4::matvec_shape((int)dt, shape)) { skipped++; continue; }  // F32 etc.
+    const double bw = bw_by_type[(int)dt];
+    if (bw <= 0) { skipped++; continue; }
+    const double bytes = (double)ld.tensor_bytes(i);
+    model_bytes += bytes;
+    est_sec += bytes / (bw * 1e9);
+  }
+  std::printf("decode estimate (matvec only): %.2f GB of weights in %.2f ms -> %.1f tok/s\n",
+              model_bytes / 1e9, est_sec * 1e3, 1.0 / est_sec);
+  std::printf("  (F32 / unsupported tensors skipped: %d; baseline Vulkan/RADV decode = 37-38 tok/s)\n",
+              skipped);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -101,13 +195,18 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "usage: check-matvec-gpu <file.gguf> [nrows]\n");
     return 2;
   }
-  const int nrows_req = argc >= 3 ? std::atoi(argv[2]) : 8;
+  const bool bench = (argc >= 3 && std::strcmp(argv[2], "--bench") == 0);
+  const int nrows_req = (!bench && argc >= 3) ? std::atoi(argv[2]) : 8;
 
   rdna4::GgufLoader ld;
   std::string err;
   if (!ld.open(argv[1], err)) {
     std::fprintf(stderr, "open %s: %s\n", argv[1], err.c_str());
     return 1;
+  }
+
+  if (bench) {
+    return run_bench(ld);
   }
 
   int failures = 0;

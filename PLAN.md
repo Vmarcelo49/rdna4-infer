@@ -76,12 +76,32 @@ Objetivo: todo tipo do union M1 computando em GPU.
     - **1e-3** para os tipos cujo `vec_dot` do llama.cpp usa **escala inteira truncada** (`iq2_xxs`: `sumi*ls/8`; `iq2_xs`/`iq2_s`: `(sumi0*ls0+sumi1*ls1+(sumi0+sumi1)/2)/4`; `iq3_xxs`: `(ls*sumi+sumi/2)/2`; `iq1_s`: termo delta em fp16 `s`) — medido 4e-6..9,4e-5, cresce com o nº de sub-blocos. A referência do teste é matemática exata (dequant + dot em f32), então a diferença **é esperada** e não é bug: o CPU do próprio llama.cpp usa a mesma formulação inteira.
   - **Bugs encontrados nesta etapa (mesma classe do passo 2 — campo fp16 lido como inteiro):** `const float d = bq3_K->d;`, `bq6_K->d` e `bq8_0->d` passados a parâmetro `const float&` (vira temporário inteiro→float, ex. 0x3800 → 14336 em vez de 0,5). Todos corrigidos com `fp16_to_float`. **Lição:** a auditoria de layout **não** pega isso (o offset está certo); o que pega é o teste numérico por tipo.
   - **Hardening pendente (próximo passo pequeno):** trocar o tipo dos campos fp16 por um wrapper `struct fp16 { uint16_t bits; operator float() const; }` para que "esquecer a conversão" vire **erro de compilação** em vez de valor errado silencioso.
-- **Passo 4 (próximo) — desempenho + `mmq`/tuning RDNA4:**
-  - Bench do matvec por tipo (tokens/s equivalente, GB/s efetivos) vs. baseline Vulkan/RADV (prefill 133–146 t/s, decode 37–38 t/s).
-  - `MMVQ_PARAMETERS_RDNA4` (nwarps por tipo/linhas) e `mmq.cuh` + `mmq-config-rdna4.cuh` para prefill (batch > 8).
+- **Passo 4 — bench do matvec (baseline de desempenho) ✅** (`check-matvec-gpu <file> --bench`):
+  - **Bug de build crítico encontrado: o código HIP estava sendo compilado em `-O0`** (o combo CMake/ROCm não define flag de otimização para HIP; `HIP_FLAGS` era só `--offload-arch=gfx1201`). Corrigido com `CMAKE_HIP_FLAGS_RELEASE = "-O3 -DNDEBUG"`. **Efeito: 4,4 GB/s → 268 GB/s agregado (62×).** Sem `-ffast-math`: o bit-exact continua garantido (verificado depois do `-O3`, valores idênticos).
+  - Bench (IQ3_S, maior tensor de cada tipo, 10 iterações, pico teórico da placa = 644 GB/s):
+    | tipo | tensor | GB/s |
+    |---|---|---|
+    | q5_k | output.weight [5120,248320] | **487** (76% do pico) |
+    | q8_0 | blk.64.attn_k.weight | 393 |
+    | q4_k | blk.63.ffn_down.weight | 376 |
+    | q6_k | blk.64.ffn_down.weight | 290 |
+    | iq1_s | blk.0.ffn_up.weight | 231 |
+    | iq3_s | blk.2.ffn_down.weight | 200 |
+    | q3_k | token_embd.weight [5120,248320] | 195 |
+    | iq3_xxs | blk.0.ffn_down.weight | 180 |
+    | iq2_s | blk.1.ffn_gate.weight | 155 |
+    | iq2_xs | blk.0.ffn_gate.weight | 137 |
+    | iq2_xxs | blk.1.ffn_up.weight | 124 |
+    | iq4_xs | blk.21.ffn_down.weight | 117 |
+    | iq4_nl | blk.11.attn_k.weight (1024 cols) | 90 |
+  - **Estimativa de decode (só matvec, soma `bytes/GB/s` por tipo sobre os 866 tensores): 12,02 GB em 68,9 ms → 14,5 tok/s.** Baseline Vulkan/RADV = 37–38 tok/s → **estamos em ~38% do baseline** (a meta é ≥100%).
+  - **Onde está o gargalo:** tipos k-quant (q4_k/q5_k/q6_k/q8_0) já vão a 290–487 GB/s; os **IQ dominam o arquivo e ficam em 117–200 GB/s** (mais ALU/lookup por byte: `perm`-based table lookups + escala inteira). `token_embd`/`output` (5120 linhas) têm pouca paralelidade com 1 warp/linha.
+- **Passo 5 — tuning do matvec (próximo):**
+  - `nwarps > 1` por linha + redução em shared memory (é o que o `MMVQ_PARAMETERS_RDNA4` do llama.cpp parametriza), com ILP no loop de blocos.
+  - Meta: IQ de 120–200 → 350+ GB/s ⇒ decode ≥ 30 tok/s só com matvec.
+  - Depois: `mmq.cuh` + `mmq-config-rdna4.cuh` para prefill (batch > 8; o matvec só cobre batch ≤ 8, igual ao `MMVQ_MAX_BATCH_SIZE`).
+- **Nota:** GPU/VRAM **liberada** para testes nesta sessão (antes estava proibido). Dequant **e** matvec já executados de verdade em gfx1201, não só compilados.
 
-  - Aqui a tolerância deixa de ser bit-exact (ordem de acumulação difere) → documentar tolerância.
-- **Nota:** GPU/VRAM **liberada** para testes nesta sessão (antes estava proibido). Dequant já executado de verdade em gfx1201, não só compilado.
 
 1. Trazer de `.ref/llama.cpp`: `vecdotq.cuh` (dequant), `mmvq.cu` + `MMVQ_PARAMETERS_RDNA4`, `mmq.cuh` + `mmq-config-rdna4.cuh` (inclui `mmq-instance-iq3_s.cu`).
    Ref: `docs/referencias-upstream-gfx1201-qwen35.md` § "llama.cpp — gfx1201/RDNA4" (linhas exatas por arquivo) · `docs/kernels-ia-gfx1201.md` § "Relatos" (`rdna4-wmma-guide`: armadilha dos tiles WMMA transpostos).

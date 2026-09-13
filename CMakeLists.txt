@@ -8,6 +8,17 @@ endif()
 
 project(rdna4-infer LANGUAGES CXX HIP)
 
+# HIP has no default optimization flag in this CMake/ROCm combo: without this
+# the device code is built at -O0 (100x+ slower device kernels). The quant
+# kernels are NOT compiled with fast-math: bit-exactness vs llama.cpp's CPU
+# oracle is a hard requirement of the M2 acceptance tests.
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+set(CMAKE_HIP_FLAGS_RELEASE "-O3 -DNDEBUG")
+set(CMAKE_HIP_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG")
+set(CMAKE_HIP_FLAGS_DEBUG "-O0 -g")
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
