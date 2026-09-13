@@ -90,7 +90,7 @@ lengths) with the exact command for every number. Headline, IQ3_S on the RX 9070
 | prefill (per-token path) | 28.8 tok/s | 440 tok/s (batched) |
 | effective weight bandwidth | 336 GB/s (IQ3_S) / 364 GB/s (IQ4_XS) | — |
 | perplexity (wikitext-2, 10×512 tokens, per position) | within **0.25 %** (IQ3_S) / **0.15 %** (IQ4_XS) | reference |
-| long context | 131K ctx on IQ3_S (decode there is 3.7 tok/s), 64K on IQ4_XS | — |
+| long context | 131K ctx on IQ3_S (13.2 tok/s there), 64K on IQ4_XS | — |
 
 ## Validation
 
@@ -107,6 +107,7 @@ running after a change:
 ./scripts/check_golden_run.sh                                # generation is reproducible
 ./scripts/compare_llama_greedy.sh 32                         # greedy == llama.cpp, token by token
 ./scripts/compare_ppl.sh <model.gguf> 10                     # perplexity vs llama.cpp, per position
+./scripts/check_attn_split.sh                                # split-KV == unsplit on real text
 ```
 
 The oracles (`build/oracle-*`) are the only binaries that link llama.cpp; they
@@ -120,13 +121,12 @@ runtime by the engine.
   Decode is at ~70 % of the reference; prefill is the gap that matters for long
   prompts. Measured numbers and the rejected alternatives are in
   `docs/medicoes-m5.md`.
-- **Long context is attention-bound** (M7 work in progress): a decode step costs
-  41 ms at 4K, 151 ms at 64K (f16 KV) and 273 ms at 131K (`q4_0`) — 6.6 and 3.7 tok/s
-  respectively, against 24 tok/s in the first 4K. Vectorized cache loads and 32
-  warps/CTA already bought 1.1-1.6× (`docs/medicoes-m7.md`); the kernel is still at
-  37-69 GB/s of the ~600 GB/s available, so **splitting the key range across CTAs**
-  (with an online-softmax merge) is the identified next step, worth an estimated
-  2-4× at 64K.
+- **Long context was attention-bound; that is now fixed** (M7): decode is 23.7 tok/s
+  at 4K, 24.1 at 16K, 19.0 at 64K (f16 KV) and 13.2 at 131K (`q4_0`), against
+  22.1/13.7/4.2/2.3 before. Vectorized cache loads, 32 warps/CTA and splitting the
+  key range across CTAs (with an online-softmax merge) bought 1.1-5.8× depending on
+  context; `docs/medicoes-m7.md` has the breakdown, and the split path is validated
+  against the unsplit one by `scripts/check_attn_split.sh`.
 - Use `f16` KV wherever it fits: it is 38 % faster than `q4_0` at the same context.
 - The CLI is single-turn (`--chat` renders one system+user turn); multi-turn
   rendering is implemented and tested in `chat_render`, the CLI just does not offer

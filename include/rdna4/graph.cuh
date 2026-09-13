@@ -98,6 +98,12 @@ class Graph {
   // copy removes one device sync per token (it would otherwise be merged into
   // forward_run's logits copy). Default true: the oracle tests compare `hidden`.
   void set_want_hidden(bool want) { want_hidden_ = want; }
+  // Force a split count (0 = automatic). tests/check_kvctx_gpu.hip compares the
+  // split-KV path against the unsplit one at the same context through this.
+  void set_attn_splits(int n) {
+    attn_splits_env_read_ = true;
+    attn_splits_env_ = n < 0 ? 0 : n;
+  }
   // per-layer output perturbation, relative to each layer's own contribution
   void set_layer_noise(float rel, bool coherent = false) {
     noise_rel_ = rel;
@@ -201,6 +207,9 @@ class Graph {
   double host_readback_ms_ = 0.0;
   bool want_hidden_ = true;
   int layer_limit_ = -1;  // < 0 => all layers
+  mutable bool attn_splits_env_read_ = false;
+  mutable int attn_splits_env_ = 0;
+  int attn_splits_last_ = 1;
 
   struct LayerW {
     GpuTensor attn_norm, attn_post_norm, ffn_gate, ffn_up, ffn_down;
@@ -223,6 +232,29 @@ class Graph {
     return n;
   }
   float *d_attnout_ = nullptr, *d_attngate_ = nullptr;
+  // Split-KV attention scratch: [n_head][kAttnMaxSplits][2 + head_dim] (M7).
+  float *d_attn_partial_ = nullptr;
+  static constexpr int kAttnMaxSplits = 16;
+  // Splits are chosen by context length: below kAttnSplitMin keys one CTA already
+  // covers the range, and keeping the unsplit path there keeps the short-context
+  // gates bit-identical to the pre-M7 numbers (the golden run, the oracle dumps).
+  static constexpr int kAttnSplitMin = 2048;
+  int attn_splits_for(int keys) const {
+    // RD_ATTN_SPLITS forces a split count (diagnostics/tests: 1 = the pre-M7 path,
+    // which is what makes the split path checkable against it at any context).
+    if (!attn_splits_env_read_) {
+      attn_splits_env_read_ = true;
+      const char *e = getenv("RD_ATTN_SPLITS");
+      attn_splits_env_ = e ? atoi(e) : 0;
+    }
+    if (attn_splits_env_ > 0) {
+      return attn_splits_env_ > kAttnMaxSplits ? kAttnMaxSplits : attn_splits_env_;
+    }
+    if (keys < kAttnSplitMin) return 1;
+    const int sp = keys / kAttnSplitMin;
+    return sp > kAttnMaxSplits ? kAttnMaxSplits : sp;
+  }
+  int attn_splits_last() const { return attn_splits_last_; }
   float *d_qkv_ = nullptr, *d_conv_ = nullptr, *d_z_ = nullptr;
   float *d_alpha_ = nullptr, *d_beta_ = nullptr, *d_gate_ = nullptr;
   float *d_state_ = nullptr, *d_convst_ = nullptr;
@@ -402,6 +434,11 @@ inline bool Graph::init(int max_ctx, KvType kv_k, KvType kv_v, std::string &err)
     return false;
   }
   if (!alloc(d_kstage_, NKV * HD, err) || !alloc(d_vstage_, NKV * HD, err)) return false;
+  const std::size_t part_bytes = attn_partial_bytes(NH, HD, kAttnMaxSplits);
+  if (hipMalloc(&d_attn_partial_, part_bytes) != hipSuccess) {
+    err = "hipMalloc attn partial failed";
+    return false;
+  }
   if (!alloc(d_state_, (std::size_t)n_recr * nvh * S * S, err)) return false;
   if (!alloc(d_convst_, (std::size_t)n_recr * (K - 1) * chan, err)) return false;
   if (hipMalloc(&d_pos_, sizeof(int)) != hipSuccess) return false;
@@ -511,7 +548,16 @@ inline bool Graph::full_attn(int il, int t, int pos, std::string &err) {
   const char *vc = (const char *)d_v_ + (std::size_t)attn_slot(il) * kv_bytes_;
 
   const float scale = 1.0f / std::sqrt((float)HD);
-  if (!attn_launch(d_attnout_, kc, vc, d_attnout_, pos, NH, NKV, HD, scale, kv_k_, kv_v_)) {
+  const int n_keys = pos + 1;
+  const int splits = attn_splits_for(n_keys);
+  attn_splits_last_ = splits;
+  if (splits > 1) {
+    if (!attn_launch_split(d_attnout_, kc, vc, d_attnout_, d_attn_partial_, pos, NH, NKV, HD,
+                           scale, kv_k_, kv_v_, splits)) {
+      err = "attn split launch failed";
+      return false;
+    }
+  } else if (!attn_launch(d_attnout_, kc, vc, d_attnout_, pos, NH, NKV, HD, scale, kv_k_, kv_v_)) {
     err = "attn launch failed";
     return false;
   }
@@ -848,6 +894,8 @@ inline void Graph::release() {
   if (d_q8_) (void)hipFree(d_q8_);
   if (d_pos_) (void)hipFree(d_pos_);
   if (d_logits_) (void)hipFree(d_logits_);
+  if (d_attn_partial_) (void)hipFree(d_attn_partial_);
+  d_attn_partial_ = nullptr;
   d_q8_ = nullptr;
   d_pos_ = nullptr;
   d_logits_ = nullptr;

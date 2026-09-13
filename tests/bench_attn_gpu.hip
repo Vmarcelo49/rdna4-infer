@@ -201,8 +201,8 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  std::printf("%8s %10s %12s %12s %10s %10s %10s\n", "t", "kv MiB", "ship ms", "gqa ms",
-              "ship GB/s", "gqa GB/s", "speedup");
+  std::printf("%8s %10s %12s %12s %12s %10s %10s\n", "t", "kv MiB", "ship ms", "split ms",
+              "gqa ms", "split GB/s", "speedup");
   for (int t : ts) {
     // fill the cache with the deterministic pattern the engine's tests use (the
     // values only need to be finite; this is a cost bench)
@@ -219,6 +219,39 @@ int main(int argc, char **argv) {
         time_ms([&] { rdna4::attn_launch(d_q, d_k, d_v, d_out, t, kHeads, kHeadsKv, kHeadDim,
                                          kScale, kt, kt, nullptr); },
                 5, 300.0);
+    // split-KV path (M7 step 2): same inputs, so the only difference is the
+    // summation order across key splits
+    float *d_partial = nullptr;
+    const int n_splits = (t / 2048) < 1 ? 1 : ((t / 2048) > 16 ? 16 : (t / 2048));
+    hipMalloc(&d_partial, rdna4::attn_partial_bytes(kHeads, kHeadDim, n_splits));
+    std::vector<float> sp((std::size_t)kHeads * kHeadDim);
+    double ms_split = -1.0, split_rel = -1.0, split_maxd = -1.0;
+    if (n_splits > 1) {
+      const bool ok_s = rdna4::attn_launch_split(d_q, d_k, d_v, d_out2, d_partial, t, kHeads,
+                                                 kHeadsKv, kHeadDim, kScale, kt, kt, n_splits);
+      hipDeviceSynchronize();
+      if (ok_s) {
+        hipMemcpy(sp.data(), d_out2, sp.size() * sizeof(float), hipMemcpyDeviceToHost);
+        std::vector<float> a2((std::size_t)kHeads * kHeadDim);
+        hipMemcpy(a2.data(), d_out, a2.size() * sizeof(float), hipMemcpyDeviceToHost);
+        double num = 0, den = 0, md = 0;
+        for (std::size_t i = 0; i < a2.size(); ++i) {
+          const double d = (double)a2[i] - (double)sp[i];
+          num += d * d;
+          den += (double)a2[i] * a2[i] + (double)sp[i] * sp[i];
+          md = std::max(md, std::fabs(d));
+        }
+        split_rel = std::sqrt(num / den);
+        split_maxd = md;
+        ms_split = time_ms(
+            [&] {
+              (void)rdna4::attn_launch_split(d_q, d_k, d_v, d_out2, d_partial, t, kHeads, kHeadsKv,
+                                             kHeadDim, kScale, kt, kt, n_splits);
+            },
+            5, 300.0);
+      }
+    }
+    hipFree(d_partial);
     bool gqa_ok = true;
     const double ms_gqa = time_ms(
         [&] {
@@ -257,10 +290,12 @@ int main(int argc, char **argv) {
     const double kv_mib = (double)bytes / (1024.0 * 1024.0);
     // traffic: 2 (K+V) rows of kv_mib, times the GQA redundancy the kernel incurs
     const double grow = (double)kHeads / kHeadsKv;
-    std::printf("%8d %10.1f %12.3f %12.3f %10.1f %10.1f %9.2fx %s (rel-L2 %.1e max|d| %.1e)\n", t,
-                kv_mib, ms_ship, gqa_ok ? ms_gqa : -1.0, 2 * kv_mib / ms_ship,
-                gqa_ok ? 2 * kv_mib / ms_gqa : -1.0, gqa_ok ? ms_ship / ms_gqa : 0.0,
-                gqa_ok ? "ok" : "UNSUPPORTED", rel, maxd);
+    std::printf("%8d %10.1f %12.3f %12.3f %12.3f %10.1f %9.2fx", t, kv_mib, ms_ship, ms_split,
+                gqa_ok ? ms_gqa : -1.0, ms_split > 0 ? 2 * kv_mib / ms_split : -1.0,
+                ms_split > 0 ? ms_ship / ms_split : 0.0);
+    std::printf("\n             split vs unsplit: rel-L2 %.2e max|d| %.2e (%d splits); "
+                "prototype vs ship: rel-L2 %.1e\n",
+                split_rel, split_maxd, n_splits, rel);
     (void)grow;
   }
   return 0;

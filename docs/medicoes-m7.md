@@ -68,11 +68,69 @@ pressure destroys occupancy. Sharing across heads only pays if one warp handles
 several heads *and* the grid is widened by splitting the position range — i.e. after
 the split-KV work below, not before it. Kept in the bench as a cross-check.
 
+## Split-KV across CTAs (step 2, done)
+
+The key range is now also split across CTAs: grid = `n_head × n_splits`
+(`attn_split_kernel`), each CTA walking keys `j = w + 32·s, step 32·S`, writing one
+partial `(m, l, acc[head_dim])` per split; `attn_merge_kernel` combines the splits
+with the same online-softmax arithmetic. Splits are chosen by context
+(`keys / 2048`, capped at 16, i.e. 384 CTAs at 64K) and `RD_ATTN_SPLITS` forces a
+count for testing.
+
+Kernel, one layer, one query token (ms), and the difference against the single-CTA
+path over the same inputs:
+
+| t | unsplit | split | speedup | split vs unsplit |
+|---|---|---|---|---|
+| 4 096 | 0.586 | 0.295 | 2.0× | rel-L2 3.5e-07 |
+| 16 384 | 1.356 | 0.248 | 5.5× | rel-L2 6.5e-07 |
+| 65 536 | 7.909 | 1.187 | **6.7×** | rel-L2 1.2e-06 |
+
+End to end (`bench --start-pos`), decode at the END of the context:
+
+| model | ctx / KV | M5 baseline | 32 warps | + split-KV | total |
+|---|---|---|---|---|---|
+| IQ3_S | 4 096 f16 | 22.13 | 24.11 | 23.73 | 1.07× |
+| IQ3_S | 16 384 f16 | 13.72 | 14.82 | **24.08** | **1.76×** |
+| IQ3_S | 65 536 f16 | — | — | **18.98** | — |
+| IQ3_S | 65 536 q4_0 | 4.18 | 6.40 | **17.81** | **4.3×** |
+| IQ3_S | 131 072 q4_0 | 2.27 | 3.66 | **13.19** | **5.8×** |
+| IQ4_XS | 32 768 f16 | 9.09 | — | **20.79** | **2.3×** |
+| IQ4_XS | 65 536 q4_0 | 4.18 | — | **17.11** | **4.1×** |
+
+**Decode is now nearly flat in context** (23.7 tok/s at 4K, 24.1 at 16K, 19.0 at 64K,
+13.2 at 131K): the attention is no longer what long context costs. It also flips the
+KV-type advice back — at 64K f16 (18.98) now beats q4_0 (17.81) — and long *prefill*
+benefits from the same kernel (27.7 tok/s for a 2048-token prompt, versus 28.8 at 512:
+almost no degradation, where the M6-era attention made long prompts progressively
+slower).
+
+### The bug this found
+
+Forcing more splits than keys (2 splits at position 0) produced **NaN logits**:
+an empty split leaves every warp slice at `m = -INFINITY`, and the CTA merge computed
+`expf(-inf - -inf)`. Empty splits now contribute zeros (guarded in both the CTA merge
+and the final merge, plus the unsplit kernel's merge for the same latent hazard). The
+auto policy never produced empty splits, which is exactly why the *forced* comparison
+exists.
+
+### Correctness of the split path
+
+It is not bit-identical (the summation order across keys changes), so the gate is
+numerical equivalence **on real text**: `scripts/check_attn_split.sh` compares
+perplexity over wiki text with `RD_ATTN_SPLITS=1` vs `4` — 5.1989 vs 5.1917, i.e.
+**0.14 %**, inside the 0.004-0.25 % inter-chunk spread the M5 gate measured. The
+synthetic-cache comparison in `check-kvctx-gpu` is kept but labelled informative: with
+random keys the attention output is a near-cancelling average, so a 1e-7 reordering
+difference is amplified to percent level there (measured rel-L2 1.7e-02 on the logits
+with the argmax preserved and `l_out#7` — a GDN layer on the same residual —
+bit-identical). All other gates stay green: graph oracle PASS, argmax PASS, rope OK,
+kvctx OK, golden run OK.
+
 ## What is left
 
-Attention is still at 69 GB/s (bench) / 37 GB/s (in-engine) of ~600 GB/s, so the
-remaining lever is concurrency: **split the key range across CTAs** (grid =
-n_head × splits, e.g. 24 × 8 = 192 CTAs) with a second online-softmax merge kernel
-(the merge of the warp partials already exists in-kernel). Expected: another 2-4×
-at 64K, which would put long-context decode in the 15-25 tok/s range instead of 6.6.
-That is the next step; it needs a scratch buffer in the graph and its own gate.
+Attention in-engine is still ~215 GB/s of ~600 GB/s (1.19 ms per layer at 64K × 16
+layers ≈ 19 ms/token against a 36 ms/token weight stream), so the next levers are
+smaller: GQA row sharing now that the grid is wide (24 × 16 = 384 CTAs, so sharing
+rows across the 6 query heads no longer costs parallelism), and a per-(type,N) re-tune
+of the batched matvec. Neither is needed for usability anymore.

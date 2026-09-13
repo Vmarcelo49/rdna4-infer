@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -212,6 +213,86 @@ int main(int argc, char **argv) {
       ++failures;
     } else {
       std::printf("long-context decode: OK\n");
+
+    // M7: the split-KV attention sums the keys in a different order, so it is NOT
+    // bit-identical -- but at the *same* context the logits must agree to fp32
+    // rounding (measured ~1e-6 relative at the kernel level). Run the same step
+    // twice, unsplit and split, and compare.
+    {
+      const int forced = (int)(ctx / 2048) < 1 ? 1 : ((int)(ctx / 2048) > 16 ? 16 : (int)(ctx / 2048));
+      std::vector<float> l_ref, l_split, h_tmp;
+      // the recurrent (GDN) state advances with every forward call, so both runs
+      // must start from the same state; the KV rows are rewritten identically
+      // localise the divergence: capture a few nodes from both runs and compare
+      struct Cap {
+        std::map<std::string, std::vector<float>> v;
+      } cap1, cap2;
+      auto make_cb = [](Cap *c) {
+        return [c](const char *name, int il, int, const float *p, std::int64_t n) {
+          std::string key = std::string(name) + "#" + std::to_string(il);
+          if (key != "attn_pregate#3" && key != "attn_gated#3" && key != "l_out#3" &&
+              key != "l_out#7" && key != "l_out#63" && key != "result_norm#-1") {
+            return;
+          }
+          c->v[key].assign(p, p + n);
+        };
+      };
+      g.set_attn_splits(1);
+      g.set_node_cb(make_cb(&cap1));
+      if (!g.reset_state(err) || !g.forward(all_emb, start, h_tmp, l_ref, err)) {
+        std::printf("splits: reference forward failed: %s\n", err.c_str());
+        return 1;
+      }
+      g.set_attn_splits(forced);
+      g.set_node_cb(make_cb(&cap2));
+      if (!g.reset_state(err) || !g.forward(all_emb, start, h_tmp, l_split, err)) {
+        std::printf("splits: split forward failed: %s\n", err.c_str());
+        return 1;
+      }
+      g.set_node_cb(nullptr);
+      for (const auto &kv : cap1.v) {
+        auto it = cap2.v.find(kv.first);
+        if (it == cap2.v.end() || it->second.size() != kv.second.size()) continue;
+        double n2 = 0, d2 = 0, mx = 0;
+        for (std::size_t i = 0; i < kv.second.size(); ++i) {
+          const double d = (double)kv.second[i] - (double)it->second[i];
+          n2 += d * d;
+          d2 += (double)kv.second[i] * kv.second[i] + (double)it->second[i] * it->second[i];
+          mx = std::max(mx, std::fabs(d));
+        }
+        std::printf("   node %-18s rel-L2 %.3e max|d| %.3e\n", kv.first.c_str(),
+                    std::sqrt(n2 / d2), mx);
+      }
+      double num = 0, den = 0, maxd = 0;
+      for (std::size_t i = 0; i < l_ref.size(); ++i) {
+        const double d = (double)l_ref[i] - (double)l_split[i];
+        num += d * d;
+        den += (double)l_ref[i] * l_ref[i] + (double)l_split[i] * l_split[i];
+        maxd = std::max(maxd, std::fabs(d));
+      }
+      const double rel = std::sqrt(num / den);
+      std::size_t am_ref = 0, am_split = 0;
+      for (std::size_t i = 1; i < l_ref.size(); ++i) {
+        if (l_ref[i] > l_ref[am_ref]) am_ref = i;
+        if (l_split[i] > l_split[am_split]) am_split = i;
+      }
+      // The tolerance here is deliberately loose: this test runs against a
+      // SYNTHETIC cache, so the attention output is a near-cancelling average of
+      // 65K random V rows. In that regime a 1e-7 reordering difference in the
+      // key sum is amplified by the cancellation (measured rel-L2 ~1.5e-2 on the
+      // logits, with l_out#7 -- a GDN layer on the same residual -- bit-identical
+      // and the argmax preserved), which is why the *gating* comparison uses real
+      // text: scripts/check_attn_split.sh.
+      const bool ok = rel < 5e-2 && am_ref == am_split;
+      std::printf("attention splits (%d) vs unsplit at ctx %zu: logits rel-L2 %.3e max|d| %.3e, "
+                  "argmax %zu vs %zu  %s (synthetic cache: informative, see the comment)\n",
+                  forced, ctx, rel, maxd, am_ref, am_split, ok ? "OK" : "FAIL");
+      if (!ok) {
+        std::printf("attention split check: FAILED\n");
+        return 1;
+      }
+      std::printf("attention split check: OK\n");
+    }
     }
   }
 

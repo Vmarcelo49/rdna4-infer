@@ -154,6 +154,10 @@ __global__ void attn_kernel(const float *__restrict__ q, const void *__restrict_
 
   float mm = -INFINITY;
   for (int s = 0; s < kAttnWarpsPerBlock; ++s) mm = fmaxf(mm, smem[(std::int64_t)s * (2 + head_dim)]);
+  if (mm == -INFINITY) {  // no keys at all
+    for (int i = 0; i < dpw; ++i) out[h * head_dim + lane * dpw + i] = 0.0f;
+    return;
+  }
   float ll = 0.0f;
   for (int s = 0; s < kAttnWarpsPerBlock; ++s) {
     const float *ps = smem + (std::int64_t)s * (2 + head_dim);
@@ -207,6 +211,218 @@ inline bool attn_launch(const float *d_q, const void *d_k, const void *d_v, floa
   RD_ATTN_CASE(Q4_0, Q8_0);
   RD_ATTN_CASE(Q4_0, Q4_0);
 #undef RD_ATTN_CASE
+  return false;
+}
+
+
+// ---------------------------------------------------------------------------
+// Split-KV attention (M7 step 2): the same flash-style kernel with the key range
+// ALSO split across CTAs.
+//
+// Why: the single-CTA version is memory-latency-bound, not bandwidth-bound --
+// measured 69 GB/s of ~600 GB/s at 64K with 24 CTAs (one per query head) on
+// 64 CUs (docs/medicoes-m7.md). More in-flight requests need more CTAs, and the
+// key range is the only dimension with room (the head dimension is already
+// spread over the lanes).
+//
+// Layout: CTA (h, s) walks keys j = w + 32*s, ... step 32*S (so consecutive CTAs
+// read adjacent 32-key blocks: coalesced, and neighbouring in L2), writing one
+// partial (m, l, acc[head_dim]) per split. attn_merge_kernel then combines the S
+// partials with the same online-softmax arithmetic the in-kernel merge uses.
+//
+// The result is NOT bit-identical to the single-CTA path (the summation order
+// across keys changes), so callers must accept ~1e-7 relative; the gate is
+// tests/bench_attn_gpu.hip's comparison against the unsplit kernel.
+// ---------------------------------------------------------------------------
+template <KvType KT, KvType VT>
+__global__ void attn_split_kernel(const float *__restrict__ q, const void *__restrict__ k,
+                                  const void *__restrict__ v, float *__restrict__ partial,
+                                  int t, int n_head, int n_head_kv, int head_dim, float dscale,
+                                  int n_splits) {
+  extern __shared__ float smem[];
+  const int h = blockIdx.x;
+  const int s = blockIdx.y;
+  const int w = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int kvh = h / (n_head / n_head_kv);
+  const int dpw = head_dim / 32;
+  float *pm = smem + (std::int64_t)w * (2 + head_dim);
+
+  const std::uint64_t krow = kv_row_bytes(KT, head_dim);
+  const std::uint64_t vrow = kv_row_bytes(VT, head_dim);
+
+  float qv[kAttnMaxDimsPerLane];
+  for (int i = 0; i < dpw; ++i) qv[i] = q[h * head_dim + lane * dpw + i];
+
+  float m = -INFINITY;
+  float l = 0.0f;
+  float acc[kAttnMaxDimsPerLane];
+  for (int i = 0; i < dpw; ++i) acc[i] = 0.0f;
+
+  const int step = kAttnWarpsPerBlock * n_splits;
+  for (int j = w + kAttnWarpsPerBlock * s; j <= t; j += step) {
+    const char *kr = (const char *)k + ((std::int64_t)j * n_head_kv + kvh) * krow;
+    float kk[kAttnMaxDimsPerLane];
+    if (dpw == 8) {
+      kv_load8<KT>(kr, lane, kk);
+    } else {
+      for (int i = 0; i < dpw; ++i) kk[i] = kv_load<KT>(kr, lane * dpw + i);
+    }
+    float partial_dot = 0.0f;
+    for (int i = 0; i < dpw; ++i) partial_dot = fmaf(qv[i], kk[i], partial_dot);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+      partial_dot += __shfl_xor_sync(0xffffffffull, partial_dot, off);
+    const float score = partial_dot * dscale;
+    if (score > m) {
+      const float corr = (m == -INFINITY) ? 0.0f : expf(m - score);
+      l *= corr;
+      for (int i = 0; i < dpw; ++i) acc[i] *= corr;
+      m = score;
+    }
+    const float p = (m == -INFINITY) ? 0.0f : expf(score - m);
+    l += p;
+    const char *vr = (const char *)v + ((std::int64_t)j * n_head_kv + kvh) * vrow;
+    float vv[kAttnMaxDimsPerLane];
+    if (dpw == 8) {
+      kv_load8<VT>(vr, lane, vv);
+    } else {
+      for (int i = 0; i < dpw; ++i) vv[i] = kv_load<VT>(vr, lane * dpw + i);
+    }
+    for (int i = 0; i < dpw; ++i) acc[i] = fmaf(p, vv[i], acc[i]);
+  }
+
+  // merge this CTA's WPB warps, then publish one partial for the CTA
+  if (lane == 0) {
+    pm[0] = m;
+    pm[1] = l;
+  }
+  for (int i = 0; i < dpw; ++i) pm[2 + lane * dpw + i] = acc[i];
+  __syncthreads();
+
+  // Reduce this CTA's WPB warp slices into one partial, spread over the block:
+  // the weights exp(m_i - mm) are computed once (one per warp), then every dim is
+  // a 32-term dot product with them. (A single-thread version costs 32*head_dim
+  // expf calls in one lane and becomes the kernel's serial tail.)
+  __shared__ float wts[kAttnWarpsPerBlock];
+  __shared__ float cmax;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float mm = -INFINITY;
+    for (int i = 0; i < kAttnWarpsPerBlock; ++i)
+      mm = fmaxf(mm, smem[(std::int64_t)i * (2 + head_dim)]);
+    cmax = mm;
+  }
+  __syncthreads();
+  if (threadIdx.x < kAttnWarpsPerBlock) {
+    // An EMPTY split (fewer keys than CTAs, e.g. two splits at position 0) leaves
+    // every warp slice at m = -INFINITY; expf(-inf - -inf) is NaN and poisons the
+    // whole attention output (found by forcing more splits than keys in the M7
+    // gate). An empty split contributes nothing, so its weights are 0.
+    wts[threadIdx.x] = (cmax == -INFINITY)
+                           ? 0.0f
+                           : expf(smem[(std::int64_t)threadIdx.x * (2 + head_dim)] - cmax);
+  }
+  __syncthreads();
+  float *out = partial + ((std::int64_t)h * n_splits + s) * (2 + head_dim);
+  if (threadIdx.x < 32) {
+    float lsum = 0.0f;
+    if (threadIdx.x < kAttnWarpsPerBlock)
+      lsum = wts[threadIdx.x] * smem[(std::int64_t)threadIdx.x * (2 + head_dim) + 1];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) lsum += __shfl_xor_sync(0xffffffffull, lsum, off);
+    if (threadIdx.x == 0) {
+      out[0] = cmax;
+      out[1] = lsum;
+    }
+  }
+  if (threadIdx.x < head_dim) {
+    float a = 0.0f;
+    for (int i = 0; i < kAttnWarpsPerBlock; ++i)
+      a += smem[(std::int64_t)i * (2 + head_dim) + 2 + threadIdx.x] * wts[i];
+    out[2 + threadIdx.x] = a;
+  }
+}
+
+// Combine the n_splits partials of each query head (one warp per head).
+__global__ void attn_merge_kernel(const float *__restrict__ partial, float *__restrict__ out,
+                                  int n_head, int head_dim, int n_splits) {
+  const int h = blockIdx.x;
+  const int lane = threadIdx.x & 31;
+  const int dpw = head_dim / 32;
+  const float *base = partial + (std::int64_t)h * n_splits * (2 + head_dim);
+
+  float mm = -INFINITY;
+  for (int s = 0; s < n_splits; ++s) mm = fmaxf(mm, base[(std::int64_t)s * (2 + head_dim)]);
+  if (mm == -INFINITY) {  // every split empty: no keys at all
+    for (int i = 0; i < dpw; ++i) out[h * head_dim + lane * dpw + i] = 0.0f;
+    return;
+  }
+  float ll = 0.0f;
+  for (int s = 0; s < n_splits; ++s) {
+    const float *ps = base + (std::int64_t)s * (2 + head_dim);
+    ll += ps[1] * expf(ps[0] - mm);
+  }
+  const float inv = (ll > 0.0f) ? 1.0f / ll : 0.0f;
+  for (int i = 0; i < dpw; ++i) {
+    float a = 0.0f;
+    for (int s = 0; s < n_splits; ++s) {
+      const float *ps = base + (std::int64_t)s * (2 + head_dim);
+      a += ps[2 + lane * dpw + i] * expf(ps[0] - mm);
+    }
+    out[h * head_dim + lane * dpw + i] = a * inv;
+  }
+}
+
+template <KvType KT, KvType VT>
+inline bool attn_launch_split_typed(const float *d_q, const void *d_k, const void *d_v, float *d_out,
+                                    float *d_partial, int t, int n_head, int n_head_kv,
+                                    int head_dim, float scale, int n_splits,
+                                    hipStream_t stream) {
+  if (head_dim % 32 != 0 || head_dim / 32 > kAttnMaxDimsPerLane) return false;
+  if (n_splits < 1) return false;
+  const int threads = kAttnWarpsPerBlock * 32;
+  const std::size_t smem =
+      (std::size_t)kAttnWarpsPerBlock * (2 + (std::size_t)head_dim) * sizeof(float);
+  dim3 grid((unsigned)n_head, (unsigned)n_splits);
+  attn_split_kernel<KT, VT><<<grid, threads, smem, stream>>>(d_q, d_k, d_v, d_partial, t, n_head,
+                                                             n_head_kv, head_dim, scale, n_splits);
+  if (hipGetLastError() != hipSuccess) return false;
+  attn_merge_kernel<<<n_head, 32, 0, stream>>>(d_partial, d_out, n_head, head_dim, n_splits);
+  return hipGetLastError() == hipSuccess;
+}
+
+// Byte size of the partial buffer for `n_splits` (caller allocates once).
+inline std::size_t attn_partial_bytes(int n_head, int head_dim, int n_splits) {
+  return (std::size_t)n_head * (std::size_t)n_splits * (2 + (std::size_t)head_dim) * sizeof(float);
+}
+
+inline bool attn_launch_split(const float *d_q, const void *d_k, const void *d_v, float *d_out,
+                              float *d_partial, int t, int n_head, int n_head_kv, int head_dim,
+                              float scale, KvType kt, KvType vt, int n_splits,
+                              hipStream_t stream = nullptr) {
+#define RD_ATTN_SPLIT_CASE(K, V)                                                                  \
+  if (kt == KvType::K && vt == KvType::V)                                                         \
+  return attn_launch_split_typed<KvType::K, KvType::V>(d_q, d_k, d_v, d_out, d_partial, t, n_head, \
+                                                       n_head_kv, head_dim, scale, n_splits,      \
+                                                       stream)
+  RD_ATTN_SPLIT_CASE(F32, F32);
+  RD_ATTN_SPLIT_CASE(F32, F16);
+  RD_ATTN_SPLIT_CASE(F32, Q8_0);
+  RD_ATTN_SPLIT_CASE(F32, Q4_0);
+  RD_ATTN_SPLIT_CASE(F16, F32);
+  RD_ATTN_SPLIT_CASE(F16, F16);
+  RD_ATTN_SPLIT_CASE(F16, Q8_0);
+  RD_ATTN_SPLIT_CASE(F16, Q4_0);
+  RD_ATTN_SPLIT_CASE(Q8_0, F32);
+  RD_ATTN_SPLIT_CASE(Q8_0, F16);
+  RD_ATTN_SPLIT_CASE(Q8_0, Q8_0);
+  RD_ATTN_SPLIT_CASE(Q8_0, Q4_0);
+  RD_ATTN_SPLIT_CASE(Q4_0, F32);
+  RD_ATTN_SPLIT_CASE(Q4_0, F16);
+  RD_ATTN_SPLIT_CASE(Q4_0, Q8_0);
+  RD_ATTN_SPLIT_CASE(Q4_0, Q4_0);
+#undef RD_ATTN_SPLIT_CASE
   return false;
 }
 

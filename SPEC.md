@@ -58,24 +58,25 @@ prefill real.
 | Arquivo | Peso | ctx / KV | VRAM em uso | Decode | Cabe em 16 GB? |
 |---|---|---|---|---|---|
 | `UD-IQ3_S.gguf` | 11,21 GiB | 4096 / f16 | 11,87 GiB | 27,6 tok/s | sim, folgado |
-| `UD-IQ3_S.gguf` | | 32768 / f16 | 13,61 GiB | 14,8 tok/s¹ | sim |
-| `UD-IQ3_S.gguf` | | 65536 / f16 | ~15,6 GiB | 6,6 tok/s¹ | sim, apertado |
-| `UD-IQ3_S.gguf` | | 65536 / q4_0 | 12,73 GiB | 6,4 tok/s¹ | sim |
-| `UD-IQ3_S.gguf` | | 131072 / q4_0 | 13,86 GiB | 3,7 tok/s¹ | sim |
+| `UD-IQ3_S.gguf` | | 32768 / f16 | 13,61 GiB | 23,3 tok/s¹ | sim |
+| `UD-IQ3_S.gguf` | | 65536 / f16 | ~15,6 GiB | 19,0 tok/s¹ | sim, apertado |
+| `UD-IQ3_S.gguf` | | 65536 / q4_0 | 12,73 GiB | 17,8 tok/s¹ | sim |
+| `UD-IQ3_S.gguf` | | 131072 / q4_0 | 13,86 GiB | 13,2 tok/s¹ | sim |
 | `UD-IQ4_XS.gguf` | 13,27 GiB | 4096 / f16 | 13,91 GiB | 27,0 tok/s | sim |
-| `UD-IQ4_XS.gguf` | | 32768 / f16 | 15,66 GiB | 9,1 tok/s¹ | sim, apertado (0,26 GiB livres) |
-| `UD-IQ4_XS.gguf` | | 65536 / q4_0 | 14,79 GiB | 4,2 tok/s¹ | sim |
+| `UD-IQ4_XS.gguf` | | 32768 / f16 | 15,66 GiB | 20,8 tok/s¹ | sim, apertado (0,26 GiB livres) |
+| `UD-IQ4_XS.gguf` | | 65536 / q4_0 | 14,79 GiB | 17,1 tok/s¹ | sim |
 | `UD-IQ4_XS.gguf` | | 131072 / q4_0 | — | — | **não** (`hipMalloc failed`) |
 
 ¹ **Decode no fim do contexto** (`bench --start-pos`), não no início: a atenção cresce
 linearmente com a posição e domina acima de ~8K (8,9 ms/token em 4K, 138 ms com f16 em
 64K). **Correção do M6:** a primeira versão desta tabela mostrava ~28 tok/s em 64K/131K;
 aquilo era decode na posição 5-40 com um cache grande apenas *alocado* (o `--fill-cache`
-não movia a posição) — um teste de caber, não de contexto longo. O M7 atacou isso (cargas vetorizadas + 32 warps por CTA, `docs/medicoes-m7.md`):
-64K f16 174 → 151 ms/token, 131K q4_0 441 → 273 ms. O kernel continua em 37-69 GB/s de
-~600 GB/s disponíveis, ou seja **limitado por latência/concorrência**, não por banda —
-o próximo passo é dividir a faixa de chaves entre CTAs. Com `q4_0` a desquantização
-custa mais que a banda, então `q4_0` é alavanca de VRAM, não de velocidade.
+não movia a posição) — um teste de caber, não de contexto longo. O M7 resolveu isso (`docs/medicoes-m7.md`): cargas vetorizadas, 32 warps por CTA e a
+faixa de chaves dividida entre CTAs com merge online-softmax. O decode agora é quase
+plano no contexto (23,7 tok/s em 4K, 24,1 em 16K, 19,0 em 64K, 13,2 em 131K — contra
+22,1/13,7/4,2/2,3 antes) e o prefill longo deixou de degradar (27,7 tok/s em 2048
+tokens contra 28,8 em 512). Em 64K o f16 passou a ser mais rápido que o q4_0
+(19,0 vs 17,8), então `q4_0` é alavanca de VRAM, não de velocidade.
 
 **Correção da estimativa anterior desta seção:** a versão do M0 dizia que o IQ4_XS
 estouraria com 32K de contexto f16. Medido: 32K f16 **cabe** (15,66 GiB em uso,
