@@ -81,6 +81,14 @@ struct block_q8_1 {
 };
 
 
+// 4-bit (KV cache type in M3; not a tensor type in the UD files, so it lives
+// here only for the cache — see include/rdna4/kv.h)
+#define QK4_0 32
+typedef struct {
+    uint16_t d;           // delta
+    uint8_t  qs[QK4_0/2]; // nibbles: element j in the low nibble, j+16 in the high
+} block_q4_0;
+
 // 8-bit
 typedef struct {
     uint16_t d;       // delta

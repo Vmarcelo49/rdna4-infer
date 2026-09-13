@@ -6,8 +6,9 @@
 //   attn_q output per head is [ q (head_dim) | gate (head_dim) ], stride 2*head_dim
 //     Qcur = view at offset 0, gate = view at offset head_dim
 //   Q/K are RMS-normalized per head (attn_q_norm / attn_k_norm, size head_dim)
-//   RoPE: GGML_ROPE_TYPE_IMROPE, which for text (t=h=w positions) is plain
-//     adjacent-pair RoPE over n_rot dims of each head (rope.dimension_count)
+//   RoPE: GGML_ROPE_TYPE_IMROPE, which ggml lowerers through
+//     rotate_pairs(n_dims, n_dims/2, ...) — SPLIT-HALF pairs (i with i+n_rot/2)
+//     over n_rot dims of each head (rope.dimension_count)
 //   attention scale = 1/sqrt(head_dim); the attention output is multiplied by
 //     sigmoid(gate) before attn_output
 #include <hip/hip_runtime.h>
@@ -15,10 +16,12 @@
 #include <cmath>
 #include <cstdint>
 
+#include "rdna4/kv.h"
+
 namespace rdna4 {
 
 // ---------------------------------------------------------------------------
-// RoPE on adjacent pairs of the first n_rot dims of each head:
+// RoPE on split-half pairs of the first n_rot dims of each head:
 //   angle(pair p, position t) = pos[t] * freq_base^(-2p/n_rot)
 //   (x0,x1) -> (x0*cos - x1*sin, x0*sin + x1*cos)
 // x is [n_tokens, n_heads, head_dim].
@@ -61,72 +64,137 @@ inline bool rope_launch(float *d_x, int n_tokens, int n_heads, int head_dim, int
 // ---------------------------------------------------------------------------
 // Causal attention for ONE query token against a KV cache.
 //   q, out: [n_head, head_dim] of token t (single token, not the cache)
-//   k, v  : cache layout [max_ctx, n_head_kv, head_dim] (row j = token j)
+//   k, v  : cache rows [max_ctx, n_head_kv]; row j = token j, stored in the
+//           type given by the KT/VT template parameters (kv.h)
 // The cache must already hold token t at row t; keys 0..t are attended.
-// Token t attends to cache rows 0..t (the cache holds every token processed so
-// far, so the causal bound is simply j <= t).
-// One block per head, head_dim threads; GQA: head h reads kv head
-// h / (n_head/n_head_kv). Shared memory: head_dim (reduction) + (t+2) scores.
-// Correctness-first: the scores are materialised, so softmax is a single pass.
+//
+// Flash-attention style: one block per head, `WPB` warps splitting the keys,
+// ONLINE softmax with a running max/sum — so there is no per-key shared array
+// and the kernel works at any context length (the naive "score per key in
+// shared memory" version needs O(t) shared memory and a block-wide reduction
+// per key, which caps t at a few thousand and is very slow).
+// GQA: query head h reads kv head h / (n_head/n_head_kv) (contiguous grouping).
+//
+// Per warp: lane owns head_dim/32 dims of every row; the score is a warp
+// shuffle reduction, the accumulation is local, and the WPB slices are merged
+// through a small shared buffer at the end.
 // ---------------------------------------------------------------------------
-__global__ void attn_kernel(const float *__restrict__ q, const float *__restrict__ k,
-                            const float *__restrict__ v, float *__restrict__ out, int t,
-                            int n_head, int n_head_kv, int head_dim, float scale) {
+constexpr int kAttnWarpsPerBlock = 8;   // key slices per block
+constexpr int kAttnMaxDimsPerLane = 16; // head_dim/32 <= 16 (head_dim <= 512)
+
+template <KvType KT, KvType VT>
+__global__ void attn_kernel(const float *__restrict__ q, const void *__restrict__ k,
+                            const void *__restrict__ v, float *__restrict__ out, int t,
+                            int n_head, int n_head_kv, int head_dim, float dscale) {
   extern __shared__ float smem[];
-  float *red = smem;            // head_dim
-  float *sc = smem + head_dim;  // t + 2
 
   const int h = blockIdx.x;
-  const int d = threadIdx.x;
-  // GQA grouping is CONTIGUOUS: the kv heads are tiled per group (HF's
-  // repeat_kv, and what llama.cpp does for this model), so query head h reads
-  // kv head h / (n_head/n_head_kv). Verified against the per-token oracle at
-  // layer 3: contiguous gives attn_pregate-3 sum rel 1.1e-04, while grouping
-  // by h % n_head_kv gives 3.2e-02 and a wrong argmax.
+  const int w = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
   const int kvh = h / (n_head / n_head_kv);
+  const int dpw = head_dim / 32;  // dims per lane
+  // this warp's slice: [running max, running sum, accumulator[head_dim]]
+  float *pm = smem + (std::int64_t)w * (2 + head_dim);
 
-  // q and out hold the CURRENT token only: [n_head, head_dim]. The cache holds
-  // the whole history: k/v are [t+1, n_head_kv, head_dim] rows 0..t.
-  const float qv = q[h * head_dim + d];
+  const std::uint64_t krow = kv_row_bytes(KT, head_dim);
+  const std::uint64_t vrow = kv_row_bytes(VT, head_dim);
+  const char *kbase = (const char *)k + ((std::int64_t)kvh * head_dim) * 0;  // set per key below
+  (void)kbase;
 
-  for (int j = 0; j <= t; ++j) {
-    red[d] = qv * k[((std::int64_t)j * n_head_kv + kvh) * head_dim + d];
-    __syncthreads();
-    for (int s = head_dim / 2; s > 0; s >>= 1) {
-      if (d < s) red[d] += red[d + s];
-      __syncthreads();
+  float qv[kAttnMaxDimsPerLane];
+  for (int i = 0; i < dpw; ++i) qv[i] = q[h * head_dim + lane * dpw + i];
+
+  float m = -INFINITY;
+  float l = 0.0f;
+  float acc[kAttnMaxDimsPerLane];
+  for (int i = 0; i < dpw; ++i) acc[i] = 0.0f;
+
+  for (int j = w; j <= t; j += kAttnWarpsPerBlock) {
+    const char *kr = (const char *)k + ((std::int64_t)j * n_head_kv + kvh) * krow;
+    float partial = 0.0f;
+    for (int i = 0; i < dpw; ++i) partial = fmaf(qv[i], kv_load<KT>(kr, lane * dpw + i), partial);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) partial += __shfl_xor_sync(0xffffffffull, partial, off);
+    const float score = partial * dscale;
+
+    // online softmax
+    if (score > m) {
+      const float corr = (m == -INFINITY) ? 0.0f : expf(m - score);
+      l *= corr;
+      for (int i = 0; i < dpw; ++i) acc[i] *= corr;
+      m = score;
     }
-    if (d == 0) sc[j] = red[0] * scale;
-    __syncthreads();  // sc[j] is written before red is reused
+    const float p = (m == -INFINITY) ? 0.0f : expf(score - m);
+    l += p;
+    const char *vr = (const char *)v + ((std::int64_t)j * n_head_kv + kvh) * vrow;
+    for (int i = 0; i < dpw; ++i) acc[i] = fmaf(p, kv_load<VT>(vr, lane * dpw + i), acc[i]);
   }
 
-  if (d == 0) {
-    float m = -INFINITY;
-    for (int j = 0; j <= t; ++j) m = fmaxf(m, sc[j]);
-    float sum = 0.0f;
-    for (int j = 0; j <= t; ++j) {
-      sc[j] = expf(sc[j] - m);
-      sum += sc[j];
-    }
-    sc[t + 1] = sum;
+  // Merge the WPB key slices: every lane publishes its own dims, so the whole
+  // head_dim-wide accumulator of each slice is available after the barrier.
+  if (lane == 0) {
+    pm[0] = m;
+    pm[1] = l;
   }
+  for (int i = 0; i < dpw; ++i) pm[2 + lane * dpw + i] = acc[i];
   __syncthreads();
-  const float inv = 1.0f / sc[t + 1];
 
-  float acc = 0.0f;
-  for (int j = 0; j <= t; ++j) {
-    acc += (sc[j] * inv) * v[((std::int64_t)j * n_head_kv + kvh) * head_dim + d];
+  float mm = -INFINITY;
+  for (int s = 0; s < kAttnWarpsPerBlock; ++s) mm = fmaxf(mm, smem[(std::int64_t)s * (2 + head_dim)]);
+  float ll = 0.0f;
+  for (int s = 0; s < kAttnWarpsPerBlock; ++s) {
+    const float *ps = smem + (std::int64_t)s * (2 + head_dim);
+    ll += ps[1] * expf(ps[0] - mm);
   }
-  out[h * head_dim + d] = acc;
+  const float inv = (ll > 0.0f) ? 1.0f / ll : 0.0f;
+  for (int i = 0; i < dpw; ++i) {
+    float a = 0.0f;
+    for (int s = 0; s < kAttnWarpsPerBlock; ++s) {
+      const float *ps = smem + (std::int64_t)s * (2 + head_dim);
+      a += ps[2 + lane * dpw + i] * expf(ps[0] - mm);
+    }
+    out[h * head_dim + lane * dpw + i] = a * inv;
+  }
 }
 
-inline bool attn_launch(const float *d_q, const float *d_k, const float *d_v, float *d_out, int t,
-                        int n_head, int n_head_kv, int head_dim, float scale,
-                        hipStream_t stream = nullptr) {
-  const std::size_t smem = (std::size_t)(head_dim + t + 2) * sizeof(float);
-  attn_kernel<<<n_head, head_dim, smem, stream>>>(d_q, d_k, d_v, d_out, t, n_head, n_head_kv,
-                                                 head_dim, scale);
+template <KvType KT, KvType VT>
+inline bool attn_launch_typed(const float *d_q, const void *d_k, const void *d_v, float *d_out,
+                              int t, int n_head, int n_head_kv, int head_dim, float scale,
+                              hipStream_t stream) {
+  if (head_dim % 32 != 0 || head_dim / 32 > kAttnMaxDimsPerLane) return false;
+  const int threads = kAttnWarpsPerBlock * 32;
+  const std::size_t smem =
+      (std::size_t)kAttnWarpsPerBlock * (2 + (std::size_t)head_dim) * sizeof(float);
+  attn_kernel<KT, VT><<<n_head, threads, smem, stream>>>(d_q, d_k, d_v, d_out, t, n_head,
+                                                         n_head_kv, head_dim, scale);
   return hipGetLastError() == hipSuccess;
+}
+
+inline bool attn_launch(const float *d_q, const void *d_k, const void *d_v, float *d_out, int t,
+                        int n_head, int n_head_kv, int head_dim, float scale, KvType kt,
+                        KvType vt, hipStream_t stream = nullptr) {
+#define RD_ATTN_CASE(K, V)                                                                        \
+  if (kt == KvType::K && vt == KvType::V)                                                         \
+  return attn_launch_typed<KvType::K, KvType::V>(d_q, d_k, d_v, d_out, t, n_head, n_head_kv,      \
+                                                 head_dim, scale, stream)
+  RD_ATTN_CASE(F32, F32);
+  RD_ATTN_CASE(F32, F16);
+  RD_ATTN_CASE(F32, Q8_0);
+  RD_ATTN_CASE(F32, Q4_0);
+  RD_ATTN_CASE(F16, F32);
+  RD_ATTN_CASE(F16, F16);
+  RD_ATTN_CASE(F16, Q8_0);
+  RD_ATTN_CASE(F16, Q4_0);
+  RD_ATTN_CASE(Q8_0, F32);
+  RD_ATTN_CASE(Q8_0, F16);
+  RD_ATTN_CASE(Q8_0, Q8_0);
+  RD_ATTN_CASE(Q8_0, Q4_0);
+  RD_ATTN_CASE(Q4_0, F32);
+  RD_ATTN_CASE(Q4_0, F16);
+  RD_ATTN_CASE(Q4_0, Q8_0);
+  RD_ATTN_CASE(Q4_0, Q4_0);
+#undef RD_ATTN_CASE
+  return false;
 }
 
 }  // namespace rdna4

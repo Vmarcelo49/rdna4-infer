@@ -111,6 +111,16 @@ target_link_libraries(check-graph-gpu PRIVATE ${GGML_BASE_LIB} ${AMDHIP64})
 target_link_options(check-graph-gpu PRIVATE --offload-arch=gfx1201)
 set_target_properties(check-graph-gpu PROPERTIES HIP_ARCHITECTURES "gfx1201")
 
+# M3 step 4 — KV cache types + long-context behaviour.
+add_executable(check-kvctx-gpu tests/check_kvctx_gpu.hip
+                 tests/dequant_cpu_oracle.cpp src/backend/gguf.cpp src/backend/loader.cpp
+                 src/backend/model.cpp)
+target_include_directories(check-kvctx-gpu PRIVATE include /opt/rocm/include
+                          ${LLAMA_CPP_SRC}/ggml/src ${LLAMA_CPP_SRC}/ggml/include)
+target_link_libraries(check-kvctx-gpu PRIVATE ${GGML_BASE_LIB} ${AMDHIP64})
+target_link_options(check-kvctx-gpu PRIVATE --offload-arch=gfx1201)
+set_target_properties(check-kvctx-gpu PROPERTIES HIP_ARCHITECTURES "gfx1201")
+
 # M3 step 2a — RoPE / attention kernels vs a CPU reference.
 add_executable(check-rope-gpu tests/check_rope_gpu.hip)
 target_include_directories(check-rope-gpu PRIVATE include /opt/rocm/include)

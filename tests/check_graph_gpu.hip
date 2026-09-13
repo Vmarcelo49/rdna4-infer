@@ -382,6 +382,13 @@ bool run_checks(const Accum &acc, const std::map<std::string, OracleNode> &oracl
       {"attn_gated-3", 0.2, 0.2, 0.0, false},
       {"attn_output-3", 0.2, 0.2, 0.0, false},
       {"l_out-3", 0.2, 5e-2, 0.0, false},
+      // last trunk layer and the end-to-end outputs. `l_out-63` existing at all
+      // is itself a check: the trunk is 64 blocks (65 - 1 MTP), so a wrong
+      // layer count shows up as CHECK MISSING here.
+      {"attn_norm-62", 0.2, 0.1, 0.0, false},
+      {"l_out-63", 0.2, 0.2, 0.0, false},
+      {"result_norm", 0.1, 0.2, 0.0, false},
+      {"result_output", 0.1, 5e-2, 0.0, false},
   };
 
   int failed = 0;
@@ -515,7 +522,7 @@ int main(int argc, char **argv) {
     }
   }
   std::printf("model: n_embd=%d n_layer=%u vocab=%llu emb_dtype=%s tokens=%zu\n", E,
-              cfg.block_count - 1 - cfg.nextn_predict_layers, (unsigned long long)ld.find("output.weight")->dims[1],
+              cfg.block_count - cfg.nextn_predict_layers, (unsigned long long)ld.find("output.weight")->dims[1],
               rdna4::dtype_name(emb_dt), tokens.size());
 
   // GRAPH_PERTURB=<rel>: multiply every embedding element by (1 +- rel) with a
@@ -538,8 +545,19 @@ int main(int argc, char **argv) {
     std::printf("oracle: %zu nodes\n", oracle.size());
   }
 
+  rdna4::KvType kv_k = rdna4::KvType::F32, kv_v = rdna4::KvType::F32;
+  if (const char *kv = std::getenv("GRAPH_KV")) {
+    const char *e = rdna4::kv_type_parse(kv, &kv_k);
+    kv_v = kv_k;
+    if (e) {
+      std::fprintf(stderr, "GRAPH_KV: %s\n", e);
+      return 2;
+    }
+    std::printf("kv cache type: %s (%.2f bytes/elem)\n", rdna4::kv_type_name(kv_k),
+                rdna4::kv_bytes_per_elem(kv_k));
+  }
   rdna4::Graph g(ld, cfg);
-  if (!g.init((int)tokens.size(), err)) {
+  if (!g.init((int)tokens.size(), kv_k, kv_v, err)) {
     std::fprintf(stderr, "graph init: %s\n", err.c_str());
     return 1;
   }

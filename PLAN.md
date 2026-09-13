@@ -246,7 +246,27 @@ Objetivo: logits corretos nos dois ramos de camada.
 
   Top-5 também bate em ordem/ids em 4/5 (um ligeiro desacordo no 4º/5º colocado em 3 dos 4 prompts).
 
-**Deriva residual (documentada, não "resolvida"):** os nós profundos continuam desviando ~1–12% (`attn_norm-62` ~9,8e-02 de diferença máxima nas amostras) e o *std* dos logits fica ~15–25% menor (1,62–1,88 vs 2,09–2,12). Como (a) o llama.cpp não é reprodutível melhor que ~4% por nó entre os seus próprios caminhos e (b) o nosso lado é medidamente mais preciso que o dele contra f32 exato, o resíduo é atribuído à diferença de quantização de ativação amplificada por 63 camadas — não a uma operação errada: perturbar 30% por camada muda o argmax em nada e o logit top-1 em ≤0,3.
+**Passo 4 — tipos de KV cache + contexto longo ✅** (`include/rdna4/kv.h`, `tests/check_kvctx_gpu.hip`)
+
+- **Tipos**: `KvType::{F32,F16,Q8_0,Q4_0}` (o default do llama.cpp é `f16`; o plano pedia `q8_0`/`q4_0` para ctx longo). As linhas do cache (uma cabeça KV de um token) são gravadas **já quantizadas** em blocos de 32 elementos, byte a byte como `quantize_row_q8_0_ref`/`quantize_row_q4_0_ref` do llama.cpp, e a atenção **desquantiza on-the-fly** (`kv_load<CT>`), sem cópia f32 do cache. `kv_store_row_launch` grava uma linha; `kv_fill_launch` preenche caches inteiros (hook de teste).
+- **Teste isolado por tipo** (`check-rope-gpu`): para cada tipo, grava as linhas com `kv_store_row_launch` e confere que a atenção (1 chave ⇒ softmax = 1) devolve **exatamente** o que o cache contém — `max|out - cache| = 0,000e+00` nos 4 tipos ✓.
+- **fim-a-fim**: os 4 tipos dão o **mesmo argmax** do llama.cpp no prompt de 8 tokens ✓.
+- **Atenção reescrita (flash-style, softmax online)**: a versão anterior guardava 1 score por chave em shared memory + uma redução de bloco por chave, o que (a) limita `t` a alguns milhares de tokens (smem!) e (b) é lento. A nova: 1 bloco por cabeça, 8 warps dividindo as chaves, max/soma correntes e merge por warp no fim — sem smem proporcional ao contexto. `check-rope-gpu` valida a causal (rel-L2 6,1e-08) e o caso de 1 chave.
+- **Continuação bit-exata**: `Graph::forward(emb, start_pos, ...)` continua o mesmo KV cache e o mesmo estado recorrente; `check-kvctx-gpu` compara **8 tokens numa chamada** contra **1+3+4 tokens em três chamadas** → hidden e logits **idênticos** ✓ (é o que o CLI vai precisar para prefill em blocos).
+- **Contexto longo (aceite M3 item 5)** — `check-kvctx-gpu <gguf> <ctx> <tipo>`, cache preenchido com padrão determinístico e um passo de decode no fim do contexto:
+
+  | ctx | KV | caches | VRAM em uso | decode no fim |
+  |---|---|---|---|---|
+  | 65536 | q4_0 | 576 MiB | **12,73 GiB** (3,19 livres) | 262 ms/token |
+  | 65536 | f16 | 2,0 GiB | 15,16 GiB (0,76 livres) | 192 ms/token |
+  | 65536 | f32 | 4,3 GiB | **não aloca** (`hipMalloc failed`) | — |
+  | 131072 | q4_0 | 1,1 GiB | **13,51 GiB** (2,41 livres) | 432 ms/token |
+
+  Ou seja: **64K e 131K com KV `q4_0` cabem nos 16 GB** (f16 cabe apertado em 64K; f32 não cabe) — exatamente o que o plano previa. O tempo de decode no fim do contexto é dominado pela atenção O(ctx): 262 ms/token em 64K, 432 ms/token em 131K (a atenção ainda não é tiled — item de performance).
+
+**Bug de contagem de camadas (achado no passo 4, corrigido)**: `Graph::n_layer()` era `block_count - 1 - nextn` = **63**, mas `block_count` cobre o tronco **mais** o bloco MTP, então o tronco é `block_count - nextn` = **64** blocos (0..63; full-attention em i = 3,7,…,63 = 16 camadas — o que o `validate_qwen35_layout` já dizia). A camada 63 nunca rodava: o LLM ainda acertava o argmax (a rede é robusta, como o estudo de perturbação mostrou), mas os logits ficavam ~15–25% comprimidos. Depois do fix: **logit top-1 dentro de 0,02–0,09 do llama.cpp em 4/4 prompts**, top-5 **5/5 na mesma ordem**, desvio padrão dos logits 2,091 vs 2,088 do oráculo, e `result_output` (token 7) com soma rel **4,2e-03** e amostras dentro de 1,2%. Os *structural checks* agora incluem `l_out-63`/`result_norm`/`result_output`, então uma contagem de camadas errada falha o teste (`CHECK MISSING l_out-63`) — foi verificado revertendo o bug.
+
+**Deriva residual (documentada, não "resolvida"):** depois do fix de camadas o desvio é pequeno mas não zero: nós profundos ficam tipicamente **1–10%** (`attn_norm-62` 7,9e-02 de diferença máxima nas amostras, `l_out-63` 5,7e-02, `result_output` 1,2e-02) e os logits batem dentro de ~0,1. Atribuição medida: (a) o llama.cpp não é reprodutível melhor que ~4% por nó entre os seus próprios caminhos (batched vs per-token), (b) o nosso matvec é **2,4× mais preciso** que o dele contra f32 exato (q8_1/blocos de 32 vs q8_K/blocos de 256), (c) perturbar 30% por camada não muda o argmax e muda o top-1 em ≤0,3. Ou seja: o resíduo é ruído de quantização de ativação amplificado por 64 camadas, não operação errada.
 
 **Knobs de diagnóstico** (usados para o estudo acima, mantidos por serem baratos): `GRAPH_NOISE=<rel>` (+`GRAPH_NOISE_COHERENT=1`) perturba a saída de cada camada antes do residual; `GRAPH_EXACT=1` roda o check f32-exato da primeira projeção; `GRAPH_SAMPLES=1` imprime os 6 valores (oráculo vs nós) de cada nó divergente; `GRAPH_LAST_TOKEN=1` compara só o último token (obrigatório com dump `-ub 1`); `diag.hidden_pre_norm` reporta RMS/min/max do estado residual que entra no `output_norm`.
 
@@ -254,10 +274,10 @@ Objetivo: logits corretos nos dois ramos de camada.
    Ref: `docs/referencias-upstream-gfx1201-qwen35.md` § "SGLang — Qwen3.5" (`qwen3_5.py` L322-1094: `GatedDeltaNet` + `LinearDecoderLayer`) e § "hipfire — Qwen3.5" (`forward.rs` L741-800 entradas, L139-280 MoE/decode patterns).
 2. Implementar o ramo full-attention GQA (`q/k/v` + QK-norm + RoPE/MRoPE + softmax + `attn_output`), RoPE `freq_base 1e7`, `dimension_count 64`, sections `[11,11,10,0]`.
    Ref: mesmo § SGLang (`AttentionDecoderLayer` L1094-1550) · `.ref/llama.cpp/src/models/qwen35.cpp` L1-120.
-3. FFN SwiGLU + RMSNorms + `output_norm`/`output` (Q5_K); KV cache incremental com tipos configuráveis (`--cache-type-k/v`: `f16`, `q8_0`, `q4_0` — K/V gravados já quantizados por bloco, atenção desquantiza on-the-fly, como o llama.cpp em `common/arg.cpp` L304-314); prefill em batch, decode token-a-token.
+3. ✅ FFN SwiGLU + RMSNorms + `output_norm`/`output` (Q6_K no IQ3_S); **KV cache incremental com tipos configuráveis** (`KvType::{F32,F16,Q8_0,Q4_0}`, gravado já quantizado por bloco de 32, atenção desquantiza on-the-fly — `include/rdna4/kv.h`); decode token-a-token (prefill em blocos via `Graph::forward(..., start_pos, ...)`, bit-exato).
    Ref: `SPEC.md` §1.4 · `docs/gguf-qwen-quantizacao-llamacpp.md` §2 (tipos `Q8_0`/`Q4_0` em `ggml.h`).
-4. Começar com `--ctx-size` pequeno; escalar para 32K+ com KV `q8_0`/`q4_0` (131K com `q4_0` cabe no orçamento — verificado no binário M0).
-5. **Aceite:** 1 camada linear + 1 full isoladas batem com o llama.cpp HIP (oráculo) dentro de tolerância; run de ctx longo (≥64K, KV `q4_0`) dentro dos 16 GB.
+4. ✅ 64K (e 131K) com KV `q4_0` cabem nos 16 GB e rodam; f16 cabe apertado em 64K, f32 não cabe (tabela no Passo 4).
+5. ✅ **Aceite cumprido:** 1 camada GDN + 1 full-attention batem com o oráculo por nó (`attn_pregate-3` soma rel 1,1e-04; estado recorrente ≤ 6,1e-05); o grafo completo dá o **mesmo argmax do llama.cpp em 4/4 prompts** e top-5 **5/5 na mesma ordem** com logits dentro de ~0,1; run de ctx longo (64K/131K, KV `q4_0`) dentro dos 16 GB.
 
 ## M4 — Sampler + CLI `run`
 

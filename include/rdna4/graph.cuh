@@ -48,6 +48,17 @@ __global__ void perturb_kernel(float *__restrict__ x, int n, float rel, unsigned
   x[i] *= up ? (1.0f + rel) : (1.0f - rel);
 }
 
+// Test hook: fill a float buffer with a deterministic pseudo-random pattern
+// (used by the long-context smoke test to give the attention a full cache).
+__global__ void fill_random_kernel(float *__restrict__ x, std::int64_t n, unsigned seed) {
+  const std::int64_t i = (std::int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  unsigned h = (unsigned)(i * 2654435761u) ^ (seed * 2246822519u);
+  h ^= h >> 13;
+  h *= 1274126177u;
+  x[i] = ((float)(h >> 8) / 8388608.0f) - 1.0f;  // ~(-1, 1)
+}
+
 struct GpuTensor {
   void *ptr = nullptr;
   std::size_t bytes = 0;
@@ -63,7 +74,10 @@ class Graph {
   Graph(const Graph &) = delete;
   Graph &operator=(const Graph &) = delete;
 
-  bool init(int max_ctx, std::string &err);
+  // kv_k / kv_v select the KV cache storage types (kv.h); F16 is llama.cpp's
+  // default and Q4_0 is what makes a 64K+ context fit the 16 GB budget.
+  bool init(int max_ctx, KvType kv_k, KvType kv_v, std::string &err);
+  bool init(int max_ctx, std::string &err) { return init(max_ctx, KvType::F32, KvType::F32, err); }
 
   // Validation hook: llama.cpp's eval callback names every graph node the same
   // way, so a test can compare each intermediate against the oracle dump. The
@@ -80,9 +94,24 @@ class Graph {
     if (cb_) cb_(name, il, cur_token_, d_ptr, n);
   }
 
-  // Runs `n_tokens` embedding rows (f32 [n_tokens][n_embd], positions 0..n-1).
+  // Runs `n_tokens` embedding rows (f32 [n_tokens][n_embd]) at positions
+  // start_pos..start_pos+n-1. Repeated calls continue the same KV cache and the
+  // same recurrent state, so prefill can be split arbitrarily (verified to be
+  // bit-identical to a single call by tests/check_kvctx_gpu.hip).
   bool forward(const std::vector<float> &embeddings, std::vector<float> &hidden,
                std::vector<float> &logits, std::string &err);
+  bool forward(const std::vector<float> &embeddings, int start_pos, std::vector<float> &hidden,
+               std::vector<float> &logits, std::string &err);
+
+  // Test hooks (diagnostics only; see PLAN.md M3).
+  // Fills every KV cache and GDN state with a deterministic pseudo-random
+  // pattern so a single decode step can be measured against a full cache.
+  bool debug_fill_caches(unsigned seed, std::string &err);
+  // Bytes per full-attention layer's cache (multiply by the number of
+  // full-attention layers for the total).
+  std::size_t kv_layer_bytes() const { return kv_bytes_; }
+  int n_full_attn() const { return n_layer() - count_recr(); }
+  int max_ctx() const { return max_ctx_; }
 
   void readback(const float *d, std::size_t n, std::vector<float> &out) const {
     out.resize(n);
@@ -90,7 +119,10 @@ class Graph {
   }
 
   int n_embd() const { return (int)cfg_.embedding_length; }
-  int n_layer() const { return (int)cfg_.block_count - 1 - (int)cfg_.nextn_predict_layers; }
+  // Executed trunk blocks. block_count covers the trunk *plus* the MTP block(s),
+  // so the trunk is block_count - nextn_predict_layers: 65 - 1 = 64 blocks
+  // (0..63), of which the full-attention ones are i = 3, 7, ..., 63 (16 layers).
+  int n_layer() const { return (int)cfg_.block_count - (int)cfg_.nextn_predict_layers; }
   int head_dim() const { return (int)cfg_.key_length; }
   int n_head() const { return (int)cfg_.head_count; }
   int n_head_kv() const { return (int)cfg_.head_count_kv; }
@@ -107,7 +139,13 @@ class Graph {
   bool proj(const GpuTensor &w, const float *d_x, float *d_y, int nrows, int ncols,
             std::string &err);
   bool add_residual(float *d_src, float *d_dst, int n, std::string &err);
-  bool full_attn(int il, int t, std::string &err);
+  bool full_attn(int il, int t, int pos, std::string &err);
+  bool kv_write(int il, int t, const float *d_ksrc, const float *d_vsrc, std::string &err);
+  int attn_slot(int il) const {
+    int a = 0;
+    for (int i = 0; i < il; ++i) a += is_recr(i) ? 0 : 1;
+    return a;
+  }
   bool gdn_layer(int il, int t, std::string &err);
   bool ffn(int il, std::string &err);
   void release();
@@ -130,7 +168,15 @@ class Graph {
   GpuTensor tok_embd_, output_norm_, output_;
 
   float *d_x_ = nullptr, *d_xn_ = nullptr, *d_proj_ = nullptr, *d_ffnout_ = nullptr;
-  float *d_q_ = nullptr, *d_k_ = nullptr, *d_v_ = nullptr;
+  KvType kv_k_ = KvType::F32, kv_v_ = KvType::F32;
+  float *d_q_ = nullptr, *d_kstage_ = nullptr, *d_vstage_ = nullptr;
+  void *d_k_ = nullptr, *d_v_ = nullptr;
+  std::size_t kv_bytes_ = 0;
+  int count_recr() const {
+    int n = 0;
+    for (int i = 0; i < n_layer(); ++i) n += is_recr(i) ? 1 : 0;
+    return n;
+  }
   float *d_attnout_ = nullptr, *d_attngate_ = nullptr;
   float *d_qkv_ = nullptr, *d_conv_ = nullptr, *d_z_ = nullptr;
   float *d_alpha_ = nullptr, *d_beta_ = nullptr, *d_gate_ = nullptr;
@@ -181,8 +227,10 @@ inline bool Graph::alloc(float *&p, std::size_t n, std::string &err) {
   return true;
 }
 
-inline bool Graph::init(int max_ctx, std::string &err) {
+inline bool Graph::init(int max_ctx, KvType kv_k, KvType kv_v, std::string &err) {
   max_ctx_ = max_ctx;
+  kv_k_ = kv_k;
+  kv_v_ = kv_v;
   const int L = n_layer();
   const int E = n_embd();
   const int HD = head_dim(), NH = n_head(), NKV = n_head_kv();
@@ -246,13 +294,18 @@ inline bool Graph::init(int max_ctx, std::string &err) {
       !alloc(d_gate_, nvh, err) || !alloc(d_ffn_a_, F, err) || !alloc(d_ffn_b_, F, err)) {
     return false;
   }
-  const std::size_t kv_elems = (std::size_t)max_ctx * NKV * HD;
+  // KV cache: `n_attn` caches of max_ctx rows, each row NKV heads of HD elements
+  // in the selected storage type.
+  const std::size_t kv_bytes =
+      (std::size_t)max_ctx * NKV * (std::size_t)kv_row_bytes(kv_k_, HD);
+  kv_bytes_ = kv_bytes;
   if (hipMalloc(&d_q_, (std::size_t)n_attn * NH * HD * sizeof(float)) != hipSuccess ||
-      hipMalloc(&d_k_, (std::size_t)n_attn * kv_elems * sizeof(float)) != hipSuccess ||
-      hipMalloc(&d_v_, (std::size_t)n_attn * kv_elems * sizeof(float)) != hipSuccess) {
+      hipMalloc(&d_k_, (std::size_t)n_attn * kv_bytes) != hipSuccess ||
+      hipMalloc(&d_v_, (std::size_t)n_attn * kv_bytes) != hipSuccess) {
     err = "hipMalloc failed (kv cache)";
     return false;
   }
+  if (!alloc(d_kstage_, NKV * HD, err) || !alloc(d_vstage_, NKV * HD, err)) return false;
   if (!alloc(d_state_, (std::size_t)n_recr * nvh * S * S, err)) return false;
   if (!alloc(d_convst_, (std::size_t)n_recr * (K - 1) * chan, err)) return false;
   if (hipMalloc(&d_pos_, sizeof(int)) != hipSuccess) return false;
@@ -298,7 +351,7 @@ inline bool Graph::add_residual(float *d_src, float *d_dst, int n, std::string &
 }
 
 // ---------------------------------------------------------------------------
-inline bool Graph::full_attn(int il, int t, std::string &err) {
+inline bool Graph::full_attn(int il, int t, int pos, std::string &err) {
   const int E = n_embd(), HD = head_dim(), NH = n_head(), NKV = n_head_kv();
   const LayerW &L = w_[il];
   if (!rms_norm_launch(d_x_, (const float *)L.attn_norm.ptr, d_xn_, 1, E,
@@ -308,24 +361,10 @@ inline bool Graph::full_attn(int il, int t, std::string &err) {
   }
   emit("attn_norm", il, d_xn_, E);
   if (!proj(L.attn_q, d_xn_, d_proj_, NH * 2 * HD, E, err)) return false;
-  if (!proj(L.attn_k, d_xn_, d_ffnout_, NKV * HD, E, err)) return false;  // K staged in ffnout
-  if (!proj(L.attn_v, d_xn_, d_ffn_a_, NKV * HD, E, err)) return false;   // V staged in ffn_a
+  if (!proj(L.attn_k, d_xn_, d_kstage_, NKV * HD, E, err)) return false;
+  if (!proj(L.attn_v, d_xn_, d_vstage_, NKV * HD, E, err)) return false;
   emit("Qcur_full", il, d_proj_, (std::int64_t)NH * 2 * HD);
-  emit("Vcur", il, d_ffn_a_, (std::int64_t)NKV * HD);
-
-  int a = 0;
-  for (int i = 0; i < il; ++i) a += is_recr(i) ? 0 : 1;
-  float *kc = d_k_ + (std::size_t)a * max_ctx_ * NKV * HD;
-  float *vc = d_v_ + (std::size_t)a * max_ctx_ * NKV * HD;
-  float *krow = kc + (std::size_t)t * NKV * HD;
-  float *vrow = vc + (std::size_t)t * NKV * HD;
-  if (hipMemcpy(krow, d_ffnout_, (std::size_t)NKV * HD * sizeof(float),
-                hipMemcpyDeviceToDevice) != hipSuccess ||
-      hipMemcpy(vrow, d_ffn_a_, (std::size_t)NKV * HD * sizeof(float),
-                hipMemcpyDeviceToDevice) != hipSuccess) {
-    err = "kv cache store failed";
-    return false;
-  }
+  emit("Vcur", il, d_vstage_, (std::int64_t)NKV * HD);
 
   if (!deinterleave_q_gate_launch(d_proj_, d_attnout_, d_attngate_, NH, HD)) {
     err = "deinterleave launch failed";
@@ -337,25 +376,33 @@ inline bool Graph::full_attn(int il, int t, std::string &err) {
     return false;
   }
   emit("Qcur_normed", il, d_attnout_, (std::int64_t)NH * HD);
-  if (!rms_norm_launch(krow, (const float *)L.attn_k_norm.ptr, krow, NKV, HD,
+  if (!rms_norm_launch(d_kstage_, (const float *)L.attn_k_norm.ptr, d_kstage_, NKV, HD,
                        (float)cfg_.rms_norm_eps)) {
     err = "k_norm launch failed";
     return false;
   }
-  emit("Kcur_normed", il, krow, (std::int64_t)NKV * HD);
-  if (hipMemcpy(d_pos_, &t, sizeof(int), hipMemcpyHostToDevice) != hipSuccess) {
+  emit("Kcur_normed", il, d_kstage_, (std::int64_t)NKV * HD);
+  if (hipMemcpy(d_pos_, &pos, sizeof(int), hipMemcpyHostToDevice) != hipSuccess) {
     err = "position upload failed";
     return false;
   }
   const float base = (float)cfg_.rope_freq_base;
   if (!rope_launch(d_attnout_, 1, NH, HD, n_rot(), base, d_pos_)) return false;
-  if (!rope_launch(krow, 1, NKV, HD, n_rot(), base, d_pos_)) return false;
+  if (!rope_launch(d_kstage_, 1, NKV, HD, n_rot(), base, d_pos_)) return false;
   emit("Qcur", il, d_attnout_, (std::int64_t)NH * HD);
-  emit("Kcur", il, krow, (std::int64_t)NKV * HD);
+  emit("Kcur", il, d_kstage_, (std::int64_t)NKV * HD);
   emit("gate_reshaped", il, d_attngate_, (std::int64_t)NH * HD);
 
+  // Store the rotated K and the raw V into the (possibly quantized) cache.
+  if (!kv_write(il, pos, d_kstage_, d_vstage_, err)) return false;
+  const char *kc = (const char *)d_k_ + (std::size_t)attn_slot(il) * kv_bytes_;
+  const char *vc = (const char *)d_v_ + (std::size_t)attn_slot(il) * kv_bytes_;
+
   const float scale = 1.0f / std::sqrt((float)HD);
-  if (!attn_launch(d_attnout_, kc, vc, d_attnout_, t, NH, NKV, HD, scale)) return false;
+  if (!attn_launch(d_attnout_, kc, vc, d_attnout_, pos, NH, NKV, HD, scale, kv_k_, kv_v_)) {
+    err = "attn launch failed";
+    return false;
+  }
   emit("attn_pregate", il, d_attnout_, (std::int64_t)NH * HD);
   if (!unary_launch(d_attngate_, d_attngate_, NH * HD, UnOp::Sigmoid)) return false;
   emit("gate_sigmoid", il, d_attngate_, (std::int64_t)NH * HD);
@@ -365,6 +412,26 @@ inline bool Graph::full_attn(int il, int t, std::string &err) {
   if (!proj(L.attn_output, d_attnout_, d_ffnout_, E, NH * HD, err)) return false;
   emit("attn_output", il, d_ffnout_, E);
   if (!add_residual(d_ffnout_, d_x_, E, err)) return false;
+  return true;
+}
+
+// Quantize the K row (already RoPE'd) and the V row into this layer's cache.
+inline bool Graph::kv_write(int il, int t, const float *d_ksrc, const float *d_vsrc,
+                            std::string &err) {
+  const int HD = head_dim(), NKV = n_head_kv();
+  const char *base = (const char *)d_k_ + (std::size_t)attn_slot(il) * kv_bytes_;
+  char *krow = (char *)base + (std::size_t)t * NKV * kv_row_bytes(kv_k_, HD);
+  char *vrow = (char *)d_v_ + (std::size_t)attn_slot(il) * kv_bytes_ +
+               (std::size_t)t * NKV * kv_row_bytes(kv_v_, HD);
+  for (int h = 0; h < NKV; ++h) {
+    if (!kv_store_row_launch(kv_k_, d_ksrc + (std::size_t)h * HD,
+                             krow + (std::size_t)h * kv_row_bytes(kv_k_, HD), HD) ||
+        !kv_store_row_launch(kv_v_, d_vsrc + (std::size_t)h * HD,
+                             vrow + (std::size_t)h * kv_row_bytes(kv_v_, HD), HD)) {
+      err = "kv_store_row launch failed";
+      return false;
+    }
+  }
   return true;
 }
 
@@ -464,9 +531,19 @@ inline bool Graph::ffn(int il, std::string &err) {
 // ---------------------------------------------------------------------------
 inline bool Graph::forward(const std::vector<float> &embeddings, std::vector<float> &hidden,
                            std::vector<float> &logits, std::string &err) {
+  return forward(embeddings, 0, hidden, logits, err);
+}
+
+inline bool Graph::forward(const std::vector<float> &embeddings, int start_pos,
+                           std::vector<float> &hidden, std::vector<float> &logits,
+                           std::string &err) {
   const int E = n_embd();
   const int L = n_layer();
   const std::size_t n_tokens = embeddings.size() / (std::size_t)E;
+  if (start_pos < 0 || (std::size_t)start_pos + n_tokens > (std::size_t)max_ctx_) {
+    err = "positions exceed the allocated context (" + std::to_string(max_ctx_) + ")";
+    return false;
+  }
 
   for (std::size_t t = 0; t < n_tokens; ++t) {
     cur_token_ = (int)t;
@@ -477,7 +554,8 @@ inline bool Graph::forward(const std::vector<float> &embeddings, std::vector<flo
     }
     emit("model.input_embed", -1, d_x_, E);
     for (int il = 0; il < L; ++il) {
-      const bool ok = w_[il].recr ? gdn_layer(il, (int)t, err) : full_attn(il, (int)t, err);
+      const bool ok = w_[il].recr ? gdn_layer(il, (int)t, err)
+                                 : full_attn(il, (int)t, start_pos + (int)t, err);
       if (!ok) {
         err = "layer " + std::to_string(il) + ": " + err;
         return false;
@@ -531,6 +609,35 @@ inline bool Graph::forward(const std::vector<float> &embeddings, std::vector<flo
   return true;
 }
 
+inline bool Graph::debug_fill_caches(unsigned seed, std::string &err) {
+  const int NKV = n_head_kv(), HD = head_dim();
+  const int n_recr = count_recr();
+  const std::int64_t rows = (std::int64_t)max_ctx_ * NKV;
+  if (!kv_fill_launch(kv_k_, d_k_, rows, HD, seed) ||
+      !kv_fill_launch(kv_v_, d_v_, rows, HD, seed + 1)) {
+    err = "kv_fill launch failed";
+    return false;
+  }
+  const int S = (int)cfg_.ssm_state_size;
+  const int nvh = (int)cfg_.ssm_time_step_rank;
+  const int K = (int)cfg_.ssm_conv_kernel;
+  const int chan = 2 * (int)cfg_.ssm_group_count * S + nvh * S;
+  const int threads = 256;
+  const std::size_t n_st = (std::size_t)(n_recr > 0 ? n_recr : 1) * nvh * S * S;
+  const std::size_t n_cv = (std::size_t)(n_recr > 0 ? n_recr : 1) * (K - 1) * chan;
+  if (n_recr > 0) {
+    fill_random_kernel<<<(unsigned)((n_st + threads - 1) / threads), threads>>>(
+        d_state_, (std::int64_t)n_st, seed);
+    fill_random_kernel<<<(unsigned)((n_cv + threads - 1) / threads), threads>>>(
+        d_convst_, (std::int64_t)n_cv, seed + 2);
+    if (hipGetLastError() != hipSuccess) {
+      err = "fill_random launch failed";
+      return false;
+    }
+  }
+  return true;
+}
+
 inline void Graph::release() {
   auto fr = [](GpuTensor &t) {
     if (t.ptr) (void)hipFree(t.ptr);
@@ -544,13 +651,17 @@ inline void Graph::release() {
     fr(L.ssm_alpha); fr(L.ssm_norm); fr(L.ssm_out);
   }
   fr(tok_embd_); fr(output_norm_); fr(output_);
-  float *ptrs[] = {d_x_,     d_xn_,    d_proj_,  d_ffnout_, d_attnout_, d_attngate_,
-                   d_q_,     d_k_,     d_v_,     d_qkv_,    d_conv_,    d_z_,
-                   d_alpha_, d_beta_,  d_gate_,  d_state_,  d_convst_,  d_ffn_a_,
-                   d_ffn_b_};
+  float *ptrs[] = {d_x_,     d_xn_,    d_proj_,   d_ffnout_, d_attnout_, d_attngate_,
+                   d_q_,     d_qkv_,   d_conv_,   d_z_,      d_alpha_,   d_beta_,
+                   d_gate_,  d_state_, d_convst_, d_ffn_a_,  d_ffn_b_,   d_kstage_,
+                   d_vstage_};
   for (float *p : ptrs) {
     if (p) (void)hipFree(p);
   }
+  if (d_k_) (void)hipFree(d_k_);
+  if (d_v_) (void)hipFree(d_v_);
+  d_k_ = nullptr;
+  d_v_ = nullptr;
   if (d_q8_) (void)hipFree(d_q8_);
   if (d_pos_) (void)hipFree(d_pos_);
   d_q8_ = nullptr;
