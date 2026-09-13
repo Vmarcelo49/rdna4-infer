@@ -16,6 +16,7 @@
 // (quantized cache types are a later step).
 #include <hip/hip_runtime.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -86,6 +87,17 @@ class Graph {
   using NodeCb =
       std::function<void(const char *name, int il, int t, const float *d_ptr, std::int64_t n)>;
   void set_node_cb(NodeCb cb) { cb_ = std::move(cb); }
+  // M5 diagnostics: where the per-token wall time goes, split into the calling
+  // thread queueing work and the thread blocked on the readbacks. Purely
+  // observational (two steady_clock reads per token), so it never changes the
+  // arithmetic; `bench` prints it.
+  double host_launch_ms() const { return host_launch_ms_; }
+  double host_readback_ms() const { return host_readback_ms_; }
+  void reset_host_timing() { host_launch_ms_ = 0.0; host_readback_ms_ = 0.0; }
+  // The CLI/bench decode loop does not consume `hidden`; skipping that blocking
+  // copy removes one device sync per token (it would otherwise be merged into
+  // forward_run's logits copy). Default true: the oracle tests compare `hidden`.
+  void set_want_hidden(bool want) { want_hidden_ = want; }
   // per-layer output perturbation, relative to each layer's own contribution
   void set_layer_noise(float rel, bool coherent = false) {
     noise_rel_ = rel;
@@ -112,6 +124,20 @@ class Graph {
   // round trip and no second implementation to keep in sync.
   bool forward_tokens(const std::vector<std::int32_t> &tokens, int start_pos,
                       std::vector<float> &hidden, std::vector<float> &logits, std::string &err);
+
+  // Diagnostic hook (M5): run only the first `n` trunk layers. The bench uses it
+  // to attribute the per-token cost between the layer loop and the head/glue; it
+  // produces wrong text by construction, so it is only reachable from the bench.
+  void debug_set_layer_limit(int n) { layer_limit_ = n < 0 ? n_layer() : n; }
+  int debug_layer_limit() const { return layer_limit_ < 0 ? n_layer() : layer_limit_; }
+
+  // M5: brings the graph back to the state it has after init(), for evaluating a
+  // second independent sequence (perplexity chunks, chat turns). The recurrent
+  // (GDN) state is zeroed — llama.cpp also starts every sequence from zeros — and
+  // the KV caches do NOT need clearing: attention is causal and every row is
+  // rewritten as the new sequence advances from position 0, so no stale row can
+  // be read.
+  bool reset_state(std::string &err);
 
   // Test hooks (diagnostics only; see PLAN.md M3).
   // Fills every KV cache and GDN state with a deterministic pseudo-random
@@ -171,6 +197,10 @@ class Graph {
   float noise_rel_ = 0.0f;
   bool noise_coherent_ = false;
   unsigned noise_seed_ = 0;
+  double host_launch_ms_ = 0.0;
+  double host_readback_ms_ = 0.0;
+  bool want_hidden_ = true;
+  int layer_limit_ = -1;  // < 0 => all layers
 
   struct LayerW {
     GpuTensor attn_norm, attn_post_norm, ffn_gate, ffn_up, ffn_down;
@@ -198,6 +228,7 @@ class Graph {
   float *d_state_ = nullptr, *d_convst_ = nullptr;
   float *d_ffn_a_ = nullptr, *d_ffn_b_ = nullptr;
   float *d_q8_ = nullptr;
+  float *d_logits_ = nullptr;  // cached LM-head output (allocated on first use)
   std::size_t q8_blocks_ = 0;
   int cur_token_ = 0;
   int *d_pos_ = nullptr;
@@ -648,7 +679,6 @@ inline bool Graph::forward_run(std::size_t n_tokens, int start_pos, const float 
                                const std::vector<std::int32_t> *toks, std::vector<float> &hidden,
                                std::vector<float> &logits, std::string &err) {
   const int E = n_embd();
-  const int L = n_layer();
   if (n_tokens == 0 || (host_emb == nullptr) == (toks == nullptr)) {
     err = "forward_run needs exactly one source of embeddings";
     return false;
@@ -660,6 +690,8 @@ inline bool Graph::forward_run(std::size_t n_tokens, int start_pos, const float 
   // Row stride of one token_embd row in its own (possibly quantized) layout.
   const std::size_t emb_row = (std::size_t)tensor_bytes(tok_embd_.dt, (std::uint64_t)E);
 
+  using clock = std::chrono::steady_clock;
+  const clock::time_point t_queue0 = clock::now();
   for (std::size_t t = 0; t < n_tokens; ++t) {
     cur_token_ = (int)t;
     if (toks != nullptr) {
@@ -675,7 +707,8 @@ inline bool Graph::forward_run(std::size_t n_tokens, int start_pos, const float 
       return false;
     }
     emit("model.input_embed", -1, d_x_, E);
-    for (int il = 0; il < L; ++il) {
+    const int l_end = debug_layer_limit();
+    for (int il = 0; il < l_end; ++il) {
       const bool ok = w_[il].recr ? gdn_layer(il, (int)t, err)
                                  : full_attn(il, (int)t, start_pos + (int)t, err);
       if (!ok) {
@@ -707,25 +740,49 @@ inline bool Graph::forward_run(std::size_t n_tokens, int start_pos, const float 
     return false;
   }
   emit("result_norm", -1, d_x_, E);
-  readback(d_x_, E, hidden);
+  // (1) host time spent queueing the trunk (no sync yet)
+  const clock::time_point t_queued = clock::now();
+  host_launch_ms_ += std::chrono::duration<double, std::milli>(t_queued - t_queue0).count();
+  // (2) the first blocking read: this is where the queued trunk is waited for.
+  if (want_hidden_) readback(d_x_, E, hidden);
+  const clock::time_point t_drained = clock::now();
 
   const int n_vocab = output_.dim1;
-  float *d_logits = nullptr;
-  if (hipMalloc(&d_logits, (std::size_t)n_vocab * sizeof(float)) != hipSuccess) {
-    err = "hipMalloc logits failed";
+  // The logits buffer is allocated once per Graph (1 MB): allocating and freeing
+  // it every token is pure overhead in the decode loop.
+  if (d_logits_ == nullptr) {
+    if (hipMalloc(&d_logits_, (std::size_t)n_vocab * sizeof(float)) != hipSuccess) {
+      err = "hipMalloc logits failed";
+      return false;
+    }
+  }
+  if (!proj(output_, d_x_, d_logits_, n_vocab, E, err)) {
     return false;
   }
-  if (!proj(output_, d_x_, d_logits, n_vocab, E, err)) {
-    (void)hipFree(d_logits);
-    return false;
-  }
-  emit("result_output", -1, d_logits, n_vocab);
+  emit("result_output", -1, d_logits_, n_vocab);
   logits.resize(n_vocab);
-  const bool copied = hipMemcpy(logits.data(), d_logits, (std::size_t)n_vocab * sizeof(float),
+  const bool copied = hipMemcpy(logits.data(), d_logits_, (std::size_t)n_vocab * sizeof(float),
                                hipMemcpyDeviceToHost) == hipSuccess;
-  (void)hipFree(d_logits);
+  host_readback_ms_ += std::chrono::duration<double, std::milli>(clock::now() - t_drained).count();
   if (!copied) {
     err = "logits readback failed";
+    return false;
+  }
+  return true;
+}
+
+inline bool Graph::reset_state(std::string &err) {
+  const int n_recr = count_recr();
+  if (n_recr == 0) return true;
+  const int S = (int)cfg_.ssm_state_size;
+  const int nvh = (int)cfg_.ssm_time_step_rank;
+  const int K = (int)cfg_.ssm_conv_kernel;
+  const int chan = 2 * (int)cfg_.ssm_group_count * S + nvh * S;
+  const std::size_t n_st = (std::size_t)n_recr * nvh * S * S;
+  const std::size_t n_cv = (std::size_t)n_recr * (K - 1) * chan;
+  if (hipMemset(d_state_, 0, n_st * sizeof(float)) != hipSuccess ||
+      hipMemset(d_convst_, 0, n_cv * sizeof(float)) != hipSuccess) {
+    err = "recurrent state reset failed";
     return false;
   }
   return true;
@@ -790,8 +847,10 @@ inline void Graph::release() {
   d_v_ = nullptr;
   if (d_q8_) (void)hipFree(d_q8_);
   if (d_pos_) (void)hipFree(d_pos_);
+  if (d_logits_) (void)hipFree(d_logits_);
   d_q8_ = nullptr;
   d_pos_ = nullptr;
+  d_logits_ = nullptr;
 }
 
 }  // namespace rdna4

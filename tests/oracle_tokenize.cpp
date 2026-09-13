@@ -4,10 +4,15 @@
 // these ids: tokenization is not a place where "close" is acceptable, because a
 // single different id changes the prompt the model sees.
 //
-// usage: oracle-tokenize <file.gguf> [corpus.txt]
+// usage: oracle-tokenize <file.gguf> [corpus.txt | --raw corpus.txt]
 //   corpus.txt: one test string per line, with \n, \t and \\ escaped (see
 //               tests/tokenizer_corpus.txt). With no file the built-in list is
 //               used.
+//   --raw: tokenize the whole file as ONE string (add_special, parse_special =
+//          false, exactly like llama-perplexity's `common_tokenize(ctx, prompt,
+//          true)`) and print one id per line. That is the mode used to compare
+//          against the engine on a real corpus: a single different id would shift
+//          every perplexity chunk.
 // Output: "<line index>\t<id> <id> ..." per line, plus a trailing "# ok".
 #include <llama.h>
 
@@ -39,8 +44,51 @@ std::string unescape(const std::string &in) {
 
 int main(int argc, char **argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: oracle-tokenize <file.gguf> [corpus.txt]\n");
+    std::fprintf(stderr, "usage: oracle-tokenize <file.gguf> [corpus.txt | --raw corpus.txt]\n");
     return 2;
+  }
+  const bool raw = argc >= 3 && std::string(argv[2]) == "--raw";
+  if (raw && argc < 4) {
+    std::fprintf(stderr, "usage: oracle-tokenize <file.gguf> --raw <corpus.txt>\n");
+    return 2;
+  }
+  if (raw) {
+    // Whole file as a single string, the way llama-perplexity tokenizes it:
+    // add_special = true, parse_special = false (common_tokenize's default).
+    std::string text;
+    std::FILE *fp = std::fopen(argv[3], "rb");
+    if (!fp) {
+      std::fprintf(stderr, "cannot open corpus %s\n", argv[3]);
+      return 1;
+    }
+    char buf[1 << 16];
+    std::size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), fp)) > 0) text.append(buf, n);
+    std::fclose(fp);
+    llama_backend_init();
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = 0;
+    mp.vocab_only = true;
+    llama_model *m = llama_model_load_from_file(argv[1], mp);
+    if (!m) {
+      std::fprintf(stderr, "load failed\n");
+      return 1;
+    }
+    const llama_vocab *v = llama_model_get_vocab(m);
+    int32_t need = llama_tokenize(v, text.c_str(), (int32_t)text.size(), nullptr, 0, true, false);
+    if (need < 0) need = -need;
+    std::vector<llama_token> ids((std::size_t)need);
+    const int32_t got =
+        llama_tokenize(v, text.c_str(), (int32_t)text.size(), ids.data(), need, true, false);
+    if (got < 0) {
+      std::fprintf(stderr, "raw tokenize failed (%d)\n", (int)got);
+      return 1;
+    }
+    for (int32_t i = 0; i < got; ++i) std::printf("%d\n", (int)ids[(std::size_t)i]);
+    std::fprintf(stderr, "# raw: %d tokens from %zu bytes\n", got, text.size());
+    llama_model_free(m);
+    llama_backend_free();
+    return 0;
   }
 
   std::vector<std::string> corpus = {

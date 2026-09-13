@@ -149,6 +149,596 @@ double now_s() {
 }
 
 // ---------------------------------------------------------------------------
+// bench: M5 measurement harness. Reports the numbers SPEC.md §3 and the README
+// quote, for one (model, ctx, kv type) combination:
+//   - load time and VRAM in use
+//   - prefill: the per-token path (this engine has no batched prefill), so the
+//     prompt is timed token by token
+//   - decode: greedy loop, RNG-free, with a warm-up phase that is excluded —
+//     gfx1201 drops to a deep DPM state between kernels (SCLK 9-16 MHz), so a
+//     cold measurement is ~1.5x too low (see PLAN.md M2 "Passo 5")
+//   - effective bandwidth = model bytes read per token / time
+// `--fill-cache` seeds every KV cache and the GDN state (Graph::debug_fill_caches)
+// so decode can be measured as if the context were full, without waiting for a
+// real long prefill — that is a synthetic cache and is labelled as such.
+// ---------------------------------------------------------------------------
+int cmd_bench(int argc, char **argv) {
+  const char *model_path = nullptr;
+  std::string prompt = "The capital of France is";
+  long long n_decode = 64;
+  long long warmup = 8;
+  long long reps = 3;
+  long long prefill = 0;  // 0 => prompt length
+  std::uint64_t ctx_size = 4096;
+  rdna4::KvType kv_k = rdna4::KvType::F16, kv_v = rdna4::KvType::F16;
+  bool fill_cache = false;
+  std::uint64_t seed = 0;
+  long long layers = -1;  // < 0 => all (diagnostic: attribute layer vs head cost)
+
+  for (int i = 1; i < argc; ++i) {
+    const char *a = argv[i];
+    auto need = [&](const char *what) -> const char * {
+      if (i + 1 >= argc) {
+        std::fprintf(stderr, "rdna4-infer bench: %s needs a value\n", what);
+        return nullptr;
+      }
+      return argv[++i];
+    };
+    if (std::strcmp(a, "-m") == 0) {
+      const char *v = need("-m");
+      if (!v) return 1;
+      model_path = v;
+    } else if (std::strcmp(a, "-p") == 0) {
+      const char *v = need("-p");
+      if (!v) return 1;
+      prompt = v;
+    } else if (std::strcmp(a, "-n") == 0 || std::strcmp(a, "--decode") == 0) {
+      const char *v = need("-n");
+      if (!v || !parse_i64(v, &n_decode) || n_decode < 1) {
+        return 1;
+      }
+    } else if (std::strcmp(a, "--warmup") == 0) {
+      const char *v = need("--warmup");
+      if (!v || !parse_i64(v, &warmup) || warmup < 0) {
+        return 1;
+      }
+    } else if (std::strcmp(a, "--reps") == 0) {
+      const char *v = need("--reps");
+      if (!v || !parse_i64(v, &reps) || reps < 1) {
+        return 1;
+      }
+    } else if (std::strcmp(a, "--prefill") == 0) {
+      const char *v = need("--prefill");
+      if (!v || !parse_i64(v, &prefill) || prefill < 0) {
+        return 1;
+      }
+    } else if (std::strcmp(a, "--ctx-size") == 0) {
+      const char *v = need("--ctx-size");
+      if (!v || !parse_u64(v, &ctx_size) || ctx_size == 0) {
+        return 1;
+      }
+    } else if (std::strcmp(a, "--cache-type-k") == 0) {
+      const char *v = need("--cache-type-k");
+      if (!v || !parse_kv_type(v, &kv_k)) return 1;
+    } else if (std::strcmp(a, "--cache-type-v") == 0) {
+      const char *v = need("--cache-type-v");
+      if (!v || !parse_kv_type(v, &kv_v)) return 1;
+    } else if (std::strcmp(a, "--fill-cache") == 0) {
+      fill_cache = true;
+    } else if (std::strcmp(a, "--layers") == 0) {
+      const char *v = need("--layers");
+      if (!v || !parse_i64(v, &layers) || layers < 0) return 1;
+    } else if (std::strcmp(a, "--seed") == 0) {
+      const char *v = need("--seed");
+      if (!v || !parse_u64(v, &seed)) return 1;
+    } else if (std::strcmp(a, "-h") == 0 || std::strcmp(a, "--help") == 0) {
+      std::printf("usage: rdna4-infer bench -m model.gguf [-p TEXT] [-n DECODE] [--warmup N] "
+                  "[--reps N] [--prefill N] [--ctx-size N] [--cache-type-k T] [--cache-type-v T] "
+                  "[--fill-cache] [--seed N]\n");
+      return 0;
+    } else {
+      std::fprintf(stderr, "rdna4-infer bench: unknown argument '%s'\n", a);
+      return 1;
+    }
+  }
+  if (model_path == nullptr) {
+    std::fprintf(stderr, "rdna4-infer bench: -m model.gguf is required\n");
+    return 1;
+  }
+
+  char arch[64] = {};
+  std::size_t total_vram = 0;
+  if (rdna4::query_device(arch, sizeof(arch), &total_vram) != 0 ||
+      !rdna4::is_gfx1201(arch)) {
+    std::fprintf(stderr, "rdna4-infer: requires gfx1201, found %s\n", arch);
+    return 2;
+  }
+  struct stat st;
+  if (stat(model_path, &st) != 0) {
+    std::fprintf(stderr, "rdna4-infer: cannot stat %s\n", model_path);
+    return 1;
+  }
+
+  rdna4::GgufLoader loader;
+  std::string err;
+  if (!loader.open(model_path, err)) {
+    std::fprintf(stderr, "rdna4-infer: gguf load failed: %s\n", err.c_str());
+    return 1;
+  }
+  rdna4::Qwen35Config cfg;
+  if (!rdna4::parse_qwen35_config(loader.meta(), cfg, err)) {
+    std::fprintf(stderr, "rdna4-infer: config failed: %s\n", err.c_str());
+    return 1;
+  }
+  rdna4::Tokenizer tk;
+  if (!tk.init(loader.meta(), err)) {
+    std::fprintf(stderr, "rdna4-infer: tokenizer failed: %s\n", err.c_str());
+    return 1;
+  }
+  std::vector<std::int32_t> ids = tk.encode(prompt, /*parse_special=*/true);
+  if (ids.empty()) {
+    std::fprintf(stderr, "rdna4-infer bench: the prompt produced no tokens\n");
+    return 1;
+  }
+  // a longer timed prefill: repeat the prompt's own tokens
+  while (prefill > 0 && (long long)ids.size() < prefill) {
+    const std::size_t before = ids.size();
+    for (std::size_t i = 0; i < before && (long long)ids.size() < prefill; ++i) {
+      ids.push_back(ids[i]);
+    }
+  }
+  if ((std::uint64_t)ids.size() + (std::uint64_t)n_decode + (std::uint64_t)warmup > ctx_size) {
+    ctx_size = (std::uint64_t)ids.size() + (std::uint64_t)n_decode + (std::uint64_t)warmup;
+  }
+
+  const double t0 = now_s();
+  rdna4::Graph graph(loader, cfg);
+  if (!graph.init((int)ctx_size, kv_k, kv_v, err)) {
+    std::fprintf(stderr, "rdna4-infer: graph init failed: %s\n", err.c_str());
+    return 1;
+  }
+  const double t_load = now_s() - t0;
+
+  graph.debug_set_layer_limit(layers < 0 ? graph.n_layer() : (int)layers);
+  rdna4::SamplerParams sp;  // greedy: bench must be deterministic and RNG-free
+  sp.temp = 0.0f;
+  sp.seed = seed;
+  rdna4::Sampler sampler;
+  sampler.init(sp, (std::int32_t)graph.n_vocab());
+
+  graph.set_want_hidden(false);  // the bench does not use `hidden`
+  std::vector<float> hidden, logits;
+  if (fill_cache && !graph.debug_fill_caches((unsigned)seed, err)) {
+    std::fprintf(stderr, "rdna4-infer: fill cache failed: %s\n", err.c_str());
+    return 1;
+  }
+  const double tp0 = now_s();
+  if (!graph.forward_tokens(ids, 0, hidden, logits, err)) {
+    std::fprintf(stderr, "rdna4-infer: prefill failed: %s\n", err.c_str());
+    return 1;
+  }
+  const double t_prefill = now_s() - tp0;
+
+  const std::size_t bytes_per_token = loader.total_bytes();
+  const double gib = 1024.0 * 1024.0 * 1024.0;
+
+  // decode: warm up outside the timed window, then `reps` timed passes
+  std::vector<std::int32_t> history = ids;
+  double sample_ms = 0.0;
+  graph.reset_host_timing();
+  auto decode_pass = [&](long long n, double *ms_out, std::size_t *n_out) {
+    const double a = now_s();
+    std::size_t done = 0;
+    for (long long i = 0; i < n; ++i) {
+      const double s0 = now_s();
+      const std::int32_t id = sampler.sample(logits.data(), history);
+      sample_ms += (now_s() - s0) * 1000.0;
+      if (id < 0) return false;
+      history.push_back(id);
+      if ((std::size_t)history.size() >= ctx_size) break;
+      if (!graph.forward_tokens({id}, (int)history.size() - 1, hidden, logits, err)) return false;
+      ++done;
+    }
+    *ms_out = (now_s() - a) * 1000.0;
+    *n_out = done;
+    return true;
+  };
+  if (warmup > 0) {
+    double ms = 0;
+    std::size_t done = 0;
+    if (!decode_pass(warmup, &ms, &done)) {
+      std::fprintf(stderr, "rdna4-infer: warmup failed: %s\n", err.c_str());
+      return 1;
+    }
+  }
+  double best_ms = 0, sum_ms = 0;
+  std::size_t best_n = 0, total_tokens_timed = 0;
+  double best_queue = 0, best_tail = 0, best_sample = 0;
+  for (long long r = 0; r < reps; ++r) {
+    double ms = 0;
+    std::size_t done = 0;
+    const double sample_before = sample_ms;
+    graph.reset_host_timing();
+    if (!decode_pass(n_decode, &ms, &done) || done == 0) {
+      std::fprintf(stderr, "rdna4-infer: decode failed: %s\n", err.c_str());
+      return 1;
+    }
+    if (best_ms == 0 || ms < best_ms) {
+      best_ms = ms;
+      best_n = done;
+      best_queue = graph.host_launch_ms();
+      best_tail = graph.host_readback_ms();
+      best_sample = sample_ms - sample_before;
+    }
+    sum_ms += ms;
+    total_tokens_timed += done;
+    // rewind: the sequence length must stay in range across reps
+    history.resize(ids.size());
+    if (fill_cache) (void)graph.debug_fill_caches((unsigned)seed, err);
+    if (!graph.forward_tokens(ids, 0, hidden, logits, err)) {
+      std::fprintf(stderr, "rdna4-infer: reset failed: %s\n", err.c_str());
+      return 1;
+    }
+  }
+  const double tok_s = (double)best_n / (best_ms / 1000.0);
+  // bytes read per *token* (all trunk weights once) divided by the per-token time
+  const double sec_per_token = (best_ms / 1000.0) / (double)best_n;
+  const double gb_s = (double)bytes_per_token / sec_per_token / 1e9;
+
+  std::size_t free_b = 0, tot_b = 0;
+  (void)hipMemGetInfo(&free_b, &tot_b);
+  std::printf("model: %s\n", model_path);
+  std::printf("arch %s, %d layers (%d full-attn), embd %d, vocab %d\n", arch, graph.n_layer(),
+              graph.n_full_attn(), graph.n_embd(), graph.n_vocab());
+  if (layers >= 0) {
+    std::printf("layers limited to %d (diagnostic: the output is meaningless)\n",
+                graph.debug_layer_limit());
+  }
+  std::printf("ctx %llu, kv %s/%s%s, load %.2f s\n", (unsigned long long)ctx_size,
+              kv_type_cstr(kv_k), kv_type_cstr(kv_v),
+              fill_cache ? " (synthetic full cache)" : "", t_load);
+  std::printf("vram in use: %.2f GiB (free %.2f of %.2f GiB)\n",
+              (double)(tot_b - free_b) / gib, (double)free_b / gib, (double)tot_b / gib);
+  std::printf("prefill %zu tokens: %.3f s (%.2f tok/s, per-token path)\n", ids.size(), t_prefill,
+              (double)ids.size() / t_prefill);
+  std::printf("decode %zu tokens x %lld reps (warmup %lld): best %.3f s (%.2f tok/s), "
+              "mean %.2f tok/s\n",
+              best_n, reps, warmup, best_ms / 1000.0, tok_s,
+              (double)best_n * (double)reps / (sum_ms / 1000.0));
+  std::printf("effective bandwidth: %.1f GB/s (%.2f GiB per token)\n", gb_s,
+              (double)bytes_per_token / gib);
+  // where the wall time goes, split host vs device (M5 diagnostics)
+  const double tot_ms = best_ms / (double)best_n;
+  const double q_ms = best_queue / (double)best_n;
+  const double r_ms = best_tail / (double)best_n;
+  const double s_ms = best_sample / (double)best_n;
+  (void)total_tokens_timed;
+  std::printf("per token: %.2f ms = launch loop %.2f (host thread; while the command queue is full "
+              "this is back-pressure from the device, not host cost) + tail %.2f (trunk drain, LM "
+              "head, logits copy) + sample %.2f\n",
+              tot_ms, q_ms, r_ms, s_ms);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// tokenize: dump the ids of a file (one per line), CPU-only. M5 added it to
+// compare the engine's BPE against llama.cpp over a real corpus
+// (tests/oracle-tokenize --raw): a single different id shifts every perplexity
+// chunk, so the perplexity comparison is only meaningful once the id streams are
+// identical.
+// ---------------------------------------------------------------------------
+int cmd_tokenize(int argc, char **argv) {
+  const char *model_path = nullptr;
+  const char *file = nullptr;
+  bool parse_special = false;  // common_tokenize's default (llama-perplexity's mode)
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+      model_path = argv[++i];
+    } else if (std::strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
+      file = argv[++i];
+    } else if (std::strcmp(argv[i], "--parse-special") == 0) {
+      parse_special = true;
+    } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
+      std::printf("usage: rdna4-infer tokenize -m model.gguf -f file.txt [--parse-special]\n");
+      return 0;
+    } else {
+      std::fprintf(stderr, "rdna4-infer tokenize: unknown argument '%s'\n", argv[i]);
+      return 1;
+    }
+  }
+  if (model_path == nullptr || file == nullptr) {
+    std::fprintf(stderr, "rdna4-infer tokenize: -m and -f are required\n");
+    return 1;
+  }
+  rdna4::GgufLoader loader;
+  std::string err;
+  if (!loader.open(model_path, err)) {
+    std::fprintf(stderr, "rdna4-infer: gguf load failed: %s\n", err.c_str());
+    return 1;
+  }
+  rdna4::Tokenizer tk;
+  if (!tk.init(loader.meta(), err)) {
+    std::fprintf(stderr, "rdna4-infer: tokenizer failed: %s\n", err.c_str());
+    return 1;
+  }
+  std::string text;
+  {
+    std::FILE *fp = std::fopen(file, "rb");
+    if (fp == nullptr) {
+      std::fprintf(stderr, "rdna4-infer tokenize: cannot open %s\n", file);
+      return 1;
+    }
+    char buf[1 << 16];
+    std::size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), fp)) > 0) text.append(buf, n);
+    std::fclose(fp);
+  }
+  const std::vector<std::int32_t> ids = tk.encode(text, parse_special);
+  for (std::int32_t id : ids) std::printf("%d\n", id);
+  std::fprintf(stderr, "# %zu tokens from %zu bytes\n", ids.size(), text.size());
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// ppl: M5 quality gate. Reproduces llama.cpp's `llama-perplexity` (strided mode,
+// tools/perplexity/perplexity.cpp perplexity_v2) so the two numbers are directly
+// comparable:
+//   - the corpus is tokenized once with add_special/parse_special as upstream
+//     does (this vocab adds neither BOS nor EOS);
+//   - the evaluation window is `ctx + stride/2` tokens per chunk (upstream
+//     enlarges n_ctx by stride/2 for the strided mode);
+//   - only positions [window - stride - 1, window - 1) are scored, i.e. the last
+//     `stride` tokens of the window, with the preceding tokens serving as
+//     context; chunk i starts at i*stride, so the scored regions tile the corpus;
+//   - NLL is -log softmax(logits)[next token] with the max-subtracted softmax of
+//     the reference, and PPL = exp(mean NLL) with the same +/- std error.
+// Each chunk restarts the sequence (Graph::reset_state), like llama.cpp clearing
+// the KV cache per chunk.
+// ---------------------------------------------------------------------------
+int cmd_ppl(int argc, char **argv) {
+  const char *model_path = nullptr;
+  const char *corpus = nullptr;
+  std::uint64_t ctx_size = 512, stride = 512;
+  long long chunks = 20;
+  rdna4::KvType kv_k = rdna4::KvType::F16, kv_v = rdna4::KvType::F16;
+  bool stats = true, verbose = false;
+  const char *nll_out = nullptr;
+
+  for (int i = 1; i < argc; ++i) {
+    const char *a = argv[i];
+    auto need = [&](const char *what) -> const char * {
+      if (i + 1 >= argc) {
+        std::fprintf(stderr, "rdna4-infer ppl: %s needs a value\n", what);
+        return nullptr;
+      }
+      return argv[++i];
+    };
+    if (std::strcmp(a, "-m") == 0) {
+      const char *v = need("-m");
+      if (!v) return 1;
+      model_path = v;
+    } else if (std::strcmp(a, "-f") == 0) {
+      const char *v = need("-f");
+      if (!v) return 1;
+      corpus = v;
+    } else if (std::strcmp(a, "--ctx-size") == 0 || std::strcmp(a, "-c") == 0) {
+      const char *v = need("--ctx-size");
+      if (!v || !parse_u64(v, &ctx_size) || ctx_size == 0) return 1;
+    } else if (std::strcmp(a, "--stride") == 0) {
+      const char *v = need("--stride");
+      if (!v || !parse_u64(v, &stride) || stride == 0 || stride % 2 != 0) return 1;
+    } else if (std::strcmp(a, "--chunks") == 0) {
+      const char *v = need("--chunks");
+      if (!v || !parse_i64(v, &chunks) || chunks < 1) return 1;
+    } else if (std::strcmp(a, "--cache-type-k") == 0) {
+      const char *v = need("--cache-type-k");
+      if (!v || !parse_kv_type(v, &kv_k)) return 1;
+    } else if (std::strcmp(a, "--cache-type-v") == 0) {
+      const char *v = need("--cache-type-v");
+      if (!v || !parse_kv_type(v, &kv_v)) return 1;
+    } else if (std::strcmp(a, "--no-stats") == 0) {
+      stats = false;
+    } else if (std::strcmp(a, "-v") == 0) {
+      verbose = true;
+    } else if (std::strcmp(a, "--nll-out") == 0) {
+      const char *v = need("--nll-out");
+      if (!v) return 1;
+      nll_out = v;
+    } else if (std::strcmp(a, "-h") == 0 || std::strcmp(a, "--help") == 0) {
+      std::printf("usage: rdna4-infer ppl -m model.gguf -f corpus.txt [--ctx-size 512] "
+                  "[--stride 512] [--chunks 20] [--cache-type-k T] [--cache-type-v T]\n");
+      return 0;
+    } else {
+      std::fprintf(stderr, "rdna4-infer ppl: unknown argument '%s'\n", a);
+      return 1;
+    }
+  }
+  if (model_path == nullptr || corpus == nullptr) {
+    std::fprintf(stderr, "rdna4-infer ppl: -m model.gguf and -f corpus.txt are required\n");
+    return 1;
+  }
+
+  char arch[64] = {};
+  std::size_t total_vram = 0;
+  if (rdna4::query_device(arch, sizeof(arch), &total_vram) != 0 || !rdna4::is_gfx1201(arch)) {
+    std::fprintf(stderr, "rdna4-infer: requires gfx1201, found %s\n", arch);
+    return 2;
+  }
+
+  rdna4::GgufLoader loader;
+  std::string err;
+  if (!loader.open(model_path, err)) {
+    std::fprintf(stderr, "rdna4-infer: gguf load failed: %s\n", err.c_str());
+    return 1;
+  }
+  rdna4::Qwen35Config cfg;
+  if (!rdna4::parse_qwen35_config(loader.meta(), cfg, err)) {
+    std::fprintf(stderr, "rdna4-infer: config failed: %s\n", err.c_str());
+    return 1;
+  }
+  rdna4::Tokenizer tk;
+  if (!tk.init(loader.meta(), err)) {
+    std::fprintf(stderr, "rdna4-infer: tokenizer failed: %s\n", err.c_str());
+    return 1;
+  }
+
+  std::string text;
+  {
+    std::FILE *fp = std::fopen(corpus, "rb");
+    if (fp == nullptr) {
+      std::fprintf(stderr, "rdna4-infer ppl: cannot open %s\n", corpus);
+      return 1;
+    }
+    char buf[1 << 16];
+    std::size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), fp)) > 0) text.append(buf, n);
+    std::fclose(fp);
+  }
+  const double t_tok0 = now_s();
+  std::vector<std::int32_t> tokens = tk.encode(text, /*parse_special=*/false);
+  const double t_tok1 = now_s();
+  if (tokens.size() < 2 * ctx_size) {
+    std::fprintf(stderr,
+                 "rdna4-infer ppl: the corpus tokenizes to %zu tokens, need >= 2*ctx = %llu\n",
+                 tokens.size(), (unsigned long long)(2 * ctx_size));
+    return 1;
+  }
+  if (tk.add_bos() || tk.add_eos()) {
+    std::fprintf(stderr, "rdna4-infer ppl: this vocab adds BOS/EOS; the reference's perplexity "
+                         "harness assumes it does not\n");
+    return 1;
+  }
+
+  const std::size_t window = (std::size_t)ctx_size + (std::size_t)(stride / 2);
+  const std::size_t n_chunk_max = (tokens.size() - window + stride - 1) / stride;
+  const std::size_t n_chunk = std::min<std::size_t>((std::size_t)chunks, n_chunk_max);
+  if (n_chunk == 0) {
+    std::fprintf(stderr, "rdna4-infer ppl: no chunks fit (corpus %zu tokens, window %zu)\n",
+                 tokens.size(), window);
+    return 1;
+  }
+
+  const double t0 = now_s();
+  rdna4::Graph graph(loader, cfg);
+  if (!graph.init((int)window, kv_k, kv_v, err)) {
+    std::fprintf(stderr, "rdna4-infer: graph init failed: %s\n", err.c_str());
+    return 1;
+  }
+  graph.set_want_hidden(false);
+  const double t_load = now_s() - t0;
+
+  if (stats) {
+    std::fprintf(stderr,
+                 "rdna4-infer ppl: %s, ctx %llu window %zu stride %llu chunks %zu, kv %s/%s\n"
+                 "  corpus %s: %.2f MB, %zu tokens (tokenized in %.1f s), model loaded in %.1f s\n",
+                 model_path, (unsigned long long)ctx_size, window, (unsigned long long)stride,
+                 n_chunk, kv_type_cstr(kv_k), kv_type_cstr(kv_v), corpus,
+                 (double)text.size() / 1048576.0, tokens.size(), t_tok1 - t_tok0, t_load);
+  }
+
+  const std::size_t first_scored = window - (std::size_t)stride - 1;
+  const int n_vocab = graph.n_vocab();
+  std::FILE *nll_fp = nullptr;
+  if (nll_out != nullptr) {
+    nll_fp = std::fopen(nll_out, "w");
+    if (nll_fp == nullptr) {
+      std::fprintf(stderr, "rdna4-infer ppl: cannot write %s\n", nll_out);
+      return 1;
+    }
+  }
+  std::vector<float> hidden, logits;
+  double nll_sum = 0.0, nll_sq = 0.0;
+  std::uint64_t scored = 0;
+  std::printf("chunks:");
+  for (std::size_t c = 0; c < n_chunk; ++c) {
+    const std::size_t start = c * (std::size_t)stride;
+    if (!graph.reset_state(err)) {
+      std::fprintf(stderr, "rdna4-infer ppl: reset failed: %s\n", err.c_str());
+      return 1;
+    }
+    double chunk_nll = 0.0;
+    std::uint64_t chunk_n = 0;
+    // diagnostics: the tokens this engine finds most surprising in the chunk.
+    // A handful of extreme values means a specific construction is mishandled;
+    // a uniformly worse chunk means something structural.
+    std::vector<std::pair<double, std::pair<std::int32_t, std::size_t>>> worst;
+    for (std::size_t t = 0; t < window; ++t) {
+      if (!graph.forward_tokens({tokens[start + t]}, (int)t, hidden, logits, err)) {
+        std::fprintf(stderr, "rdna4-infer ppl: forward failed at chunk %zu token %zu: %s\n", c, t,
+                     err.c_str());
+        return 1;
+      }
+      if (t < first_scored || t + 1 >= window) continue;
+      const int next = tokens[start + t + 1];
+      float max_logit = logits[0];
+      for (int i = 1; i < n_vocab; ++i) max_logit = std::max(max_logit, logits[i]);
+      float sum_exp = 0.0f;
+      for (int i = 0; i < n_vocab; ++i) sum_exp += std::exp(logits[i] - max_logit);
+      if (!(sum_exp > 0.0f)) {
+        std::fprintf(stderr, "rdna4-infer ppl: degenerate softmax at chunk %zu token %zu\n", c, t);
+        return 1;
+      }
+      const float prob = std::exp(logits[next] - max_logit) / sum_exp;
+      if (!(prob > 0.0f)) {
+        std::fprintf(stderr, "rdna4-infer ppl: zero probability for token %d (chunk %zu)\n", next,
+                     c);
+        return 1;
+      }
+      const double nll = -std::log((double)prob);
+      if (nll_fp != nullptr) {
+        std::fprintf(nll_fp, "%zu %.8f %d\n", start + t + 1, nll, next);
+      }
+      if (worst.size() < 5) {
+        worst.push_back({nll, {next, start + t + 1}});
+        std::sort(worst.begin(), worst.end(),
+                  [](const auto &x, const auto &y) { return x.first > y.first; });
+      } else if (nll > worst.back().first) {
+        worst.back() = {nll, {next, start + t + 1}};
+        std::sort(worst.begin(), worst.end(),
+                  [](const auto &x, const auto &y) { return x.first > y.first; });
+      }
+      chunk_nll += nll;
+      ++chunk_n;
+      nll_sum += nll;
+      nll_sq += nll * nll;
+      ++scored;
+    }
+    std::printf("[%zu]%.4f,", c + 1, std::exp(chunk_nll / (double)chunk_n));
+    std::fflush(stdout);
+    if (verbose) {
+      std::fprintf(stderr, "  chunk %zu worst tokens:", c + 1);
+      for (const auto &w : worst) {
+        std::fprintf(stderr, " [%zu] %d '%s' nll %.2f;", w.second.second, w.second.first,
+                     tk.token_text(w.second.first).c_str(), w.first);
+      }
+      std::fprintf(stderr, "\n");
+    }
+  }
+  std::printf("\n");
+
+  if (nll_fp != nullptr) std::fclose(nll_fp);
+  const double mean_nll = nll_sum / (double)scored;
+  const double ppl = std::exp(mean_nll);
+  double var = nll_sq / (double)scored - mean_nll * mean_nll;
+  double ppl_std = 0.0;
+  if (var > 0.0) {
+    var = std::sqrt(var / (double)(scored - 1));
+    ppl_std = var * ppl;
+  }
+  const double dt = now_s() - t0 - t_load;
+  std::printf("Final estimate: PPL = %.4f +/- %.5f\n", ppl, ppl_std);
+  if (stats) {
+    std::fprintf(stderr,
+                 "  scored %llu tokens over %zu chunks in %.1f s (%.2f tok/s, window %zu, kv "
+                 "%s/%s)\n",
+                 (unsigned long long)scored, n_chunk, dt,
+                 dt > 0 ? (double)(scored + n_chunk * (window - (std::size_t)stride)) / dt : 0.0,
+                 window, kv_type_cstr(kv_k), kv_type_cstr(kv_v));
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // info: the M0/M1/M2 device gate and VRAM budget check (unchanged behaviour).
 // ---------------------------------------------------------------------------
 int cmd_info(int argc, char **argv) {
@@ -616,6 +1206,15 @@ int cmd_run(int argc, char **argv) {
 int main(int argc, char **argv) {
   if (argc > 1 && std::strcmp(argv[1], "run") == 0) {
     return cmd_run(argc - 1, argv + 1);
+  }
+  if (argc > 1 && std::strcmp(argv[1], "bench") == 0) {
+    return cmd_bench(argc - 1, argv + 1);
+  }
+  if (argc > 1 && std::strcmp(argv[1], "tokenize") == 0) {
+    return cmd_tokenize(argc - 1, argv + 1);
+  }
+  if (argc > 1 && std::strcmp(argv[1], "ppl") == 0) {
+    return cmd_ppl(argc - 1, argv + 1);
   }
   if (argc > 1 && std::strcmp(argv[1], "info") == 0) {
     return cmd_info(argc - 1, argv + 1);

@@ -48,12 +48,45 @@ Pesquisas de base em `docs/`: `rdna4-gfx1201-referencias-amd.md`, `referencias-u
 - **Treino/finetune**, RLHF, imatrix, avaliação embutida.
 - **Gramáticas/constrained decoding** (JSON schema etc.) — sampler cobre só o §1.4.
 
-## 3. Orçamento de VRAM (27B, arquivos reais)
+## 3. Orçamento de VRAM e números medidos (27B, arquivos reais)
 
-| Arquivo | Tamanho | Cabe em 16 GB? |
-|---|---|---|
-| `Qwen3.8-27B-UD-IQ3_S.gguf` | 12 GB | sim (alvo principal) |
-| `Qwen3.8-27B-UD-IQ4_XS.gguf` | 14 GB | sim, mas ctx cheio de 32K estoura por ~0.5 GB (KV ≈ 2.1 GB) — na prática ctx ≤ ~24K por esta estimativa |
+Medido no M5 com `rdna4-infer bench`/`info` na 9070 XT (16 GB), tabela completa em
+`docs/medicoes-m5.md`. "fill" = cache KV e estado recorrente pré-semeados
+(`--fill-cache`), que é como o decode em contexto longo é medido sem esperar por um
+prefill real.
+
+| Arquivo | Peso | ctx / KV | VRAM em uso | Decode | Cabe em 16 GB? |
+|---|---|---|---|---|---|
+| `UD-IQ3_S.gguf` | 11,21 GiB | 4096 / f16 | 11,87 GiB | 27,6 tok/s | sim, folgado |
+| `UD-IQ3_S.gguf` | | 32768 / f16 | 13,61 GiB | 28,2 tok/s | sim |
+| `UD-IQ3_S.gguf` | | 65536 / q4_0 | 12,73 GiB | 28,7 tok/s | sim |
+| `UD-IQ3_S.gguf` | | 131072 / q4_0 | 13,86 GiB | 28,6 tok/s | sim |
+| `UD-IQ4_XS.gguf` | 13,27 GiB | 4096 / f16 | 13,91 GiB | 27,0 tok/s | sim |
+| `UD-IQ4_XS.gguf` | | 32768 / f16 | 15,66 GiB | 25,4 tok/s | sim, apertado (0,26 GiB livres) |
+| `UD-IQ4_XS.gguf` | | 65536 / q4_0 | 14,79 GiB | 25,8 tok/s | sim |
+| `UD-IQ4_XS.gguf` | | 131072 / q4_0 | — | — | **não** (`hipMalloc failed`) |
+
+**Correção da estimativa anterior desta seção:** a versão do M0 dizia que o IQ4_XS
+estouraria com 32K de contexto f16. Medido: 32K f16 **cabe** (15,66 GiB em uso,
+0,26 GiB livres — no limite, mas roda); o que não cabe é **131K** com `q4_0`. O
+orçamento do `info` recusa o caso de 32K por ser conservador (assume 1,00 GiB de
+overhead; o motor usa ~0,40 GiB) — é um guard pré-voo, não uma medição.
+
+Tempos por arquivo (prompt de 512 tokens, decodificação greedy):
+
+| Arquivo | Prefill (por token) | Decode | Banda efetiva |
+|---|---|---|---|
+| `UD-IQ3_S.gguf` | 28,8 tok/s (17,75 s) | 27,6 tok/s | 336 GB/s |
+| `UD-IQ4_XS.gguf` | 27,4 tok/s (18,67 s) | 27,0 tok/s | 364 GB/s |
+
+Referência na mesma máquina (`llama-bench -ngl 99`, backend Vulkan/RADV, mesmo
+arquivo): **decode 39,7 tok/s**, **prefill em batch 440 tok/s**. Ou seja: decode a
+~70 % da referência; **prefill é a lacuna grande (16×)**, porque este motor processa
+o prompt token a token (ver `docs/medicoes-m5.md` §5).
+
+Qualidade (wikitext-2, 10 chunks de 512 tokens pontuados, comparados **posição a
+posição** com o mesmo modelo no llama.cpp): PPL dentro de **0,25 %** no IQ3_S e
+**0,15 %** no IQ4_XS.
 
 `Q4_K_M` puro (~16–17 GB) segue fora da v1; `Q8_0` (~29 GB) e `F16` (~54 GB) idem.
 

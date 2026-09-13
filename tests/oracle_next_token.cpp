@@ -32,6 +32,89 @@ int main(int argc, char **argv) {
   std::vector<llama_token> tokens;
   for (int i = 2; i < argc; ++i) tokens.push_back((llama_token)std::atoi(argv[i]));
 
+  // ---- M5: per-token NLL (the perplexity building block) ------------------
+  // ORACLE_NLL_OUT=<file> writes one line per predicted token:
+  //   <global index> <nll> <token id>
+  // The sequence is decoded one token at a time (the engine's own path) with
+  // logits requested at every step, so a perplexity difference can be localised
+  // to a single position. ORACLE_NLL_OFFSET=<k> starts the sequence at tokens[k]
+  // so the reference conditions on exactly the same prefix a perplexity chunk
+  // does.
+  if (const char *nll_path = std::getenv("ORACLE_NLL_OUT")) {
+    llama_backend_init();
+    const char *ngl = std::getenv("ORACLE_NGL");
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = ngl ? std::atoi(ngl) : 0;
+    llama_model *model = llama_model_load_from_file(argv[1], mp);
+    if (!model) {
+      std::fprintf(stderr, "nll: load failed\n");
+      return 1;
+    }
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    FILE *f = std::fopen(nll_path, "w");
+    if (!f) {
+      std::fprintf(stderr, "cannot write %s\n", nll_path);
+      return 1;
+    }
+    const char *off_env = std::getenv("ORACLE_NLL_OFFSET");
+    const std::size_t off = off_env ? (std::size_t)std::atoi(off_env) : 0;
+    if (off >= tokens.size()) {
+      std::fprintf(stderr, "nll: offset %zu beyond the %zu tokens\n", off, tokens.size());
+      std::fclose(f);
+      return 1;
+    }
+    // Own context: the sequence to score can be longer than the default 512.
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = (uint32_t)(tokens.size() - off + 16);
+    cp.n_batch = cp.n_ctx;
+    cp.n_ubatch = cp.n_ctx;
+    cp.no_perf = true;
+    llama_context *ctx = llama_init_from_model(model, cp);
+    if (!ctx) {
+      std::fprintf(stderr, "nll: context failed\n");
+      std::fclose(f);
+      return 1;
+    }
+    const float *lg = nullptr;
+    for (std::size_t i = off; i < tokens.size(); ++i) {
+      llama_batch one = llama_batch_init(1, 0, 1);
+      one.n_tokens = 1;
+      one.token[0] = tokens[i];
+      one.pos[0] = (llama_pos)(i - off);
+      one.seq_id[0][0] = 0;
+      one.n_seq_id[0] = 1;
+      one.logits[0] = 1;
+      const int rc = llama_decode(ctx, one);
+      llama_batch_free(one);
+      if (rc != 0) {
+        std::fprintf(stderr, "nll: decode failed at %zu\n", i);
+        std::fclose(f);
+        return 1;
+      }
+      lg = llama_get_logits_ith(ctx, 0);
+      if (!lg) {
+        std::fprintf(stderr, "nll: no logits at %zu\n", i);
+        std::fclose(f);
+        return 1;
+      }
+      if (i + 1 >= tokens.size()) break;
+      const int target = tokens[i + 1];
+      float mx = lg[0];
+      for (int v = 1; v < n_vocab; ++v) mx = std::max(mx, lg[v]);
+      double sum = 0.0;
+      for (int v = 0; v < n_vocab; ++v) sum += std::exp((double)lg[v] - (double)mx);
+      const double nll = -(std::log(std::exp((double)lg[target] - (double)mx)) - std::log(sum));
+      std::fprintf(f, "%zu %.8f %d\n", i + 1, nll, target);
+    }
+    std::fclose(f);
+    std::printf("nll written to %s from offset %zu (%zu tokens)\n", nll_path, off,
+                tokens.size() - off);
+    llama_free(ctx);
+    llama_model_free(model);
+    llama_backend_free();
+    return 0;
+  }
+
   llama_backend_init();
   llama_model_params mparams = llama_model_default_params();
   // CPU by default (deterministic reference); ORACLE_NGL=99 measures the same

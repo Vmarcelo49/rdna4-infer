@@ -398,17 +398,119 @@ Revisão contra `llama-sampler.cpp`, `llama-vocab.cpp`, `common/*` e o próprio 
 4. ✅ **Aceite cumprido:** golden test — prompt fixo no `UD-IQ3_S`, mesma seed, mesma saída (e greedy **idêntico ao llama.cpp por 32 tokens**).
 
 
-## M5 — Validação nos dois arquivos + docs
+## M5 — Validação nos dois arquivos + docs ✅ concluído em 2026-09-13
 
 Objetivo: os dois modelos conversando na 9070 XT.
 
-1. Rodar M4 nos dois `.gguf`; registrar perplexidade/tempo por arquivo.
-   Ref: `docs/kernels-ia-gfx1201.md` § "Relatos" (flags que decidem perf em gfx1201: `GGML_HIP_GRAPHS`, `ROCWMMA_FATTN`, `num_kv_splits=64`).
-2. Afinamentos gfx1201 de baixo risco (prefill batch, kv splits) só com medição antes/depois.
-   Ref: `docs/kernels-ia-gfx1201.md` (blogs CK-Tile para o que for custom) · `docs/rdna4-gfx1201-referencias-amd.md` §6 (profilers).
-3. README reproduzível + `SPEC.md` §3 com números medidos.
-4. **Aceite:** coerência nos dois arquivos dentro dos 16 GB.
+### Passo 1 — ferramenta de medição (`bench`) e baselines dos dois arquivos
 
+`rdna4-infer bench -m <gguf> [-n N] [--warmup N] [--reps N] [--prefill N] [--ctx-size N]
+[--cache-type-k/-v T] [--fill-cache] [--layers N]` reporta prefill/decode em tok/s,
+VRAM em uso, banda efetiva (bytes do modelo por token ÷ tempo) e a divisão do tempo
+por token entre thread chamadora e device. Aquece fora da janela medida (esta GPU cai
+para DPM profundo entre kernels) e usa greedy (sem RNG). `--layers N` roda só as N
+primeiras camadas: é o que permitiu **atribuir** o custo por token em vez de supor.
+
+| | IQ3_S | IQ4_XS |
+|---|---|---|
+| peso | 11,21 GiB | 13,27 GiB |
+| decode (4K, KV f16) | 27,6 tok/s | 27,0 tok/s |
+| prefill (512 tokens, por token) | 28,8 tok/s | 27,4 tok/s |
+| banda efetiva | 336 GB/s | 364 GB/s |
+| PPL (wikitext-2, 10×512) vs llama.cpp | ≤ 0,25 % de desvio | ≤ 0,15 % |
+
+Referência na mesma máquina (`llama-bench -ngl 99`, Vulkan, mesmo arquivo): **decode
+39,7 tok/s**, **prefill 440 tok/s**. Tabelas de VRAM por ctx/KV (4K→131K) em
+`docs/medicoes-m5.md` e em `SPEC.md` §3 — inclui uma **correção** da estimativa do M0:
+o IQ4_XS com 32K f16 **cabe** (15,66 GiB, 0,26 GiB livres); o que não cabe é 131K q4_0.
+
+### Passo 2 — onde o tempo vai (medido, não suposto)
+
+Decomposição com `--layers` (IQ3_S, 32 tokens, 3 repetições):
+
+| parte | custo | fração |
+|---|---|---|
+| embeddings + norm final + LM head + cópia de logits + sampler | 1,96 ms | 5,5 % |
+| 64 camadas do tronco | 33,87 ms (0,529 ms/camada) | 94,5 % |
+| — quantização de ativação (teto, medido pulando **todos** os `quantize_q8_1`) | 1,5 ms | 4,1 % |
+
+O matvec foi tunado no M2 contra um teto de leitura medido de **619 GB/s**; a
+estimativa matvec-only (12,02 GB em ~28,9 ms = 416 GB/s) explica ~29 ms dos 35,8 ms,
+ou seja ~6,9 ms são os ~1300 kernels pequenos por token (norms, conv/delta do GDN,
+atenção, ~450 quantizações de ativação, somas de residual). **Duas hipóteses foram
+medidas e rejeitadas:** (a) *HIP graphs* — o caminho de lançamento desta máquina
+custa **1,04 µs/launch** (medido com kernel nulo 2000×), então ~1300 lançamentos
+custam ~1,4 ms; o tempo que a thread passa no laço de lançamento é *back-pressure* da
+fila cheia, não custo de host; (b) *fundir a quantização de ativação* — pular todas as
+450 por token muda 27,73 → 28,82 tok/s (**4,1 %**). Nenhuma das duas virou mudança de
+código, e ficou registrado o motivo.
+
+Única otimização de fato aplicada (aritmética idêntica, ganho pequeno mas estrito):
+buffer de logits reaproveitado entre tokens (era `hipMalloc`/`hipFree` de 1 MB por
+token), leitura de `hidden` opcional (`set_want_hidden`, uma sincronização a menos por
+token no CLI) e `reset_state()` para reusar o grafo em sequências independentes.
+
+### Passo 3 — perplexidade (o aceite de qualidade do SPEC §1.5)
+
+`rdna4-infer ppl -m <gguf> -f <corpus> [--ctx-size 512] [--stride 512] [--chunks N]
+[--nll-out FILE]` reproduz a metodologia do `llama-perplexity` modo strided: janela de
+`ctx + stride/2` tokens, pontuando as posições `[window-stride-1, window-1)`, softmax
+com max subtraído e `PPL = exp(média NLL)`.
+
+`scripts/compare_ppl.sh` fecha o aceite **posição a posição**: tokeniza o corpus com os
+dois tokenizadores (ids idênticos nos 297 193 tokens), roda o motor sobre as janelas,
+roda **o mesmo modelo no llama.cpp** sobre as janelas idênticas
+(`oracle-next-token` com `ORACLE_NLL_OUT`, um token por vez) e compara NLL por posição.
+Resultado: 5120 posições por arquivo, desvio por chunk **0,004–0,25 %** (IQ3_S) e
+**0,001–0,15 %** (IQ4_XS); pior diferença numa única posição 0,458 / 0,873 nats.
+
+⚠️ **Pegadinha encontrada no caminho (documentada porque muda a interpretação de
+qualquer comparação futura):** o `llama-perplexity` **não** pontua uma janela limpa. Para
+o chunk 2 deste corpus ele imprime PPL **5,8045**, mas o *mesmo modelo* sobre a *mesma*
+janela de 768 tokens (estado zerado, mesmas posições) dá **8,7591** — o número da
+ferramenta carrega contexto dos chunks anteriores. A primeira leitura (nossa 8,75 contra
+5,80 da ferramenta) parecia um bug de 51 % no motor; a comparação por posição mostrou
+que o motor estava certo (2,16905 vs 2,17010 de NLL média, 0,05 %). **Lição:** comparar
+agregados de uma ferramenta sem entender o que ela condiciona custa horas; comparar por
+posição localiza o problema na hora.
+
+### Passo 4 — docs
+
+`README.md` ganhou uso completo (5 subcomandos, flags, tipos de KV, códigos de saída),
+números medidos, os comandos de validação e as limitações conhecidas.
+`docs/medicoes-m5.md` é o log de medição (baseline da referência, decomposição por
+token, tabelas de VRAM/ctx/KV dos dois arquivos, PPL por chunk). `SPEC.md` §3 passou a
+ter os números medidos, com a correção do IQ4_XS/32K.
+
+### Passo 5 — o que **não** foi feito (e por quê)
+
+**Prefill em batch** é a única lacuna grande: 28,8 tok/s (por token) contra 440 tok/s
+da referência = **16×**, e é o que dói em prompt longo (>200 s para 4K tokens de
+contexto, contra ~10 s do llama.cpp). Não foi feito no M5 porque não é "afinamento de
+baixo risco": é trocar GEMV por GEMM nos 14 kernels quantizados (cada thread passa a
+acumular N tokens com o mesmo bloco de peso desquantizado) e revalidar bit-exatidão —
+trabalho de milestone, com mudança de numérica. Fica como **M6** com o número que o
+justifica. Atenção (não tiling) continua sendo limite de performance em contexto longo
+(262 ms/token em 64K), também registrado.
+
+1. ✅ Rodar M4 nos dois `.gguf`; registrar perplexidade/tempo por arquivo.
+2. ⚠️ Afinamentos gfx1201 de baixo risco: **medidos antes/depois** e, dos dois
+   candidatos, **nenhum** se pagou (HIP graphs 1,04 µs/launch, quantização de ativação
+   4,1 % como teto); aplicadas só as mudanças de custo estritamente menor. O
+   afinamento grande (prefill batch) foi para o M6 com medição que o justifica.
+3. ✅ README reproduzível + `SPEC.md` §3 com números medidos.
+4. ✅ **Aceite cumprido:** coerência nos dois arquivos dentro dos 16 GB — greedy
+   idêntico ao llama.cpp por 32 tokens, PPL por posição dentro de 0,25 %, 131K de
+   contexto no IQ3_S e 64K no IQ4_XS (o 131K do IQ4_XS não cabe, documentado).
+
+## M6 — Prefill em batch (proposto, medido como necessário)
+
+1. GEMM quantizado (os mesmos vec_dot, com N tokens por bloco de peso): a leitura de
+   pesos por prompt cai de `n_tokens × 11,2 GB` para `11,2 GB`. Alvo: ≥ 150 tok/s de
+   prefill (era 28,8; referência 440).
+2. Manter o caminho por token como default de decode e revalidar todos os gates de
+   exatidão (o prefill em batch muda a ordem de acumulação, como no próprio llama.cpp).
+3. Tiling da atenção para contexto longo (262 ms/token em 64K hoje).
 ## Fora deste plano (futuro, ver `SPEC.md` §4)
 
 Servidor OpenAI-compatible, `qwen35moe`, MTP/`nextn_*`, mmproj de visão, offload, outros quants/GPUs.
