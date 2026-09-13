@@ -101,6 +101,21 @@ target_link_libraries(check-nn-gpu PRIVATE ${GGML_BASE_LIB} ${AMDHIP64})
 target_link_options(check-nn-gpu PRIVATE --offload-arch=gfx1201)
 set_target_properties(check-nn-gpu PROPERTIES HIP_ARCHITECTURES "gfx1201")
 
+# M4 — tokenizer (vendored unicode tables + BPE) and its oracle comparison.
+add_library(rdna4_tokenizer STATIC src/backend/unicode.cpp src/backend/unicode_data.cpp
+                                   src/backend/tokenizer.cpp)
+target_include_directories(rdna4_tokenizer PUBLIC include)
+
+add_executable(oracle-tokenize tests/oracle_tokenize.cpp)
+target_include_directories(oracle-tokenize PRIVATE ${LLAMA_CPP_SRC}/include
+                          ${LLAMA_CPP_SRC}/ggml/include)
+target_link_libraries(oracle-tokenize PRIVATE ${LLAMA_CPP_BUILD}/bin/libllama.so ${AMDHIP64})
+set_target_properties(oracle-tokenize PROPERTIES BUILD_RPATH "${LLAMA_CPP_BUILD}")
+
+add_executable(check-tokenizer tests/check_tokenizer.cpp src/backend/gguf.cpp
+                                src/backend/loader.cpp)
+target_link_libraries(check-tokenizer PRIVATE rdna4_tokenizer)
+
 # M3 step 3 — the assembled qwen35 forward graph vs the eval-callback oracle.
 add_executable(check-graph-gpu tests/check_graph_gpu.hip
                  tests/dequant_cpu_oracle.cpp src/backend/gguf.cpp src/backend/loader.cpp

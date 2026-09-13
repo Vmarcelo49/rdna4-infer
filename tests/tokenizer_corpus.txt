@@ -1,0 +1,205 @@
+Hello world, this is a test.
+The capital of France is
+def fibonacci(n):
+1 2 3 4 5 6 7 8 9
+Hello
+ don't stop believin'
+café naïve résumé
+日本語のテキスト
+emoji: 🚀🔥
+  leading and trailing  
+line1\nline2\n\nline3
+tab\tseparated\tvalues
+x = (a + b) * c / d[0] - 1.5e-3
+int main(void) { return 0; }
+<|im_start|>user\nHello<|im_end|>\n
+<|endoftext|>
+MiXeD CaSe WOULDn't
+12345678901234567890
+https://example.com/path?q=1
+a
+ 
+  
+\n
+αβγδε ΑΒΓΔΕ
+Ünïcödé with combĩning
+e\u0301 combining acute
+\t\t\t
+\r\n\r\n
+......
+!!!!
+((((
+????
+''''
+"quoted"
+[brackets]
+{braces}
+a-b-c
+3.14159
+-0.5
+1e10
+🧑‍💻 zero width joiner
+🇧🇷 flag
+ß sharp s
+ﬁ ligature
+½ fraction
+㍿ ideographic
+Ａ全角Ｂ
+ｱｲｳ halfwidth
+한국어
+ไทย
+العربية
+עברית
+हिन्दी
+русский
+𝔘𝔫𝔦𝔠𝔬𝔡𝔢
+0x1F\\1.5e-3…<|endoftext|>βα😀1.5e-3*'ll'thttps://😀→
+<|vision_start|>'t  αü\\n 🏳️‍🌈https://__init__)|>Z#🧑‍💻語“q”αdef <|im_start|>
+def 's<|a.com🚀90Z'll__init__'m#b<|endoftext|>βñα*.com
+🚀're|>é€areturn 
+βdef 'S
+\\….com {'dñ<|im_end|>'re😀éb9/
+語  1.5e-3é
+9“q”b1.5e-3for(a've've…naïve0→本
+中9/|>'ll<|endoftext|>for('Sß üßa
+<|im_end|>…\\t\\n'm{  a0βhttps://€'tfor(
+'llα😀'll}<|endoftext|>\\n中def 本\\t語中'vea'S0x1F🧑‍💻
+ü__init__b've't語1.5e-3#def /  Z\\n'veα'da<|endoftext|><|
+.comé本99 've*|>'ma
+日日<|β\\n“q”*→.com/\\n0x1F本't|>\\nünaïve'rewww.
+'m}'ll's<|im_start|>|>—\\'llfor(—本__init__→# 中0    
+😀“q”
+'m<|im_start|>{語'd中www.café#
+é🚀't…}🧑‍💻9\\n're→\\def 1.5e-3<|<|9
+'venaïvenaïve've<|im_start|>b9'S中
+'m0Z'té日🚀/🧑‍💻\\n 日\\ncaféα
+return })🚀*—\\n*Z…b
+naïveç)ü“q”Zb#|>9→9}üñ\\n
+9α🏳️‍🌈
+<|im_start|>Zcafé…<|im_start|><|im_start|>{\\n<|vision_start|>“q”naïveß
+ for(→café90x1F1.5e-3中—<|vision_start|>b0x1F
+/a<|return 本本*a#9  |>\\t'd__init__
+}ß本…<|im_start|>)*βαβ.com🏳️‍🌈 🚀
+bü# →b're“q”)\\t€<|endoftext|><|return naïve€'d
+日
+\\nfor(<|'ll🚀's<|im_end|>caféßreturn 
+€café'mñ語return 'd'll|>文https://https://<|im_end|>naïve'll
+本're*naïveñ've\\n
+€ç.comcafé1.5e-3
+{9
+www.'s\\tα→'S…'ve.com
+本|>🚀€for(ñ{.com.com🧑‍💻<|αñ9
+'S0x1F
+Zfor({'S/çüdef <|vision_start|>/bdef \\n語β'llb<|endoftext|>.com'S
+<|endoftext|>\\n<|vision_start|>0🧑‍💻|>\\tα
+|>🏳️‍🌈def |>
+“q”9for('ll'llwww.→'d't{a<|im_end|>
+🏳️‍🌈{Z't're'S<|endoftext|>ç🏳️‍🌈)—🚀😀<|<|im_end|>'s
+1.5e-3<|vision_start|>)café're 中…café}本\\nα
+'ll|>__init__naïvea本\\/def __init__😀<|vision_start|>www.—ß
+ñdef 🧑‍💻've  }0x1Fwww.https://def …{\\t've'm
+🧑‍💻 🧑‍💻ü🏳️‍🌈🧑‍💻<|vision_start|>…ñ'dnaïve{1.5e-3
+ç
+ Zαß\\中<|endoftext|>'S€naïveb'vehttps://0x1F9文https://
+'t🏳️‍🌈
+for(<|vision_start|>naïve\\n→\\n🚀café}🚀.com
+—__init__€*—) <|im_end|>'reα🚀\\é.com}
+|>'s🚀😀.comnaïve\\'düreturn 本“q”1.5e-30x1Fcafé<|'veü
+“q”🏳️‍🌈🚀'S/
+'ll中🏳️‍🌈\\t😀a#本b🏳️‍🌈🧑‍💻Z🚀naïve語🏳️‍🌈
+\\t€ )'s9…🏳️‍🌈β中naïve“q”https://…語'S'm→€
+ß文caféwww.…
+🚀ñ  'll中<|b…'d\\n)<|endoftext|>🧑‍💻bZ'll
+'reafor(éñ
+'m<|€  €}*\\t1.5e-3😀<|'d
+)🚀__init__文b本|>
+www.🚀<|'s🏳️‍🌈've0x1F|>🏳️‍🌈|>'ve🚀've1.5e-3
+<|*1.5e-3\\n'renaïve<|im_start|>|>https://çcafé'tñ#ñcafé…'ll
+<|endoftext|>'ll__init__  \\n__init__'m
+} 'd本  
+.com—中🏳️‍🌈<|vision_start|>{\\n'll語|>for(https://b  
+/for(çnaïvewww.“q”日
+{😀|><|im_end|>
+😀for(.com'llhttps://9→  bZ<|im_end|>
+<|😀café/→\\n'll't\\t've't.com'sé…for(  *
+\\n—
+9<|im_end|>  ñ語β文😀ç文've#日a|>
+1.5e-3'll
+中β日<|im_start|>日語
+#'s  😀<|vision_start|>añ
+https://.com{
+/#'ll😀*🧑‍💻ßhttps://<|im_end|>'d'Snaïve\\t
+www.…語\\ncaféß
+)日<|endoftext|>文<|im_end|>'t語've}'t9https://ßü→  a__init__
+|>café<|0're'S—“q”return üß've
+/'t🏳️‍🌈9本😀€def 've)\\t<|im_end|>語
+b\\t<|  <|im_start|>'m'dα語😀0<|im_end|>'lldef 本a  'd'd
+caféß\\🏳️‍🌈😀中“q”🚀/
+|>αhttps://def 
+\\#return 
+本…
+本→🧑‍💻's1.5e-3€
+<|#0文—€中é🚀語#ü日🚀é→def 'S
+…éreturn {<|im_start|>éba<|endoftext|>'m*Z|>'s中<|im_end|>for(本
+caféñ
+0*}—ñ9https://café're文}→'d
+Z🚀  …https://}naïveβ
+🧑‍💻“q”www.'m#
+0<|中β
+'ve0x1F0ç
+\\n\\t日α\\nreturn 中β#'d|>*for(中日<|endoftext|><|im_start|>
+www.\\n—é}\\n'm→\\t😀caféü<|vision_start|>😀<|1.5e-3ç
+'S<|for(}/)*'ll|>
+<|im_end|>'m'll—'m😀🧑‍💻def naïve
+__init__for(Z|>0a'S
+文b<|Z  're🏳️‍🌈'S9
+naïvefor('s
+'m|>🧑‍💻日→→ç'veßß€<|im_start|>\\n.com0x1F9https://\\t
+https://www.<|.com<|endoftext|><|endoftext|>'veα文<|im_start|>'d本https://\\n日
+def .com#ñé
+<|im_end|><|im_start|>www.naïve't文def 日*  β__init__ñ 🏳️‍🌈 文/
+€www.for(βüwww.<|endoftext|>a9ü'venaïvereturn # )ü€}
+é__init__\\n'reçreturn }ñ日naïve\\t
+{α/#naïvecafé—for(naïve'Sα
+https://üβñ're語“q”…}café🚀'm 日.com日b
+for(語*本<|vision_start|>'ll<|im_start|>/日https://本🏳️‍🌈
+.com*/'t't
+<|im_end|>β__init__
+https://b're🚀0🏳️‍🌈's/é“q”
+def 
+9*🏳️‍🌈ü<|vision_start|>🏳️‍🌈 ß 'S<|im_start|>  caféñ
+b|>def 
+  <|im_start|>www.def 文
+{'re€<|im_end|>naïve🚀ß<|im_end|>
+語çßhttps://“q”ßfor(\\n€€🏳️‍🌈https://}9{
+naïveZ中<|im_end|>www.return ç1.5e-3ahttps://本.com __init__β“q”🏳️‍🌈|>b🚀
+{ahttps://\\t中…中naïve\\n'm<|im_start|>'s
+for('sñ've本文🚀é'S🧑‍💻__init__0→
+}\\tüdef \\n<|endoftext|>naïve'tnaïve0
+b*→naïvehttps://Zñ  'll'tç've*'m#
+#😀'reα'tcafé'S語'tnaïve<|im_end|>…ü|>\\—
+→1.5e-3'd€__init__語naïve“q”ßreturn \\<|endoftext|>“q” →0x1F're語
+'ve—
+https://https://本🧑‍💻🚀
+<|endoftext|>'S<|vision_start|>0return …'mcaféa0x1F→café日α<|vision_start|>'m{
+#0x1F's中's<|endoftext|>ñ\\n'dnaïve0x1Fhttps://🚀\\n
+'S🚀🏳️‍🌈0\\n/<|endoftext|>'ta'vewww.naïve1.5e-3\\nwww.\\n ç'S<|
+  __init__→)β “q”<|im_start|>*🏳️‍🌈1.5e-3😀üb<|vision_start|>'ll中
+naïvefor( <|vision_start|>www.α've
+🏳️‍🌈中
+€'s—.com“q”üñü語9\\üβreturn {9日
+for(\\n  
+for(β<|im_start|>“q”<|vision_start|>.com\\tdef αa0x1F本{
+'mé/\\tβ<|endoftext|>a1.5e-31.5e-3https://}'vecafé<|\\né
+…🏳️‍🌈<|im_start|>ü“q”ß<|im_end|>語\\return  'd'll
+本}\\tßü—'S
+→}|>ßαwww.本   \\n<|  \\nfor(|>{'t't'll
+Z.comβ*{   'reZ's\\t文中
+ßnaïvewww.
+…😀\\ndef 've<|endoftext|>\\nwww.)本→ßnaïve中
+a}語<|)ñ🧑‍💻<|vision_start|><|vision_start|>'mreturn #🚀b'dß'llßüdef 
+  \\本've😀ß<|vision_start|>éwww.  <|{'s'd<|endoftext|>
+caféü\\'reç<|😀😀\\n/{'ll…🚀{{.com…
+/—b|>return 'll<|endoftext|>
+\\n'm→
+中)ßß …0x1F日'Sβ__init__\\tα🧑‍💻}\\n'mcafé/
