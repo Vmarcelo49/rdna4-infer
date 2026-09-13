@@ -612,7 +612,11 @@ inline bool Graph::forward(const std::vector<float> &embeddings, int start_pos,
 inline bool Graph::debug_fill_caches(unsigned seed, std::string &err) {
   const int NKV = n_head_kv(), HD = head_dim();
   const int n_recr = count_recr();
-  const std::int64_t rows = (std::int64_t)max_ctx_ * NKV;
+  // Every full-attention layer has its own cache; the buffers are contiguous
+  // row arrays (n_layers * max_ctx * n_head_kv rows), so fill all of them —
+  // leaving a layer uninitialised would feed the attention uninitialised VRAM.
+  const std::int64_t rows =
+      (std::int64_t)(n_layer() - n_recr) * (std::int64_t)max_ctx_ * NKV;
   if (!kv_fill_launch(kv_k_, d_k_, rows, HD, seed) ||
       !kv_fill_launch(kv_v_, d_v_, rows, HD, seed + 1)) {
     err = "kv_fill launch failed";
