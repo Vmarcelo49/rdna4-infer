@@ -35,7 +35,15 @@ struct Cursor {
     }
     return s;
   }
+  std::uint64_t pos() {
+    const long p = std::ftell(fp);
+    return p < 0 ? 0 : static_cast<std::uint64_t>(p);
+  }
 };
+
+std::uint64_t pad_to(std::uint64_t v, std::size_t align) {
+  return (v + (align - 1)) / align * align;
+}
 
 bool read_value(Cursor &c, ValueType type, Value &out) {
   out.type = type;
@@ -115,33 +123,29 @@ const char *ggml_type_name(std::uint32_t dtype) {
   return dtype < n ? names[dtype] : "?";
 }
 
-bool read(const char *path, File &out, std::string &err) {
+// Reads the header from an already-open file. On success the file is left
+// open and positioned at the start of the tensor data section (so callers
+// can fseek to data_offset + tensor.offset). On failure the caller still owns
+// (and must close) the file.
+bool read(FILE *fp, File &out, std::string &err) {
   File f;
-  FILE *fp = std::fopen(path, "rb");
-  if (!fp) {
-    err = "cannot open file";
-    return false;
-  }
   Cursor c{fp, true};
 
   char magic[4] = {};
   c.read(magic, 4);
   if (!c.ok || magic[0] != 'G' || magic[1] != 'G' || magic[2] != 'U' || magic[3] != 'F') {
     err = "bad GGUF magic";
-    std::fclose(fp);
     return false;
   }
   f.version = c.get<std::uint32_t>();
   if (f.version != 3) {
     err = "unsupported GGUF version (want 3)";
-    std::fclose(fp);
     return false;
   }
   const std::int64_t n_tensors = c.get<std::int64_t>();
   const std::int64_t n_kv = c.get<std::int64_t>();
   if (!c.ok || n_tensors < 0 || n_tensors > (1 << 24) || n_kv < 0 || n_kv > (1 << 20)) {
     err = "insane header counts";
-    std::fclose(fp);
     return false;
   }
 
@@ -153,6 +157,12 @@ bool read(const char *path, File &out, std::string &err) {
       break;
     }
     f.kv[key] = v;
+  }
+
+  // Alignment is a KV; read it now (needed to compute the data-section start).
+  auto it = f.kv.find("general.alignment");
+  if (it != f.kv.end() && it->second.type == U32 && it->second.u != 0) {
+    f.alignment = static_cast<std::size_t>(it->second.u);
   }
 
   f.tensors.reserve(n_tensors);
@@ -173,17 +183,30 @@ bool read(const char *path, File &out, std::string &err) {
     f.tensors.push_back(t);
   }
 
-  std::fclose(fp);
   if (!c.ok) {
     err = "truncated or corrupt header";
     return false;
   }
-  auto it = f.kv.find("general.alignment");
-  if (it != f.kv.end() && it->second.type == U32) {
-    f.alignment = static_cast<std::size_t>(it->second.u);
+  // Data section starts at the header end, padded up to alignment.
+  f.data_offset = pad_to(c.pos(), f.alignment);
+  // Seek there so a successful return leaves the cursor at the data start.
+  if (std::fseek(fp, static_cast<long>(f.data_offset), SEEK_SET) != 0) {
+    err = "seek to data section failed";
+    return false;
   }
   out = f;
   return true;
+}
+
+bool read(const char *path, File &out, std::string &err) {
+  FILE *fp = std::fopen(path, "rb");
+  if (!fp) {
+    err = "cannot open file";
+    return false;
+  }
+  const bool ok = read(fp, out, err);
+  std::fclose(fp);
+  return ok;
 }
 
 std::string kv_str(const File &f, const char *key, const char *dflt) {

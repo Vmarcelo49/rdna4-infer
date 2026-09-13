@@ -59,6 +59,51 @@ inline std::optional<DType> dtype_from_ggml(std::uint32_t ggml_type) {
   }
 }
 
+// Block layout per type: elements per block, bytes per block.
+// Verified against the UD files (scripts/check_geometry.py: every tensor size
+// fits its on-disk span, alignment holds, last tensor ends exactly at EOF) and
+// cross-checked with the llama.cpp b10902 reference dump (llama-gguf r).
+// The .ref snapshot (790cf51) is mid-refactor and self-inconsistent for
+// IQ1_S (struct 66B vs its own static_assert 50B); it is NOT trusted for
+// file format. The on-disk IQ1_S block is 50B (1.5625 bpw).
+inline std::uint32_t dtype_block_elems(DType t) {
+  switch (t) {
+    case DType::F32: return 1;
+    case DType::Q8_0: return 32;
+    case DType::IQ4_NL: return 32;
+    default: return 256;  // all K-quants and the remaining IQ types
+  }
+}
+
+inline std::uint32_t dtype_block_bytes(DType t) {
+  switch (t) {
+    case DType::F32: return 4;      // 4.0 bpw
+    case DType::Q8_0: return 34;    // 8.5
+    case DType::Q2_K: return 84;    // 2.625
+    case DType::Q3_K: return 110;   // 3.4375
+    case DType::Q4_K: return 144;   // 4.5
+    case DType::Q5_K: return 176;   // 5.5
+    case DType::Q6_K: return 210;   // 6.5625
+    case DType::IQ2_XXS: return 66; // 2.0625
+    case DType::IQ2_XS: return 74;  // 2.3125
+    case DType::IQ3_XXS: return 98; // 3.0625
+    case DType::IQ1_S: return 50;   // 1.5625
+    case DType::IQ4_NL: return 18;  // 4.5 (32-elem blocks)
+    case DType::IQ3_S: return 110;  // 3.4375
+    case DType::IQ2_S: return 82;   // 2.5625
+    case DType::IQ4_XS: return 136; // 4.25
+  }
+  return 0;
+}
+
+// Byte size of a tensor with `nelem` elements of type `t` (ceil to whole
+// blocks, per ggml_row_size).
+inline std::uint64_t tensor_bytes(DType t, std::uint64_t nelem) {
+  const std::uint64_t be = dtype_block_elems(t);
+  const std::uint64_t blocks = (nelem + be - 1) / be;
+  return blocks * dtype_block_bytes(t);
+}
+
 inline const char *dtype_name(DType t) {
   switch (t) {
     case DType::F32: return "f32";

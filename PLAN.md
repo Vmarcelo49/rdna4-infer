@@ -18,6 +18,16 @@ Objetivo: binário que só existe no mundo gfx1201.
 
 Objetivo: ler os dois arquivos UD e validar tudo fail-fast.
 
+### Progresso
+
+- **Passo 1 — dtype mapping ✅** (`include/rdna4/dtype.h`, `tests/check_dtype.cpp`): `DType` = union de 15 tipos dos UD, `dtype_from_ggml()` mapeia os ids raw do GGUF, resto é erro. `check-dtype` passa nos dois arquivos (866 tensores, 15/15 tipos presentes no IQ3_S; IQ4_XS sem `IQ2_XXS`/`IQ1_S`).
+- **Passo 2 — GgufLoader ✅** (`include/rdna4/loader.h`, `src/backend/loader.cpp`, `tests/check_loader.cpp`): `GgufLoader::open()` = parse GGUF v3 + whitelist + geometria fail-fast (size de cada tensor ≤ span até o próximo, fim alinhado a 32, nomes únicos) + `load_tensor()` copia os bytes quantizados de um tensor p/ host.
+  - **Geometria validada nos dois arquivos** (C++ + espelho Python `scripts/check_geometry.py`): todos os 866 tensores de cada arquivo batem exatamente — último termina no EOF (`file_end_exact=yes`), zero overflow, zero desalinhamento.
+  - **Fato de formato (crítico p/ o loader):** offsets dos tensores são **relativos ao início da seção de dados** = fim do header **padded a `alignment`** (`GGML_PAD`), confirmado no reader de referência (`ggml/src/gguf.cpp`: `gr.seek(GGML_PAD(tell, alignment)); ctx->offset = tell`). Header ~11 MB (vocab 248320); `data_offset=10996640` nos dois arquivos.
+  - **Tabela de block size (elems, bytes)** validada empiricamente nos arquivos reais e cross-check com `llama-gguf r` (b10902): F32(1,4), Q8_0(32,34), Q2_K(256,84), Q3_K(256,110), Q4_K(256,144), Q5_K(256,176), Q6_K(256,210), IQ2_XXS(256,66), IQ2_XS(256,74), IQ3_XXS(256,98), IQ1_S(256,50), IQ4_NL(32,18), IQ3_S(256,110), IQ2_S(256,82), IQ4_XS(256,136). **O snapshot `.ref` (790cf51) está em refactoring e é auto-inconsistente para `IQ1_S` (struct 66 B vs `static_assert` 50 B) — NÃO usar como referência de formato de arquivo.**
+  - Spot-loads F32 com valores plausíveis (`attn_norm` ∈ [0.86,1.2], `ssm_a` negativo pequeno) nos dois arquivos — valores idênticos entre os dois UD, como esperado para tensores F32.
+- **Itens do M1:** item 1 (parser binário) ✅, item 4 (union de tipos) ✅, item 5 (aceite: 866 tensores listados) ✅ — via `check-loader` + `rdna4-infer --list-tensors`, ambos nos dois arquivos. Item 2 (KVs obrigatórias `qwen35.*`: arch/rope/ctx) e item 3 (inventário por camada 48 GDN / 16 full / bloco 64 MTP) — **pendentes** (próximo passo).
+
 1. Implementar o parser binário (magic `GGUF`, versão 3, KVs, tensores).
    Ref: `docs/gguf-qwen-quantizacao-llamacpp.md` §1 (`gguf.h` L1-32) · `.ref/llama.cpp/ggml/include/gguf.h`.
 2. Validar KVs obrigatórias: `general.architecture == "qwen35"`, 65 blocos, `qwen35.rope.dimension_sections == [11,11,10,0]`, ctx 262144.

@@ -5,7 +5,7 @@
 #include <sys/stat.h>
 
 #include "rdna4/device.h"
-#include "rdna4/gguf.h"
+#include "rdna4/loader.h"
 
 namespace {
 
@@ -92,18 +92,21 @@ int main(int argc, char **argv) {
   }
   const auto file_bytes = static_cast<std::uint64_t>(st.st_size);
 
-  rdna4::gguf::File gf;
+  rdna4::GgufLoader loader;
   std::string gerr;
-  if (!rdna4::gguf::read(model_path, gf, gerr)) {
-    std::fprintf(stderr, "rdna4-infer: gguf parse failed: %s\n", gerr.c_str());
+  if (!loader.open(model_path, gerr)) {
+    std::fprintf(stderr, "rdna4-infer: gguf load failed: %s\n", gerr.c_str());
     return 1;
   }
-  std::printf("gguf v%u: arch=%s tensors=%llu kv=%llu\n", gf.version,
+  const rdna4::gguf::File &gf = loader.meta();
+  std::printf("gguf v%u: arch=%s tensors=%llu kv=%llu data=%.2f GiB\n", gf.version,
               rdna4::gguf::kv_str(gf, "general.architecture", "?").c_str(),
-              (unsigned long long)gf.tensors.size(), (unsigned long long)gf.kv.size());
+              (unsigned long long)gf.tensors.size(), (unsigned long long)gf.kv.size(),
+              static_cast<double>(loader.total_bytes()) / (1u << 30));
   if (list_tensors) {
-    for (const auto &t : gf.tensors) {
-      std::printf("  %-40s %-8s [", t.name.c_str(), rdna4::gguf::ggml_type_name(t.dtype));
+    for (std::size_t i = 0; i < gf.tensors.size(); ++i) {
+      const auto &t = gf.tensors[i];
+      std::printf("  %-40s %-8s [", t.name.c_str(), rdna4::dtype_name(loader.dtype(i)));
       for (std::size_t d = 0; d < t.dims.size(); ++d) {
         std::printf("%s%lld", d ? ", " : "", (long long)t.dims[d]);
       }
