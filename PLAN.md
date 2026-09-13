@@ -304,17 +304,77 @@ Também corrigido por conta própria: `softplus` usava `log1pf(expf(x))` onde o 
 4. ✅ 64K (e 131K) com KV `q4_0` cabem nos 16 GB e rodam; f16 cabe apertado em 64K, f32 não cabe (tabela no Passo 4).
 5. ✅ **Aceite cumprido:** 1 camada GDN + 1 full-attention batem com o oráculo por nó (`attn_pregate-3` soma rel 1,1e-04; estado recorrente ≤ 6,1e-05); o grafo completo dá o **mesmo argmax do llama.cpp em 4/4 prompts** e top-5 **5/5 na mesma ordem** com logits dentro de ~0,1; run de ctx longo (64K/131K, KV `q4_0`) dentro dos 16 GB.
 
-## M4 — Sampler + CLI `run`
+## M4 — Sampler + CLI `run` ✅ concluído em 2026-09-13
 
 Objetivo: gerar texto determinístico com template de chat.
 
-1. Sampler (greedy, temperature, top-k/n, top-p, min-p, repetition penalty, seed) com defaults dos metadados (top_k 20, top_p 0.95, temp 1.0).
+### Passo 1 — tokenizer BPE (pré-requisito que o plano não listava)
+
+`include/rdna4/tokenizer.h` + `src/backend/tokenizer.cpp`, com `unicode.h`/`unicode.cpp`/`unicode_data.*` vendorizados de `llama.cpp/src/unicode.cpp` + `unicode-data.cpp` (MIT) — só o que o `pre = qwen35` usa (`unicode_regex_split_custom_qwen35`, byte-encoding GPT-2, `unicode_tolower`, as tabelas de ranges/categorias), mais um wrapper novo `unicode_regex_split()`. Pipeline = `llm_tokenizer_bpe`: split nos tokens especiais (`USER_DEFINED` sempre, `CONTROL`/`UNKNOWN` com `parse_special`) → regex do qwen35 → byte-encode → merges por rank.
+
+- Oráculo: `tests/oracle_tokenize.cpp` (libllama) vs `tests/check_tokenizer.cpp`.
+- `tests/tokenizer_corpus.txt` (205 linhas) + `tests/golden/tokenizer_ids.txt` commitados; além do corpus, **3000 strings aleatórias → 0 divergências de id e 0 falhas de roundtrip** (`decode(encode(s)) == s`).
+- Dois defeitos de teste encontrados e corrigidos no caminho: (a) o oráculo rodava com `vocab_only = true`, então os tensores não eram carregados e o `llama-tokenize` devolvia ids **errados** (1814 → 1206); (b) `llama_tokenize` devolve `-n` quando o buffer é curto e o oráculo tratava o negativo como "o tamanho", alocando 0 tokens → o teste passava com **0 comparações** (vacuidade); agora `need = -need` e `check-tokenizer` **falha** se faltar linha no oráculo.
+
+### Passo 2 — sampler
+
+`include/rdna4/sampler.h` + `src/backend/sampler.cpp`: cadeia e semântica por estágio copiadas de `src/llama-sampler.cpp` (penalties → top_k → top_p → min_p → temperature → dist), com as fórmulas exatas (`logit <= 0 ? logit*penalty : logit/penalty`; top_k por `partial_sort`; top_p via softmax com max subtraído e o menor prefixo ≥ p; `min_p` com `max + log(min_p)`; `temp <= 0` ⇒ greedy; dist = softmax + 1 sorteio uniforme). RNG próprio (`std::mt19937_64` + uniforme de 53 bits) e **deliberadamente não** o stream do llama.cpp — está documentado no header: a comparação direta com o llama.cpp é feita no modo greedy, que não usa RNG.
+
+`tests/check_sampler.cpp` (`check-sampler`): 20+ asserções sobre a cadeia, os defaults dos metadados (`top_k 20`, `top_p 0.95`, `temp 1.0`), o greedy e o determinismo por seed. Dois bugs de teste achados: usar o **valor** de `max_element` como índice e assertar a penalidade no token vencedor (que deixa de ser o vencedor) — a asserção passou a usar penalidade 1,0001 e a checar os dois sinais com `temp 1`.
+
+### Passo 3 — `--chat`
+
+`include/rdna4/chat.h` + `src/backend/chat.cpp` renderiza o template qwen35 direto (sem engine Jinja): merge de system/developer, instrução de `reasoning_effort` (default `xhigh`), `<|im_start|>user\n…<|im_end|>\n`, assistant com `<think>`, tool response, e o prompt de geração `<|im_start|>assistant\n<think>\n` (ou a variante com `</think>` fechado quando thinking está desligado).
+
+`tests/oracle_chat.cpp` (libllama-common, `common_chat_templates_apply`) gera `tests/golden/chat_renders.txt` com 13 conversas; `tests/check_chat.cpp` compara **byte a byte** → todas idênticas (300/270/74/330/308/313/396/297/345/320/313/397/433 bytes) + 3 caminhos de erro (papel desconhecido, system após o primeiro turno) rejeitados.
+
+### Passo 4 — entrada por token no grafo + CLI `run`
+
+- `Graph::forward_tokens(ids, pos, …)` (`include/rdna4/graph.cuh`): `token_embd.weight` é **quantizado** nos UD (q3_K no IQ3_S, q4_K no IQ4_XS) e o grafo de referência alimenta a linha **desquantizada** (`ggml_get_rows` → f32). A linha é desquantizada no device reusando exatamente os kernels já validados bit-exatos (`include/rdna4/dequant_row.cuh`, extraído de `check_dequant_gpu.hip`), sem round-trip pelo host e sem uma segunda implementação para manter em sincronia. `forward()` (embeddings f32 do host) e `forward_tokens()` compartilham o mesmo corpo (`forward_run`).
+  - Esse refactor pegou um bug real: o launcher compartilhado do `q8_0` subia com **32 threads** onde o kernel usa o mapeamento `float2` de **16** threads (32 elementos por bloco) → escrevia fora do bloco; `check-dequant-gpu` acusou `q8_0 MISMATCH` e voltou a `OK (14 types tested)` com o conserto.
+  - `Graph::init` agora exige `token_embd.dim0 == n_embd && dim1 == output.dim1` (o índice por id de token sairia do buffer sem isso).
+- `src/main.hip`: subcomando `run` (o `info`/orçamento do M0-M2 continua sendo o comportamento padrão). Flags: `-m -p -n --chat --system --no-thinking --reasoning-effort --temp --greedy --top-k --top-p --min-p --repeat-penalty --repeat-last-n --seed --ctx-size --cache-type-k/-v -v --no-stats`.
+  - **stdout só leva texto gerado**; todo diagnóstico (timings, ids, avisos) vai para stderr — é o que permite comparar a saída byte a byte.
+  - Streaming com fronteira de UTF-8: re-decodifica o prefixo gerado e emite só o que termina em sequência completa (`utf8_keep_len`), guardando bytes de um caractere multibyte partido entre dois tokens.
+  - Para em EOS (`<|im_end|>` = 248046), clipa `-n` ao contexto disponível, e falha com exit ≠ 0 em prompt/token fora de faixa, parâmetros inválidos, flag desconhecida, `-m` ausente, ctx pequeno demais.
+
+### Passo 5 — aceite do M4
+
+**Golden test** (`scripts/check_golden_run.sh`, prompt fixo "The capital of France is", `-n 32`):
+
+| arquivo em `tests/golden/` | o que fixa |
+|---|---|
+| `run_greedy_IQ3_S.txt` + `run_greedy_ids_IQ3_S.txt` | saída e ids com `--greedy` (independente de RNG) |
+| `run_sample_IQ3_S.txt` + `run_sample_ids_IQ3_S.txt` | saída e ids com `--temp 1 --seed 42` |
+
+O script roda o greedy, roda a amostragem **duas vezes** (mesma seed ⇒ mesma saída byte a byte), roda com `seed 43` (tem que **diferir**: sem isso um sampler que ignorasse a seed passaria) e roda com KV `q4_0` (continua coerente). **Controle negativo feito:** corrompendo cada golden, o script falha (`FAILED` + diff) — o teste não é vacuoso. `UPDATE=1` regenera os goldens.
+
+**Comparação com o llama.cpp (aceite forte):** `scripts/compare_llama_greedy.sh` roda o mesmo prompt (ids vindos do **nosso** tokenizer, já validado bit-exato) no nosso motor e no llama.cpp (`oracle-next-token` estendido com `ORACLE_GREEDY=N`, backend Vulkan, decodificação token-a-token):
+
+```
+rdna4: 32 tokens, llama.cpp: 32 tokens
+IDS MATCH: all 32 greedy tokens identical
+text: rdna4 130 bytes, llama.cpp 130 bytes, IDENTICAL
+" Paris.\nThe capital of Germany is Berlin.\nThe capital of Italy is Rome.\n
+ The capital of Spain is Madrid.\nThe capital of Portugal is"
+```
+
+32 passos de decode consecutivos (64 camadas cada) sem **nenhuma** divergência — é o mesmo tipo de evidência que o argmax do M3, agora encadeado.
+
+**Uso real medido** (IQ3_S, KV f16, 9070 XT): carga 3,5-16,6 s (page cache), prefill 19 tokens 0,84 s (22,6 tok/s), decode **~26 tok/s**; `--chat --no-thinking -p "What is the capital of France?"` responde `The capital of France is **Paris**.` e para no EOS em 8 tokens. `--chat` com thinking produz o rastro de raciocínio normalmente.
+
+### Passo 6 — revisão adversarial do M4
+
+(pendente: agente separado, só leitura de código, ao fim do M4)
+
+1. ✅ Sampler (greedy, temperature, top-k/n, top-p, min-p, repetition penalty, seed) com defaults dos metadados (top_k 20, top_p 0.95, temp 1.0).
    Ref: `SPEC.md` §1.4 · KVs `general.sampling.*` lidas em M1.
-2. CLI `run` com streaming e erros em stderr/exit != 0.
+2. ✅ CLI `run` com streaming e erros em stderr/exit != 0.
    Ref: `SPEC.md` §1.1.
-3. `--chat` aplicando `tokenizer.chat_template` (`pre = qwen35`, BOS 248044 / EOS 248046 / PAD 248055).
+3. ✅ `--chat` aplicando `tokenizer.chat_template` (`pre = qwen35`, BOS 248044 / EOS 248046 / PAD 248055).
    Ref: `docs/gguf-qwen-quantizacao-llamacpp.md` §1 · `SPEC.md` §1.1.
-4. **Aceite:** golden test — prompt fixo no `UD-IQ3_S`, mesma seed, mesma saída.
+4. ✅ **Aceite cumprido:** golden test — prompt fixo no `UD-IQ3_S`, mesma seed, mesma saída (e greedy **idêntico ao llama.cpp por 32 tokens**).
+
 
 ## M5 — Validação nos dois arquivos + docs
 

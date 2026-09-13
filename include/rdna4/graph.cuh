@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "rdna4/attn.cuh"
+#include "rdna4/dequant_row.cuh"
 #include "rdna4/dtype.h"
 #include "rdna4/gdn.cuh"
 #include "rdna4/loader.h"
@@ -103,6 +104,15 @@ class Graph {
   bool forward(const std::vector<float> &embeddings, int start_pos, std::vector<float> &hidden,
                std::vector<float> &logits, std::string &err);
 
+  // M4: the CLI's entry point. `token_embd.weight` is quantized in the UD files
+  // (q3_K in IQ3_S, q4_K in IQ4_XS), and llama.cpp's graph feeds the *dequantized*
+  // row to the trunk (`ggml_get_rows` -> f32), so the row is dequantized on the
+  // device with the same kernels validated bit-exact against llama.cpp's
+  // dequantize_row_* in tests/check_dequant_gpu.hip (dequant_row.cuh) — no host
+  // round trip and no second implementation to keep in sync.
+  bool forward_tokens(const std::vector<std::int32_t> &tokens, int start_pos,
+                      std::vector<float> &hidden, std::vector<float> &logits, std::string &err);
+
   // Test hooks (diagnostics only; see PLAN.md M3).
   // Fills every KV cache and GDN state with a deterministic pseudo-random
   // pattern so a single decode step can be measured against a full cache.
@@ -119,6 +129,7 @@ class Graph {
   }
 
   int n_embd() const { return (int)cfg_.embedding_length; }
+  int n_vocab() const { return output_.dim1; }
   // Executed trunk blocks. block_count covers the trunk *plus* the MTP block(s),
   // so the trunk is block_count - nextn_predict_layers: 65 - 1 = 64 blocks
   // (0..63), of which the full-attention ones are i = 3, 7, ..., 63 (16 layers).
@@ -135,6 +146,11 @@ class Graph {
   bool up(const char *name, GpuTensor &t, std::string &err);
   bool up_f32(const char *name, GpuTensor &t, std::string &err);
   bool alloc(float *&p, std::size_t n, std::string &err);
+  // Body shared by both entry points. Exactly one of host_emb (n_tokens * n_embd
+  // f32 rows) and toks (token ids) is non-null.
+  bool forward_run(std::size_t n_tokens, int start_pos, const float *host_emb,
+                   const std::vector<std::int32_t> *toks, std::vector<float> &hidden,
+                   std::vector<float> &logits, std::string &err);
   bool proj(const GpuTensor &w, const float *d_x, float *d_y, int nrows, int ncols,
             std::string &err);
   bool add_residual(float *d_src, float *d_dst, int n, std::string &err);
@@ -328,6 +344,13 @@ inline bool Graph::init(int max_ctx, KvType kv_k, KvType kv_v, std::string &err)
   // output.weight is absent); the UD files always carry it, so be loud instead
   // of silent (review n14)
   if (!up("output.weight", output_, err)) return false;
+  // forward_tokens indexes token_embd rows by token id and forward() takes
+  // n_vocab from output_, so a token_embd that does not cover the same rows
+  // would read out of bounds (review M4)
+  if (tok_embd_.dim0 != E || tok_embd_.dim1 != output_.dim1) {
+    err = "token_embd.weight must be [n_embd, n_vocab], same n_vocab as output.weight";
+    return false;
+  }
 
   const int n_attn = L - n_recr;
   if (!alloc(d_x_, E, err) || !alloc(d_xn_, E, err) || !alloc(d_proj_, NH * 2 * HD, err) ||
@@ -596,21 +619,58 @@ inline bool Graph::forward(const std::vector<float> &embeddings, int start_pos,
                            std::vector<float> &hidden, std::vector<float> &logits,
                            std::string &err) {
   const int E = n_embd();
-  const int L = n_layer();
   if (embeddings.empty() || embeddings.size() % (std::size_t)E != 0) {
     err = "embeddings must hold whole rows of n_embd floats";
     return false;
   }
-  const std::size_t n_tokens = embeddings.size() / (std::size_t)E;
+  return forward_run(embeddings.size() / (std::size_t)E, start_pos, embeddings.data(), nullptr,
+                     hidden, logits, err);
+}
+
+inline bool Graph::forward_tokens(const std::vector<std::int32_t> &tokens, int start_pos,
+                                  std::vector<float> &hidden, std::vector<float> &logits,
+                                  std::string &err) {
+  if (tokens.empty()) {
+    err = "token list must not be empty";
+    return false;
+  }
+  const std::int32_t n_vocab = (std::int32_t)tok_embd_.dim1;
+  for (std::int32_t tk : tokens) {
+    if (tk < 0 || tk >= n_vocab) {
+      err = "token id " + std::to_string(tk) + " out of range [0, " + std::to_string(n_vocab) + ")";
+      return false;
+    }
+  }
+  return forward_run(tokens.size(), start_pos, nullptr, &tokens, hidden, logits, err);
+}
+
+inline bool Graph::forward_run(std::size_t n_tokens, int start_pos, const float *host_emb,
+                               const std::vector<std::int32_t> *toks, std::vector<float> &hidden,
+                               std::vector<float> &logits, std::string &err) {
+  const int E = n_embd();
+  const int L = n_layer();
+  if (n_tokens == 0 || (host_emb == nullptr) == (toks == nullptr)) {
+    err = "forward_run needs exactly one source of embeddings";
+    return false;
+  }
   if (start_pos < 0 || (std::size_t)start_pos + n_tokens > (std::size_t)max_ctx_) {
     err = "positions exceed the allocated context (" + std::to_string(max_ctx_) + ")";
     return false;
   }
+  // Row stride of one token_embd row in its own (possibly quantized) layout.
+  const std::size_t emb_row = (std::size_t)tensor_bytes(tok_embd_.dt, (std::uint64_t)E);
 
   for (std::size_t t = 0; t < n_tokens; ++t) {
     cur_token_ = (int)t;
-    if (hipMemcpy(d_x_, embeddings.data() + t * E, (std::size_t)E * sizeof(float),
-                  hipMemcpyHostToDevice) != hipSuccess) {
+    if (toks != nullptr) {
+      const char *src = (const char *)tok_embd_.ptr + (std::size_t)(*toks)[t] * emb_row;
+      if (!dequant_row_launch(tok_embd_.dt, src, d_x_, E)) {
+        err = "embedding dequant failed (type " + std::string(dtype_name(tok_embd_.dt)) +
+              ", row " + std::to_string((*toks)[t]) + ")";
+        return false;
+      }
+    } else if (hipMemcpy(d_x_, host_emb + t * (std::size_t)E, (std::size_t)E * sizeof(float),
+                         hipMemcpyHostToDevice) != hipSuccess) {
       err = "embedding upload failed";
       return false;
     }

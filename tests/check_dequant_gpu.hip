@@ -8,6 +8,7 @@
 //
 // usage: check-dequant-gpu <file.gguf> [nblocks]
 #include "rdna4/dequant.cuh"
+#include "rdna4/dequant_row.cuh"
 
 #include <hip/hip_runtime.h>
 
@@ -51,45 +52,8 @@ const TypeCase kCases[] = {
     {DType::IQ4_XS, "iq4_xs", 32},
 };
 
-// --- device kernels -------------------------------------------------------
-
-template <class Fn>
-__global__ void dequant_kernel_256(const void *vx, float *yy, int64_t nblocks) {
-  for (int64_t i = blockIdx.x; i < nblocks; i += gridDim.x) {
-    Fn::apply(vx, i, yy + i * 256, threadIdx.x);
-  }
-}
-
-__global__ void dequant_kernel_q8_0(const void *vx, float *yy, int64_t nblocks) {
-  for (int64_t i = blockIdx.x; i < nblocks; i += gridDim.x) {
-    float2 v;
-    rdna4::dequantize_q8_0(vx, i, 2 * (int)threadIdx.x, v);
-    yy[i * 32 + 2 * threadIdx.x + 0] = v.x;
-    yy[i * 32 + 2 * threadIdx.x + 1] = v.y;
-  }
-}
-
-#define FN(Name, FnName)                                                                        \
-  struct Name {                                                                                 \
-    static __device__ __forceinline__ void apply(const void *vx, int64_t i, float *y, int tid) { \
-      rdna4::FnName(vx, i, y, tid);                                                             \
-    }                                                                                           \
-  }
-
-FN(FnQ2K, dequantize_q2_K);
-FN(FnQ3K, dequantize_q3_K);
-FN(FnQ4K, dequantize_q4_K);
-FN(FnQ5K, dequantize_q5_K);
-FN(FnQ6K, dequantize_q6_K);
-FN(FnIQ2XXS, dequantize_iq2_xxs);
-FN(FnIQ2XS, dequantize_iq2_xs);
-FN(FnIQ3XXS, dequantize_iq3_xxs);
-FN(FnIQ1S, dequantize_iq1_s);
-FN(FnIQ4NL, dequantize_iq4_nl);
-FN(FnIQ3S, dequantize_iq3_s);
-FN(FnIQ2S, dequantize_iq2_s);
-FN(FnIQ4XS, dequantize_iq4_xs);
-
+// (the per-type dequant kernels + the 14-type dispatch now live in
+// include/rdna4/dequant_row.cuh, shared with the engine)
 // --- host -----------------------------------------------------------------
 
 struct Stats {
@@ -140,28 +104,11 @@ int run_case(const char *label, DType dt, const std::uint8_t *src, std::int64_t 
   }
   hipMemcpy(d_src, src, nbytes, hipMemcpyHostToDevice);
 
-  const int grid = (int)(nblocks < 4096 ? nblocks : 4096);
-  if (q8_variant) {
-    dequant_kernel_q8_0<<<grid, 16>>>(d_src, d_dst, nblocks);
-  } else {
-    switch (dt) {
-      case DType::Q2_K:    dequant_kernel_256<FnQ2K><<<grid, nthreads>>>(d_src, d_dst, nblocks); break;
-      case DType::Q3_K:    dequant_kernel_256<FnQ3K><<<grid, nthreads>>>(d_src, d_dst, nblocks); break;
-      case DType::Q4_K:    dequant_kernel_256<FnQ4K><<<grid, nthreads>>>(d_src, d_dst, nblocks); break;
-      case DType::Q5_K:    dequant_kernel_256<FnQ5K><<<grid, nthreads>>>(d_src, d_dst, nblocks); break;
-      case DType::Q6_K:    dequant_kernel_256<FnQ6K><<<grid, nthreads>>>(d_src, d_dst, nblocks); break;
-      case DType::IQ2_XXS: dequant_kernel_256<FnIQ2XXS><<<grid, nthreads>>>(d_src, d_dst, nblocks); break;
-      case DType::IQ2_XS:  dequant_kernel_256<FnIQ2XS><<<grid, nthreads>>>(d_src, d_dst, nblocks); break;
-      case DType::IQ3_XXS: dequant_kernel_256<FnIQ3XXS><<<grid, nthreads>>>(d_src, d_dst, nblocks); break;
-      case DType::IQ1_S:   dequant_kernel_256<FnIQ1S><<<grid, nthreads>>>(d_src, d_dst, nblocks); break;
-      case DType::IQ4_NL:  dequant_kernel_256<FnIQ4NL><<<grid, nthreads>>>(d_src, d_dst, nblocks); break;
-      case DType::IQ3_S:   dequant_kernel_256<FnIQ3S><<<grid, nthreads>>>(d_src, d_dst, nblocks); break;
-      case DType::IQ2_S:   dequant_kernel_256<FnIQ2S><<<grid, nthreads>>>(d_src, d_dst, nblocks); break;
-      case DType::IQ4_XS:  dequant_kernel_256<FnIQ4XS><<<grid, nthreads>>>(d_src, d_dst, nblocks); break;
-      default:
-        std::fprintf(stderr, "%-9s unsupported\n", label);
-        return 1;
-    }
+  if (!rdna4::dequant_row_launch(dt, d_src, d_dst, nelem)) {
+    std::fprintf(stderr, "%-9s unsupported or launch failed\n", label);
+    hipFree(d_src);
+    hipFree(d_dst);
+    return 1;
   }
   const hipError_t le = hipGetLastError();
   if (le != hipSuccess) {

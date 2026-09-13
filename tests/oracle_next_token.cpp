@@ -8,13 +8,20 @@
 //
 // usage: oracle-next-token <file.gguf> <token id> [token id...]
 //        (ids as printed by llama-tokenize, e.g. 9419 1814 11 411 369 264 1228 13)
+//
+// M4 acceptance: with ORACLE_GREEDY=N, after the prompt it continues greedily
+// (argmax) for up to N tokens, one token at a time, and writes the ids to
+// ORACLE_IDS_OUT and the detokenized text to ORACLE_TEXT_OUT — the reference the
+// engine's own `run --greedy` output is compared against.
 #include <llama.h>
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <cstring>
 #include <numeric>
+#include <string>
 #include <vector>
 
 int main(int argc, char **argv) {
@@ -111,6 +118,68 @@ int main(int argc, char **argv) {
   std::printf("top5:");
   for (int i = 0; i < 5; ++i) std::printf(" %d(%.4f)", idx[i], logits[idx[i]]);
   std::printf("\n");
+
+  // ---- M4: greedy continuation -------------------------------------------
+  const char *greedy_env = std::getenv("ORACLE_GREEDY");
+  if (greedy_env) {
+    const int want = std::atoi(greedy_env);
+    const llama_vocab *vocab = llama_model_get_vocab(model);
+    const llama_token eos = llama_vocab_eos(vocab);
+    std::vector<llama_token> out;
+    std::string text;
+    llama_pos pos = (llama_pos)tokens.size();
+    llama_token best = (llama_token)idx[0];
+    float best_logit = logits[idx[0]];
+    for (int step = 0; step < want; ++step) {
+      if (best == eos) break;
+      out.push_back(best);
+      std::vector<char> buf(256);
+      const int n = llama_token_to_piece(vocab, best, buf.data(), (int)buf.size(), 0, false);
+      if (n > 0) text.append(buf.data(), (std::size_t)n);
+      if (step + 1 >= want) break;  // no need for the logits of the last token
+      llama_batch one = llama_batch_init(1, 0, 1);
+      one.n_tokens = 1;
+      one.token[0] = best;
+      one.pos[0] = pos++;
+      one.seq_id[0][0] = 0;
+      one.n_seq_id[0] = 1;
+      one.logits[0] = 1;
+      const int rc = llama_decode(ctx, one);
+      llama_batch_free(one);
+      if (rc != 0) {
+        std::fprintf(stderr, "greedy decode failed at step %d\n", step);
+        return 1;
+      }
+      const float *lg = llama_get_logits_ith(ctx, 0);
+      if (!lg) {
+        std::fprintf(stderr, "greedy: no logits at step %d\n", step);
+        return 1;
+      }
+      int arg = 0;
+      for (int i = 1; i < n_vocab; ++i) {
+        if (lg[i] > lg[arg]) arg = i;
+      }
+      best = (llama_token)arg;
+      best_logit = lg[arg];
+      std::printf("greedy step %d: %d (logit %.6f)\n", step, (int)best, best_logit);
+    }
+    std::printf("greedy: %zu tokens\n", out.size());
+    std::printf("greedy ids:");
+    for (llama_token t : out) std::printf(" %d", (int)t);
+    std::printf("\n");
+    if (const char *p = std::getenv("ORACLE_IDS_OUT")) {
+      FILE *f = std::fopen(p, "w");
+      if (!f) { std::fprintf(stderr, "cannot write %s\n", p); return 1; }
+      for (llama_token t : out) std::fprintf(f, "%d\n", (int)t);
+      std::fclose(f);
+    }
+    if (const char *p = std::getenv("ORACLE_TEXT_OUT")) {
+      FILE *f = std::fopen(p, "wb");
+      if (!f) { std::fprintf(stderr, "cannot write %s\n", p); return 1; }
+      std::fwrite(text.data(), 1, text.size(), f);
+      std::fclose(f);
+    }
+  }
 
   llama_free(ctx);
   llama_model_free(model);
