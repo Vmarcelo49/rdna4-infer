@@ -257,7 +257,19 @@ bool exact_check(const rdna4::GgufLoader &ld, const rdna4::Qwen35Config &cfg,
   const std::vector<float> &x = xit->second;  // [t][E]
   const std::vector<float> &y = yit->second;  // [t][R]
 
-  const std::size_t t_last = (std::size_t)n_tokens - 1;
+  // Accum holds every token unless GRAPH_LAST_TOKEN is set, in which case it
+  // holds exactly one — derive the index from the data instead of assuming
+  // n_tokens-1, which would read past the end (review M3).
+  const std::size_t n_held = x.size() / (std::size_t)E;
+  const std::size_t t_last = n_held - 1;
+  if (n_held != (std::size_t)n_tokens) {
+    std::printf("exact-f32 check: Accum holds %zu token(s) of %d (GRAPH_LAST_TOKEN): using token %zu\n",
+                n_held, n_tokens, t_last);
+  }
+  if (y.size() / (std::size_t)R != n_held) {
+    std::printf("exact-f32 check: node sizes disagree, skipping\n");
+    return true;
+  }
   const float *xt = x.data() + t_last * (std::size_t)E;
   const float *yt = y.data() + t_last * (std::size_t)R;
 
@@ -288,9 +300,14 @@ bool exact_check(const rdna4::GgufLoader &ld, const rdna4::Qwen35Config &cfg,
   auto o = acc.oracle ? acc.oracle->find("linear_attn_qkv_mixed-0")
                       : std::map<std::string, OracleNode>::const_iterator{};
   if (acc.oracle && o != acc.oracle->end()) {
-    // first 3 rows belong to token 0, last 3 to the last token
+    // first 3 rows belong to token 0, last 3 to the last token — only true for a
+    // batched-prefill dump, so skip it when Accum holds a single token
     const float *x0 = x.data();
     const float *y0 = y.data();
+    if (n_held < 2) {
+      std::printf("  (single-token accumulation: oracle row comparison skipped)\n");
+      return std::sqrt(l2_diff / l2_ref) < 1e-3;
+    }
     double o_sq = 0.0, g_sq = 0.0;
     for (int i = 0; i < 6; ++i) {
       const bool first = i < 3;
@@ -393,6 +410,21 @@ bool run_checks(const Accum &acc, const std::map<std::string, OracleNode> &oracl
       {"attn_gated-3", 0.2, 0.2, 0.0, false},
       {"attn_output-3", 0.2, 0.2, 0.0, false},
       {"l_out-3", 0.2, 5e-2, 0.0, false},
+      // every tenth layer: without these the middle of the graph (4..61) would
+      // only be pinned by the final nodes (review n12)
+      // (attn_norm is an RMS-normalized node: its element sum cancels almost
+      // completely — e.g. attn_norm-30 sums to 6.6 out of ~5120 — so only the
+      // sampled-value criterion is meaningful there)
+      {"attn_norm-10", 0.2, 0.0, 0.0, false},
+      {"l_out-10", 0.2, 0.2, 0.0, false},
+      {"attn_norm-20", 0.2, 0.0, 0.0, false},
+      {"l_out-20", 0.2, 0.2, 0.0, false},
+      {"attn_norm-30", 0.2, 0.0, 0.0, false},
+      {"l_out-30", 0.2, 0.2, 0.0, false},
+      {"attn_norm-40", 0.2, 0.0, 0.0, false},
+      {"l_out-40", 0.2, 0.2, 0.0, false},
+      {"attn_norm-50", 0.2, 0.0, 0.0, false},
+      {"l_out-50", 0.2, 0.2, 0.0, false},
       // last trunk layer and the end-to-end outputs. `l_out-63` existing at all
       // is itself a check: the trunk is 64 blocks (65 - 1 MTP), so a wrong
       // layer count shows up as CHECK MISSING here.
@@ -492,7 +524,7 @@ bool check_argmax(const char *path, const std::vector<float> &logits) {
 }
 
 int main(int argc, char **argv) {
-  if (argc < 3) {
+  if (argc < 4) {
     std::fprintf(stderr,
                  "usage: check-graph-gpu <file.gguf> <oracle_dump|-> <argmax_ref|-> [token ids...]\n");
     return 2;
@@ -665,10 +697,24 @@ int main(int argc, char **argv) {
     // from its own single-token results, so the checks would be measuring
     // llama.cpp's path difference instead of our engine.
     auto probe = oracle.find("attn_norm-0");
-    const bool batched = probe != oracle.end() && probe->second.shape.find(", 8, 1, 1}") != std::string::npos;
+    bool batched = false;
+    if (probe != oracle.end()) {
+      // "= {5120, N, 1, 1}" — N > 1 means the reference evaluated several tokens
+      // per graph (a batched prefill), which is not the computation this engine
+      // does. That is a *failure*, not a skip: the checks are the gate.
+      const std::string &sh = probe->second.shape;
+      const std::size_t c1 = sh.find(',');
+      if (c1 != std::string::npos) {
+        const long n = std::strtol(sh.c_str() + c1 + 1, nullptr, 10);
+        batched = n > 1;
+      }
+    }
     if (batched) {
-      std::printf("\nstructural checks SKIPPED: dump is a batched-prefill capture; "
-                  "re-capture with -ub 1 (scripts/capture_oracle.sh, see PLAN.md M3)\n");
+      std::fprintf(stderr,
+                   "structural checks FAILED: the dump is a batched-prefill capture (node 0 has "
+                   "more than one token); re-capture with UB=1 scripts/capture_oracle.sh ... "
+                   "(see PLAN.md M3)\n");
+      ok = false;
     } else {
       std::printf("\nstructural checks:\n");
       ok = run_checks(acc, oracle) && ok;

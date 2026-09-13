@@ -237,18 +237,18 @@ Objetivo: logits corretos nos dois ramos de camada.
 - Precisão do matvec medida contra **f32 exato** (`GRAPH_EXACT=1`, dequant no host + dot em double): `||gpu-exact||/||exact|| = 1,1e-03` para `blk.0.attn_qkv`; o **próprio oráculo CPU fica 2,4× pior** (rms 1,6e-02 vs 6,7e-03 nas mesmas 6 linhas) — a nossa quantização de ativação (q8_1, blocos de 32) é mais fina que a q8_K dele (blocos de 256).
 - **Aceite end-to-end: argmax igual ao do llama.cpp em 4/4 prompts** (`check-graph-gpu <gguf> - reference/argmax_<p>_cpu.txt <ids>`):
 
-  | prompt | ids | llama.cpp | nós |
-  |---|---|---|---|
-  | "Hello world, this is a test." | `9419 1814 11 411 369 264 1228 13` | 198 | 198 (12,41 vs 13,53) |
-  | "The capital of France is" | `760 6511 314 9338 369` | 11751 | 11751 (14,19 vs 17,53) |
-  | "def fibonacci(n):" | `727 73111 1393 1590` | 198 | 198 (16,16 vs 20,03) |
-  | "1 2 3 … 9" | `16 220 17 … 24` | 220 | 220 (19,07 vs 16,41) |
+  | prompt | ids | llama.cpp top-1 | nós top-1 | top-5 (ordem) |
+  |---|---|---|---|---|
+  | "Hello world, this is a test." | `9419 1814 11 411 369 264 1228 13` | 198 @ 13,5299 | **198 @ 13,5186** | 5/5 |
+  | "The capital of France is" | `760 6511 314 9338 369` | 11751 @ 17,5278 | **11751 @ 17,5793** | 5/5 |
+  | "def fibonacci(n):" | `727 73111 1393 1590` | 198 @ 20,0289 | **198 @ 19,9924** | 5/5 |
+  | "1 2 3 … 9" | `16 220 17 … 24` | 220 @ 16,4062 | **220 @ 16,3145** | 5/5 |
 
-  Top-5 também bate em ordem/ids em 4/5 (um ligeiro desacordo no 4º/5º colocado em 3 dos 4 prompts).
+  *(números pós-fix de contagem de camadas; antes dele os "nossos" eram 12,41/14,19/16,16/19,07 — a tabela antiga ficou registrada no commit `f525b27`.)* O `std` dos logits também acompanha: 2,091 vs 2,088 do oráculo neste prompt.
 
 **Passo 4 — tipos de KV cache + contexto longo ✅** (`include/rdna4/kv.h`, `tests/check_kvctx_gpu.hip`)
 
-- **Tipos**: `KvType::{F32,F16,Q8_0,Q4_0}` (o default do llama.cpp é `f16`; o plano pedia `q8_0`/`q4_0` para ctx longo). As linhas do cache (uma cabeça KV de um token) são gravadas **já quantizadas** em blocos de 32 elementos, byte a byte como `quantize_row_q8_0_ref`/`quantize_row_q4_0_ref` do llama.cpp, e a atenção **desquantiza on-the-fly** (`kv_load<CT>`), sem cópia f32 do cache. `kv_store_row_launch` grava uma linha; `kv_fill_launch` preenche caches inteiros (hook de teste).
+- **Tipos**: `KvType::{F32,F16,Q8_0,Q4_0}` (o default do llama.cpp é `f16`; o plano pedia `q8_0`/`q4_0` para ctx longo). As linhas do cache (uma cabeça KV de um token) são gravadas **já quantizadas** em blocos de 32 elementos, **byte a byte como o llama.cpp** (`quantize_row_q8_0_ref` e `quantize_row_q4_0_ref` — inclusive o detalhe do q4_0: escala `d = max_sinalizado / -8` e arredondamento `(int8_t)(x*id + 8.5)` com `MIN(15,·)`, não uma grade simétrica `amax/7`), e a atenção **desquantiza on-the-fly** (`kv_load<CT>`), sem cópia f32 do cache. `kv_store_row_launch` grava uma linha; `kv_fill_launch` preenche caches inteiros (hook de teste). A byte-exatidão é **testada** contra um espelho host das fórmulas do ggml em `check-rope-gpu` (`kv store (tipo): bytes differing from the ggml reference: 0`).
 - **Teste isolado por tipo** (`check-rope-gpu`): para cada tipo, grava as linhas com `kv_store_row_launch` e confere que a atenção (1 chave ⇒ softmax = 1) devolve **exatamente** o que o cache contém — `max|out - cache| = 0,000e+00` nos 4 tipos ✓.
 - **fim-a-fim**: os 4 tipos dão o **mesmo argmax** do llama.cpp no prompt de 8 tokens ✓.
 - **Atenção reescrita (flash-style, softmax online)**: a versão anterior guardava 1 score por chave em shared memory + uma redução de bloco por chave, o que (a) limita `t` a alguns milhares de tokens (smem!) e (b) é lento. A nova: 1 bloco por cabeça, 8 warps dividindo as chaves, max/soma correntes e merge por warp no fim — sem smem proporcional ao contexto. `check-rope-gpu` valida a causal (rel-L2 6,1e-08) e o caso de 1 chave.
@@ -271,6 +271,27 @@ Objetivo: logits corretos nos dois ramos de camada.
 **Estatística honesta da comparação por nó** (dump por token, último token, 1219 nós comparados): **15 nós com valores amostrados desviando >20%** (todos em camadas tardias: `l_out-{58..63}`, `attn_residual-{60..63}`, `Qcur_full-59`, `alpha/a_softplus-54`, com desvio **absoluto** 0,29–0,73 sobre valores de 5–15, isto é 2–6%) e 843 nós com erro de **soma** >1e-2 — mas a soma é um critério inútil para os ~metade dos nós cujos valores cancelam (`Qcur` pós-RoPE chega a soma rel 14×). Por isso o teste reporta os dois critérios separados e só o de valores alimenta os checks.
 
 **Deriva residual (documentada, não "resolvida"):** depois do fix de camadas o desvio é pequeno mas não zero: nós profundos ficam tipicamente **1–10%** (`attn_norm-62` 7,9e-02 de diferença máxima nas amostras, `l_out-63` 5,7e-02, `result_output` 1,2e-02) e os logits batem dentro de ~0,1. Atribuição medida: (a) o llama.cpp não é reprodutível melhor que ~4% por nó entre os seus próprios caminhos (batched vs per-token), (b) o nosso matvec é **2,4× mais preciso** que o dele contra f32 exato (q8_1/blocos de 32 vs q8_K/blocos de 256), (c) perturbar 30% por camada não muda o argmax e muda o top-1 em ≤0,3. Ou seja: o resíduo é ruído de quantização de ativação amplificado por 64 camadas, não operação errada.
+
+### Passo 5 — revisão adversarial do M3 (agente separado, só leitura de código)
+
+Revisão contra `qwen35.cpp`/`delta-net-base.cpp`/`ggml-cpu/ops.cpp`, revisão do commit `d2db5c1`. **Nenhum achado crítico**; 4 achados "major", 6 "minor", 4 "nit". Todos os itens acionáveis foram corrigidos:
+
+| achado | correção |
+|---|---|
+| M1 `q4_0` do cache KV **não** era o do ggml (grade simétrica `amax/7` em vez de `d = max/-8` com o máximo *sinalizado*) — a alegação "byte-idêntico" era falsa | encoder reescrito a partir do `quantize_row_q4_0_ref`; novo teste de byte-exatidão contra espelho host das fórmulas do ggml (com o bug reintroduzido: 489 bytes diferem → MISMATCH) |
+| M2 `scripts/capture_oracle.sh` não sabia capturar com `-ub 1`, e um dump em batch era **pulado** deixando `PASS` | `UB=<n>`/`ORACLE_STEP=1` no script, sufixo nos nomes dos arquivos, detecção de batch pelo shape (`N > 1`) e **falha** (não skip) em `check-graph-gpu` |
+| M3 `exact_check` lia fora do vetor com `GRAPH_EXACT=1`+`GRAPH_LAST_TOKEN=1` (indexava `n_tokens-1` com só 1 token acumulado) | índice derivado do tamanho acumulado; o caminho de 6 amostras do oráculo em batch é pulado quando só há 1 token |
+| M4 nenhum tensor consumido como f32 tinha o dtype checado (norm weights, `ssm_a`, `ssm_dt`, conv1d) — F16 passaria silenciosamente; `ssm_a` de 1 elemento lia fora do buffer | `up_f32()` obrigatório para os papéis f32 + `ssm_a.dim0 == nvh` |
+| M5 `proj()` confiava nos argumentos (nrows/ncols) e `head_dim()` usa `key_length` enquanto o layout valida `value_length` | `proj()` confere `dim0/dim1/bytes` do tensor; `key_length == value_length` exigido no `init()`; `validate_qwen35_layout()` chamado pelo próprio `Graph::init` |
+| m6/m7 sem validação de `n_head % n_head_kv == 0` e de `n_rot <= head_dim` | ambos validados no `init()` |
+| m8 o caminho multi-warp do merge nunca era testado (só `t ≤ 7` ⇒ só o warp 0) | `check-rope-gpu` passa a usar **32 tokens** (merges com 8 fatias não vazias + caudas ímpares) |
+| m9 `kv_fill_kernel<Q4_0>` tinha corrida read-modify-write nos nibbles | cada thread < 16 calcula os dois nibbles do seu byte |
+| m10 `argv[3]` NULL com `argc == 3` | guarda `argc < 4` |
+| m11 batch vazio aceito (logits velhos) e embedding com cauda parcial | falha explícita |
+| n12 o meio do grafo (camadas 4..61) só era pinado pelos nós finais | checks em `attn_norm`/`l_out` das camadas 10/20/30/40/50 |
+| n15 tabela de aceite com números pré-fix e alegação de byte-exatidão errada | corrigidos acima |
+
+Também corrigido por conta própria: `softplus` usava `log1pf(expf(x))` onde o ggml usa `logf(1 + expf(x))` (diferença ≤1e-8, mas é o que se compara). **Não corrigidos (conscientes)**: (n13) o teste isolado de atenção é auto-consistente por construção — o oráculo do grafo é a validação de convenção; (n14) sem fallback de embeddings amarrados (`output.weight` ausente é erro barulhento); o kernel de atenção continua sem tiling (performance, não correção — 262 ms/token em 64K).
 
 **Knobs de diagnóstico** (usados para o estudo acima, mantidos por serem baratos): `GRAPH_NOISE=<rel>` (+`GRAPH_NOISE_COHERENT=1`) perturba a saída de cada camada antes do residual; `GRAPH_EXACT=1` roda o check f32-exato da primeira projeção; `GRAPH_SAMPLES=1` imprime os 6 valores (oráculo vs nós) de cada nó divergente; `GRAPH_LAST_TOKEN=1` compara só o último token (obrigatório com dump `-ub 1`); `diag.hidden_pre_norm` reporta RMS/min/max do estado residual que entra no `output_norm`.
 

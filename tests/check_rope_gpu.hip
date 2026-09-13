@@ -15,10 +15,16 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <string>
 #include <vector>
 
 namespace {
-constexpr int kTokens = 8;
+// 32 tokens (> kAttnWarpsPerBlock = 8) so every query has to walk several keys
+// per warp and the cross-warp merge is exercised with 8 non-empty slices, plus a
+// tail that is not a multiple of the warp count (32 % 8 == 0, but t = 13, 21, 29
+// inside the loop are not).
+constexpr int kTokens = 32;
 constexpr int kHeadDim = 256;
 constexpr int kHead = 24;
 constexpr int kHeadKv = 4;
@@ -171,27 +177,100 @@ int main() {
                                      rdna4::KvType::Q4_0};
       for (rdna4::KvType ty : types) {
         const std::uint64_t row = rdna4::kv_row_bytes(ty, kHeadDim);
-        std::vector<std::uint8_t> cache((std::size_t)kHeadKv * row, 0);
-        void *d_cache = nullptr;
-        hipMalloc(&d_cache, cache.size());
-        hipMemset(d_cache, 0, cache.size());
+        std::vector<std::uint8_t> kcache((std::size_t)kHeadKv * row, 0);
+        std::vector<std::uint8_t> vcache((std::size_t)kHeadKv * row, 0);
+        void *d_kcache = nullptr, *d_vcache = nullptr;
+        hipMalloc(&d_kcache, kcache.size());
+        hipMalloc(&d_vcache, vcache.size());
+        hipMemset(d_kcache, 0, kcache.size());
+        hipMemset(d_vcache, 0, vcache.size());
         bool ok1 = true;
         for (int h = 0; h < kHeadKv; ++h) {
-          ok1 = ok1 && rdna4::kv_store_row_launch(ty, d_vsrc + (std::size_t)h * kHeadDim,
-                                                  (std::uint8_t *)d_cache + h * row, kHeadDim);
           ok1 = ok1 && rdna4::kv_store_row_launch(ty, d_ksrc + (std::size_t)h * kHeadDim,
-                                                  (std::uint8_t *)d_cache + h * row, kHeadDim);
+                                                  (std::uint8_t *)d_kcache + h * row, kHeadDim);
+          ok1 = ok1 && rdna4::kv_store_row_launch(ty, d_vsrc + (std::size_t)h * kHeadDim,
+                                                  (std::uint8_t *)d_vcache + h * row, kHeadDim);
         }
-        // (K and V share the buffer here only to keep the test short; the kernel
-        // reads them with the same row layout, so the scores are checked too)
-        ok1 = ok1 && rdna4::attn_launch(d_q1, d_cache, d_cache, d_o1, 0, kHead, kHeadKv, kHeadDim,
+        ok1 = ok1 && rdna4::attn_launch(d_q1, d_kcache, d_vcache, d_o1, 0, kHead, kHeadKv, kHeadDim,
                                         scale, ty, ty);
         std::vector<float> got1((std::size_t)kHead * kHeadDim);
         hipMemcpy(got1.data(), d_o1, got1.size() * sizeof(float), hipMemcpyDeviceToHost);
         // read the quantized rows back: the expectation is "the kernel returns
         // exactly what was stored", whatever the storage type did to the values
-        hipMemcpy(cache.data(), d_cache, cache.size(), hipMemcpyDeviceToHost);
+        hipMemcpy(kcache.data(), d_kcache, kcache.size(), hipMemcpyDeviceToHost);
+        hipMemcpy(vcache.data(), d_vcache, vcache.size(), hipMemcpyDeviceToHost);
         hipDeviceSynchronize();
+
+        // Byte-exactness of the stored rows against ggml's reference
+        // quantizers (host mirror of quantize_row_q8_0_ref /
+        // quantize_row_q4_0_ref / GGML_FP32_TO_FP16). This is what backs the
+        // "the cache holds what llama.cpp would store" claim; the attention
+        // check below then only has to prove the loader reads it back.
+        {
+          int bad_bytes = 0;
+          double worst_f16 = 0.0;
+          for (int h = 0; h < kHeadKv; ++h) {
+            const std::uint8_t *rowp = vcache.data() + (std::size_t)h * row;
+            const float *src = vc.data() + (std::size_t)h * kHeadDim;
+            for (int blk = 0; blk < kHeadDim / 32; ++blk) {
+              const float *xb = src + blk * 32;
+              if (ty == rdna4::KvType::F32) {
+                for (int j = 0; j < 32; ++j) {
+                  float v = 0.0f;
+                  std::memcpy(&v, rowp + ((std::size_t)blk * 32 + j) * 4, 4);
+                  if (v != xb[j]) ++bad_bytes;
+                }
+              } else if (ty == rdna4::KvType::F16) {
+                for (int j = 0; j < 32; ++j) {
+                  std::uint16_t h16 = 0;
+                  std::memcpy(&h16, rowp + ((std::size_t)blk * 32 + j) * 2, 2);
+                  const double back = rdna4::fp16_to_float(h16);
+                  worst_f16 = std::max(worst_f16, std::fabs(back - (double)xb[j]) /
+                                                        std::max(1e-9, (double)std::fabs(xb[j])));
+                }
+              } else if (ty == rdna4::KvType::Q8_0) {
+                float amax = 0.0f;
+                for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(xb[j]));
+                const float d = amax / 127.0f;
+                const float id = d != 0.0f ? 1.0f / d : 0.0f;
+                const rdna4::block_q8_0 *b =
+                    (const rdna4::block_q8_0 *)rowp + blk;
+                if (b->d != rdna4::float_to_fp16(d)) ++bad_bytes;
+                for (int j = 0; j < 32; ++j) {
+                  if (b->qs[j] != (std::int8_t)std::round(xb[j] * id)) ++bad_bytes;
+                }
+              } else {
+                float amax = 0.0f, vmax = 0.0f;
+                for (int j = 0; j < 32; ++j) {
+                  if (amax < std::fabs(xb[j])) {
+                    amax = std::fabs(xb[j]);
+                    vmax = xb[j];
+                  }
+                }
+                const float d = vmax / -8.0f;
+                const float id = d != 0.0f ? 1.0f / d : 0.0f;
+                const rdna4::block_q4_0 *b = (const rdna4::block_q4_0 *)rowp + blk;
+                if (b->d != rdna4::float_to_fp16(d)) ++bad_bytes;
+                for (int j = 0; j < 16; ++j) {
+                  const int q0 = (int)(std::int8_t)(xb[j] * id + 8.5f);
+                  const int q1 = (int)(std::int8_t)(xb[j + 16] * id + 8.5f);
+                  const std::uint8_t xi0 = (std::uint8_t)(q0 > 15 ? 15 : (q0 < 0 ? 0 : q0));
+                  const std::uint8_t xi1 = (std::uint8_t)(q1 > 15 ? 15 : (q1 < 0 ? 0 : q1));
+                  const std::uint8_t want = (std::uint8_t)(xi0 | (xi1 << 4));
+                  if (b->qs[j] != want) ++bad_bytes;
+                }
+              }
+            }
+          }
+          const bool ok3 = (ty == rdna4::KvType::F16) ? (worst_f16 <= 5e-4) : (bad_bytes == 0);
+          std::printf("kv store  (%-4s) %s  %s\n", rdna4::kv_type_name(ty),
+                      (ty == rdna4::KvType::F16)
+                          ? ("max relative fp16 error = " + std::to_string(worst_f16)).c_str()
+                          : ("bytes differing from the ggml reference: " +
+                             std::to_string(bad_bytes)).c_str(),
+                      ok3 ? "OK" : "MISMATCH");
+          if (!ok3) ++failures;
+        }
 
         // The kernel must return exactly what the cache holds (the quantized
         // values, dequantized): this checks every offset of the row layout.
@@ -203,19 +282,19 @@ int main() {
             double exp_v = 0.0;
             if (ty == rdna4::KvType::F32) {
               float f32v = 0.0f;
-              std::memcpy(&f32v, cache.data() + (std::uint64_t)kvh * row + i * 4, 4);
+              std::memcpy(&f32v, vcache.data() + (std::uint64_t)kvh * row + i * 4, 4);
               exp_v = (double)f32v;
             } else if (ty == rdna4::KvType::F16) {
               std::uint16_t h16 = 0;
-              std::memcpy(&h16, cache.data() + (std::uint64_t)kvh * row + i * 2, 2);
+              std::memcpy(&h16, vcache.data() + (std::uint64_t)kvh * row + i * 2, 2);
               exp_v = rdna4::fp16_to_float(h16);
             } else if (ty == rdna4::KvType::Q8_0) {
               const rdna4::block_q8_0 *b =
-                  (const rdna4::block_q8_0 *)(cache.data() + (std::uint64_t)kvh * row) + (i / 32);
+                  (const rdna4::block_q8_0 *)(vcache.data() + (std::uint64_t)kvh * row) + (i / 32);
               exp_v = rdna4::fp16_to_float(b->d) * (float)b->qs[i & 31];
             } else {
               const rdna4::block_q4_0 *b =
-                  (const rdna4::block_q4_0 *)(cache.data() + (std::uint64_t)kvh * row) + (i / 32);
+                  (const rdna4::block_q4_0 *)(vcache.data() + (std::uint64_t)kvh * row) + (i / 32);
               const int j = i & 31;
               const std::uint8_t byte = b->qs[j & 15];
               const int qq = (j < 16) ? (byte & 0x0F) : (byte >> 4);
@@ -230,7 +309,8 @@ int main() {
         std::printf("attn (1 key, %-4s) max|out - cache| = %.3e  %s\n", rdna4::kv_type_name(ty),
                     worst, ok2 ? "OK" : "MISMATCH");
         if (!ok2) ++failures;
-        hipFree(d_cache);
+        hipFree(d_kcache);
+        hipFree(d_vcache);
       }
       hipFree(d_ksrc); hipFree(d_vsrc); hipFree(d_q1); hipFree(d_o1);
     }

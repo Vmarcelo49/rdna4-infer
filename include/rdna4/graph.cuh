@@ -133,6 +133,7 @@ class Graph {
 
  private:
   bool up(const char *name, GpuTensor &t, std::string &err);
+  bool up_f32(const char *name, GpuTensor &t, std::string &err);
   bool alloc(float *&p, std::size_t n, std::string &err);
   bool proj(const GpuTensor &w, const float *d_x, float *d_y, int nrows, int ncols,
             std::string &err);
@@ -188,6 +189,18 @@ class Graph {
 };
 
 // ---------------------------------------------------------------------------
+// Tensors the kernels read as f32 (norm weights, ssm_a/ssm_dt, conv1d weights)
+// must really be F32: nothing else in the pipeline would notice an F16 weight,
+// the values would just be wrong (review M4).
+inline bool Graph::up_f32(const char *name, GpuTensor &t, std::string &err) {
+  if (!up(name, t, err)) return false;
+  if (t.dt != DType::F32) {
+    err = std::string("tensor ") + name + " must be f32, got " + dtype_name(t.dt);
+    return false;
+  }
+  return true;
+}
+
 inline bool Graph::up(const char *name, GpuTensor &t, std::string &err) {
   const auto *info = ld_.find(name);
   if (!info) {
@@ -241,6 +254,27 @@ inline bool Graph::init(int max_ctx, KvType kv_k, KvType kv_v, std::string &err)
   const int F = (int)cfg_.feed_forward_length;
   const int K = (int)cfg_.ssm_conv_kernel;
 
+  // The graph trusts the config's shape fields, so validate the inventory first
+  // (names *and* dims of all 866 tensors) and enforce the reference's own
+  // assertions before touching any buffer (review M4/M5/m6/m7).
+  if (!validate_qwen35_layout(ld_, cfg_, err)) return false;
+  if (cfg_.key_length != cfg_.value_length) {
+    err = "key_length != value_length is not supported (llama.cpp asserts equality)";
+    return false;
+  }
+  if (NH <= 0 || NKV <= 0 || NH % NKV != 0) {
+    err = "head_count must be a positive multiple of head_count_kv";
+    return false;
+  }
+  if (n_rot() <= 0 || n_rot() > HD || n_rot() % 2 != 0) {
+    err = "rope.dimension_count must be even and <= key_length";
+    return false;
+  }
+  if (max_ctx <= 0) {
+    err = "max_ctx must be positive";
+    return false;
+  }
+
   w_.resize(L);
   int n_recr = 0;
   for (int il = 0; il < L; ++il) {
@@ -254,9 +288,17 @@ inline bool Graph::init(int max_ctx, KvType kv_k, KvType kv_v, std::string &err)
       }
       return true;
     };
-    if (!upn("blk.%d.attn_norm.weight", w_[il].attn_norm)) return false;
+    auto upn_f32 = [&](const char *fmt, GpuTensor &t) {
+      std::snprintf(b, sizeof(b), fmt, il);
+      if (!up_f32(b, t, err)) {
+        err = "layer " + std::to_string(il) + ": " + err;
+        return false;
+      }
+      return true;
+    };
+    if (!upn_f32("blk.%d.attn_norm.weight", w_[il].attn_norm)) return false;
     // the GGUF name is `post_attention_norm` (llama.cpp maps it to attn_post_norm)
-    if (!upn("blk.%d.post_attention_norm.weight", w_[il].attn_post_norm)) return false;
+    if (!upn_f32("blk.%d.post_attention_norm.weight", w_[il].attn_post_norm)) return false;
     if (!upn("blk.%d.ffn_gate.weight", w_[il].ffn_gate)) return false;
     if (!upn("blk.%d.ffn_up.weight", w_[il].ffn_up)) return false;
     if (!upn("blk.%d.ffn_down.weight", w_[il].ffn_down)) return false;
@@ -264,24 +306,27 @@ inline bool Graph::init(int max_ctx, KvType kv_k, KvType kv_v, std::string &err)
       ++n_recr;
       if (!upn("blk.%d.attn_qkv.weight", w_[il].attn_qkv)) return false;
       if (!upn("blk.%d.attn_gate.weight", w_[il].attn_gate)) return false;
-      if (!upn("blk.%d.ssm_conv1d.weight", w_[il].ssm_conv1d)) return false;
-      if (!upn("blk.%d.ssm_a", w_[il].ssm_a)) return false;
-      if (!upn("blk.%d.ssm_dt.bias", w_[il].ssm_dt)) return false;
+      if (!upn_f32("blk.%d.ssm_conv1d.weight", w_[il].ssm_conv1d)) return false;
+      if (!upn_f32("blk.%d.ssm_a", w_[il].ssm_a)) return false;
+      if (!upn_f32("blk.%d.ssm_dt.bias", w_[il].ssm_dt)) return false;
       if (!upn("blk.%d.ssm_beta.weight", w_[il].ssm_beta)) return false;
       if (!upn("blk.%d.ssm_alpha.weight", w_[il].ssm_alpha)) return false;
-      if (!upn("blk.%d.ssm_norm.weight", w_[il].ssm_norm)) return false;
+      if (!upn_f32("blk.%d.ssm_norm.weight", w_[il].ssm_norm)) return false;
       if (!upn("blk.%d.ssm_out.weight", w_[il].ssm_out)) return false;
     } else {
       if (!upn("blk.%d.attn_q.weight", w_[il].attn_q)) return false;
       if (!upn("blk.%d.attn_k.weight", w_[il].attn_k)) return false;
       if (!upn("blk.%d.attn_v.weight", w_[il].attn_v)) return false;
       if (!upn("blk.%d.attn_output.weight", w_[il].attn_output)) return false;
-      if (!upn("blk.%d.attn_q_norm.weight", w_[il].attn_q_norm)) return false;
-      if (!upn("blk.%d.attn_k_norm.weight", w_[il].attn_k_norm)) return false;
+      if (!upn_f32("blk.%d.attn_q_norm.weight", w_[il].attn_q_norm)) return false;
+      if (!upn_f32("blk.%d.attn_k_norm.weight", w_[il].attn_k_norm)) return false;
     }
   }
   if (!up("token_embd.weight", tok_embd_, err)) return false;
-  if (!up("output_norm.weight", output_norm_, err)) return false;
+  if (!up_f32("output_norm.weight", output_norm_, err)) return false;
+  // tied embeddings are legal in the reference (it reuses token_embd when
+  // output.weight is absent); the UD files always carry it, so be loud instead
+  // of silent (review n14)
   if (!up("output.weight", output_, err)) return false;
 
   const int n_attn = L - n_recr;
@@ -307,6 +352,12 @@ inline bool Graph::init(int max_ctx, KvType kv_k, KvType kv_v, std::string &err)
   if (!alloc(d_convst_, (std::size_t)n_recr * (K - 1) * chan, err)) return false;
   if (hipMalloc(&d_pos_, sizeof(int)) != hipSuccess) return false;
 
+  // ssm_a is read with nvh floats (the reference broadcasts it), so a
+  // single-element ssm_a would read out of bounds (review M4)
+  if (w_[0].recr && w_[0].ssm_a.dim0 != nvh) {
+    err = "ssm_a must have ssm_time_step_rank elements";
+    return false;
+  }
   q8_blocks_ = (std::size_t)(F / QK8_1) + 8;  // ffn_down has the largest reduction
   if (hipMalloc(&d_q8_, q8_blocks_ * sizeof(block_q8_1)) != hipSuccess) {
     err = "hipMalloc failed (q8 scratch)";
@@ -317,6 +368,16 @@ inline bool Graph::init(int max_ctx, KvType kv_k, KvType kv_v, std::string &err)
 
 inline bool Graph::proj(const GpuTensor &w, const float *d_x, float *d_y, int nrows, int ncols,
                         std::string &err) {
+  // The caller passes the shape it expects; verify it against the tensor that
+  // is actually in VRAM, otherwise a wrong width silently reads past the
+  // weights (review M5).
+  if (w.dim0 != ncols || w.dim1 != nrows ||
+      w.bytes != tensor_bytes(w.dt, (std::uint64_t)nrows * (std::uint64_t)ncols)) {
+    err = "weight shape mismatch (expected " + std::to_string(nrows) + "x" +
+          std::to_string(ncols) + ", tensor is " + std::to_string(w.dim1) + "x" +
+          std::to_string(w.dim0) + ")";
+    return false;
+  }
   const int nb = ncols / QK8_1;
   if (ncols % QK8_1 != 0 || (std::size_t)nb > q8_blocks_) {
     err = "bad reduction dim for q8 scratch";
@@ -536,6 +597,10 @@ inline bool Graph::forward(const std::vector<float> &embeddings, int start_pos,
                            std::string &err) {
   const int E = n_embd();
   const int L = n_layer();
+  if (embeddings.empty() || embeddings.size() % (std::size_t)E != 0) {
+    err = "embeddings must hold whole rows of n_embd floats";
+    return false;
+  }
   const std::size_t n_tokens = embeddings.size() / (std::size_t)E;
   if (start_pos < 0 || (std::size_t)start_pos + n_tokens > (std::size_t)max_ctx_) {
     err = "positions exceed the allocated context (" + std::to_string(max_ctx_) + ")";

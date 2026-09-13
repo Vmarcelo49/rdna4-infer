@@ -108,8 +108,11 @@ __device__ __forceinline__ float kv_load<KvType::Q4_0>(const void *row, int d) {
 
 // ---------------------------------------------------------------------------
 // Device: quantize one f32 row (head_dim elements) into the cache layout.
-// Q8_0/Q4_0 reproduce ggml's reference quantizers bit for bit (amax/127 for
-// q8_0; amax/7 with the +8.5 rounding and the nibble split for q4_0).
+// Q8_0 and Q4_0 reproduce ggml's reference quantizers byte for byte
+// (quantize_row_q8_0_ref: amax/127 + roundf + an fp16 scale; quantize_row_q4_0_ref:
+// the signed max, d = max/-8, the (int8_t)(x*id + 8.5) rounding and the nibble
+// split). check-rope-gpu checks the stored rows against a host mirror of those
+// formulas for every type.
 // One thread per block of 32 (Q4_0/Q8_0) or per element (F16/F32).
 // ---------------------------------------------------------------------------
 template <KvType CT>
@@ -138,19 +141,30 @@ __global__ void kv_store_row_kernel(const float *__restrict__ src, void *__restr
     for (int j = 0; j < 32; ++j) y->qs[j] = (std::int8_t)roundf(x[j] * id);
     return;
   }
-  // Q4_0
+  // Q4_0 — transcribe of ggml's quantize_row_q4_0_ref (ggml-quants.c): the scale
+  // is built from the *signed* value with the largest magnitude,
+  // `d = max / -8`, so the grid is [-8, 8] with d carrying the sign. (An
+  // amax/7 symmetric grid looks equivalent but stores different bytes.)
   block_q4_0 *y = (block_q4_0 *)dst + blk;
-  float amax = 0.0f;
-  for (int j = 0; j < 32; ++j) amax = fmaxf(amax, fabsf(x[j]));
-  const float d = amax / 7.0f;
+  float amax = 0.0f, vmax = 0.0f;
+  for (int j = 0; j < 32; ++j) {
+    const float v = x[j];
+    if (amax < fabsf(v)) {
+      amax = fabsf(v);
+      vmax = v;
+    }
+  }
+  const float d = vmax / -8.0f;
   const float id = d != 0.0f ? 1.0f / d : 0.0f;
   y->d = float_to_fp16(d);
   for (int j = 0; j < 16; ++j) {
-    const int x0 = (int)(x[j] * id + 8.5f);
-    const int x1 = (int)(x[j + 16] * id + 8.5f);
-    const std::uint8_t q0 = (std::uint8_t)(x0 < 0 ? 0 : (x0 > 15 ? 15 : x0));
-    const std::uint8_t q1 = (std::uint8_t)(x1 < 0 ? 0 : (x1 > 15 ? 15 : x1));
-    y->qs[j] = (std::uint8_t)((q0 & 0x0F) | (q1 << 4));
+    const float x0 = x[j] * id;
+    const float x1 = x[j + 16] * id;
+    const int q0 = (int)(std::int8_t)(x0 + 8.5f);  // (int8_t) cast, then MIN(15, ..)
+    const int q1 = (int)(std::int8_t)(x1 + 8.5f);
+    const std::uint8_t xi0 = (std::uint8_t)(q0 > 15 ? 15 : (q0 < 0 ? 0 : q0));
+    const std::uint8_t xi1 = (std::uint8_t)(q1 > 15 ? 15 : (q1 < 0 ? 0 : q1));
+    y->qs[j] = (std::uint8_t)(xi0 | (xi1 << 4));
   }
 }
 
@@ -190,27 +204,31 @@ __global__ void kv_fill_kernel(void *__restrict__ cache, std::int64_t n_rows, in
   for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffull, amax, off));
   if (CT == KvType::Q8_0) {
     block_q8_0 *b = (block_q8_0 *)dst + blk;
-    const float d = amax / 127.0f;
+    const float d = amax / 127.0f;  // amax is the warp-reduced |x| over the block
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
     b->d = float_to_fp16(d);
     b->qs[lane] = (std::int8_t)roundf(x * id);
     return;
   }
   block_q4_0 *b = (block_q4_0 *)dst + blk;
-  const float d = amax / 7.0f;
+  if (lane >= 16) return;  // one thread per byte: both nibbles are computed
+                           // together, so there is no read-modify-write race
+  // half the warp computed amax from its own element above; the pair value must
+  // come from the same element that contributed it, so redo the signed max over
+  // the two elements this byte covers.
+  float a0 = kv_rand((unsigned)(row * head_dim + blk * 32 + lane), seed);
+  float a1 = kv_rand((unsigned)(row * head_dim + blk * 32 + lane + 16), seed);
+  const float amx = fmaxf(fabsf(a0), fabsf(a1));
+  const float signed_max = (fabsf(a0) >= fabsf(a1)) ? a0 : a1;
+  const float d = signed_max / -8.0f;
   const float id = d != 0.0f ? 1.0f / d : 0.0f;
   b->d = float_to_fp16(d);
-  // pairing: element j (low nibble) and j+16 (high) are in the same thread pair
-  const int half = lane & 15;
-  const int which = lane >> 4;  // 0 = low nibble, 1 = high
-  const float xa = kv_rand((unsigned)(row * head_dim + blk * 32 + half + which * 16), seed);
-  const int q = (int)(xa * id + 8.5f);
-  const std::uint8_t qu = (std::uint8_t)(q < 0 ? 0 : (q > 15 ? 15 : q));
-  if (which == 0) {
-    b->qs[half] = (std::uint8_t)((b->qs[half] & 0xF0) | qu);
-  } else {
-    b->qs[half] = (std::uint8_t)((b->qs[half] & 0x0F) | (qu << 4));
-  }
+  const int q0 = (int)(std::int8_t)(a0 * id + 8.5f);
+  const int q1 = (int)(std::int8_t)(a1 * id + 8.5f);
+  (void)amx;
+  const std::uint8_t xi0 = (std::uint8_t)(q0 > 15 ? 15 : (q0 < 0 ? 0 : q0));
+  const std::uint8_t xi1 = (std::uint8_t)(q1 > 15 ? 15 : (q1 < 0 ? 0 : q1));
+  b->qs[lane] = (std::uint8_t)(xi0 | (xi1 << 4));
 }
 
 inline bool kv_fill_launch(KvType t, void *d_cache, std::int64_t n_rows, int head_dim,

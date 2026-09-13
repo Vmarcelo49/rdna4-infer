@@ -74,13 +74,15 @@ __global__ void l2_norm_kernel(const float *__restrict__ x, float *__restrict__ 
 // ---------------------------------------------------------------------------
 // Elementwise ops (all ggml ops used by the reference graph).
 //   silu(x) = x * sigmoid(x)              (ggml_silu)
-//   softplus(x) = log(1 + exp(x))         (ggml_softplus, with the same clamp)
+//   softplus(x) = log(1 + exp(x))         (ggml_compute_softplus_f32, same clamp)
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ float silu_f(float x) { return x / (1.0f + expf(-x)); }
 __device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + expf(-x)); }
 __device__ __forceinline__ float softplus_f(float x) {
-  // ggml: x > 20 ? x : log1p(exp(x))
-  return x > 20.0f ? x : log1pf(expf(x));
+  // ggml_compute_softplus_f32 (ggml-impl.h): (x > 20) ? x : log(1 + exp(x)).
+  // log1pf(expf(x)) is mathematically the same and differs by <= 1e-8, but the
+  // reference formula is what we compare against, so use it verbatim.
+  return (x > 20.0f) ? x : logf(1.0f + expf(x));
 }
 
 enum class UnOp { Silu, Sigmoid, Softplus };
