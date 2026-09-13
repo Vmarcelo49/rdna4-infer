@@ -90,3 +90,13 @@ target_include_directories(check-matvec-gpu PRIVATE include /opt/rocm/include
 target_link_libraries(check-matvec-gpu PRIVATE ${GGML_BASE_LIB} ${AMDHIP64})
 target_link_options(check-matvec-gpu PRIVATE --offload-arch=gfx1201)
 set_target_properties(check-matvec-gpu PROPERTIES HIP_ARCHITECTURES "gfx1201")
+
+# M3 step 1 — device primitives vs the llama.cpp eval-callback oracle.
+add_executable(check-nn-gpu tests/check_nn_gpu.hip
+                 tests/dequant_cpu_oracle.cpp src/backend/gguf.cpp src/backend/loader.cpp
+                 src/backend/model.cpp)
+target_include_directories(check-nn-gpu PRIVATE include /opt/rocm/include
+                          ${LLAMA_CPP_SRC}/ggml/src ${LLAMA_CPP_SRC}/ggml/include)
+target_link_libraries(check-nn-gpu PRIVATE ${GGML_BASE_LIB} ${AMDHIP64})
+target_link_options(check-nn-gpu PRIVATE --offload-arch=gfx1201)
+set_target_properties(check-nn-gpu PROPERTIES HIP_ARCHITECTURES "gfx1201")

@@ -190,6 +190,16 @@ Objetivo: todo tipo do union M1 computando em GPU.
 
 Objetivo: logits corretos nos dois ramos de camada.
 
+### Progresso
+
+- **Oráculo escolhido: `llama-eval-callback`** (o `qwen35.cpp` do llama.cpp marca cada nó com `cb()`, e a ferramenta imprime nome, shape, 3 primeiros + 3 últimos valores e a **soma** de cada nó). `scripts/capture_oracle.sh` captura o dump (`-ngl 0`, seed/temp fixos → determinístico) em `reference/` (gitignored, ~4 MB). Isso dá um oráculo por nó — muito melhor que re-derivar semântica do source.
+- **Passo 1 — primitivas de device validadas contra o oráculo ✅** (`include/rdna4/nn.cuh`, `tests/check_nn_gpu.hip`):
+  - `check-nn-gpu <gguf> <dump> [token]` reproduz no GPU os 2 primeiros nós do grafo a partir do **token real** (9419 = "Hello"): linha do `token_embd.weight` (Q3_K, `GgufLoader::load_tensor_range` + dequant) → `rms_norm` → `mul` por `blk.0.attn_norm.weight`.
+  - **Resultado: `norm-0` e `attn_norm-0` batem com o oráculo** — os 6 valores amostrados coincidem até a 4ª decimal e a soma relativa difere **2,5e-06** / **2,3e-06**.
+  - Semânticas fixadas no caminho (todas lidas do fonte de referência, não adivinhadas): `RMSNorm` = `x * rsqrt(mean(x²) + eps)` com o `eps` do GGUF e o peso em `MUL` separado; `L2 norm` do GDN = `x / sqrt(Σx² + eps)` (de `build_gdn_l2_norm` = `scale(rms_norm(x, eps/n), 1/√n)`); `silu`/`sigmoid`/`softplus` (com o clamp `x>20` do ggml); **RoPE do qwen35 = `LLAMA_ROPE_TYPE_IMROPE`** (de `llama_model_rope_type`), que para texto (posições t=h=w iguais) degenera em RoPE padrão de **pares adjacentes** sobre `n_rot=64` dims com `freq_base=1e7` — as seções `[11,11,10,0]` só importam para posições distintas (imagem/áudio).
+  - `Qwen35Config` agora carrega `rms_norm_eps` e `rope_freq_base` (o parser já lia, mas descartava).
+- **Passo 2 (próximo) — ramo full-attention**: `attn_q` (com gate intercalado por head, `view_3d` com stride 2×head_dim), `attn_k`/`attn_v`, QK-norm, RoPE/MRoPE, GQA + KV cache, `sigmoid(gate)` multiplicando a saída da atenção, `attn_output`; validar contra os nós `Qcur-N`/`Kcur-N`/`attn_pregate-N`/`attn_gated-N`/`attn_output-N` do dump.
+
 1. Implementar o ramo linear GDN (`attn_qkv` + `attn_gate` + SSM conv/recorrência + `ssm_out`).
    Ref: `docs/referencias-upstream-gfx1201-qwen35.md` § "SGLang — Qwen3.5" (`qwen3_5.py` L322-1094: `GatedDeltaNet` + `LinearDecoderLayer`) e § "hipfire — Qwen3.5" (`forward.rs` L741-800 entradas, L139-280 MoE/decode patterns).
 2. Implementar o ramo full-attention GQA (`q/k/v` + QK-norm + RoPE/MRoPE + softmax + `attn_output`), RoPE `freq_base 1e7`, `dimension_count 64`, sections `[11,11,10,0]`.

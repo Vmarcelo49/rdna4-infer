@@ -44,6 +44,8 @@ struct Qwen35Config {
   std::uint32_t ssm_inner_size = 0;     // inner
   std::uint32_t rope_dim_count = 0;
   std::vector<std::uint64_t> rope_dim_sections;
+  double rms_norm_eps = 0.0;            // attention.layer_norm_rms_epsilon
+  double rope_freq_base = 0.0;          // rope.freq_base
   std::uint32_t bos_token_id = 0;
   std::uint32_t eos_token_id = 0;
   std::uint32_t pad_token_id = 0;

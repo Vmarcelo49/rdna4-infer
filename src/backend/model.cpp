@@ -290,6 +290,9 @@ bool parse_qwen35_config(const gguf::File &f, Qwen35Config &cfg, std::string &er
     err = "missing or wrong-type KV: qwen35.rope.freq_base";
     return false;
   }
+  cfg.rms_norm_eps = eps;
+  cfg.rope_freq_base = freq_base;
+
   auto req_tok = [&](const char *key, std::uint32_t &out) -> bool {
     auto it = f.kv.find(key);
     if (it == f.kv.end() || it->second.type != gguf::ValueType::U32) {

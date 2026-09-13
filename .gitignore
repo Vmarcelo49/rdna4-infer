@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 compile_commands.json
 .cache/
+
+# llama-eval-callback activation dumps (regenerate: scripts/capture_oracle.sh)
+reference/
