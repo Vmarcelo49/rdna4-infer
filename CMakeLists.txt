@@ -37,3 +37,19 @@ target_include_directories(check-loader PRIVATE include)
 add_executable(check-model tests/check_model.cpp src/backend/gguf.cpp
                  src/backend/loader.cpp src/backend/model.cpp)
 target_include_directories(check-model PRIVATE include)
+
+# M2 step 1: CPU dequant oracle — links the reference dequant (llama.cpp
+# libggml-base, MIT, extern "C") as ground truth for the GPU-vs-CPU test.
+set(LLAMA_CPP_SRC "/home/marcelo/Projetos/llama.cpp" CACHE PATH
+    "llama.cpp source tree (oracle headers)")
+set(LLAMA_CPP_BUILD "/home/marcelo/Projetos/llama.cpp/build" CACHE PATH
+    "llama.cpp build tree (libggml-base.so)")
+add_executable(check-dequant tests/check_dequant.cpp src/backend/gguf.cpp
+                 src/backend/loader.cpp)
+target_include_directories(check-dequant PRIVATE include
+                       ${LLAMA_CPP_SRC}/ggml/src ${LLAMA_CPP_SRC}/ggml/include)
+find_library(GGML_BASE_LIB ggml-base PATHS ${LLAMA_CPP_BUILD}/bin NO_DEFAULT_PATH)
+if(NOT GGML_BASE_LIB)
+  message(FATAL_ERROR "libggml-base.so not found under ${LLAMA_CPP_BUILD}/bin — build llama.cpp first")
+endif()
+target_link_libraries(check-dequant PRIVATE ${GGML_BASE_LIB})

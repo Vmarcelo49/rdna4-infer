@@ -48,6 +48,20 @@ Objetivo: ler os dois arquivos UD e validar tudo fail-fast.
 
 Objetivo: todo tipo do union M1 computando em GPU.
 
+### Progresso
+
+- **Passo 1 — oracle CPU de dequant ✅** (`tests/check_dequant.cpp`, `GgufLoader::load_tensor_range`):
+  - Oracle = `dequantize_row_*` do **llama.cpp buildado** (`libggml-base.so`, MIT, `extern "C"`) — referência garantida, sem re-derivar matemática. O teste **não** roda GPU/VRAM (CPU puro).
+  - **(1) Ponte de structs:** `sizeof(block_X)` (llama.cpp) == `dtype_block_bytes(X)` (tabela M1) para os 14 tipos quantizados — a tabela de bytes do M1 bate com o layout de referência.
+  - **(2) Por tipo:** primeiro tensor do tipo nos arquivos reais dequantiza p/ valores finitos e plausíveis (|max| ≤ 32) — `check-dequant` passa nos dois UD (14/14 tipos no IQ3_S; IQ4_XS sem `iq2_xxs`/`iq1_s`).
+  - **(3) Pipeline Q8_0 bit-exact:** fórmula trivial inline `d*qs[i]` == oracle → prova o cast raw-bytes→struct + alinhamento.
+  - **(4) Cross-file:** mesmo peso, duas quantizações → rel-L2 pequeno (cap 0.3). `output.weight`/`ffn_down` rel-L2≈0 (mesma quant nos dois arquivos); `attn_q` (q2_k vs q5_k) rel-L2=0.21 OK.
+  - **Nota:** `block_q*_K` usa **K maiúsculo** no llama.cpp; as grids/LUTs (`iq3s_grid` etc.) vivem em `ggml-common.h`/`ggml-quants.c`. Snapshot `.ref` (790cf51) é incompleto p/ quants (faltam `iq3xs_grid`, `block_q4_K`) — **usar o checkout novo** (`/home/marcelo/Projetos/llama.cpp` @ df03399b8) como fonte de kernels/quants.
+- **Passo 2 (próximo) — dequant GPU + matvec no HIP** (compilar p/ gfx1201; execução ainda sem VRAM):
+  - Trazer do checkout novo `ggml/src/ggml-cuda/`: `vecdotq.cuh` (dequant), `mmvq.cu` + `MMVQ_PARAMETERS_RDNA4` (L102-130), `mmq.cuh` + `mmq-config-rdna4.cuh` + `mmq-instance-*.cu`.
+  - Teste GPU-vs-CPU: nosso matvec GPU vs. f32 do oracle (passo 1). Execução só quando houver VRAM.
+- **Restrição de sessão:** ainda **não** alocar memória de vídeo (VRAM) p/ testes — testes GPU só depois. CPU/compilação liberados.
+
 1. Trazer de `.ref/llama.cpp`: `vecdotq.cuh` (dequant), `mmvq.cu` + `MMVQ_PARAMETERS_RDNA4`, `mmq.cuh` + `mmq-config-rdna4.cuh` (inclui `mmq-instance-iq3_s.cu`).
    Ref: `docs/referencias-upstream-gfx1201-qwen35.md` § "llama.cpp — gfx1201/RDNA4" (linhas exatas por arquivo) · `docs/kernels-ia-gfx1201.md` § "Relatos" (`rdna4-wmma-guide`: armadilha dos tiles WMMA transpostos).
 2. Cobrir com teste GPU-vs-CPU cada tipo presente nos UD, priorizando `IQ3_S`, `IQ4_XS`, `Q4_K`, `Q8_0`, `Q5_K` (output) e `Q3_K` (embed).

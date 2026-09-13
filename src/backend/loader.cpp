@@ -110,25 +110,34 @@ const gguf::TensorInfo *GgufLoader::find(const char *name) const {
   return &f_.tensors[it->second];
 }
 
-bool GgufLoader::load_tensor(std::size_t i, std::vector<std::uint8_t> &out,
-                             std::string &err) const {
+bool GgufLoader::load_tensor_range(std::size_t i, std::uint64_t off,
+                                   std::uint64_t count, std::vector<std::uint8_t> &out,
+                                   std::string &err) const {
   if (!fp_ || i >= f_.tensors.size()) {
     err = "bad tensor index";
     return false;
   }
   const gguf::TensorInfo &t = f_.tensors[i];
-  const std::uint64_t size = bytes_[i];
-  const long where = static_cast<long>(f_.data_offset + t.offset);
+  if (off + count > bytes_[i]) {
+    err = "range out of tensor bounds";
+    return false;
+  }
+  const long where = static_cast<long>(f_.data_offset + t.offset + off);
   if (std::fseek(fp_, where, SEEK_SET) != 0) {
     err = "seek to tensor failed";
     return false;
   }
-  out.resize(size);
-  if (size > 0 && std::fread(out.data(), 1, size, fp_) != size) {
+  out.resize(count);
+  if (count > 0 && std::fread(out.data(), 1, count, fp_) != count) {
     err = "short read of tensor data";
     return false;
   }
   return true;
+}
+
+bool GgufLoader::load_tensor(std::size_t i, std::vector<std::uint8_t> &out,
+                             std::string &err) const {
+  return load_tensor_range(i, 0, bytes_[i], out, err);
 }
 
 }  // namespace rdna4

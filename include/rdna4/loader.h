@@ -46,6 +46,11 @@ class GgufLoader {
   // tensor_bytes(i)).
   bool load_tensor(std::size_t i, std::vector<std::uint8_t> &out, std::string &err) const;
 
+  // Copies a byte range [off, off+count) of tensor i's raw bytes into `out`
+  // (resized to count). off+count must fit the tensor.
+  bool load_tensor_range(std::size_t i, std::uint64_t off, std::uint64_t count,
+                         std::vector<std::uint8_t> &out, std::string &err) const;
+
  private:
   std::string path_;
   mutable FILE *fp_ = nullptr;
