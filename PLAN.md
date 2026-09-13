@@ -96,10 +96,29 @@ Objetivo: todo tipo do union M1 computando em GPU.
     | iq4_nl | blk.11.attn_k.weight (1024 cols) | 90 |
   - **Estimativa de decode (só matvec, soma `bytes/GB/s` por tipo sobre os 866 tensores): 12,02 GB em 68,9 ms → 14,5 tok/s.** Baseline Vulkan/RADV = 37–38 tok/s → **estamos em ~38% do baseline** (a meta é ≥100%).
   - **Onde está o gargalo:** tipos k-quant (q4_k/q5_k/q6_k/q8_0) já vão a 290–487 GB/s; os **IQ dominam o arquivo e ficam em 117–200 GB/s** (mais ALU/lookup por byte: `perm`-based table lookups + escala inteira). `token_embd`/`output` (5120 linhas) têm pouca paralelidade com 1 warp/linha.
-- **Passo 5 — tuning do matvec (próximo):**
-  - `nwarps > 1` por linha + redução em shared memory (é o que o `MMVQ_PARAMETERS_RDNA4` do llama.cpp parametriza), com ILP no loop de blocos.
-  - Meta: IQ de 120–200 → 350+ GB/s ⇒ decode ≥ 30 tok/s só com matvec.
-  - Depois: `mmq.cuh` + `mmq-config-rdna4.cuh` para prefill (batch > 8; o matvec só cobre batch ≤ 8, igual ao `MMVQ_MAX_BATCH_SIZE`).
+- **Passo 5 — tuning do matvec: infraestrutura de config pronta, ganho pequeno ⚠️**:
+  - Kernel generalizado `matvec_kernel_gen<T, ROWS, WPR>`: `ROWS` linhas por CTA × `WPR` warps por linha (cobre tanto 4 warps/4 linhas quanto o layout 1 linha/8 warps do `mmvq`). Redução intra-warp + shared memory quando `WPR > 1`.
+  - `matvec_default_config(dt)` por tipo, escolhido por **medição** (sweep de 8 shapes × 14 tipos, 3 repetições, média). Valores medidos (GB/s) para o maior tensor de cada tipo:
+    | tipo | 4x1 | 2x1 | 1x1 | 8x1 | 1x2 | 1x4 | 1x8 | 2x2 | default |
+    |---|---|---|---|---|---|---|---|---|---|
+    | q8_0 | 399 | 401 | **407** | 395 | 357 | 292 | 193 | 355 | 4x1 |
+    | q2_k | 179 | 184 | 187 | 190 | 146 | **191** | 142 | 190 | 2x2 |
+    | q3_k | 178 | 176 | 178 | 175 | 183 | 187 | **187** | 180 | 1x4 |
+    | q4_k | 321 | 359 | 402 | 366 | 405 | 325 | 212 | **408** | 2x2 |
+    | q5_k | 454 | 461 | 468 | 459 | **493** | 490 | 491 | 480 | 1x2 |
+    | q6_k | 292 | 273 | **312** | 287 | 281 | 300 | 260 | 281 | 1x1 |
+    | iq2_xxs | 124 | 111 | **128** | 123 | 126 | 107 | 100 | 109 | 1x1 |
+    | iq2_xs | 130 | 142 | **146** | 127 | 139 | 126 | 113 | 131 | 1x1 |
+    | iq3_xxs | 166 | 175 | 182 | **193** | 138 | 111 | 103 | 147 | 8x1 |
+    | iq1_s | 236 | 198 | 235 | 234 | 235 | 225 | 229 | **249** | 2x2 |
+    | iq4_nl | 95 | 70 | 42 | **99** | 36 | 49 | 48 | 60 | 8x1 |
+    | iq3_s | 174 | 208 | **215** | 203 | 169 | 128 | 109 | 149 | 1x1 |
+    | iq2_s | 156 | 145 | 151 | **166** | 158 | 126 | 126 | 160 | 8x1 |
+    | iq4_xs | 110 | 69 | 37 | **124** | 54 | 70 | 93 | 97 | 8x1 |
+  - **Resultado:** agregado 262 GB/s (era 268 com 4x1 fixo) → **13,6 tok/s** de estimativa. **Ou seja: o tuning de shape por tipo rendeu ~0** — a escolha depende mais do *formato da linha* (nº de blocos por linha) do que do tipo, e a maior parte dos 866 tensores tem formato diferente do "maior tensor do tipo" usado no sweep. **Lição registrada:** a tabela precisa ser indexada por (tipo, blocos-por-linha), não só por tipo.
+  - **Onde está o gargalo real (hipóteses para o M5):** o loop por thread tem pouca ILP (5–20 iterações, dependência `sum += dot(...)`, sem prefetch) → latência de memória não escondida. Caminhos: acumuladores independentes + unroll, prefetch L2 explícito (o `mmvq_prefetch_l2` do llama.cpp), `ncols_dst > 1` (batch), e kernels específicos para os IQ (mais ALU/byte). O `-O3` já tirou o gargalo artificial de 62×.
+  - **Correção de rota registrada:** a regra `nwarps=8` do `MMVQ_PARAMETERS_RDNA4` (llama.cpp, para `ncols_dst=1`) **não** transfere para este kernel: medido q8_0 8x1=395 vs 4x1=399 e q4_k 8x1=366 vs 2x2=408; as regressões que o llama.cpp reporta para Q3_K/IQ são reais aqui também (Q3_K 8x1=175 ≈ 4x1).
+  - Depois (M5): `mmq.cuh` + `mmq-config-rdna4.cuh` para prefill (batch > 8; o matvec só cobre batch ≤ 8, igual ao `MMVQ_MAX_BATCH_SIZE`).
 - **Nota:** GPU/VRAM **liberada** para testes nesta sessão (antes estava proibido). Dequant **e** matvec já executados de verdade em gfx1201, não só compilados.
 
 

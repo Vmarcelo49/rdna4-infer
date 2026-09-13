@@ -138,28 +138,48 @@ int run_bench(rdna4::GgufLoader &ld) {
     rdna4::quantize_q8_1_kernel<<<(unsigned)((ncols / QK8_1 + 3) / 4), 128>>>(d_x, d_a, ncols / QK8_1);
 
     const int iters = 10;
-    for (int i = 0; i < 3; ++i) {  // warmup
-      rdna4::matvec_launch((int)tc.dt, d_w, d_a, d_y, nrows, ncols, nullptr);
-    }
     hipEvent_t e0, e1;
     hipEventCreate(&e0); hipEventCreate(&e1);
-    hipEventRecord(e0, nullptr);
-    for (int i = 0; i < iters; ++i) {
-      rdna4::matvec_launch((int)tc.dt, d_w, d_a, d_y, nrows, ncols, nullptr);
-    }
-    hipEventRecord(e1, nullptr);
-    hipEventSynchronize(e1);
-    float ms = 0;
-    hipEventElapsedTime(&ms, e0, e1);
-    ms /= iters;
-    hipEventDestroy(e0); hipEventDestroy(e1);
+    auto time_cfg = [&](rdna4::MatvecConfig c) {
+      for (int i = 0; i < 3; ++i) {
+        rdna4::matvec_launch_cfg((int)tc.dt, d_w, d_a, d_y, nrows, ncols, nullptr, c);
+      }
+      hipEventRecord(e0, nullptr);
+      for (int i = 0; i < iters; ++i) {
+        rdna4::matvec_launch_cfg((int)tc.dt, d_w, d_a, d_y, nrows, ncols, nullptr, c);
+      }
+      hipEventRecord(e1, nullptr);
+      hipEventSynchronize(e1);
+      float ms = 0;
+      hipEventElapsedTime(&ms, e0, e1);
+      return (double)ms / iters;
+    };
 
-    const double gbs = (double)w.size() / (ms * 1e-3) / 1e9;
-    bw_by_type[(int)tc.dt] = gbs;
+    const rdna4::MatvecConfig kCfgs[] = {{4, 1}, {2, 1}, {1, 1}, {8, 1}, {1, 2}, {1, 4}, {1, 8}, {2, 2}};
+    double best_ms = 1e30;
+    rdna4::MatvecConfig best_cfg{0, 0};
+    char sweep[192] = {0};
+    for (const rdna4::MatvecConfig &c : kCfgs) {
+      const double ms = time_cfg(c);
+      char tmp[32];
+      std::snprintf(tmp, sizeof(tmp), "%dx%d:%.0f ", c.rows, c.wpr,
+                    (double)w.size() / (ms * 1e-3) / 1e9);
+      std::strncat(sweep, tmp, sizeof(sweep) - std::strlen(sweep) - 1);
+      if (ms < best_ms) { best_ms = ms; best_cfg = c; }
+    }
+    // Must run BEFORE the events are destroyed (time_cfg records into them).
+    const rdna4::MatvecConfig def = rdna4::matvec_default_config((int)tc.dt);
+    const double def_ms = time_cfg(def);
+    hipEventDestroy(e0); hipEventDestroy(e1);
+    const double def_gbs = (double)w.size() / (def_ms * 1e-3) / 1e9;
+    const double gbs = (double)w.size() / (best_ms * 1e-3) / 1e9;
+    bw_by_type[(int)tc.dt] = def_gbs;   // decode estimate uses the SHIPPED default
     total_bytes += (double)w.size();
-    total_sec += ms * 1e-3;
-    std::printf("%-9s %-24s %10lld %10lld %8.1f %10.3f\n", tc.name, info.name.c_str(),
-                (long long)nrows, (long long)ncols, gbs, ms);
+    total_sec += (double)w.size() / (def_gbs * 1e9);
+    std::printf("%-9s %-22s %6lld x %6lld  best %dx%d: %6.1f GB/s  (default %dx%d: %.1f)\n",
+                tc.name, info.name.c_str(), (long long)nrows, (long long)ncols, best_cfg.rows,
+                best_cfg.wpr, gbs, def.rows, def.wpr, def_gbs);
+    std::printf("          [%s]\n", sweep);
     hipFree(d_w); hipFree(d_a); hipFree(d_y); hipFree(d_x);
   }
   std::printf("\nbench total: %.2f GB of weights, %.2f ms -> %.1f GB/s aggregate\n",
