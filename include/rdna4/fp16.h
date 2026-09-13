@@ -7,7 +7,7 @@
 namespace rdna4 {
 
 // Convert a 16-bit IEEE754 fp16 (little-endian bit layout) to float32.
-__device__ __forceinline__ float fp16_to_float(uint16_t h) {
+__host__ __device__ __forceinline__ float fp16_to_float(uint16_t h) {
     unsigned sign = (h >> 15) & 1u;
     unsigned e    = (h >> 10) & 0x1fu;
     unsigned m    = h & 0x3ffu;
@@ -20,6 +20,30 @@ __device__ __forceinline__ float fp16_to_float(uint16_t h) {
     union { unsigned u; float f; } conv;
     conv.u = (sign << 31) | ((e + 112u) << 23) | (m << 13);
     return conv.f;
+}
+
+
+// Convert a float32 to fp16 bits, round-to-nearest-even.
+__host__ __device__ __forceinline__ uint16_t float_to_fp16(float f) {
+    union { float f; unsigned u; } conv;
+    conv.f = f;
+    const unsigned x = conv.u;
+    const unsigned sign = (x >> 16) & 0x8000u;
+    unsigned mant = x & 0x007fffffu;
+    const int exp = (int)((x >> 23) & 0xffu) - 127 + 15;
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;          // underflow -> +-0
+        mant |= 0x00800000u;                            // implicit bit
+        const unsigned shift = (unsigned)(14 - exp);
+        unsigned half_mant = mant >> shift;
+        const unsigned round_bit = 1u << (shift - 1);
+        if ((mant & round_bit) && ((mant & (round_bit - 1)) || (half_mant & 1u))) ++half_mant;
+        return (uint16_t)(sign | half_mant);
+    }
+    if (exp >= 31) return (uint16_t)(sign | 0x7c00u);   // overflow -> inf
+    unsigned half = sign | ((unsigned)exp << 10) | (mant >> 13);
+    if ((mant & 0x1fffu) > 0x1000u || ((mant & 0x1fffu) == 0x1000u && (half & 1u))) ++half;
+    return (uint16_t)half;
 }
 
 }  // namespace rdna4

@@ -19,6 +19,68 @@ namespace rdna4 {
 
 struct half2 { uint16_t d; uint16_t dmin; };
 
+#define QK8_1 32
+
+// QI/QR: "quants per int" / "quants per row" per type (from ggml-common.h).
+#define QI1_0 (QK1_0 / 32)
+#define QR1_0 1
+#define QI2_0 (QK2_0 / 32)
+#define QR2_0 1
+#define QI4_0 (QK4_0 / (4 * QR4_0))
+#define QR4_0 2
+#define QI4_1 (QK4_1 / (4 * QR4_1))
+#define QR4_1 2
+#define QI_MXFP4 (QK_MXFP4 / (4 * QR_MXFP4))
+#define QR_MXFP4 2
+#define QI_NVFP4 (QK_NVFP4 / (4 * QR_NVFP4))
+#define QR_NVFP4 2
+#define QI5_0 (QK5_0 / (4 * QR5_0))
+#define QR5_0 2
+#define QI5_1 (QK5_1 / (4 * QR5_1))
+#define QR5_1 2
+#define QI8_0 (QK8_0 / (4 * QR8_0))
+#define QR8_0 1
+#define QI8_1 (QK8_1 / (4 * QR8_1))
+#define QR8_1 1
+#define QI2_K (QK_K / (4*QR2_K))
+#define QR2_K 4
+#define QI3_K (QK_K / (4*QR3_K))
+#define QR3_K 4
+#define QI4_K (QK_K / (4*QR4_K))
+#define QR4_K 2
+#define QI5_K (QK_K / (4*QR5_K))
+#define QR5_K 2
+#define QI6_K (QK_K / (4*QR6_K))
+#define QR6_K 2
+#define QI2_XXS (QK_K / (4*QR2_XXS))
+#define QR2_XXS 4
+#define QI2_XS (QK_K / (4*QR2_XS))
+#define QR2_XS 4
+#define QI2_S (QK_K / (4*QR2_S))
+#define QR2_S 4
+#define QI3_XXS (QK_K / (4*QR3_XXS))
+#define QR3_XXS 4
+#define QI3_XS (QK_K / (4*QR3_XS))
+#define QR3_XS 4
+#define QI1_S (QK_K / (4*QR1_S))
+#define QR1_S 8
+#define QI1_M (QK_K / (4*QR1_M))
+#define QR1_M 8
+#define QI4_NL (QK4_NL / (4*QR4_NL))
+#define QR4_NL 2
+#define QI4_XS (QK_K / (4*QR4_XS))
+#define QR4_XS 2
+#define QI3_S (QK_K / (4*QR3_S))
+#define QR3_S 4
+
+// 8-bit activation block (matvec input side): ds packs {d, s} as two fp16
+// halves (low = d, high = s) exactly like llama.cpp's anonymous union.
+struct block_q8_1 {
+    uint32_t ds;          // low 16 bits = d (scale), high 16 = s (d*sum(qs))
+    int8_t   qs[QK8_1];
+};
+
+
 // 8-bit
 typedef struct {
     uint16_t d;       // delta

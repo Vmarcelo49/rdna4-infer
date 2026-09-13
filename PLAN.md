@@ -66,9 +66,20 @@ Objetivo: todo tipo do union M1 computando em GPU.
   - **Bug de build resolvido:** TU HIP **precisa** da extensão `.hip` (com `.cpp`, o `amdclang++` compila host-only e `__device__`/`float2` não existem).
   - **Tabelas IQ vendoradas** em `quant_tables.h` (grids `iq1s_grid_gpu`/`iq2xxs`/`iq2xs`/`iq2s`/`iq3xxs`/`iq3s`, `kmask_iq2xs`, `ksigns_iq2xs`, `kvalues_iq4nl`) + `IQ1S_DELTA`, `NGRID_IQ1S`.
   - **VRAM:** liberada (hipFree nos dois buffers); pico de alocação por caso = 64–1024 blocos. GPU RX 9070 XT 16 GB, ~15,7 GB livres.
-- **Passo 3 (próximo) — matvec fundido (dequant+dot) + tuning RDNA4:**
-  - Trazer `vecdotq.cuh` (`vec_dot_*`), `mmvq.cu` + `MMVQ_PARAMETERS_RDNA4`, `mmq.cuh` + `mmq-config-rdna4.cuh`.
-  - Teste GPU-vs-CPU: nosso matvec GPU vs. `dequantize_row_*` + dot em f32 (oracle do passo 1)/vs. `ggml` CPU.
+- **Passo 3 — matvec fundido (dequant+dot em int8) por tipo ✅** (`include/rdna4/vecdotq.cuh`, `include/rdna4/matvec.cuh`, `tests/check_matvec_gpu.hip`):
+  - **Resultado: 14/14 tipos OK** nos dois UD (`check-matvec-gpu`), 8 linhas por tipo, até 248 320 colunas.
+  - **Kernels:** `vec_dot_<tipo>_q8_1` vendorados de `ggml-cuda/vecdotq.cuh` (MIT), **subset** aos 14 tipos do union M1 + helpers (`get_int_b1/b2/b4`, `get_int_from_table_16` (path HIP com `__builtin_amdgcn_perm`), `unpack_ksigns`) + emulações HIP de `__vsubss4/__vsub4/__vcmpeq4/__vcmpne4` (de `vendors/hip.h`) + `ggml_cuda_dp4a` com **RDNA4**: `__builtin_amdgcn_sudot4`.
+  - **Estrutura do matvec** (espelha o `mul_mat_vec_q` do llama.cpp, caso `ncols_dst=1`, sem fusão): 1 warp por linha; `kqs = vdr*(tid % (qi/vdr))`; `slot = tid/(qi/vdr)`; `blocks_per_iter = vdr*32/qi`; `kby = kb*(qk/QK8_1)`; redução por `__shfl_xor`. Constantes `(qk, qi, vdr)` por tipo vêm de `QI*/QR*` (ggml-common.h) e `VDR_*_MMVQ`.
+  - **Ativação:** `quantize_q8_1_block()` — 1 warp quantiza 32 floats → `block_q8_1` (`d = amax/127`, `qs = roundf(x/d)`, `s = fp16(d*Σqs)`), igual ao `quantize_row_q8_1_ref`.
+  - **Tolerâncias (documentadas, é o critério de aceite do item 4):**
+    - **1e-6** (erro de fp32) para os tipos que usam matemática exata: `q8_0, q2_K, q3_K, q4_K, q5_K, q6_K, iq3_s, iq4_nl, iq4_xs` — medido ~1e-7..4e-7.
+    - **1e-3** para os tipos cujo `vec_dot` do llama.cpp usa **escala inteira truncada** (`iq2_xxs`: `sumi*ls/8`; `iq2_xs`/`iq2_s`: `(sumi0*ls0+sumi1*ls1+(sumi0+sumi1)/2)/4`; `iq3_xxs`: `(ls*sumi+sumi/2)/2`; `iq1_s`: termo delta em fp16 `s`) — medido 4e-6..9,4e-5, cresce com o nº de sub-blocos. A referência do teste é matemática exata (dequant + dot em f32), então a diferença **é esperada** e não é bug: o CPU do próprio llama.cpp usa a mesma formulação inteira.
+  - **Bugs encontrados nesta etapa (mesma classe do passo 2 — campo fp16 lido como inteiro):** `const float d = bq3_K->d;`, `bq6_K->d` e `bq8_0->d` passados a parâmetro `const float&` (vira temporário inteiro→float, ex. 0x3800 → 14336 em vez de 0,5). Todos corrigidos com `fp16_to_float`. **Lição:** a auditoria de layout **não** pega isso (o offset está certo); o que pega é o teste numérico por tipo.
+  - **Hardening pendente (próximo passo pequeno):** trocar o tipo dos campos fp16 por um wrapper `struct fp16 { uint16_t bits; operator float() const; }` para que "esquecer a conversão" vire **erro de compilação** em vez de valor errado silencioso.
+- **Passo 4 (próximo) — desempenho + `mmq`/tuning RDNA4:**
+  - Bench do matvec por tipo (tokens/s equivalente, GB/s efetivos) vs. baseline Vulkan/RADV (prefill 133–146 t/s, decode 37–38 t/s).
+  - `MMVQ_PARAMETERS_RDNA4` (nwarps por tipo/linhas) e `mmq.cuh` + `mmq-config-rdna4.cuh` para prefill (batch > 8).
+
   - Aqui a tolerância deixa de ser bit-exact (ordem de acumulação difere) → documentar tolerância.
 - **Nota:** GPU/VRAM **liberada** para testes nesta sessão (antes estava proibido). Dequant já executado de verdade em gfx1201, não só compilado.
 

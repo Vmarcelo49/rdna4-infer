@@ -70,3 +70,12 @@ set_target_properties(check-dequant-gpu PROPERTIES
     HIP_ARCHITECTURES "gfx1201"
     HIP_HIPCC_ADDITIONAL_FLAGS "-O2"
 )
+
+# M2 step 3 — fused matvec (quantized weights x q8_1 activations) vs CPU.
+add_executable(check-matvec-gpu tests/check_matvec_gpu.hip
+                 tests/dequant_cpu_oracle.cpp src/backend/gguf.cpp src/backend/loader.cpp)
+target_include_directories(check-matvec-gpu PRIVATE include /opt/rocm/include
+                          ${LLAMA_CPP_SRC}/ggml/src ${LLAMA_CPP_SRC}/ggml/include)
+target_link_libraries(check-matvec-gpu PRIVATE ${GGML_BASE_LIB} ${AMDHIP64})
+target_link_options(check-matvec-gpu PRIVATE --offload-arch=gfx1201)
+set_target_properties(check-matvec-gpu PROPERTIES HIP_ARCHITECTURES "gfx1201")
