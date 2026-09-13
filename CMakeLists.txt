@@ -178,3 +178,15 @@ target_link_libraries(oracle-eog PRIVATE ${LLAMA_CPP_BUILD}/bin/libllama.so ${AM
 add_executable(check-eog tests/check_eog.cpp src/backend/gguf.cpp src/backend/loader.cpp)
 target_include_directories(check-eog PRIVATE include)
 target_link_libraries(check-eog PRIVATE rdna4_tokenizer)
+
+# M6 — batched matvec (weight sharing across tokens): bit-exactness vs N GEMV
+# calls plus the prefill scaling curve per quant type.
+add_executable(check-matmul-gpu tests/check_matmul_gpu.hip
+               src/backend/gguf.cpp src/backend/loader.cpp)
+target_compile_options(check-matmul-gpu PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_link_options(check-matmul-gpu PRIVATE --offload-arch=gfx1201)
+target_include_directories(check-matmul-gpu PRIVATE include)
+if(EXISTS "/opt/rocm/include")
+  target_include_directories(check-matmul-gpu PRIVATE /opt/rocm/include)
+endif()
+target_link_libraries(check-matmul-gpu PRIVATE ${AMDHIP64})

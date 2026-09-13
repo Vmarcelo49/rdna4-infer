@@ -208,6 +208,113 @@ matvec_kernel_gen(const void *__restrict__ vx, const block_q8_1 *__restrict__ vy
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// Batched matvec (PLAN.md M6): N activation vectors share ONE pass over the
+// weights, so the weight traffic per token drops by N. This is what makes prefill
+// fast without touching the decode path.
+//
+// Bit-exactness by construction: for a given token the k-walk, the ILP slots, the
+// per-slot sum and both reduction stages are byte-for-byte the same operations in
+// the same order as matvec_kernel_gen, so each output element equals what N
+// separate GEMV calls produce (checked by tests/check_matmul_gpu.hip). That is
+// what lets a validated graph switch to it without invalidating the M2/M3 gates.
+//
+//   vy         : N activation rows of q8_1 blocks, row stride `act_stride` blocks
+//   dst        : N rows of `nrows` floats, row stride `nrows` (token-major)
+// ---------------------------------------------------------------------------
+template <class T, int ROWS, int WPR, int ILP = 1, int N = 1>
+__global__ void
+#if defined(__HIP_DEVICE_COMPILE__)
+__launch_bounds__(ROWS * WPR * 32, 1)
+#endif
+matvec_kernel_batch(const void *__restrict__ vx, const block_q8_1 *__restrict__ vy,
+                    float *__restrict__ dst, int64_t nrows, int64_t blocks_per_row,
+                    int64_t act_stride) {
+  constexpr int vdr = T::vdr;
+  constexpr int qi = T::qi;
+  constexpr int qk = T::qk;
+  constexpr int slots_per_block = qi / vdr;
+  constexpr int blocks_per_iter = vdr * (WPR * 32) / qi;
+
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int row_group = warp / WPR;
+  const int w_in_group = warp % WPR;
+  const int tg = w_in_group * 32 + lane;
+
+  const int row_raw = (int)(blockIdx.x * ROWS + row_group);
+  const bool active = row_raw < nrows;
+  const int row = active ? row_raw : 0;
+
+  const char *rowp = (const char *)vx +
+                     (int64_t)row * blocks_per_row * (int64_t)sizeof(typename T::block_t);
+  const int kqs = vdr * (tg % slots_per_block);
+  const int slot = tg / slots_per_block;
+
+  float acc[N][ILP];
+#pragma unroll
+  for (int n = 0; n < N; ++n) {
+#pragma unroll
+    for (int i = 0; i < ILP; ++i) acc[n][i] = 0.0f;
+  }
+
+  int64_t kb = slot;
+  for (; kb + (ILP - 1) * blocks_per_iter < blocks_per_row; kb += ILP * blocks_per_iter) {
+#pragma unroll
+    for (int u = 0; u < ILP; ++u) {
+      const int64_t k = kb + u * blocks_per_iter;
+      const block_q8_1 *abase = vy + k * (qk / QK8_1);
+#pragma unroll
+      for (int n = 0; n < N; ++n) {
+        acc[n][u] +=
+            T::dot((const void *)rowp, abase + (int64_t)n * act_stride, (const int)k, kqs);
+      }
+    }
+  }
+  for (; kb < blocks_per_row; kb += blocks_per_iter) {
+    const block_q8_1 *abase = vy + kb * (qk / QK8_1);
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+      acc[n][0] += T::dot((const void *)rowp, abase + (int64_t)n * act_stride, (const int)kb, kqs);
+    }
+  }
+
+  float sum[N];
+#pragma unroll
+  for (int n = 0; n < N; ++n) {
+    sum[n] = 0.0f;
+#pragma unroll
+    for (int i = 0; i < ILP; ++i) sum[n] += acc[n][i];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) sum[n] += __shfl_xor(sum[n], off);
+  }
+
+  if (WPR == 1) {
+    if (active && lane == 0) {
+#pragma unroll
+      for (int n = 0; n < N; ++n) dst[(int64_t)n * nrows + row] = sum[n];
+    }
+    return;
+  }
+  __shared__ float part[ROWS][WPR][N];
+  if (lane == 0) {
+#pragma unroll
+    for (int n = 0; n < N; ++n) part[row_group][w_in_group][n] = sum[n];
+  }
+  __syncthreads();
+  if (active && w_in_group == 0 && lane == 0) {
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+      float t = 0.0f;
+#pragma unroll
+      for (int i = 0; i < WPR; ++i) t += part[row_group][i][n];
+      dst[(int64_t)n * nrows + row] = t;
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Host launch helpers
 // ---------------------------------------------------------------------------
@@ -363,6 +470,60 @@ inline bool matvec_launch(int dt, const void *d_w, const block_q8_1 *d_a, float 
 #undef RD_SHIP
 }
 
+
+
+// Batched shipping path. N is a compile-time constant (2/4/8/16) and the shape
+// per type is the *same* one the GEMV path uses, which is what makes the results
+// bit-identical; n_tokens is capped at the largest instantiation and the caller
+// loops over sub-batches.
+inline int matvec_batch_cap() { return 16; }
+
+template <int N>
+inline bool matvec_launch_batch_n(int dt, const void *d_w, const block_q8_1 *d_a, float *d_o,
+                                  int64_t nrows, int64_t ncols, int64_t act_stride,
+                                  hipStream_t stream) {
+#define RD_BATCH(Traits, Dt, QK)                                                              \
+  case Dt: {                                                                                  \
+    const int grid = (int)((nrows + MtShape<Dt>::rows - 1) / MtShape<Dt>::rows);              \
+    const int threads = MtShape<Dt>::rows * MtShape<Dt>::wpr * 32;                            \
+    matvec_kernel_batch<Traits, MtShape<Dt>::rows, MtShape<Dt>::wpr, MtIlp<Dt>::value, N>     \
+        <<<grid, threads, 0, stream>>>(d_w, d_a, d_o, nrows, ncols / QK, act_stride);         \
+    return hipGetLastError() == hipSuccess;                                                   \
+  }
+  switch (dt) {
+    RD_BATCH(TQ8_0, 1, 32)
+    RD_BATCH(TQ2K, 2, 256)
+    RD_BATCH(TQ3K, 3, 256)
+    RD_BATCH(TQ4K, 4, 256)
+    RD_BATCH(TQ5K, 5, 256)
+    RD_BATCH(TQ6K, 6, 256)
+    RD_BATCH(TIQ2XXS_S, 7, 256)
+    RD_BATCH(TIQ2XS_S, 8, 256)
+    RD_BATCH(TIQ3XXS_S, 9, 256)
+    RD_BATCH(TIQ1S, 10, 256)
+    RD_BATCH(TIQ4NL, 11, 32)
+    RD_BATCH(TIQ3S_S, 12, 256)
+    RD_BATCH(TIQ2S_S, 13, 256)
+    RD_BATCH(TIQ4XS, 14, 256)
+    default:
+      return false;  // no kernel: caller must fail loudly (SPEC 1.3)
+  }
+#undef RD_BATCH
+}
+
+// `n_tokens` must be <= matvec_batch_cap(); d_a holds `n_tokens` activation rows
+// of `act_stride` q8_1 blocks each (act_stride >= ncols / 32).
+inline bool matvec_launch_batch(int dt, const void *d_w, const block_q8_1 *d_a, float *d_o,
+                                int64_t nrows, int64_t ncols, int64_t act_stride, int n_tokens,
+                                hipStream_t stream) {
+  switch (n_tokens) {
+    case 2:  return matvec_launch_batch_n<2>(dt, d_w, d_a, d_o, nrows, ncols, act_stride, stream);
+    case 4:  return matvec_launch_batch_n<4>(dt, d_w, d_a, d_o, nrows, ncols, act_stride, stream);
+    case 8:  return matvec_launch_batch_n<8>(dt, d_w, d_a, d_o, nrows, ncols, act_stride, stream);
+    case 16: return matvec_launch_batch_n<16>(dt, d_w, d_a, d_o, nrows, ncols, act_stride, stream);
+    default: return false;  // N is a compile-time instantiation, not a runtime knob
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Tuned dispatch: the shipping shape per type is a compile-time constant (it is

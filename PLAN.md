@@ -503,14 +503,61 @@ justifica. Atenção (não tiling) continua sendo limite de performance em conte
    idêntico ao llama.cpp por 32 tokens, PPL por posição dentro de 0,25 %, 131K de
    contexto no IQ3_S e 64K no IQ4_XS (o 131K do IQ4_XS não cabe, documentado).
 
-## M6 — Prefill em batch (proposto, medido como necessário)
+## M6 — Prefill em batch (passo 1 feito; escopo re-medido)
 
-1. GEMM quantizado (os mesmos vec_dot, com N tokens por bloco de peso): a leitura de
-   pesos por prompt cai de `n_tokens × 11,2 GB` para `11,2 GB`. Alvo: ≥ 150 tok/s de
-   prefill (era 28,8; referência 440).
-2. Manter o caminho por token como default de decode e revalidar todos os gates de
-   exatidão (o prefill em batch muda a ordem de acumulação, como no próprio llama.cpp).
-3. Tiling da atenção para contexto longo (262 ms/token em 64K hoje).
-## Fora deste plano (futuro, ver `SPEC.md` §4)
+### Passo 1 — kernel batched + curva de escala ✅ (feito em 2026-09-13)
 
-Servidor OpenAI-compatible, `qwen35moe`, MTP/`nextn_*`, mmproj de visão, offload, outros quants/GPUs.
+`matvec_kernel_batch<T, ROWS, WPR, ILP, N>` + `matvec_launch_batch()` em
+`include/rdna4/matvec.cuh`: N vetores de ativação compartilham **uma** passagem pelos
+pesos. Para um dado token o k-walk, os slots de ILP, a soma por slot e os dois
+estágios de redução são as mesmas operações na mesma ordem do `matvec_kernel_gen`,
+então cada elemento de saída é **bit-idêntico a N chamadas GEMV separadas** —
+verificado, não assumido (`tests/check_matmul_gpu.hip`: *bit-exact in every
+configuration tested*).
+
+**Resultado medido (IQ3_S, working set maior que o L2, aquecimento com sync):**
+ganho de **~2-5× por tipo**, não N× (iq3_s 4,35×, iq3_xxs 5,14×, q3_k 5,45×,
+iq4_xs 2,62×, q4_k 3,34×; alguns tipos *regridem* em N=16 por pressão de registradores).
+Motivo: os `vec_dot` são **issue-bound** (o custo de ALU por byte de peso cresce com N),
+exatamente o que o M2 mediu no corpo do iq3_s (452 instruções por vec_dot, 55-62 % de
+emulação de bytes).
+
+**Projeção para o modelo** (bytes reais por tipo × banda medida):
+
+| | por token | taxa |
+|---|---|---|
+| matvec GEMV (hoje) | 35,9 ms | 27,9 tok/s |
+| matvec batched | 8,97 ms | — |
+| + andaime por token (norms, atenção, GDN, quantização: 6,9 ms medidos no M5) | 15,9 ms | **~63 tok/s** |
+
+**Duas conclusões que mudam o escopo deste milestone:**
+
+1. Batching do matvec vale **~2,2× de prefill** (28,8 → ~63 tok/s; num prompt de 512
+   tokens: 17,8 s → 8 s), e exige a reestruturação layer-major do grafo.
+2. O andaime por token sozinho **limita o prefill a ~145 tok/s** mesmo com matvec
+   infinitamente rápido. Chegar aos 440 tok/s do llama.cpp exige em batch *tudo*
+   (norms, atenção, recorrência GDN, quantização) **e** um laço interno muito mais
+   barato (kernel tiled estilo MMQ com peso em shared memory e dot int8 largo — a rota
+   que o M2 deliberadamente não tomou, porque troca exatidão bit a bit por velocidade).
+
+**Correção de registro (afeta o M2):** a tabela de GB/s por tipo do M2 (iq3_s 557-753
+GB/s) foi medida com tensores que cabem no L2 de 64 MB — são números de **L2**, não de
+DRAM. Com working set realista, o N=1 fica em **143-552 GB/s**, o que explica a banda
+efetiva de 336 GB/s medida ponta a ponta no M5.
+
+**Duas armadilhas de metodologia** (registradas em `docs/medicoes-m6.md`): working set
+precisa exceder o L2 (senão mede-se L2), e o laço de aquecimento precisa de `sync`
+(sem ele a fila de comandos absorve milhares de iterações e o relógio de parede mede
+vazão de lançamento — a primeira execução do M6 enfileirou ~20 minutos de trabalho).
+
+### Passo 2 (a decidir, com os números acima)
+
+- **2a. Reestruturar para prefill batched** (layer-major: projeções em batch, atenção e
+  recorrência GDN por token): ~63 tok/s de prefill, bit-exatidão verificável contra o
+  caminho por token. Trabalho grande, ganho real de 2,2×.
+- **2b. Batching completo** (norms + atenção + GDN + quantização em batch): teto ~145
+  tok/s; bem mais trabalho (máscara causal em batch, recorrência sequencial).
+- **2c. Kernel tiled estilo MMQ**: única rota para ~300-440 tok/s; perde bit-exatidão,
+  precisa de rodada própria de validação numérica; trabalho de milestão separado.
+- **2d. Tiling da atenção** (262 ms/token em 64K hoje): mudança contida, ganho visível
+  em contexto longo — provavelmente o melhor ganho por hora se contexto longo importa.
