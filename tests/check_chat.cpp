@@ -54,6 +54,7 @@ struct Case {
   std::vector<rdna4::ChatMessage> messages;
   bool add_assistant;
   bool thinking;
+  const char *effort = "xhigh";  // reasoning_effort; the oracle's "-" row is xhigh
 };
 
 std::vector<Case> make_cases() {
@@ -92,6 +93,18 @@ std::vector<Case> make_cases() {
     cases.push_back({"tool-after-assistant",
                      {msg("user", "What is 2+2?"), msg("assistant", ""), t}, true, true});
   }
+  // reasoning_effort: every value the template accepts (including the
+  // `high` -> `xhigh` alias and `medium`, which emits no instruction at all),
+  // with and without a user system message to prepend to.
+  cases.push_back({"effort-xhigh", {msg("user", "Hi")}, true, true, "xhigh"});
+  cases.push_back({"effort-high-alias", {msg("user", "Hi")}, true, true, "high"});
+  cases.push_back({"effort-medium", {msg("user", "Hi")}, true, true, "medium"});
+  cases.push_back({"effort-low", {msg("user", "Hi")}, true, true, "low"});
+  cases.push_back({"effort-medium-system",
+                   {msg("system", "You are terse."), msg("user", "Hi")}, true, true, "medium"});
+  cases.push_back({"effort-low-system",
+                   {msg("system", "You are terse."), msg("user", "Hi")}, true, true, "low"});
+  cases.push_back({"effort-low-no-thinking", {msg("user", "Hi")}, true, false, "low"});
   return cases;
 }
 
@@ -110,11 +123,19 @@ int main(int argc, char **argv) {
 
   std::vector<std::string> ref;
   std::vector<std::string> ref_names;
+  std::vector<std::string> ref_effort;
   std::string line;
   while (std::getline(f, line)) {
     if (line.rfind("# case ", 0) == 0) {
       const std::size_t p = line.find(' ', 7);
       ref_names.push_back(p == std::string::npos ? line : line.substr(7, p - 7));
+      // effort=<x|medium|low|-> records the reasoning_effort kwarg the oracle
+      // passed; a case we render with a different effort would otherwise compare
+      // against the wrong reference silently
+      const std::string k = "effort=";
+      const std::size_t e = line.find(k);
+      ref_effort.push_back(e == std::string::npos ? std::string("-")
+                                                  : line.substr(e + k.size()));
       continue;
     }
     if (line.rfind("#", 0) == 0 || line.empty()) continue;
@@ -132,6 +153,18 @@ int main(int argc, char **argv) {
     rdna4::ChatOptions opts;
     opts.add_generation_prompt = cases[i].add_assistant;
     opts.enable_thinking = cases[i].thinking;
+    opts.reasoning_effort = cases[i].effort;
+    // refuse to compare against a reference rendered with another effort: the
+    // failure would look like a rendering bug instead of a stale golden
+    if (i < ref_effort.size()) {
+      const std::string want = ref_effort[i] == "-" ? std::string("xhigh") : ref_effort[i];
+      if (want != cases[i].effort) {
+        std::printf("FAIL case %zu (%s): golden was rendered with effort=%s, test uses %s\n", i,
+                    cases[i].name, ref_effort[i].c_str(), cases[i].effort);
+        ++failures;
+        continue;
+      }
+    }
     std::string out, err;
     const bool ok = rdna4::chat_render(cases[i].messages, opts, out, err);
     if (!ok) {
@@ -170,6 +203,13 @@ int main(int argc, char **argv) {
     const bool ok3 = rdna4::chat_render(m2, o, out, err);
     std::printf("%-5s unknown role rejected (%s)\n", !ok3 ? "ok" : "FAIL", err.c_str());
     if (ok3) ++failures;
+
+    // the template raises for an effort outside ('xhigh','medium','low') after
+    // mapping 'high' to 'xhigh'
+    o.reasoning_effort = "ultra";
+    const bool ok4 = rdna4::chat_render({{"user", "hi"}}, o, out, err);
+    std::printf("%-5s unknown reasoning effort rejected (%s)\n", !ok4 ? "ok" : "FAIL", err.c_str());
+    if (ok4) ++failures;
   }
 
   std::printf("check-chat: %s\n", failures ? "FAILED" : "OK");

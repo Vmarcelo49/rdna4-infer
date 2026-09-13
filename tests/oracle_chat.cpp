@@ -8,8 +8,12 @@
 //
 // usage: oracle-chat <file.gguf>
 // Output: one record per case:
-//   # case <n> add_assistant=<0|1> thinking=<0|1> roles=<...>
+//   # case <n> <name> add_assistant=<0|1> thinking=<0|1> effort=<xhigh|medium|low|->
 //   <prompt with \n \t \\ escaped>
+//
+// `effort=-` means the template kwarg was not passed (the template's own
+// default, xhigh); the other rows pin `chat_reasoning_instructions()` for every
+// value the template accepts, including the `high` -> `xhigh` alias.
 #include "chat.h"
 
 #include <llama.h>
@@ -40,6 +44,7 @@ struct Case {
   std::vector<common_chat_msg> messages;
   bool add_assistant;
   bool thinking;
+  const char *effort = nullptr;  // reasoning_effort kwarg; null = template default
 };
 
 std::vector<Case> make_cases() {
@@ -77,6 +82,18 @@ std::vector<Case> make_cases() {
     cases.push_back({"tool-after-assistant",
                      {msg("user", "What is 2+2?"), msg("assistant", ""), t}, true, true});
   }
+  // reasoning_effort: every value the template accepts, with and without a user
+  // system message (the template emits the instruction either as its own system
+  // message or prepended to the user's, and emits nothing for `medium`).
+  cases.push_back({"effort-xhigh", {msg("user", "Hi")}, true, true, "xhigh"});
+  cases.push_back({"effort-high-alias", {msg("user", "Hi")}, true, true, "high"});
+  cases.push_back({"effort-medium", {msg("user", "Hi")}, true, true, "medium"});
+  cases.push_back({"effort-low", {msg("user", "Hi")}, true, true, "low"});
+  cases.push_back({"effort-medium-system",
+                   {msg("system", "You are terse."), msg("user", "Hi")}, true, true, "medium"});
+  cases.push_back({"effort-low-system",
+                   {msg("system", "You are terse."), msg("user", "Hi")}, true, true, "low"});
+  cases.push_back({"effort-low-no-thinking", {msg("user", "Hi")}, true, false, "low"});
   return cases;
 }
 
@@ -106,9 +123,13 @@ int main(int argc, char **argv) {
     in.add_generation_prompt = c.add_assistant;
     in.enable_thinking = c.thinking;
     in.use_jinja = true;
+    if (c.effort != nullptr) {
+      // chat_template_kwargs values are JSON, so a string needs its quotes
+      in.chat_template_kwargs["reasoning_effort"] = std::string("\"") + c.effort + "\"";
+    }
     const common_chat_params params = common_chat_templates_apply(tmpls.get(), in);
-    std::printf("# case %zu %s add_assistant=%d thinking=%d\n", n, c.name, (int)c.add_assistant,
-                (int)c.thinking);
+    std::printf("# case %zu %s add_assistant=%d thinking=%d effort=%s\n", n, c.name,
+                (int)c.add_assistant, (int)c.thinking, c.effort ? c.effort : "-");
     std::printf("%s\n", escape(params.prompt).c_str());
     ++n;
   }
