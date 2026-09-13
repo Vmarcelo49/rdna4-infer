@@ -100,3 +100,10 @@ target_include_directories(check-nn-gpu PRIVATE include /opt/rocm/include
 target_link_libraries(check-nn-gpu PRIVATE ${GGML_BASE_LIB} ${AMDHIP64})
 target_link_options(check-nn-gpu PRIVATE --offload-arch=gfx1201)
 set_target_properties(check-nn-gpu PROPERTIES HIP_ARCHITECTURES "gfx1201")
+
+# M3 step 2a — RoPE / attention kernels vs a CPU reference.
+add_executable(check-rope-gpu tests/check_rope_gpu.hip)
+target_include_directories(check-rope-gpu PRIVATE include /opt/rocm/include)
+target_link_libraries(check-rope-gpu PRIVATE ${AMDHIP64})
+target_link_options(check-rope-gpu PRIVATE --offload-arch=gfx1201)
+set_target_properties(check-rope-gpu PROPERTIES HIP_ARCHITECTURES "gfx1201")
