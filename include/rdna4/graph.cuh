@@ -131,8 +131,6 @@ class Graph {
     return ((il + 1) % (int)cfg_.full_attention_interval) != 0 && il < n_layer();
   }
 
-  const float *stage_norm() const { return d_xn_; }
-
  private:
   bool up(const char *name, GpuTensor &t, std::string &err);
   bool alloc(float *&p, std::size_t n, std::string &err);
@@ -169,7 +167,7 @@ class Graph {
 
   float *d_x_ = nullptr, *d_xn_ = nullptr, *d_proj_ = nullptr, *d_ffnout_ = nullptr;
   KvType kv_k_ = KvType::F32, kv_v_ = KvType::F32;
-  float *d_q_ = nullptr, *d_kstage_ = nullptr, *d_vstage_ = nullptr;
+  float *d_kstage_ = nullptr, *d_vstage_ = nullptr;
   void *d_k_ = nullptr, *d_v_ = nullptr;
   std::size_t kv_bytes_ = 0;
   int count_recr() const {
@@ -299,8 +297,7 @@ inline bool Graph::init(int max_ctx, KvType kv_k, KvType kv_v, std::string &err)
   const std::size_t kv_bytes =
       (std::size_t)max_ctx * NKV * (std::size_t)kv_row_bytes(kv_k_, HD);
   kv_bytes_ = kv_bytes;
-  if (hipMalloc(&d_q_, (std::size_t)n_attn * NH * HD * sizeof(float)) != hipSuccess ||
-      hipMalloc(&d_k_, (std::size_t)n_attn * kv_bytes) != hipSuccess ||
+  if (hipMalloc(&d_k_, (std::size_t)n_attn * kv_bytes) != hipSuccess ||
       hipMalloc(&d_v_, (std::size_t)n_attn * kv_bytes) != hipSuccess) {
     err = "hipMalloc failed (kv cache)";
     return false;
@@ -656,7 +653,7 @@ inline void Graph::release() {
   }
   fr(tok_embd_); fr(output_norm_); fr(output_);
   float *ptrs[] = {d_x_,     d_xn_,    d_proj_,   d_ffnout_, d_attnout_, d_attngate_,
-                   d_q_,     d_qkv_,   d_conv_,   d_z_,      d_alpha_,   d_beta_,
+                   d_qkv_,   d_conv_,  d_z_,      d_alpha_,  d_beta_,
                    d_gate_,  d_state_, d_convst_, d_ffn_a_,  d_ffn_b_,   d_kstage_,
                    d_vstage_};
   for (float *p : ptrs) {
