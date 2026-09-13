@@ -435,11 +435,19 @@ __global__ void read_only_kernel(const void *__restrict__ vx, float *__restrict_
   const char *rowp =
       (const char *)vx + (int64_t)row * blocks_per_row * (int64_t)sizeof(typename T::block_t);
   const int slot = tg / slots_per_block;
-  const int within = (tg % slots_per_block) * (int)sizeof(typename T::block_t) / slots_per_block;
+  const int lane_in_block = tg % slots_per_block;
+  constexpr int block_u32 = (int)(sizeof(typename T::block_t) / 4);
 
+  // Read EVERY byte of every visited block: the warp's slots_per_block threads
+  // walk the block's uint32s cooperatively. (Reading only one uint32 per thread
+  // touches ~20% of a large block while still being credited with the whole
+  // tensor size, which overstates the ceiling by up to 5x.)
   uint32_t acc = 0;
   for (int64_t kb = slot; kb < blocks_per_row; kb += blocks_per_iter) {
-    acc += *(const uint32_t *)(rowp + kb * (int64_t)sizeof(typename T::block_t) + within);
+    const uint32_t *blk = (const uint32_t *)(rowp + kb * (int64_t)sizeof(typename T::block_t));
+    for (int u = lane_in_block; u < block_u32; u += slots_per_block) {
+      acc += blk[u];
+    }
   }
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off);
