@@ -114,6 +114,16 @@ set_target_properties(oracle-tokenize PROPERTIES BUILD_RPATH "${LLAMA_CPP_BUILD}
 
 add_executable(check-tokenizer tests/check_tokenizer.cpp src/backend/gguf.cpp
                                 src/backend/loader.cpp)
+add_executable(check-chat tests/check_chat.cpp src/backend/chat.cpp)
+target_include_directories(check-chat PRIVATE include)
+
+# oracle-chat renders the metadata chat template with llama.cpp's Jinja engine.
+add_executable(oracle-chat tests/oracle_chat.cpp)
+target_include_directories(oracle-chat PRIVATE ${LLAMA_CPP_SRC}/include
+                          ${LLAMA_CPP_SRC}/common ${LLAMA_CPP_SRC}/ggml/include)
+target_link_libraries(oracle-chat PRIVATE ${LLAMA_CPP_BUILD}/bin/libllama-common.so
+                                            ${LLAMA_CPP_BUILD}/bin/libllama.so ${AMDHIP64})
+set_target_properties(oracle-chat PROPERTIES BUILD_RPATH "${LLAMA_CPP_BUILD}")
 target_link_libraries(check-tokenizer PRIVATE rdna4_tokenizer)
 
 # M4 — sampler.
