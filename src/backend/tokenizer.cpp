@@ -123,6 +123,50 @@ bool Tokenizer::init(const gguf::File &f, std::string &err) {
   add_bos_ = kv_bool(f, "tokenizer.ggml.add_bos_token", false);
   add_eos_ = kv_bool(f, "tokenizer.ggml.add_eos_token", false);
 
+  // End-of-generation set, built the way llama.cpp builds it (llama-vocab.cpp
+  // "maintain a list of tokens that cause end-of-generation"): the FIM ids, then
+  // every token whose *text* is in the control-looking EOG list, then the EOS
+  // (and EOT/EOM) ids from the metadata. For qwen35 that adds 248044
+  // (`<|endoftext|>`) next to 248046 (`<|im_end|>`), and a generation that ends
+  // on the former must stop like the reference does.
+  eog_.assign(tokens_.size(), false);
+  auto add_eog = [&](std::int32_t id) {
+    if (id >= 0 && (std::size_t)id < eog_.size()) eog_[(std::size_t)id] = true;
+  };
+  static const char *kEogTexts[] = {
+      "<|eot_id|>", "<|im_end|>", "<|end|>", "<|return|>", "<|call|>", "<|flush|>",
+      "<|calls|>", "<end_of_turn>", "<|endoftext|>", "</s>", "<|eom_id|>", "<EOT>",
+      "_<EOT>", "[EOT]", "[EOS]", "<|end_of_text|>", "<end_of_utterance>", "<eos>",
+      "<turn|>", "<|tool_response>", "<\xEF\xBD\x9Cend\xE2\x96\x81of\xE2\x96\x81sentence\xEF\xBD\x9C>",
+      "[e~[",
+  };
+  for (const char *txt : kEogTexts) {
+    auto it = token_to_id_.find(txt);
+    if (it != token_to_id_.end()) add_eog(it->second);
+  }
+  // The FIM ids are *not* in this GGUF's metadata: llama.cpp auto-detects them by
+  // text too (llama-vocab.cpp "find FIM_PAD token: ...", :2769-2810) and then
+  // inserts them into the EOG set, which is where 248063/248064/248065 come
+  // from. llama.cpp keeps only the first text match it encounters while scanning
+  // an unordered_map; every candidate here has at most one match in this vocab,
+  // so adding all matches is identical. (A vocab carrying two spellings of the
+  // same FIM token would make us add both — documented divergence.)
+  static const char *kFimTexts[] = {
+      "<|fim_pad|>", "<fim-pad>", "<fim_pad>", "<PAD>", "[PAD]",
+      "<|fim_repo|>", "<|repo_name|>", "<fim-repo>", "<REPO>", "<reponame>",
+      "<|file_sep|>",
+  };
+  for (const char *txt : kFimTexts) {
+    auto it = token_to_id_.find(txt);
+    if (it != token_to_id_.end()) add_eog(it->second);
+  }
+  add_eog(kv_i32(f, "tokenizer.ggml.fim_pad_token_id", -1));
+  add_eog(kv_i32(f, "tokenizer.ggml.fim_rep_token_id", -1));
+  add_eog(kv_i32(f, "tokenizer.ggml.fim_sep_token_id", -1));
+  add_eog(eos_);
+  add_eog(kv_i32(f, "tokenizer.ggml.eot_token_id", -1));
+  add_eog(kv_i32(f, "tokenizer.ggml.eom_token_id", -1));
+
   if (tokens_.empty()) {
     err = "empty vocabulary";
     return false;
@@ -215,16 +259,45 @@ std::vector<std::int32_t> Tokenizer::encode(const std::string &text, bool parse_
   return out;
 }
 
+namespace {
+// "<0xXX>" placeholder helper (BYTE tokens): value of one hex digit, -1 if not.
+int hex_digit(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+}  // namespace
+
 std::string Tokenizer::token_to_piece(std::int32_t id) const {
   if (id < 0 || (std::size_t)id >= tokens_.size()) return std::string();
   const std::string &text = tokens_[id];
+  // A BYTE token's text is the placeholder "<0xXX>"; llama.cpp emits the raw
+  // byte itself (llama-vocab.cpp token_to_piece). Not reachable in the qwen35
+  // vocab (it has no BYTE tokens) but cheap to get right.
+  if ((std::size_t)id < types_.size() && types_[id] == kTokenByte && text.size() == 6 &&
+      text.compare(0, 3, "<0x") == 0 && text[5] == '>') {
+    const int hi = hex_digit(text[3]);
+    const int lo = hex_digit(text[4]);
+    if (hi >= 0 && lo >= 0) return std::string(1, (char)((hi << 4) | lo));
+  }
   std::string out;
   out.reserve(text.size());
   for (std::size_t off = 0; off < text.size();) {
     const std::size_t n = unicode_len_utf8(text[off]);
+    if (n == 0 || off + n > text.size()) {
+      out.append(text, off, std::string::npos);  // malformed tail: keep it verbatim
+      break;
+    }
     const std::string cpt = text.substr(off, n);
-    const std::uint8_t byte = unicode_utf8_to_byte(cpt);
-    out.push_back((char)byte);
+    std::uint8_t byte = 0;
+    if (unicode_utf8_to_byte_safe(cpt, &byte)) {
+      out.push_back((char)byte);
+    } else {
+      // not part of the GPT-2 byte encoding: emit the codepoint as-is instead of
+      // throwing out of std::unordered_map::at (review M4)
+      out.append(cpt);
+    }
     off += n;
   }
   return out;

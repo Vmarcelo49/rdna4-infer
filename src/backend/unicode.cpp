@@ -357,6 +357,14 @@ uint8_t unicode_utf8_to_byte(const std::string & utf8) {
     return map.at(utf8);
 }
 
+bool unicode_utf8_to_byte_safe(const std::string & utf8, uint8_t * out) {
+    static std::unordered_map<std::string, uint8_t> map = unicode_utf8_to_byte_map();
+    const auto it = map.find(utf8);
+    if (it == map.end()) return false;
+    *out = it->second;
+    return true;
+}
+
 uint32_t unicode_tolower(uint32_t cpt) {
     // binary search
     auto it = std::lower_bound(unicode_map_lowercase.begin(), unicode_map_lowercase.end(), cpt,

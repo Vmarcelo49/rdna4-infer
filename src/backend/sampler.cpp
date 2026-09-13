@@ -39,12 +39,14 @@ std::vector<Candidate> Sampler::filter(const float *logits,
   // Count occurrences in the window, then for every candidate that appears:
   // logit <= 0 ? logit * penalty : logit / penalty. (The frequency and presence
   // penalties default to 0 in llama.cpp and are out of scope here.)
+  // `repeat_last_n == 0` (or negative, which llama.cpp clamps to 0) disables the
+  // penalty entirely: llama_sampler_init_penalties does penalty_last_n =
+  // max(n, 0) and its is_disabled() includes penalty_last_n == 0, so there is no
+  // "whole history" spelling in the reference (review M4).
   std::unordered_map<std::int32_t, int> counts;
-  if (params_.repeat_penalty != 1.0f && !history.empty()) {
-    const std::size_t n = params_.repeat_last_n > 0
-                              ? std::min<std::size_t>((std::size_t)params_.repeat_last_n,
-                                                      history.size())
-                              : history.size();
+  if (params_.repeat_penalty != 1.0f && params_.repeat_last_n > 0 && !history.empty()) {
+    const std::size_t n = std::min<std::size_t>((std::size_t)params_.repeat_last_n,
+                                                history.size());
     for (std::size_t i = history.size() - n; i < history.size(); ++i) {
       ++counts[history[i]];
     }
@@ -68,6 +70,28 @@ std::vector<Candidate> Sampler::filter(const float *logits,
   }
 
   auto by_logit_desc = [](const Candidate &a, const Candidate &b) { return a.logit > b.logit; };
+
+  // --- greedy (llama_sampler_temp_impl with temp <= 0) ---------------------
+  // The reference does not sort here: it scans for the *first* strict maximum in
+  // id order and sets everything else to -inf. Doing it before the other filters
+  // keeps the same result (they can only remove candidates, and the maximum
+  // always survives: top_k keeps the best, top_p keeps at least one, min_p has
+  // min_keep = 1) while making ties and NaN/+-inf logits deterministic instead of
+  // depending on an unstable sort's order (review M4).
+  if (params_.temp <= 0.0f) {
+    // same scan as llama_sampler_temp_impl: the running maximum starts at the
+    // first candidate and only a *strictly* larger logit replaces it, so ties
+    // keep the smaller id and all-(-inf)/NaN logits fall back to cands[0]
+    // instead of yielding an empty set (review M4).
+    std::size_t max_i = 0;
+    for (std::size_t i = 1; i < cands.size(); ++i) {
+      if (cands[i].logit > cands[max_i].logit) max_i = i;
+    }
+    const Candidate best = cands[max_i];
+    cands.clear();
+    cands.push_back(best);
+    return cands;
+  }
 
   // --- top_k (llama_sampler_top_k_impl) ------------------------------------
   if (params_.top_k > 0 && (std::size_t)params_.top_k < cands.size()) {
@@ -103,11 +127,8 @@ std::vector<Candidate> Sampler::filter(const float *logits,
   }
 
   // --- temperature (llama_sampler_temp_impl) -------------------------------
-  if (params_.temp <= 0.0f) {
-    // greedy: keep only the best (the others become -inf, which makes the
-    // following softmax a one-hot distribution)
-    if (cands.size() > 1) cands.resize(1);
-  } else if (params_.temp != 1.0f) {
+  // (temp <= 0 was handled above: it short-circuits to the greedy candidate)
+  if (params_.temp != 1.0f) {
     for (Candidate &c : cands) c.logit /= params_.temp;
   }
 

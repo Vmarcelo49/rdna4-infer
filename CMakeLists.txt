@@ -171,3 +171,10 @@ set_target_properties(oracle-next-token PROPERTIES BUILD_RPATH "${LLAMA_CPP_BUIL
 # keeps the engine from writing half a multibyte character to stdout.
 add_executable(check-stream tests/check_stream.cpp)
 target_include_directories(check-stream PRIVATE include)
+
+# M4: end-of-generation set (the CLI must stop where llama.cpp stops).
+add_executable(oracle-eog tests/oracle_eog.cpp)
+target_link_libraries(oracle-eog PRIVATE ${LLAMA_CPP_BUILD}/bin/libllama.so ${AMDHIP64})
+add_executable(check-eog tests/check_eog.cpp src/backend/gguf.cpp src/backend/loader.cpp)
+target_include_directories(check-eog PRIVATE include)
+target_link_libraries(check-eog PRIVATE rdna4_tokenizer)

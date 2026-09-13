@@ -9,6 +9,7 @@
 // usage: check-sampler
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <map>
 #include <random>
@@ -324,6 +325,91 @@ int main() {
     const double tol = 4.0 * std::sqrt(p_best * (1.0 - p_best) / draws) + 0.01;
     std::printf("      top token: p=%.4f empirical=%.4f (tol %.4f)\n", p_best, emp, tol);
     check(std::fabs(emp - p_best) < tol, "sampling frequency matches the filtered probability");
+  }
+
+
+  // ---------------- degenerate inputs (review M4) ----------------
+  // These are the cases that make an ill-defined sort or an empty candidate set
+  // observable; each expectation mirrors llama.cpp's implementation.
+  {
+    const int n = 8;
+    std::vector<std::int32_t> no_hist;
+
+    // all -inf logits with greedy: llama_sampler_temp_impl keeps the first
+    // candidate (its running max starts at data[0] and nothing is > -inf), so the
+    // engine must not return an empty set / -1
+    std::vector<float> all_neg_inf((std::size_t)n, -std::numeric_limits<float>::infinity());
+    rdna4::SamplerParams g;
+    g.temp = 0.0f;
+    rdna4::Sampler sg;
+    sg.init(g, n);
+    std::vector<float> l1 = all_neg_inf;
+    const std::int32_t got = sg.sample(l1.data(), no_hist);
+    check(got == 0, "greedy with all -inf logits returns the first candidate (not -1)");
+
+    // NaN logits must not crash or produce an out-of-range id (llama.cpp's
+    // comparisons are false for NaN as well, so candidate 0 wins)
+    std::vector<float> nans((std::size_t)n, std::numeric_limits<float>::quiet_NaN());
+    std::vector<float> l2 = nans;
+    const std::int32_t got_nan = sg.sample(l2.data(), no_hist);
+    check(got_nan == 0, "greedy with NaN logits returns the first candidate");
+
+    // greedy must pick the lowest id among exact ties (strict comparison)
+    std::vector<float> tied((std::size_t)n, 1.0f);
+    std::vector<float> l3 = tied;
+    check(sg.sample(l3.data(), no_hist) == 0, "greedy breaks ties by lowest id");
+
+    // n_vocab == 1: every stage is a no-op, and the RNG is still consumed so the
+    // stream stays aligned with the multi-candidate case
+    rdna4::Sampler one;
+    one.init(g, 1);
+    std::vector<float> l4{2.5f};
+    check(one.sample(l4.data(), no_hist) == 0, "single-candidate vocab returns id 0");
+
+    // top_k >= n_vocab keeps everything
+    rdna4::SamplerParams tk;
+    tk.top_k = 1000;
+    tk.temp = 0.0f;
+    rdna4::Sampler s_tk;
+    s_tk.init(tk, n);
+    std::vector<float> base((std::size_t)n, 0.0f);
+    base[5] = 3.0f;
+    std::vector<float> l5 = base;
+    check(s_tk.sample(l5.data(), no_hist) == 5, "top_k > n_vocab keeps every candidate");
+
+    // repeat_last_n = 0 disables the penalty (llama.cpp clamps it to 0 and
+    // is_disabled() includes penalty_last_n == 0), so a repeated token keeps its
+    // logit; a positive window applies the penalty
+    std::vector<std::int32_t> hist{5, 5, 5};
+    rdna4::SamplerParams pen;
+    pen.temp = 0.0f;
+    pen.repeat_penalty = 2.0f;
+    pen.repeat_last_n = 0;
+    rdna4::Sampler s0;
+    s0.init(pen, n);
+    auto c0 = s0.filter(base.data(), hist);
+    check(c0.size() == 1 && c0[0].id == 5 && c0[0].logit == 3.0f,
+          "repeat_last_n 0 disables the penalty");
+    pen.repeat_last_n = -4;  // llama.cpp: max(n, 0) -> also disabled
+    rdna4::Sampler sneg;
+    sneg.init(pen, n);
+    auto cneg = sneg.filter(base.data(), hist);
+    check(cneg.size() == 1 && cneg[0].logit == 3.0f, "negative repeat_last_n disables the penalty");
+    pen.repeat_last_n = 64;
+    rdna4::Sampler sp2;
+    sp2.init(pen, n);
+    auto cp = sp2.filter(base.data(), hist);
+    check(cp.size() == 1 && cp[0].logit == 1.5f, "a positive window applies the penalty (3/2)");
+
+    // top_p <= 0 keeps exactly one candidate (llama.cpp's p<=0 path), min_p <= 0
+    // and repeat_penalty == 1 are disabled
+    rdna4::SamplerParams tp;
+    tp.temp = 0.0f;
+    tp.top_p = 0.0f;
+    rdna4::Sampler s_tp;
+    s_tp.init(tp, n);
+    std::vector<float> l6 = base;
+    check(s_tp.sample(l6.data(), no_hist) == 5, "top_p 0 keeps the best candidate");
   }
 
   std::printf("check-sampler: %s\n", failures ? "FAILED" : "OK");

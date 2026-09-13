@@ -80,6 +80,15 @@ Stats compare(const float *a, const float *b, std::int64_t n) {
   return s;
 }
 
+// Poison byte for the destination guard band: 0xAB is not a value any
+// dequantizer produces, so "still 0xABABABAB" is a reliable "never written".
+constexpr int kGuardByte = 0xAB;
+inline bool guard_is(float v) {
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &v, sizeof(bits));
+  return bits == 0xABABABABu;
+}
+
 int run_case(const char *label, DType dt, const std::uint8_t *src, std::int64_t nblocks,
              int nthreads, bool q8_variant) {
   const std::uint32_t be = rdna4::dtype_block_elems(dt);
@@ -97,12 +106,26 @@ int run_case(const char *label, DType dt, const std::uint8_t *src, std::int64_t 
 
   void *d_src = nullptr;
   float *d_dst = nullptr;
+  // Guard band: the destination is over-allocated and poisoned before the
+  // launch, so a kernel that writes past `nelem` (a block count that is too
+  // large for the dtype) trips the pattern check below instead of silently
+  // corrupting VRAM while the compared prefix stays bit-exact — exactly how the
+  // IQ4_NL 8x overrun slipped through (review M4, CRITICAL). The poison also
+  // catches the opposite: elements the kernel never wrote.
+  const std::size_t guard = 4096;
+  const std::size_t dst_elems = (std::size_t)nelem + guard;
   if (hipMalloc(&d_src, nbytes) != hipSuccess ||
-      hipMalloc(&d_dst, (std::size_t)nelem * sizeof(float)) != hipSuccess) {
+      hipMalloc(&d_dst, dst_elems * sizeof(float)) != hipSuccess) {
     std::fprintf(stderr, "%-9s hipMalloc failed\n", label);
     return 1;
   }
   hipMemcpy(d_src, src, nbytes, hipMemcpyHostToDevice);
+  if (hipMemset(d_dst, kGuardByte, dst_elems * sizeof(float)) != hipSuccess) {
+    std::fprintf(stderr, "%-9s hipMemset failed\n", label);
+    hipFree(d_src);
+    hipFree(d_dst);
+    return 1;
+  }
 
   if (!rdna4::dequant_row_launch(dt, d_src, d_dst, nelem)) {
     std::fprintf(stderr, "%-9s unsupported or launch failed\n", label);
@@ -117,17 +140,36 @@ int run_case(const char *label, DType dt, const std::uint8_t *src, std::int64_t 
     hipFree(d_dst);
     return 1;
   }
-  std::vector<float> gpu(nelem);
-  hipMemcpy(gpu.data(), d_dst, (std::size_t)nelem * sizeof(float), hipMemcpyDeviceToHost);
+  std::vector<float> gpu(dst_elems);
+  hipMemcpy(gpu.data(), d_dst, dst_elems * sizeof(float), hipMemcpyDeviceToHost);
   hipFree(d_src);
   hipFree(d_dst);
 
+  std::int64_t unwritten = 0, overflow = 0;
+  for (std::size_t i = 0; i < dst_elems; ++i) {
+    const bool poisoned = guard_is(gpu[i]);
+    if (i < (std::size_t)nelem) {
+      if (poisoned) ++unwritten;
+    } else if (!poisoned) {
+      ++overflow;
+    }
+  }
+
   const Stats s = compare(cpu.data(), gpu.data(), nelem);
   const bool bit_exact = (s.exact == s.nelem);
-  const bool ok = bit_exact || s.rel_l2 < 1e-6;
-  std::printf("%-9s %5lld blocks %8lld elems  exact=%7lld/%lld  max|d|=%.3e  rel-L2=%.3e  %s\n",
+  const bool ok = (bit_exact || s.rel_l2 < 1e-6) && unwritten == 0 && overflow == 0;
+  std::printf("%-9s %5lld blocks %8lld elems  exact=%7lld/%lld  max|d|=%.3e  rel-L2=%.3e  guard=%s  %s\n",
               label, (long long)nblocks, (long long)nelem, s.exact, s.nelem, s.max_abs, s.rel_l2,
+              overflow ? "OVERFLOW" : (unwritten ? "GAPS" : "ok"),
               bit_exact ? "BIT-EXACT" : (ok ? "OK" : "MISMATCH"));
+  if (overflow) {
+    std::fprintf(stderr, "%-9s wrote %lld element(s) past the %lld-element destination\n", label,
+                 (long long)overflow, (long long)nelem);
+  }
+  if (unwritten) {
+    std::fprintf(stderr, "%-9s left %lld element(s) unwritten (the destination is poisoned)\n",
+                 label, (long long)unwritten);
+  }
   return ok ? 0 : 1;
 }
 

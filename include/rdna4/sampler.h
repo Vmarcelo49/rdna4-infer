@@ -22,12 +22,14 @@
 namespace rdna4 {
 
 struct SamplerParams {
-  float temp = 1.0f;            // <= 0 => greedy (argmax of the survivors)
+  float temp = 1.0f;            // <= 0 => greedy (first max in id order)
   int top_k = 20;               // <= 0 => disabled
   float top_p = 0.95f;          // >= 1 => disabled
   float min_p = 0.0f;           // <= 0 => disabled
   float repeat_penalty = 1.0f;  // == 1 => disabled
-  int repeat_last_n = 64;       // window for the penalty (<= 0 => whole history)
+  // Penalty window, clamped to >= 0 as llama.cpp does; 0 disables the penalty
+  // (there is no "whole history" spelling in the reference — review M4).
+  int repeat_last_n = 64;
   std::uint64_t seed = 0;
 };
 

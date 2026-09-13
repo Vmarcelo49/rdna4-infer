@@ -48,11 +48,11 @@ void usage_run() {
       "  --no-thinking           disable thinking (--chat)\n"
       "  --reasoning-effort E    xhigh (default) | medium | low\n"
       "  --temp F                temperature, <= 0 => greedy (default 1.0)\n"
-      "  --top-k N               (default 20, <= 0 disables)\n"
-      "  --top-p F               (default 0.95, >= 1 disables)\n"
-      "  --min-p F               (default 0.0)\n"
+      "  --top-k N               (metadata default 20; <= 0 disables)\n"
+      "  --top-p F               (metadata default 0.95; >= 1 disables)\n"
+      "  --min-p F               (default 0.0; <= 0 disables)\n"
       "  --repeat-penalty F      (default 1.0)\n"
-      "  --repeat-last-n N       penalty window (default 64, <= 0 => whole history)\n"
+      "  --repeat-last-n N       penalty window (default 64; 0 disables the penalty)\n"
       "  --seed N                RNG seed (default 0)\n"
       "  --greedy                same as --temp 0\n"
       "  --ctx-size N            context (default 4096)\n"
@@ -63,6 +63,7 @@ void usage_run() {
 }
 
 bool parse_u64(const char *s, std::uint64_t *out) {
+  if (s[0] == '-') return false;  // strtoull would wrap "-1" into a huge value
   char *end = nullptr;
   unsigned long long v = std::strtoull(s, &end, 10);
   if (end == s || *end != '\0') {
@@ -107,6 +108,28 @@ bool parse_kv_type(const char *s, rdna4::KvType *out) {
     return false;
   }
   return true;
+}
+
+// The GGUF's own sampling defaults (general.sampling.*), which SPEC.md §1.4 and
+// PLAN.md M4 item 1 require the CLI to honour. Any value the user passes on the
+// command line wins; these are only the starting point, so a different file's
+// metadata is respected instead of a hardcoded 20/0.95/1.0.
+void apply_metadata_sampling(const rdna4::gguf::File &gf, rdna4::SamplerParams *sp,
+                             bool set_temp, bool set_top_k, bool set_top_p, bool set_min_p) {
+  auto num = [&](const char *key, double *out) {
+    auto it = gf.kv.find(key);
+    if (it == gf.kv.end()) return false;
+    const rdna4::gguf::Value &v = it->second;
+    const bool is_float = v.type == rdna4::gguf::F32 || v.type == rdna4::gguf::F64;
+    if (!is_float && (std::int32_t)v.type > (std::int32_t)rdna4::gguf::U64) return false;
+    *out = is_float ? v.f : (double)v.u;
+    return true;
+  };
+  double d = 0.0;
+  if (set_top_k && num("general.sampling.top_k", &d) && d > 0) sp->top_k = (int)d;
+  if (set_top_p && num("general.sampling.top_p", &d) && d > 0.0 && d <= 1.0) sp->top_p = (float)d;
+  if (set_temp && num("general.sampling.temp", &d) && d >= 0.0) sp->temp = (float)d;
+  if (set_min_p && num("general.sampling.min_p", &d) && d >= 0.0) sp->min_p = (float)d;
 }
 
 const char *kv_type_cstr(rdna4::KvType t) {
@@ -252,6 +275,7 @@ int cmd_run(int argc, char **argv) {
   std::uint64_t ctx_size = 4096;
   rdna4::KvType kv_k = rdna4::KvType::F16, kv_v = rdna4::KvType::F16;
   rdna4::SamplerParams sp;
+  bool temp_set = false, top_k_set = false, top_p_set = false, min_p_set = false;
   bool chat = false, thinking = true, verbose = false, stats = true;
   std::string effort = "xhigh";
 
@@ -296,8 +320,10 @@ int cmd_run(int argc, char **argv) {
         usage_run();
         return 1;
       }
+      temp_set = true;
     } else if (std::strcmp(a, "--greedy") == 0) {
       sp.temp = 0.0f;
+      temp_set = true;
     } else if (std::strcmp(a, "--top-k") == 0) {
       long long v = 0;
       const char *s = need_arg("--top-k");
@@ -306,18 +332,21 @@ int cmd_run(int argc, char **argv) {
         return 1;
       }
       sp.top_k = (int)v;
+      top_k_set = true;
     } else if (std::strcmp(a, "--top-p") == 0) {
       const char *v = need_arg("--top-p");
       if (!v || !parse_f32(v, &sp.top_p)) {
         usage_run();
         return 1;
       }
+      top_p_set = true;
     } else if (std::strcmp(a, "--min-p") == 0) {
       const char *v = need_arg("--min-p");
       if (!v || !parse_f32(v, &sp.min_p)) {
         usage_run();
         return 1;
       }
+      min_p_set = true;
     } else if (std::strcmp(a, "--repeat-penalty") == 0) {
       const char *v = need_arg("--repeat-penalty");
       if (!v || !parse_f32(v, &sp.repeat_penalty)) {
@@ -376,12 +405,6 @@ int cmd_run(int argc, char **argv) {
     usage_run();
     return 1;
   }
-  if (sp.top_k == 0 || sp.top_p <= 0.0f || sp.min_p < 0.0f || sp.repeat_penalty <= 0.0f) {
-    std::fprintf(stderr,
-                 "rdna4-infer run: invalid sampler parameters (top_k must not be 0, top_p > 0, "
-                 "min_p >= 0, repeat_penalty > 0)\n");
-    return 1;
-  }
 
   char arch[64] = {};
   std::size_t total_vram = 0;
@@ -413,6 +436,10 @@ int cmd_run(int argc, char **argv) {
     return 1;
   }
 
+  // sampler defaults from the metadata unless the user overrode them (see
+  // SamplerParams; the flags that were *not* given keep their literal value)
+  apply_metadata_sampling(gf, &sp, !temp_set, !top_k_set, !top_p_set, !min_p_set);
+
   rdna4::Tokenizer tk;
   if (!tk.init(gf, err)) {
     std::fprintf(stderr, "rdna4-infer: tokenizer failed: %s\n", err.c_str());
@@ -443,7 +470,8 @@ int cmd_run(int argc, char **argv) {
     std::fprintf(stderr, "rdna4-infer: the prompt produced no tokens\n");
     return 1;
   }
-  if (tk.add_bos()) prompt_ids.insert(prompt_ids.begin(), tk.bos_id());
+  // no BOS insert here: Tokenizer::encode() already applies add_bos_token (doing
+  // it twice would double the BOS for a vocab that sets it)
   if ((std::uint64_t)prompt_ids.size() >= ctx_size) {
     std::fprintf(stderr, "rdna4-infer: prompt (%zu tokens) does not fit ctx %llu\n",
                  prompt_ids.size(), (unsigned long long)ctx_size);
@@ -521,7 +549,10 @@ int cmd_run(int argc, char **argv) {
       std::fprintf(stderr, "rdna4-infer: sampler produced no token (empty candidate set)\n");
       return 1;
     }
-    if (id == tk.eos_id()) {
+    // stop on any end-of-generation token, exactly like llama.cpp's
+    // llama_vocab_is_eog (248044 <|endoftext|>, 248046 <|im_end|>, the FIM ids):
+    // stopping only on EOS would run past a generation the reference ends.
+    if (tk.is_eog(id)) {
       hit_eos = true;
       break;
     }
@@ -553,8 +584,9 @@ int cmd_run(int argc, char **argv) {
   }
   const double t_gen1 = now_s();
 
-  // flush a trailing incomplete UTF-8 sequence (it can never be completed once
-  // the loop ends) and make sure stdout ends with a newline for shell use
+  // Flush whatever is left: a trailing incomplete UTF-8 sequence can never be
+  // completed once the loop ends, so it is written as-is rather than dropped.
+  // No newline is appended (stdout is exactly the generated text).
   const std::string all = tk.decode(generated, /*skip_special=*/true);
   if (all.size() > emitted.size()) {
     std::fwrite(all.data() + emitted.size(), 1, all.size() - emitted.size(), stdout);

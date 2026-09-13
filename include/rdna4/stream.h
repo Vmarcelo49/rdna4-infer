@@ -1,4 +1,4 @@
-// Incremental output helpers for the CLI (PLAN.md M4, `run --stream`).
+// Incremental output helpers for the CLI's `run` command (PLAN.md M4).
 //
 // The engine emits one token at a time, but a UTF-8 character can span two
 // tokens: byte-encoded BPE pieces routinely split a multibyte character (e.g.

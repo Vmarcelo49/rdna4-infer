@@ -60,6 +60,17 @@ class Tokenizer {
            (types_[id] == kTokenControl || types_[id] == kTokenUnknown);
   }
 
+  // End of generation, exactly as llama.cpp defines it: the EOS token plus every
+  // vocab entry whose text is in llama.cpp's control-looking EOG list
+  // (`<|im_end|>`, `<|endoftext|>`, `</s>`, ...) plus the FIM ids when the GGUF
+  // carries them. For this vocab that is 248044 (`<|endoftext|>`) *and* 248046
+  // (`<|im_end|>`): stopping only on EOS would run past a generation the
+  // reference would have ended (review M4, MAJOR). `tests/check_eog.cpp` pins the
+  // set against `llama_vocab_is_eog`.
+  bool is_eog(std::int32_t id) const {
+    return id >= 0 && (std::size_t)id < eog_.size() && eog_[(std::size_t)id];
+  }
+
   // Text of one token, un-byte-decoded (the raw vocab entry).
   const std::string &token_text(std::int32_t id) const { return tokens_[id]; }
 
@@ -69,6 +80,7 @@ class Tokenizer {
 
   std::vector<std::string> tokens_;
   std::vector<std::int32_t> types_;
+  std::vector<bool> eog_;  // indexed by token id
   std::unordered_map<std::string, std::int32_t> token_to_id_;
   std::unordered_map<std::string, std::int32_t> merge_rank_;  // "left right" -> rank
   // Special tokens sorted longest-first, for the partition pass.

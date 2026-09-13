@@ -64,6 +64,13 @@ unicode_cpt_flags unicode_cpt_flags_from_utf8(const std::string & utf8);
 
 std::string unicode_byte_to_utf8(uint8_t byte);
 uint8_t unicode_utf8_to_byte(const std::string & utf8);
+// Non-throwing variant of unicode_utf8_to_byte (added here, not upstream): the
+// upstream version is `map.at()`, which throws std::out_of_range on a codepoint
+// that is not part of the GPT-2 byte encoding. A tokenizer decoding an
+// unexpected vocab (a BYTE token, a special token spelled with a codepoint
+// outside the map) would then abort through an uncaught exception instead of
+// emitting text (review M4). Returns false when there is no mapping.
+bool unicode_utf8_to_byte_safe(const std::string & utf8, uint8_t * out);
 
 uint32_t unicode_tolower(uint32_t cpt);
 bool unicode_cpt_is_han(uint32_t cpt);

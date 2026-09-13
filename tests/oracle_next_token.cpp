@@ -124,14 +124,17 @@ int main(int argc, char **argv) {
   if (greedy_env) {
     const int want = std::atoi(greedy_env);
     const llama_vocab *vocab = llama_model_get_vocab(model);
-    const llama_token eos = llama_vocab_eos(vocab);
+    // llama-cli stops on any EOG token (llama_vocab_is_eog), not just EOS: for
+    // this vocab that includes 248044 (<|endoftext|>) and the FIM ids, so using
+    // llama_vocab_eos here would compare against a reference that generates past
+    // its own stop condition (review M4).
     std::vector<llama_token> out;
     std::string text;
     llama_pos pos = (llama_pos)tokens.size();
     llama_token best = (llama_token)idx[0];
     float best_logit = logits[idx[0]];
     for (int step = 0; step < want; ++step) {
-      if (best == eos) break;
+      if (llama_vocab_is_eog(vocab, best)) break;
       out.push_back(best);
       std::vector<char> buf(256);
       const int n = llama_token_to_piece(vocab, best, buf.data(), (int)buf.size(), 0, false);

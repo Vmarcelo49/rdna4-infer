@@ -51,28 +51,40 @@ RD_FN(FnIQ2S, dequantize_iq2_s);
 RD_FN(FnIQ4XS, dequantize_iq4_xs);
 #undef RD_FN
 
-// Dequantizes `nelem` elements (nelem % block_elems == 0) starting at d_src.
+// Dequantizes `nelem` elements (nelem % unit == 0) starting at d_src.
+//
+// The unit size is NOT `dtype_block_elems()`: every kernel here consumes a
+// 256-element unit, because the 256-based dequantizers are the fused variants
+// that decode a whole QK_K group per call — including `dequantize_iq4_nl`, whose
+// *storage* block is 32 elements but whose kernel indexes 8 of them at once
+// (`x + ibs*(QK_K/QK4_NL)`, `yy + i*256`, dequant.cuh:286). Only q8_0 keeps its
+// 32-element shape, because llama.cpp's get_rows has a dedicated float2 kernel
+// for it. Counting IQ4_NL in 32-element blocks launched 8x too many units and
+// wrote past the destination (review M4, CRITICAL) — the block arithmetic is
+// therefore explicit here instead of derived from the storage layout.
 inline bool dequant_row_launch(DType dt, const void *d_src, float *d_dst, std::int64_t nelem,
                                hipStream_t stream = nullptr) {
   if (dt == DType::F32) {
     return hipMemcpyAsync(d_dst, d_src, (std::size_t)nelem * sizeof(float),
                           hipMemcpyDeviceToDevice, stream) == hipSuccess;
   }
-  const std::int64_t be = (std::int64_t)dtype_block_elems(dt);
-  if (be == 0 || nelem % be != 0) return false;
-  const std::int64_t nblocks = nelem / be;
+  const std::int64_t unit = dt == DType::Q8_0 ? 32 : 256;
+  if (nelem <= 0 || nelem % unit != 0) return false;
+  const std::int64_t nblocks = nelem / unit;
+  // the kernels are grid-strided, so the grid can be capped (the validated test
+  // copy did the same)
+  const unsigned grid = (unsigned)(nblocks < 4096 ? nblocks : 4096);
 
   if (dt == DType::Q8_0) {
     // 16 threads x 2 elements (the float2 form llama.cpp's get_rows uses for
     // q8_0); a 32-thread launch would index past the 32-element block
-    dequant_kernel_q8_0<<<(unsigned)nblocks, 16, 0, stream>>>(d_src, d_dst, nblocks);
+    dequant_kernel_q8_0<<<grid, 16, 0, stream>>>(d_src, d_dst, nblocks);
     return hipGetLastError() == hipSuccess;
   }
   if (dt == DType::IQ4_NL) {
-    dequant_kernel_256<FnIQ4NL><<<(unsigned)nblocks, 32, 0, stream>>>(d_src, d_dst, nblocks);
+    dequant_kernel_256<FnIQ4NL><<<grid, 32, 0, stream>>>(d_src, d_dst, nblocks);
     return hipGetLastError() == hipSuccess;
   }
-  const unsigned grid = (unsigned)nblocks;
   switch (dt) {
     case DType::Q2_K: dequant_kernel_256<FnQ2K><<<grid, 64, 0, stream>>>(d_src, d_dst, nblocks); break;
     case DType::Q3_K: dequant_kernel_256<FnQ3K><<<grid, 64, 0, stream>>>(d_src, d_dst, nblocks); break;

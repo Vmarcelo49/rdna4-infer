@@ -35,13 +35,19 @@ ORACLE_NGL="$ORACLE_NGL" ORACLE_STEP=1 ORACLE_GREEDY="$N" \
   { echo "oracle failed (see $TMP/oracle.log)"; tail -5 "$TMP/oracle.log"; exit 1; }
 
 # 3. compare token by token (an id-by-id diff localises the first divergence)
-python3 - "$TMP/rdna4.ids" "$TMP/llama.ids" "$TMP/rdna4.txt" "$TMP/llama.txt" <<'PY'
+python3 - "$TMP/rdna4.ids" "$TMP/llama.ids" "$TMP/rdna4.txt" "$TMP/llama.txt" "$N" <<'PY'
 import sys
 a = [int(x) for x in open(sys.argv[1]).read().split()]
 b = [int(x) for x in open(sys.argv[2]).read().split()]
+want = int(sys.argv[5])
 n = min(len(a), len(b))
 first = next((i for i in range(n) if a[i] != b[i]), None)
-print(f"rdna4: {len(a)} tokens, llama.cpp: {len(b)} tokens")
+print(f"rdna4: {len(a)} tokens, llama.cpp: {len(b)} tokens (asked for {want})")
+# An empty comparison is not evidence: two engines that both emit nothing match
+# vacuously, so require at least one token on both sides (review M4).
+if not a or not b:
+    print("VACUOUS: at least one engine produced no tokens — nothing was compared")
+    sys.exit(1)
 if first is None and len(a) == len(b):
     print(f"IDS MATCH: all {len(a)} greedy tokens identical")
 elif first is None:
@@ -55,5 +61,9 @@ print(f"text: rdna4 {len(ta)} bytes, llama.cpp {len(tb)} bytes, "
       f"{'IDENTICAL' if ta == tb else 'DIFFERENT'}")
 sys.stdout.write("rdna4 text: " + repr(ta) + "\n")
 sys.stdout.write("llama text: " + repr(tb) + "\n")
+# a run that stopped early is still a comparison, but a run shorter than asked
+# for means the engines disagreed about stopping (or the prompt decode failed)
+if len(a) < want or len(b) < want:
+    print(f"NOTE: asked for {want} tokens, got {len(a)}/{len(b)} (early EOG?)")
 sys.exit(0 if (ta == tb and a == b) else 1)
 PY

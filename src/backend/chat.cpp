@@ -44,8 +44,12 @@ bool chat_render(const std::vector<ChatMessage> &messages, const ChatOptions &op
     err = "no messages provided";
     return false;
   }
-  if (opts.reasoning_effort != "xhigh" && opts.reasoning_effort != "high" &&
-      opts.reasoning_effort != "medium" && opts.reasoning_effort != "low") {
+  // The template only looks at reasoning_effort inside its thinking block, so
+  // with thinking disabled an unknown effort is never validated there (and must
+  // not be rejected here either — review M4).
+  if (opts.enable_thinking && opts.reasoning_effort != "xhigh" &&
+      opts.reasoning_effort != "high" && opts.reasoning_effort != "medium" &&
+      opts.reasoning_effort != "low") {
     err = "unexpected reasoning effort " + opts.reasoning_effort +
           " (supported: xhigh, medium, low)";
     return false;

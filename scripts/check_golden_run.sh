@@ -45,10 +45,14 @@ run_case() {
 
 # ---------------------------------------------------------------- greedy ----
 # temp 0 => RNG-independent, so this is a pure model/engine regression gate.
-run_case "greedy" "$TMP/g.out" "$TMP/g.err" --greedy
-grep '^generated ids:' "$TMP/g.err" > "$TMP/g.ids" || bad "greedy: no 'generated ids:' line"
+greedy_ok=1
+run_case "greedy" "$TMP/g.out" "$TMP/g.err" --greedy || greedy_ok=0
+grep '^generated ids:' "$TMP/g.err" > "$TMP/g.ids" || { bad "greedy: no 'generated ids:' line"; greedy_ok=0; }
 
-if [ "${UPDATE:-0}" = "1" ]; then
+# Never overwrite a committed golden with the output of a run that failed: a
+# broken build would otherwise destroy the reference it is supposed to be
+# checked against (review M4).
+if [ "$greedy_ok" = "1" ] && [ "${UPDATE:-0}" = "1" ]; then
   cp "$TMP/g.out" "$GOLD/run_greedy_IQ3_S.txt"
   cp "$TMP/g.ids" "$GOLD/run_greedy_ids_IQ3_S.txt"
   note "updated $GOLD/run_greedy_IQ3_S.txt and run_greedy_ids_IQ3_S.txt"
@@ -73,9 +77,11 @@ if ! cmp -s "$TMP/s1.out" "$TMP/s2.out"; then
   bad "same seed produced different text"
   diff -u "$TMP/s1.out" "$TMP/s2.out" | head -20
 fi
-grep '^generated ids:' "$TMP/s1.err" > "$TMP/s1.ids" || bad "sample: no 'generated ids:' line"
+sample_ok=1
+grep '^generated ids:' "$TMP/s1.err" > "$TMP/s1.ids" || { bad "sample: no 'generated ids:' line"; sample_ok=0; }
+if [ "$sample_ok" != "1" ]; then UPDATE=0; fi
 
-if [ "${UPDATE:-0}" = "1" ]; then
+if [ "$sample_ok" = "1" ] && [ "${UPDATE:-0}" = "1" ]; then
   cp "$TMP/s1.out" "$GOLD/run_sample_IQ3_S.txt"
   cp "$TMP/s1.ids" "$GOLD/run_sample_ids_IQ3_S.txt"
   note "updated $GOLD/run_sample_IQ3_S.txt and run_sample_ids_IQ3_S.txt"
@@ -89,6 +95,20 @@ else
       diff -u "$want" "$got" | head -30
     fi
   done
+fi
+
+# ------------------------------------------------------- stdout purity -----
+# stdout must carry generated text only: running with and without -v must give
+# byte-identical stdout (every diagnostic belongs on stderr).
+run_case "no-verbose" "$TMP/p.out" "$TMP/p.err" --greedy
+if ! cmp -s "$TMP/p.out" "$TMP/g.out"; then
+  bad "-v changed stdout (a diagnostic leaked into the generated text)"
+  diff <(cat "$TMP/g.out") <(cat "$TMP/p.out") | head -10
+fi
+if [ -s "$TMP/p.err" ]; then
+  note "no-verbose stderr: $(wc -l < "$TMP/p.err") line(s)"
+else
+  bad "stderr is empty without --no-stats (stats should still be printed)"
 fi
 
 # ------------------------------------------------------------ seed control --
@@ -113,6 +133,19 @@ fi
 if ! head -c 8 "$TMP/q.out" | grep -q 'Paris'; then
   bad "kv q4_0: greedy continuation does not start with ' Paris' (got '$(head -c 20 "$TMP/q.out")')"
 fi
+
+# mixed cache types (the graph supports k/v independently; only f16/f16 and
+# q4_0/q4_0 had been exercised)
+for combo in "f16 q8_0" "q8_0 f16" "f32 q4_0"; do
+  set -- $combo
+  if run_case "kv-$1-$2" "$TMP/m.out" "$TMP/m.err" --greedy --cache-type-k "$1" --cache-type-v "$2"; then
+    if head -c 8 "$TMP/m.out" | grep -q 'Paris'; then
+      note "kv $1/$2: ok"
+    else
+      bad "kv $1/$2: continuation does not start with ' Paris' ('$(head -c 20 "$TMP/m.out")')"
+    fi
+  fi
+done
 
 if [ "$fail" = "0" ]; then
   note "check-golden-run: OK"
