@@ -251,25 +251,6 @@ struct MatvecConfig {
   int wpr;   // warps cooperating per row
 };
 
-inline MatvecConfig matvec_default_config(int dt) {
-  switch (dt) {
-    case 1:  return {2, 1};  // q8_0     671 GB/s
-    case 2:  return {2, 1};  // q2_K     337
-    case 3:  return {1, 8};  // q3_K     321  (very long rows: token_embd)
-    case 4:  return {8, 1};  // q4_K     694
-    case 5:  return {4, 1};  // q5_K     610
-    case 6:  return {1, 4};  // q6_K     484
-    case 7:  return {4, 1};  // iq2_xxs  227
-    case 8:  return {2, 2};  // iq2_xs   248
-    case 9:  return {2, 1};  // iq3_xxs  336
-    case 10: return {1, 4};  // iq1_s    433
-    case 11: return {8, 1};  // iq4_nl   179
-    case 12: return {8, 1};  // iq3_s    374
-    case 13: return {2, 1};  // iq2_s    289
-    case 14: return {8, 1};  // iq4_xs   241
-    default: return {4, 1};
-  }
-}
 
 template <class T, int ROWS, int WPR, int ILP = 1, bool PF = false, int MINB = 0>
 inline bool launch_gen(const void *d_weights, const block_q8_1 *d_act, float *d_out, int64_t nrows,
@@ -281,42 +262,6 @@ inline bool launch_gen(const void *d_weights, const block_q8_1 *d_act, float *d_
   return hipGetLastError() == hipSuccess;
 }
 
-// Supported (ROWS, WPR) shapes; the bench sweeps exactly these.
-#define RD_CFG_CASES(Traits, QK)                                                                \
-  if (cfg.rows == 4 && cfg.wpr == 1) return launch_gen<Traits, 4, 1>(d_w, d_a, d_o, nrows, ncols / QK, stream); \
-  if (cfg.rows == 2 && cfg.wpr == 1) return launch_gen<Traits, 2, 1>(d_w, d_a, d_o, nrows, ncols / QK, stream); \
-  if (cfg.rows == 1 && cfg.wpr == 1) return launch_gen<Traits, 1, 1>(d_w, d_a, d_o, nrows, ncols / QK, stream); \
-  if (cfg.rows == 8 && cfg.wpr == 1) return launch_gen<Traits, 8, 1>(d_w, d_a, d_o, nrows, ncols / QK, stream); \
-  if (cfg.rows == 1 && cfg.wpr == 2) return launch_gen<Traits, 1, 2>(d_w, d_a, d_o, nrows, ncols / QK, stream); \
-  if (cfg.rows == 1 && cfg.wpr == 4) return launch_gen<Traits, 1, 4>(d_w, d_a, d_o, nrows, ncols / QK, stream); \
-  if (cfg.rows == 1 && cfg.wpr == 8) return launch_gen<Traits, 1, 8>(d_w, d_a, d_o, nrows, ncols / QK, stream); \
-  if (cfg.rows == 2 && cfg.wpr == 2) return launch_gen<Traits, 2, 2>(d_w, d_a, d_o, nrows, ncols / QK, stream);
-
-// Dispatches on type and shape. Returns false for a type with no kernel: the
-// caller must fail loudly, never fall back to CPU (SPEC 1.3).
-inline bool matvec_launch_cfg(int dt, const void *d_w, const block_q8_1 *d_a, float *d_o,
-                              int64_t nrows, int64_t ncols, hipStream_t stream, MatvecConfig cfg) {
-  switch (dt) {
-    case 1:  RD_CFG_CASES(TQ8_0, 32)  break;
-    case 2:  RD_CFG_CASES(TQ2K, 256)  break;
-    case 3:  RD_CFG_CASES(TQ3K, 256)  break;
-    case 4:  RD_CFG_CASES(TQ4K, 256)  break;
-    case 5:  RD_CFG_CASES(TQ5K, 256)  break;
-    case 6:  RD_CFG_CASES(TQ6K, 256)  break;
-    case 7:  RD_CFG_CASES(TIQ2XXS, 256) break;
-    case 8:  RD_CFG_CASES(TIQ2XS, 256) break;
-    case 9:  RD_CFG_CASES(TIQ3XXS, 256) break;
-    case 10: RD_CFG_CASES(TIQ1S, 256) break;
-    case 11: RD_CFG_CASES(TIQ4NL, 32) break;
-    case 12: RD_CFG_CASES(TIQ3S, 256) break;
-    case 13: RD_CFG_CASES(TIQ2S, 256) break;
-    case 14: RD_CFG_CASES(TIQ4XS, 256) break;
-    default: return false;
-  }
-  return false;  // unsupported (rows, wpr) shape
-}
-
-#undef RD_CFG_CASES
 
 template <int Dt> struct MtShape;             // { rows, wpr } per dtype ordinal
 template <> struct MtShape<1>  { static constexpr int rows = 2, wpr = 1; };  // q8_0
@@ -352,6 +297,41 @@ template <> struct MtIlp<11> { static constexpr int value = 1; };  // iq4_nl
 template <> struct MtIlp<12> { static constexpr int value = 1; };  // iq3_s
 template <> struct MtIlp<13> { static constexpr int value = 1; };  // iq2_s
 template <> struct MtIlp<14> { static constexpr int value = 2; };  // iq4_xs
+
+inline MatvecConfig matvec_default_config(int dt) {
+  // Derived from the compile-time tables so the reported/shipping shape and the
+  // instantiated kernel can never disagree (review finding L7).
+  switch (dt) {
+    case 1:  return {MtShape<1>::rows,  MtShape<1>::wpr};
+    case 2:  return {MtShape<2>::rows,  MtShape<2>::wpr};
+    case 3:  return {MtShape<3>::rows,  MtShape<3>::wpr};
+    case 4:  return {MtShape<4>::rows,  MtShape<4>::wpr};
+    case 5:  return {MtShape<5>::rows,  MtShape<5>::wpr};
+    case 6:  return {MtShape<6>::rows,  MtShape<6>::wpr};
+    case 7:  return {MtShape<7>::rows,  MtShape<7>::wpr};
+    case 8:  return {MtShape<8>::rows,  MtShape<8>::wpr};
+    case 9:  return {MtShape<9>::rows,  MtShape<9>::wpr};
+    case 10: return {MtShape<10>::rows, MtShape<10>::wpr};
+    case 11: return {MtShape<11>::rows, MtShape<11>::wpr};
+    case 12: return {MtShape<12>::rows, MtShape<12>::wpr};
+    case 13: return {MtShape<13>::rows, MtShape<13>::wpr};
+    case 14: return {MtShape<14>::rows, MtShape<14>::wpr};
+    default: return {4, 1};
+  }
+}
+
+inline int matvec_default_ilp(int dt) {
+  switch (dt) {
+    case 1:  return MtIlp<1>::value;   case 2:  return MtIlp<2>::value;
+    case 3:  return MtIlp<3>::value;   case 4:  return MtIlp<4>::value;
+    case 5:  return MtIlp<5>::value;   case 6:  return MtIlp<6>::value;
+    case 7:  return MtIlp<7>::value;   case 8:  return MtIlp<8>::value;
+    case 9:  return MtIlp<9>::value;   case 10: return MtIlp<10>::value;
+    case 11: return MtIlp<11>::value;  case 12: return MtIlp<12>::value;
+    case 13: return MtIlp<13>::value;  case 14: return MtIlp<14>::value;
+    default: return 1;
+  }
+}
 
 // Shipping path: shape and ILP are compile-time per type (both measured), so
 // this instantiates exactly one kernel per type.
