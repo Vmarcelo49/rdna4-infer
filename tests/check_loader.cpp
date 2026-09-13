@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "rdna4/loader.h"
+#include "rdna4/model.h"
 
 namespace {
 
@@ -118,6 +119,29 @@ int main(int argc, char **argv) {
   }
 
   bool ok = true;
+  // qwen35 config + layer-layout validation (M1 items 2-3).
+  rdna4::Qwen35Config cfg;
+  std::string verr;
+  if (!rdna4::parse_qwen35_config(f, cfg, verr)) {
+    std::fprintf(stderr, "check-loader: config failed: %s\n", verr.c_str());
+    return 1;
+  }
+  std::printf("qwen35: %u blocks (full-attn every %u) emb=%llu ffn=%llu ctx=%llu "
+              "rope_sections=[",
+              cfg.block_count, cfg.full_attention_interval,
+              (unsigned long long)cfg.embedding_length,
+              (unsigned long long)cfg.feed_forward_length,
+              (unsigned long long)cfg.context_length);
+  for (std::size_t i = 0; i < cfg.rope_dim_sections.size(); ++i) {
+    std::printf("%s%llu", i ? "," : "",
+                (unsigned long long)cfg.rope_dim_sections[i]);
+  }
+  std::printf("]\n");
+  ok = rdna4::validate_qwen35_layout(ld, cfg, verr) && ok;
+  if (!ok) {
+    std::fprintf(stderr, "check-loader: layout failed: %s\n", verr.c_str());
+    return 1;
+  }
   // F32 spot-loads: finiteness + magnitude prove the data section offsets are
   // right (garbage offsets => garbage floats).
   ok = check_f32(ld, "blk.0.attn_norm.weight", 10.0) && ok;

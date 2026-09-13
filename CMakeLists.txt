@@ -13,7 +13,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # v1 targets gfx1201 only (SPEC.md 1.3). No other arch is ever added here.
 # --offload-arch em vez de CMAKE_HIP_ARCHITECTURES: funciona em CMake antigo.
-add_executable(rdna4-infer src/main.hip src/backend/gguf.cpp src/backend/loader.cpp)
+add_executable(rdna4-infer src/main.hip src/backend/gguf.cpp src/backend/loader.cpp
+                     src/backend/model.cpp)
 
 target_compile_options(rdna4-infer PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
 target_link_options(rdna4-infer PRIVATE --offload-arch=gfx1201)
@@ -30,5 +31,9 @@ target_link_libraries(rdna4-infer PRIVATE ${AMDHIP64})
 add_executable(check-dtype tests/check_dtype.cpp src/backend/gguf.cpp)
 target_include_directories(check-dtype PRIVATE include)
 
-add_executable(check-loader tests/check_loader.cpp src/backend/gguf.cpp src/backend/loader.cpp)
+add_executable(check-loader tests/check_loader.cpp src/backend/gguf.cpp
+                   src/backend/loader.cpp src/backend/model.cpp)
 target_include_directories(check-loader PRIVATE include)
+add_executable(check-model tests/check_model.cpp src/backend/gguf.cpp
+                 src/backend/loader.cpp src/backend/model.cpp)
+target_include_directories(check-model PRIVATE include)

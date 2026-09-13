@@ -14,7 +14,7 @@ Objetivo: binário que só existe no mundo gfx1201.
    Ref: `SPEC.md` §1.3 e §3.
 4. **Aceite:** binário imprime nome/arch da GPU; aborta com mensagem clara sem gfx1201 ou sem VRAM.
 
-## M1 — Loader GGUF `qwen35` denso
+## M1 — Loader GGUF `qwen35` denso ✅ (todos os itens 1-5, ver Progresso)
 
 Objetivo: ler os dois arquivos UD e validar tudo fail-fast.
 
@@ -26,7 +26,13 @@ Objetivo: ler os dois arquivos UD e validar tudo fail-fast.
   - **Fato de formato (crítico p/ o loader):** offsets dos tensores são **relativos ao início da seção de dados** = fim do header **padded a `alignment`** (`GGML_PAD`), confirmado no reader de referência (`ggml/src/gguf.cpp`: `gr.seek(GGML_PAD(tell, alignment)); ctx->offset = tell`). Header ~11 MB (vocab 248320); `data_offset=10996640` nos dois arquivos.
   - **Tabela de block size (elems, bytes)** validada empiricamente nos arquivos reais e cross-check com `llama-gguf r` (b10902): F32(1,4), Q8_0(32,34), Q2_K(256,84), Q3_K(256,110), Q4_K(256,144), Q5_K(256,176), Q6_K(256,210), IQ2_XXS(256,66), IQ2_XS(256,74), IQ3_XXS(256,98), IQ1_S(256,50), IQ4_NL(32,18), IQ3_S(256,110), IQ2_S(256,82), IQ4_XS(256,136). **O snapshot `.ref` (790cf51) está em refactoring e é auto-inconsistente para `IQ1_S` (struct 66 B vs `static_assert` 50 B) — NÃO usar como referência de formato de arquivo.**
   - Spot-loads F32 com valores plausíveis (`attn_norm` ∈ [0.86,1.2], `ssm_a` negativo pequeno) nos dois arquivos — valores idênticos entre os dois UD, como esperado para tensores F32.
-- **Itens do M1:** item 1 (parser binário) ✅, item 4 (union de tipos) ✅, item 5 (aceite: 866 tensores listados) ✅ — via `check-loader` + `rdna4-infer --list-tensors`, ambos nos dois arquivos. Item 2 (KVs obrigatórias `qwen35.*`: arch/rope/ctx) e item 3 (inventário por camada 48 GDN / 16 full / bloco 64 MTP) — **pendentes** (próximo passo).
+- **Passo 3 — Config `qwen35` + inventário por camada ✅** (`include/rdna4/model.h`, `src/backend/model.cpp`, `tests/check_model.cpp`, `tests/gen_fake_qwen35.py`):
+  - `parse_qwen35_config()` (item 2): fail-fast em `general.architecture != "qwen35"` ou KV ausente/tipo errado. Conjunto exigido: `block_count`, `full_attention_interval`, `nextn_predict_layers`, `context_length`, `embedding_length`, `feed_forward_length`, `attention.head_count`/`head_count_kv`, `key_length`/`value_length`, `ssm.{conv_kernel,state_size,group_count,time_step_rank,inner_size}`, `rope.dimension_count`, `rope.dimension_sections` (array inteiro — **I32** no arquivo, `[11,11,10,0]`), `layer_norm_rms_epsilon`, `rope.freq_base`, `bos/eos/pad_token_id`.
+  - `validate_qwen35_layout()` (item 3): inventário exato por bloco — 48 GDN (14 tensores) quando `(i+1) % interval != 0`, 16 full (11 tensores) quando `(i+1) % interval == 0`, bloco 64 = MTP (conjunto full + 4 `nextn.*`); nomes **e** dims exatos, derivadas dos KVs (ex.: `attn_qkv` GDN = 5·group·state = 10240; `attn_q` full = heads·2·klen = 12288). Top-level: `token_embd`/`output`/`output_norm` (vocab não fixado; consistência emb + shared-V checada). Erro nomeia o tensor (missing / unexpected / dims mismatch).
+  - Wired em `rdna4-infer` (toda execução real), `check-loader` e `check-model` (CPU-only, standalone).
+  - **Fail-fast provado**: `tests/gen_fake_qwen35.py` gera mini-qwen35 de 2 blocos (dims 32-B aligned); `check-model` aceita o arquivo íntegro e rejeita tensor faltando / dim errada / tensor extra com mensagem específica. Arquivos reais passam nos dois: `65 blocks (16 full-attn, 48 GDN, 1 MTP)`.
+  - **Layout ground truth (extraído dos arquivos)**: GDN = `attn_gate [5120,6144]`, `attn_norm [5120]`, `attn_qkv [5120,10240]`, `ffn_down/gate/up`, `post_attention_norm [5120]`, `ssm_a [48]`, `ssm_alpha/beta [5120,48]`, `ssm_conv1d [4,10240]`, `ssm_dt.bias [48]`, `ssm_norm [128]`, `ssm_out [6144,5120]`; full = `attn_k [5120,1024]`, `attn_k_norm [256]`, `attn_norm`, `attn_output [6144,5120]`, `attn_q [5120,12288]`, `attn_q_norm [256]`, `attn_v [5120,1024]`, `ffn_*`; MTP = full + `nextn.eh_proj [10240,5120]`, `nextn.enorm/hnorm/shared_head_norm [5120]`.
+- **Itens do M1:** todos ✅ — item 1 (parser binário), item 2 (KVs obrigatórias), item 3 (inventário 48 GDN / 16 full / bloco 64 MTP), item 4 (union de tipos), item 5 (aceite: 866 tensores listados nos dois arquivos). **M1 completo.**
 
 1. Implementar o parser binário (magic `GGUF`, versão 3, KVs, tensores).
    Ref: `docs/gguf-qwen-quantizacao-llamacpp.md` §1 (`gguf.h` L1-32) · `.ref/llama.cpp/ggml/include/gguf.h`.

@@ -6,6 +6,7 @@
 
 #include "rdna4/device.h"
 #include "rdna4/loader.h"
+#include "rdna4/model.h"
 
 namespace {
 
@@ -103,6 +104,23 @@ int main(int argc, char **argv) {
               rdna4::gguf::kv_str(gf, "general.architecture", "?").c_str(),
               (unsigned long long)gf.tensors.size(), (unsigned long long)gf.kv.size(),
               static_cast<double>(loader.total_bytes()) / (1u << 30));
+  rdna4::Qwen35Config cfg;
+  if (!rdna4::parse_qwen35_config(gf, cfg, gerr)) {
+    std::fprintf(stderr, "rdna4-infer: config failed: %s\n", gerr.c_str());
+    return 1;
+  }
+  if (!rdna4::validate_qwen35_layout(loader, cfg, gerr)) {
+    std::fprintf(stderr, "rdna4-infer: layout failed: %s\n", gerr.c_str());
+    return 1;
+  }
+  const unsigned main_blocks = cfg.block_count - 1;  // exclude the MTP block
+  const unsigned full_attn = main_blocks / cfg.full_attention_interval;
+  std::printf("qwen35: %u blocks (%u full-attn, %u GDN, 1 MTP) emb=%llu ffn=%llu "
+              "ctx=%llu  layout OK\n",
+              cfg.block_count, full_attn, main_blocks - full_attn,
+              (unsigned long long)cfg.embedding_length,
+              (unsigned long long)cfg.feed_forward_length,
+              (unsigned long long)cfg.context_length);
   if (list_tensors) {
     for (std::size_t i = 0; i < gf.tensors.size(); ++i) {
       const auto &t = gf.tensors[i];
