@@ -544,7 +544,7 @@ int cmd_run(int argc, char **argv) {
     }
     const double t0 = now_s();
     if (!graph.forward_tokens({id}, (int)history.size() - 1, hidden, logits, err)) {
-      std::fprintf(stderr, "\rdna4-infer: decode failed at step %lld: %s\n", step, err.c_str());
+      std::fprintf(stderr, "rdna4-infer: decode failed at step %lld: %s\n", step, err.c_str());
       return 1;
     }
     if (verbose) {
