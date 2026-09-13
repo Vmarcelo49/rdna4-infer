@@ -116,6 +116,10 @@ add_executable(check-tokenizer tests/check_tokenizer.cpp src/backend/gguf.cpp
                                 src/backend/loader.cpp)
 target_link_libraries(check-tokenizer PRIVATE rdna4_tokenizer)
 
+# M4 — sampler.
+add_executable(check-sampler tests/check_sampler.cpp src/backend/sampler.cpp)
+target_include_directories(check-sampler PRIVATE include)
+
 # M3 step 3 — the assembled qwen35 forward graph vs the eval-callback oracle.
 add_executable(check-graph-gpu tests/check_graph_gpu.hip
                  tests/dequant_cpu_oracle.cpp src/backend/gguf.cpp src/backend/loader.cpp
