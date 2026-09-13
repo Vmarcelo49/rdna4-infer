@@ -2,7 +2,9 @@
 //
 // Validates the kernels in include/rdna4/attn.cuh against the documented
 // reference semantics (llama.cpp qwen35 + ggml_rope_cache_init):
-//   angle(pair p, position t) = pos[t] * freq_base^(-2p/n_rot), adjacent pairs,
+//   angle(pair p, position t) = pos[t] * freq_base^(-2p/n_rot), split-half pairs
+//   (element p rotates with element p + n_rot/2 — ggml's rotate_pairs with
+//   n_offset = n_dims/2 is what NEOX/MROPE/IMROPE use),
 //   applied to the first n_rot dims of each head.
 // The attention check is a straightforward softmax(q·k/sqrt(d))·v reference.
 //
@@ -57,9 +59,9 @@ int main() {
         for (int p = 0; p < kRot / 2; ++p) {
           const float theta = (float)pos[t] * std::pow(kBase, -2.0f * (float)p / (float)kRot);
           const float c = std::cos(theta), s = std::sin(theta);
-          const float x0 = base[2 * p], x1 = base[2 * p + 1];
-          base[2 * p] = x0 * c - x1 * s;
-          base[2 * p + 1] = x0 * s + x1 * c;
+          const float x0 = base[p], x1 = base[p + kRot / 2];
+          base[p] = x0 * c - x1 * s;
+          base[p + kRot / 2] = x0 * s + x1 * c;
         }
       }
     }
@@ -92,7 +94,9 @@ int main() {
     std::vector<float> ref(nq, 0.0f);
     for (int t = 0; t < kTokens; ++t) {
       for (int h = 0; h < kHead; ++h) {
-        const int kvh = h / (kHead / kHeadKv);
+        // GQA as the reference does it: query head h reads kv head h % kHeadKv
+        // (ggml flash attention repeats the kv heads into the query heads)
+        const int kvh = h % kHeadKv;
         std::vector<double> sc(t + 1);
         double m = -1e30;
         for (int j = 0; j <= t; ++j) {
@@ -124,9 +128,16 @@ int main() {
     hipMemcpy(d_q, q.data(), nq * sizeof(float), hipMemcpyHostToDevice);
     hipMemcpy(d_k, k.data(), nkv * sizeof(float), hipMemcpyHostToDevice);
     hipMemcpy(d_v, v.data(), nkv * sizeof(float), hipMemcpyHostToDevice);
-    const bool ok = rdna4::attn_launch(d_q, d_k, d_v, d_o, kTokens, kHead, kHeadKv, kHeadDim, scale);
-    std::vector<float> got(nq);
-    hipMemcpy(got.data(), d_o, nq * sizeof(float), hipMemcpyDeviceToHost);
+    // one launch per query token, against the cache rows 0..t
+    std::vector<float> got(nq, 0.0f);
+    bool ok = true;
+    for (int t = 0; t < kTokens; ++t) {
+      // q is the current token's slice: attn_launch takes [n_head, head_dim]
+      ok = ok && rdna4::attn_launch(d_q + (std::int64_t)t * kHead * kHeadDim, d_k, d_v, d_o, t,
+                                    kHead, kHeadKv, kHeadDim, scale);
+      hipMemcpy(got.data() + (std::int64_t)t * kHead * kHeadDim, d_o, (std::size_t)kHead * kHeadDim * sizeof(float),
+                hipMemcpyDeviceToHost);
+    }
     const double rel = rel_l2(ref, got);
     std::printf("attn (causal) rel-L2=%.3e  %s\n", rel, (ok && rel < 1e-5) ? "OK" : "MISMATCH");
     if (!ok || rel >= 1e-5) ++failures;

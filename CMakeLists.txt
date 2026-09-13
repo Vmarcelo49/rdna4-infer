@@ -101,9 +101,27 @@ target_link_libraries(check-nn-gpu PRIVATE ${GGML_BASE_LIB} ${AMDHIP64})
 target_link_options(check-nn-gpu PRIVATE --offload-arch=gfx1201)
 set_target_properties(check-nn-gpu PROPERTIES HIP_ARCHITECTURES "gfx1201")
 
+# M3 step 3 — the assembled qwen35 forward graph vs the eval-callback oracle.
+add_executable(check-graph-gpu tests/check_graph_gpu.hip
+                 tests/dequant_cpu_oracle.cpp src/backend/gguf.cpp src/backend/loader.cpp
+                 src/backend/model.cpp)
+target_include_directories(check-graph-gpu PRIVATE include /opt/rocm/include
+                          ${LLAMA_CPP_SRC}/ggml/src ${LLAMA_CPP_SRC}/ggml/include)
+target_link_libraries(check-graph-gpu PRIVATE ${GGML_BASE_LIB} ${AMDHIP64})
+target_link_options(check-graph-gpu PRIVATE --offload-arch=gfx1201)
+set_target_properties(check-graph-gpu PROPERTIES HIP_ARCHITECTURES "gfx1201")
+
 # M3 step 2a — RoPE / attention kernels vs a CPU reference.
 add_executable(check-rope-gpu tests/check_rope_gpu.hip)
 target_include_directories(check-rope-gpu PRIVATE include /opt/rocm/include)
 target_link_libraries(check-rope-gpu PRIVATE ${AMDHIP64})
 target_link_options(check-rope-gpu PRIVATE --offload-arch=gfx1201)
 set_target_properties(check-rope-gpu PROPERTIES HIP_ARCHITECTURES "gfx1201")
+
+# Test tool — llama.cpp's own argmax for a raw token sequence (the acceptance
+# reference for the assembled graph; see tests/oracle_next_token.cpp).
+add_executable(oracle-next-token tests/oracle_next_token.cpp)
+target_include_directories(oracle-next-token PRIVATE ${LLAMA_CPP_SRC}/include
+                          ${LLAMA_CPP_SRC}/ggml/include)
+target_link_libraries(oracle-next-token PRIVATE ${LLAMA_CPP_BUILD}/bin/libllama.so ${AMDHIP64})
+set_target_properties(oracle-next-token PROPERTIES BUILD_RPATH "${LLAMA_CPP_BUILD}")

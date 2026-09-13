@@ -6,7 +6,9 @@
 # and last three values plus the element sum. check-nn-gpu (and the M3 layer
 # tests) diff our kernels against those numbers.
 #
-# Usage: scripts/capture_oracle.sh [prompt] [n_predict] [ngl]
+# Usage: scripts/capture_oracle.sh [prompt] [n_predict] [ngl] [name]
+#   `name` labels the output files (default: the prompt itself, spaces removed)
+#   and also drives the argmax capture below.
 #   default: "Hello", 1 token, -ngl 0 (CPU: deterministic, no GPU scheduling
 #            differences; pass 99 to capture the Vulkan path instead)
 #
@@ -20,6 +22,7 @@ MODEL="${MODEL:-/mnt/raid0/GGUF/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_S.gg
 PROMPT="${1:-Hello}"
 NPRED="${2:-1}"
 NGL="${3:-0}"
+NAME="${4:-${PROMPT// /}}"
 
 if [[ ! -x "$EVAL_CB" ]]; then
   echo "error: $EVAL_CB not found (build llama.cpp first, or set EVAL_CB)" >&2
@@ -34,7 +37,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 mkdir -p "$ROOT/reference"
 
 BACKEND=$([[ "$NGL" == "0" ]] && echo cpu || echo gpu)
-OUT="$ROOT/reference/oracle_${PROMPT}_${BACKEND}.txt"
+OUT="$ROOT/reference/oracle_${NAME}_${BACKEND}.txt"
+ARGMAX_OUT="$ROOT/reference/argmax_${NAME}_${BACKEND}.txt"
+NEXT_TOKEN="$ROOT/build/oracle-next-token"
 
 echo "capturing: prompt='$PROMPT' n_predict=$NPRED ngl=$NGL"
 echo "  model : $MODEL"
@@ -46,3 +51,16 @@ echo "  output: $OUT"
 
 echo "  nodes : $(grep -c 'common_debug_cb_eval' "$OUT")"
 echo "  token : $(grep -oE 'number of input tokens = [0-9]+' "$OUT" | head -1) / $(grep -A1 'number of input tokens' "$OUT" | tail -1 | tr -d ' ')"
+
+# The end-to-end acceptance reference: llama.cpp's own next token for the exact
+# token sequence the dump was captured with (the dump prints node values, not
+# the argmax of result_output). Tokens come from the dump's own tokenization.
+IDS=$(awk '/number of input tokens = /{n=$NF; getline; for (i=0;i<n;i++) {printf "%s ", $NF; getline}}' "$OUT")
+if [[ -x "$NEXT_TOKEN" ]]; then
+  echo "  argmax: $(ORACLE_NGL=$NGL "$NEXT_TOKEN" "$MODEL" $IDS 2>/dev/null | grep '^argmax' || echo 'FAILED')"
+  ORACLE_NGL=$NGL "$NEXT_TOKEN" "$MODEL" $IDS 2>/dev/null | grep -E '^(tokens|result_output|argmax|top5)' > "$ARGMAX_OUT"
+  echo "  saved : $ARGMAX_OUT"
+  echo "  ids   : $IDS"
+else
+  echo "  (build/oracle-next-token missing: argmax reference not captured)"
+fi

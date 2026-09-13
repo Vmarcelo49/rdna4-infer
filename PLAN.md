@@ -196,16 +196,59 @@ Objetivo: logits corretos nos dois ramos de camada.
 - **Passo 1 — primitivas de device validadas contra o oráculo ✅** (`include/rdna4/nn.cuh`, `tests/check_nn_gpu.hip`):
   - `check-nn-gpu <gguf> <dump> [token]` reproduz no GPU os 2 primeiros nós do grafo a partir do **token real** (9419 = "Hello"): linha do `token_embd.weight` (Q3_K, `GgufLoader::load_tensor_range` + dequant) → `rms_norm` → `mul` por `blk.0.attn_norm.weight`.
   - **Resultado: `norm-0` e `attn_norm-0` batem com o oráculo** — os 6 valores amostrados coincidem até a 4ª decimal e a soma relativa difere **2,5e-06** / **2,3e-06**.
-  - Semânticas fixadas no caminho (todas lidas do fonte de referência, não adivinhadas): `RMSNorm` = `x * rsqrt(mean(x²) + eps)` com o `eps` do GGUF e o peso em `MUL` separado; `L2 norm` do GDN = `x / sqrt(Σx² + eps)` (de `build_gdn_l2_norm` = `scale(rms_norm(x, eps/n), 1/√n)`); `silu`/`sigmoid`/`softplus` (com o clamp `x>20` do ggml); **RoPE do qwen35 = `LLAMA_ROPE_TYPE_IMROPE`** (de `llama_model_rope_type`), que para texto (posições t=h=w iguais) degenera em RoPE padrão de **pares adjacentes** sobre `n_rot=64` dims com `freq_base=1e7` — as seções `[11,11,10,0]` só importam para posições distintas (imagem/áudio).
+  - Semânticas fixadas no caminho (todas lidas do fonte de referência, não adivinhadas): `RMSNorm` = `x * rsqrt(mean(x²) + eps)` com o `eps` do GGUF e o peso em `MUL` separado; `L2 norm` do GDN = `x / sqrt(Σx² + eps)` (de `build_gdn_l2_norm` = `scale(rms_norm(x, eps/n), 1/√n)`); `silu`/`sigmoid`/`softplus` (com o clamp `x>20` do ggml); **RoPE do qwen35 = `LLAMA_ROPE_TYPE_IMROPE`** (de `llama_model_rope_type`), `n_rot=64` dims com `freq_base=1e7`; as seções `[11,11,10,0]` só importam para posições distintas (imagem/áudio), então para texto as 4 posições são iguais.
+  - ⚠️ **Correção (Passo 3): "pares adjacentes" estava errado.** O `ggml_compute_forward_rope_f32` roteia NEOX/**MROPE**/**IMROPE** por `rotate_pairs(n_dims, n_dims/2, ...)`: o elemento `i` rotaciona com `i + n_rot/2` (**split-half**), com `cache[i0]` ainda pertencendo ao par `i0/2` (ângulo `pos·freq_base^(-2p/n_rot)` inalterado). Pares adjacentes só valem para `GGML_ROPE_TYPE_NORMAL`.
   - `Qwen35Config` agora carrega `rms_norm_eps` e `rope_freq_base` (o parser já lia, mas descartava).
 - **Passo 2a — RoPE + atenção causal ✅** (`include/rdna4/attn.cuh`, `tests/check_rope_gpu.hip`):
-  - `rope_kernel` (pares adjacentes, `angle = pos·freq_base^(-2p/n_rot)`, primeiros `n_rot` dims de cada head) e `attn_kernel` (causal, 1 bloco por (token, head), GQA, softmax em shared memory).
-  - Validados contra implementação CPU direta da semântica documentada: **rel-L2 2,7e-08 (RoPE)** e **5,7e-08 (atenção)**.
+  - `rope_kernel` (split-half, `angle = pos·freq_base^(-2p/n_rot)`, primeiros `n_rot` dims de cada head) e `attn_kernel` (causal, 1 bloco por head, softmax em shared memory).
+  - Validados contra implementação CPU direta da semântica documentada: **rel-L2 2,7e-08 (RoPE)** e **5,7e-08 (atenção)**. ⚠️ Esse teste é **auto-consistente** (a referência CPU foi escrita a partir da mesma leitura do ggml), então ele não pega erro de *convenção* — os dois erros de convenção abaixo só apareceram contra o oráculo do grafo completo.
 - **Dimensões da arquitetura decodificadas dos shapes do oráculo** (não de suposição): `head_dim = 256`, `n_head = 24`, `n_head_kv = 4` (GQA 6×), `n_rot = 64` (**só 64 dos 256 dims rodam**), `scale = 1/√256 = 1/16`; `attn_q` = 24 × **2** × 256 = 12288 (q e gate **intercalados por head**, stride `2·head_dim`), `attn_k/v` = 4 × 256 = 1024, `attn_output` = 24 × 256 = 6144.
 - **Oráculo multi-token capturado**: `reference/oracle_prompt6_cpu.txt` (8 tokens: "Hello world, this is a test." → ids `9419 1814 11 411 369 264 1228 13`). Necessário porque com 1 token a posição é 0 (RoPE = identidade) e a atenção é trivial — nenhum dos dois validaria nada.
 - **Limite de validação descoberto:** o dump imprime apenas 6 valores + a soma por nó, então **não dá para semear uma camada isolada** com a entrada real dela (a entrada da camada N vem do grafo). A validação do M3 é portanto **incremental**: montar o grafo e comparar `l_out-N` (amostras + soma) camada a camada, fechando em `result_norm` e `result_output`.
-- **Passo 2b (próximo) — montagem do grafo** (`include/rdna4/graph.cuh`, `src/backend/graph.hip`): upload dos pesos para VRAM (bytes quantizados consumidos direto pelo matvec; f32 para norms/viéses), laço de 65 camadas token-a-token, FFN `down(silu(gate)*up)` com `attn_post_norm` e o residual do MTP, e então o ramo GDN (conv causal com estado + regra delta). Ordem: full-attention primeiro (nós `Qcur-N`/`attn_gated-N`/`attn_output-N`), depois GDN (`conv_output_silu-N`, `attn_output-N` do GDN), depois o grafo inteiro contra `result_norm`/`result_output`.
+- **Passo 3 — grafo montado e validado ✅** (`include/rdna4/graph.cuh`, `tests/check_graph_gpu.hip`, `tests/oracle_next_token.cpp`): ver a seção "Passo 3" abaixo.
 - **Passo 2 (histórico) — ramo full-attention**: `attn_q` (com gate intercalado por head, `view_3d` com stride 2×head_dim), `attn_k`/`attn_v`, QK-norm, RoPE/MRoPE, GQA + KV cache, `sigmoid(gate)` multiplicando a saída da atenção, `attn_output`; validar contra os nós `Qcur-N`/`Kcur-N`/`attn_pregate-N`/`attn_gated-N`/`attn_output-N` do dump.
+
+
+### Passo 3 — grafo montado (M3 ✅)
+
+**O que existe agora**
+
+- `include/rdna4/graph.cuh`: `rdna4::Graph` — upload de todos os pesos dos 63 blocos executáveis para VRAM (bytes quantizados consumidos direto pelo matvec; f32 para norms/viéses), laço de camadas token-a-token, ramo GDN (conv causal com estado rolante + regra delta + norm gateada) e ramo full-attention (split q/gate, QK-norm, RoPE, KV cache f32, `sigmoid(gate)`), FFN `down(silu(gate)·up)` com o residual do `post_attention_norm` (o FFN **não** tem residual na entrada: soma-se ao tensor de *antes* do norm), `output_norm` e LM head. `set_node_cb()` expõe cada nó intermediário com **o mesmo nome do `cb()` do llama.cpp**, que é o que torna a comparação por nó possível.
+- `tests/check-graph-gpu <gguf> <dump|-> <argmax_ref|-> [ids...]`: compara nó a nó contra o dump e roda os *structural checks* + o argmax.
+- `tests/oracle_next_token.cpp` (`oracle-next-token`): argmax do llama.cpp para uma sequência **crua** de ids (o dump não imprime argmax). `ORACLE_NGL=99` roda no backend Vulkan, `ORACLE_STEP=1` decodifica token-a-token (mede a variância do próprio llama.cpp entre caminhos: **0,078 no logit top-1**, ou seja ~0,4%, contra 2,1–2,6 do caminho em batch).
+- `scripts/capture_oracle.sh` agora também salva `reference/argmax_<nome>_<backend>.txt`; `scripts/extract_dump_block.py` extrai o bloco de **um** token de uma captura `-ub 1`.
+
+**Metodologia (o que foi preciso mudar no caminho)**
+
+1. **O oráculo tem que ser capturado com `-ub 1` para comparar com este motor.** Com prefill em batch (8 tokens) o CPU do llama.cpp usa outro caminho de `MUL_MAT`, e os nós do *próprio* llama.cpp ficam 4–5% diferentes dos do caminho token-a-token (`attn_norm-3` do token 0, mesma entrada). Como o nosso motor faz um matvec por token (caminho de decode), a referência correta é a captura com `-ub 1` (`reference/oracle_prompt6_ub1_cpu.txt` + `reference/oracle_prompt6_ub1_tok7_cpu.txt` = bloco do último token). O teste detecta dump em batch pelo shape (`{5120, 8, 1, 1}`) e **pula** os structural checks com aviso.
+2. **Sensibilidade medida antes de acusar ruído.** Injetando perturbação por camada (`GRAPH_NOISE`, ver abaixo) o logit top-1 varia **≤0,3 mesmo com ±30% por camada** e o *std* dos logits não se move: ou seja, desvio do oráculo **não** se explica por ruído de quantização acumulado. Isso foi o que obrigou a procurar bug em vez de aceitar o desvio — e achou dois.
+3. **Amostra não serve para nós com amostras pequenas:** o dump imprime 4 decimais, então o *sample metric* tem piso ~1e-4; os checks descontam esse slack antes de normalizar.
+
+**Os dois bugs reais que a validação pegou**
+
+- **RoPE com pares adjacentes** (`include/rdna4/attn.cuh`): deveria ser **split-half** (`i` com `i + n_rot/2`), como em `rotate_pairs(n_dims, n_dims/2, …)` para IMROPE. Sintoma: `Qcur-3` com métrica de amostra **1,57** (agora 0,16). Curiosamente era **benigno para os scores de atenção** (a mesma rotação aplicada em q e k preserva o produto interno), então não mudava o texto gerado — mas deixava `Qcur-N`/`Kcur-N` errados.
+- **GQA com agrupamento errado + índice da query fora do buffer** (`attn_kernel`): usávamos `kvh = h / (n_head/n_head_kv)`… não: usávamos `h % n_head_kv` (agrupamento "tile"), quando o correto para este checkpoint é o **contíguo** `h / (n_head/n_head_kv)` (convenção HF/`repeat_kv`); e a query era indexada como `q[t*n_head + h]` quando o buffer `d_attnout_` contém **um único token** — para `t ≥ 1` isso **lia fora da alocação**. Sintoma: `attn_pregate-3` com soma rel **3,2e-02** (agora **1,05e-04**) e argmax errado em 1 de 3 prompts. É o único bug até agora que realmente muda a resposta do modelo.
+
+**Evidência numérica (oráculo por token, `-ub 1`, último token do prompt de 8)**
+
+- Prefixo determinístico: `model.input_embed` soma rel **8,6e-08**; `attn_norm-0` **2,6e-08**; `beta-0`/`gate-0`/`a_softplus-0` ≤ 1,1e-07.
+- Camada 0 (GDN): todas as somas ≤ 3,3e-03 (`linear_attn_qkv_mixed` 1,5e-03, `conv_output_silu` 2,1e-03, `final_output` 1,5e-04, `l_out-0` 3,2e-04) e o **estado recorrente** `new_state-0/1/2` com erro absoluto ≤ 6,1e-05 (o estado atravessa conv1d + L2-norms + regra delta + decay).
+- Camada 3 (primeira full-attention): `Qcur_full-3` 6,2e-03, `attn_pregate-3` **1,05e-04**, `attn_output-3` 5,2e-03, `l_out-3` 3,1e-02.
+- Precisão do matvec medida contra **f32 exato** (`GRAPH_EXACT=1`, dequant no host + dot em double): `||gpu-exact||/||exact|| = 1,1e-03` para `blk.0.attn_qkv`; o **próprio oráculo CPU fica 2,4× pior** (rms 1,6e-02 vs 6,7e-03 nas mesmas 6 linhas) — a nossa quantização de ativação (q8_1, blocos de 32) é mais fina que a q8_K dele (blocos de 256).
+- **Aceite end-to-end: argmax igual ao do llama.cpp em 4/4 prompts** (`check-graph-gpu <gguf> - reference/argmax_<p>_cpu.txt <ids>`):
+
+  | prompt | ids | llama.cpp | nós |
+  |---|---|---|---|
+  | "Hello world, this is a test." | `9419 1814 11 411 369 264 1228 13` | 198 | 198 (12,41 vs 13,53) |
+  | "The capital of France is" | `760 6511 314 9338 369` | 11751 | 11751 (14,19 vs 17,53) |
+  | "def fibonacci(n):" | `727 73111 1393 1590` | 198 | 198 (16,16 vs 20,03) |
+  | "1 2 3 … 9" | `16 220 17 … 24` | 220 | 220 (19,07 vs 16,41) |
+
+  Top-5 também bate em ordem/ids em 4/5 (um ligeiro desacordo no 4º/5º colocado em 3 dos 4 prompts).
+
+**Deriva residual (documentada, não "resolvida"):** os nós profundos continuam desviando ~1–12% (`attn_norm-62` ~9,8e-02 de diferença máxima nas amostras) e o *std* dos logits fica ~15–25% menor (1,62–1,88 vs 2,09–2,12). Como (a) o llama.cpp não é reprodutível melhor que ~4% por nó entre os seus próprios caminhos e (b) o nosso lado é medidamente mais preciso que o dele contra f32 exato, o resíduo é atribuído à diferença de quantização de ativação amplificada por 63 camadas — não a uma operação errada: perturbar 30% por camada muda o argmax em nada e o logit top-1 em ≤0,3.
+
+**Knobs de diagnóstico** (usados para o estudo acima, mantidos por serem baratos): `GRAPH_NOISE=<rel>` (+`GRAPH_NOISE_COHERENT=1`) perturba a saída de cada camada antes do residual; `GRAPH_EXACT=1` roda o check f32-exato da primeira projeção; `GRAPH_SAMPLES=1` imprime os 6 valores (oráculo vs nós) de cada nó divergente; `GRAPH_LAST_TOKEN=1` compara só o último token (obrigatório com dump `-ub 1`); `diag.hidden_pre_norm` reporta RMS/min/max do estado residual que entra no `output_norm`.
 
 1. Implementar o ramo linear GDN (`attn_qkv` + `attn_gate` + SSM conv/recorrência + `ssm_out`).
    Ref: `docs/referencias-upstream-gfx1201-qwen35.md` § "SGLang — Qwen3.5" (`qwen3_5.py` L322-1094: `GatedDeltaNet` + `LinearDecoderLayer`) e § "hipfire — Qwen3.5" (`forward.rs` L741-800 entradas, L139-280 MoE/decode patterns).

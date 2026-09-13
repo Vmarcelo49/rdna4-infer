@@ -36,11 +36,17 @@ __global__ void rope_kernel(float *__restrict__ x, int n_tokens, int n_heads, in
   const float c = cosf(theta);
   const float s = sinf(theta);
 
+  // SPLIT-HALF pairing, not adjacent pairs: qwen35 is LLAMA_ROPE_TYPE_IMROPE and
+  // ggml routes NEOX/MROPE/IMROPE through rotate_pairs(n_dims, n_dims/2, ...)
+  // (ggml-cpu/ops.cpp) — element i rotates with element i + n_rot/2 while the
+  // cache index still steps by 2 (cache[i0] belongs to pair i0/2, so the angle
+  // of pair p is pos * freq_base^(-2p/n_rot), unchanged).
   float *base = x + ((std::int64_t)(t * n_heads + h)) * head_dim;
-  const float x0 = base[2 * p];
-  const float x1 = base[2 * p + 1];
-  base[2 * p] = x0 * c - x1 * s;
-  base[2 * p + 1] = x0 * s + x1 * c;
+  const int jc = p + n_rot / 2;
+  const float x0 = base[p];
+  const float x1 = base[jc];
+  base[p] = x0 * c - x1 * s;
+  base[jc] = x0 * s + x1 * c;
 }
 
 inline bool rope_launch(float *d_x, int n_tokens, int n_heads, int head_dim, int n_rot,
@@ -53,27 +59,35 @@ inline bool rope_launch(float *d_x, int n_tokens, int n_heads, int head_dim, int
 }
 
 // ---------------------------------------------------------------------------
-// Causal attention, one block per (token, head): token t attends to 0..t.
-// GQA: head h reads the kv head h / (n_head / n_head_kv).
-//   q, out: [n_tokens, n_head, head_dim]      (head_dim threads per block)
-//   k, v  : [n_tokens, n_head_kv, head_dim]
-// Shared memory: head_dim (reduction) + n_tokens + 1 (scores and their sum).
-// Correctness-first: the scores live in shared memory, so the softmax is a
-// single pass with no online rescaling.
+// Causal attention for ONE query token against a KV cache.
+//   q, out: [n_head, head_dim] of token t (single token, not the cache)
+//   k, v  : cache layout [max_ctx, n_head_kv, head_dim] (row j = token j)
+// The cache must already hold token t at row t; keys 0..t are attended.
+// Token t attends to cache rows 0..t (the cache holds every token processed so
+// far, so the causal bound is simply j <= t).
+// One block per head, head_dim threads; GQA: head h reads kv head
+// h / (n_head/n_head_kv). Shared memory: head_dim (reduction) + (t+2) scores.
+// Correctness-first: the scores are materialised, so softmax is a single pass.
 // ---------------------------------------------------------------------------
 __global__ void attn_kernel(const float *__restrict__ q, const float *__restrict__ k,
-                            const float *__restrict__ v, float *__restrict__ out, int n_tokens,
+                            const float *__restrict__ v, float *__restrict__ out, int t,
                             int n_head, int n_head_kv, int head_dim, float scale) {
   extern __shared__ float smem[];
-  float *red = smem;             // head_dim
-  float *sc = smem + head_dim;   // n_tokens + 1
+  float *red = smem;            // head_dim
+  float *sc = smem + head_dim;  // t + 2
 
-  const int h = blockIdx.x / n_tokens;
-  const int t = blockIdx.x % n_tokens;
+  const int h = blockIdx.x;
   const int d = threadIdx.x;
+  // GQA grouping is CONTIGUOUS: the kv heads are tiled per group (HF's
+  // repeat_kv, and what llama.cpp does for this model), so query head h reads
+  // kv head h / (n_head/n_head_kv). Verified against the per-token oracle at
+  // layer 3: contiguous gives attn_pregate-3 sum rel 1.1e-04, while grouping
+  // by h % n_head_kv gives 3.2e-02 and a wrong argmax.
   const int kvh = h / (n_head / n_head_kv);
 
-  const float qv = q[((std::int64_t)t * n_head + h) * head_dim + d];
+  // q and out hold the CURRENT token only: [n_head, head_dim]. The cache holds
+  // the whole history: k/v are [t+1, n_head_kv, head_dim] rows 0..t.
+  const float qv = q[h * head_dim + d];
 
   for (int j = 0; j <= t; ++j) {
     red[d] = qv * k[((std::int64_t)j * n_head_kv + kvh) * head_dim + d];
@@ -83,7 +97,7 @@ __global__ void attn_kernel(const float *__restrict__ q, const float *__restrict
       __syncthreads();
     }
     if (d == 0) sc[j] = red[0] * scale;
-    __syncthreads();  // sc[j] written before red is reused next iteration
+    __syncthreads();  // sc[j] is written before red is reused
   }
 
   if (d == 0) {
@@ -94,24 +108,23 @@ __global__ void attn_kernel(const float *__restrict__ q, const float *__restrict
       sc[j] = expf(sc[j] - m);
       sum += sc[j];
     }
-    sc[n_tokens] = sum;
+    sc[t + 1] = sum;
   }
   __syncthreads();
-  const float inv = 1.0f / sc[n_tokens];
+  const float inv = 1.0f / sc[t + 1];
 
   float acc = 0.0f;
   for (int j = 0; j <= t; ++j) {
     acc += (sc[j] * inv) * v[((std::int64_t)j * n_head_kv + kvh) * head_dim + d];
   }
-  out[((std::int64_t)t * n_head + h) * head_dim + d] = acc;
+  out[h * head_dim + d] = acc;
 }
 
-inline bool attn_launch(const float *d_q, const float *d_k, const float *d_v, float *d_out,
-                        int n_tokens, int n_head, int n_head_kv, int head_dim, float scale,
+inline bool attn_launch(const float *d_q, const float *d_k, const float *d_v, float *d_out, int t,
+                        int n_head, int n_head_kv, int head_dim, float scale,
                         hipStream_t stream = nullptr) {
-  const int blocks = n_tokens * n_head;
-  const std::size_t smem = (std::size_t)(head_dim + n_tokens + 1) * sizeof(float);
-  attn_kernel<<<blocks, head_dim, smem, stream>>>(d_q, d_k, d_v, d_out, n_tokens, n_head, n_head_kv,
+  const std::size_t smem = (std::size_t)(head_dim + t + 2) * sizeof(float);
+  attn_kernel<<<n_head, head_dim, smem, stream>>>(d_q, d_k, d_v, d_out, t, n_head, n_head_kv,
                                                  head_dim, scale);
   return hipGetLastError() == hipSuccess;
 }
