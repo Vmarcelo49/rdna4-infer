@@ -53,3 +53,20 @@ if(NOT GGML_BASE_LIB)
   message(FATAL_ERROR "libggml-base.so not found under ${LLAMA_CPP_BUILD}/bin — build llama.cpp first")
 endif()
 target_link_libraries(check-dequant PRIVATE ${GGML_BASE_LIB})
+
+# M2 step 2/3 — GPU dequant vs CPU oracle (gfx1201, real execution).
+# The HIP TU holds the device kernels; the CPU oracle bridge is a plain C++
+# TU so llama.cpp's headers never enter the HIP compilation.
+add_executable(check-dequant-gpu tests/check_dequant_gpu.hip
+                 tests/dequant_cpu_oracle.cpp src/backend/gguf.cpp src/backend/loader.cpp)
+target_include_directories(check-dequant-gpu PRIVATE include
+                          ${LLAMA_CPP_SRC}/ggml/src ${LLAMA_CPP_SRC}/ggml/include)
+if(EXISTS "/opt/rocm/include")
+  target_include_directories(check-dequant-gpu PRIVATE /opt/rocm/include)
+endif()
+target_link_libraries(check-dequant-gpu PRIVATE ${GGML_BASE_LIB} ${AMDHIP64})
+target_link_options(check-dequant-gpu PRIVATE --offload-arch=gfx1201)
+set_target_properties(check-dequant-gpu PROPERTIES
+    HIP_ARCHITECTURES "gfx1201"
+    HIP_HIPCC_ADDITIONAL_FLAGS "-O2"
+)

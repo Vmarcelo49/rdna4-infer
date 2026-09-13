@@ -57,10 +57,20 @@ Objetivo: todo tipo do union M1 computando em GPU.
   - **(3) Pipeline Q8_0 bit-exact:** fórmula trivial inline `d*qs[i]` == oracle → prova o cast raw-bytes→struct + alinhamento.
   - **(4) Cross-file:** mesmo peso, duas quantizações → rel-L2 pequeno (cap 0.3). `output.weight`/`ffn_down` rel-L2≈0 (mesma quant nos dois arquivos); `attn_q` (q2_k vs q5_k) rel-L2=0.21 OK.
   - **Nota:** `block_q*_K` usa **K maiúsculo** no llama.cpp; as grids/LUTs (`iq3s_grid` etc.) vivem em `ggml-common.h`/`ggml-quants.c`. Snapshot `.ref` (790cf51) é incompleto p/ quants (faltam `iq3xs_grid`, `block_q4_K`) — **usar o checkout novo** (`/home/marcelo/Projetos/llama.cpp` @ df03399b8) como fonte de kernels/quants.
-- **Passo 2 (próximo) — dequant GPU + matvec no HIP** (compilar p/ gfx1201; execução ainda sem VRAM):
-  - Trazer do checkout novo `ggml/src/ggml-cuda/`: `vecdotq.cuh` (dequant), `mmvq.cu` + `MMVQ_PARAMETERS_RDNA4` (L102-130), `mmq.cuh` + `mmq-config-rdna4.cuh` + `mmq-instance-*.cu`.
-  - Teste GPU-vs-CPU: nosso matvec GPU vs. f32 do oracle (passo 1). Execução só quando houver VRAM.
-- **Restrição de sessão:** ainda **não** alocar memória de vídeo (VRAM) p/ testes — testes GPU só depois. CPU/compilação liberados.
+- **Passo 2 — dequant GPU vs oracle CPU, por tipo ✅** (`include/rdna4/{quants,dequant.cuh,fp16.h,quant_tables.h}`, `tests/check_dequant_gpu.hip`, `tests/dequant_cpu_oracle.cpp`):
+  - **Resultado: 14/14 tipos BIT-EXACT na GPU (gfx1201) contra o oracle CPU do llama.cpp.** IQ3_S: 14 tipos × 16 K elems (q8_0/iq4_nl 2 K). IQ4_XS: 12 tipos presentes × 262 K elems (≈3,1 M elems) — `exact=N/N`, `max|d|=0`.
+  - **Kernels:** `dequantize_*` vendorados de `ggml-cuda/dequantize.cuh` (MIT) com adaptação **mecânica apenas**: structs de `quants.h`, `ggml_half`→`uint16_t`, `__low2half/__high2half`→`rdna4::fp16_to_float`, `dst_t`→`float`, `ggml_cuda_cast`→`static_cast<float>`.
+  - **Thread mapping por tipo** (é o que faz o kernel escrever o bloco certo): 64 threads → `q2_K,q3_K,q5_K,q6_K`; 32 → `q4_K` + todos os IQ; `q8_0` usa a forma `float2` (16 threads, 2 elems/chamada). Fonte: `getrows.cu` `get_rows_cuda_kq<N, dst_t, dequantize_X>`.
+  - **Fonte de verdade = build do llama.cpp** (`libggml-base.so`): TU separada (`dequant_cpu_oracle.cpp`) para os headers do llama.cpp **não** entrarem na TU HIP.
+  - **Auditoria de layout de struct (anti-corrupção silenciosa):** `rdna4_audit_layout()` compara `sizeof` + `offsetof` de **todos** os campos nossos vs llama.cpp. Pegou um bug real: `block_q5_K` tem **`qh` antes de `qs`** (mesmo tamanho 176 B, ordem trocada → valores errados). Também corrigido: `(float)x[].d` era cast inteiro→float (nosso `d` é `uint16_t`) — precisava `fp16_to_float`.
+  - **Bug de build resolvido:** TU HIP **precisa** da extensão `.hip` (com `.cpp`, o `amdclang++` compila host-only e `__device__`/`float2` não existem).
+  - **Tabelas IQ vendoradas** em `quant_tables.h` (grids `iq1s_grid_gpu`/`iq2xxs`/`iq2xs`/`iq2s`/`iq3xxs`/`iq3s`, `kmask_iq2xs`, `ksigns_iq2xs`, `kvalues_iq4nl`) + `IQ1S_DELTA`, `NGRID_IQ1S`.
+  - **VRAM:** liberada (hipFree nos dois buffers); pico de alocação por caso = 64–1024 blocos. GPU RX 9070 XT 16 GB, ~15,7 GB livres.
+- **Passo 3 (próximo) — matvec fundido (dequant+dot) + tuning RDNA4:**
+  - Trazer `vecdotq.cuh` (`vec_dot_*`), `mmvq.cu` + `MMVQ_PARAMETERS_RDNA4`, `mmq.cuh` + `mmq-config-rdna4.cuh`.
+  - Teste GPU-vs-CPU: nosso matvec GPU vs. `dequantize_row_*` + dot em f32 (oracle do passo 1)/vs. `ggml` CPU.
+  - Aqui a tolerância deixa de ser bit-exact (ordem de acumulação difere) → documentar tolerância.
+- **Nota:** GPU/VRAM **liberada** para testes nesta sessão (antes estava proibido). Dequant já executado de verdade em gfx1201, não só compilado.
 
 1. Trazer de `.ref/llama.cpp`: `vecdotq.cuh` (dequant), `mmvq.cu` + `MMVQ_PARAMETERS_RDNA4`, `mmq.cuh` + `mmq-config-rdna4.cuh` (inclui `mmq-instance-iq3_s.cu`).
    Ref: `docs/referencias-upstream-gfx1201-qwen35.md` § "llama.cpp — gfx1201/RDNA4" (linhas exatas por arquivo) · `docs/kernels-ia-gfx1201.md` § "Relatos" (`rdna4-wmma-guide`: armadilha dos tiles WMMA transpostos).
