@@ -25,3 +25,7 @@ endif()
 
 find_library(AMDHIP64 amdhip64 HINTS /opt/rocm/lib REQUIRED)
 target_link_libraries(rdna4-infer PRIVATE ${AMDHIP64})
+
+# M1 acceptance checks: plain CXX, CPU-only (no offload flags, no amdhip64).
+add_executable(check-dtype tests/check_dtype.cpp src/backend/gguf.cpp)
+target_include_directories(check-dtype PRIVATE include)
