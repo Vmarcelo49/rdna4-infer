@@ -467,11 +467,11 @@ int run_bench_ab(rdna4::GgufLoader &ld, int rounds, int dt) {
   hipMemcpy(d_x, x.data(), (std::size_t)ncols * sizeof(float), hipMemcpyHostToDevice);
   rdna4::quantize_q8_1_kernel<<<(unsigned)((ncols / QK8_1 + 3) / 4), 128>>>(d_x, d_a, ncols / QK8_1);
 
-  const bool diag = (dt == 12);                 // iq3_s has 5 variants
+  const bool diag = (dt == 12);                 // iq3_s has 6 variants
   const bool xx = (dt == 9);                    // iq3_xxs has 4
-  const int kVariants = diag ? 5 : (xx ? 4 : 2);
-  const char *names[5] = {"shipping", "perm+lin (cand)", "DIAG-no-sign", "lin (candidate)",
-                          "DIAG-no-lookup"};
+  const int kVariants = diag ? 6 : (xx ? 4 : 2);
+  const char *names[6] = {"shipping", "DIAG-no-sign", "perm+lin (cand)", "lin (candidate)",
+                          "DIAG-no-lookup", "xoradd (cand)"};
   if (xx) {
     names[0] = "vendored"; names[1] = "perm2 (shipping)"; names[2] = "perm (mid)";
     names[3] = "DIAG-no-sign";

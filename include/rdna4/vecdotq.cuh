@@ -1304,6 +1304,54 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1_perm2(
     return d * sumi;
 }
 
+
+// iq3_s: direct 6-op sign application (research-agent proposal, independently
+// verified exhaustively here: 0 mismatches over all 512 iq3s_grid entries x all
+// 16 sign nibbles). Per 4-byte group:
+//   t_b = 1 if sign bit b else 0      (nib * 0x00204081) & 0x01010101
+//   m_b = 0xFF if sign bit b else 0   t * 0xFF
+//   signed = (g ^ m) + t              == +g when t=0, == -g when t=1
+// The add cannot carry between bytes because every iq3s_grid byte is odd and
+// >= 1, so (~g) + 1 <= 0xFF (checked over the whole table).
+// Keeps ONE dp4a per group instead of the two the linearity form needs.
+static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_xoradd(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_iq3_s * bq3 = (const block_iq3_s *) vbq + kbx;
+
+    const int2      qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+    const int qh = bq3->qh[iqs/2];
+
+    const int       signs_packed_32 = get_int_b2(bq3->signs, iqs/2);
+    const uint8_t * sp              = (const uint8_t *) &signs_packed_32;
+
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const uint32_t gx = iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)];
+        const uint32_t gy = iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)];
+
+        const uint32_t sb = sp[l0/2];
+        const uint32_t tx = (((sb)       & 0x0Fu) * 0x00204081u) & 0x01010101u;
+        const uint32_t ty = (((sb >> 4)  & 0x0Fu) * 0x00204081u) & 0x01010101u;
+
+        const int grid_l = (int)((gx ^ (tx * 0xFFu)) + tx);
+        const int grid_h = (int)((gy ^ (ty * 0xFFu)) + ty);
+
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+
+        sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+    }
+
+    sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+
+    const float d = rdna4::fp16_to_float(bq3->d) * rdna4::fp16_to_float((uint16_t)((bq8_1[iqs/2].ds) & 0xFFFFu));
+    return d * sumi;
+}
+
 // DIAGNOSTIC (wrong on purpose): no sign application.
 static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_diag_nosign(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {

@@ -92,6 +92,7 @@ RD_MATVEC_TRAITS(TIQ4XS, vec_dot_iq4_xs_q8_1, 256, QI4_XS, VDR_IQ4_XS_Q8_1_MMVQ,
 // iq3_s A/B variants (bench only; see vecdotq.cuh)
 RD_MATVEC_TRAITS(TIQ3S_LIN, vec_dot_iq3_s_q8_1_lin, 256, QI3_S, VDR_IQ3_S_Q8_1_MMVQ, block_iq3_s);
 RD_MATVEC_TRAITS(TIQ3S_PERM, vec_dot_iq3_s_q8_1_perm, 256, QI3_S, VDR_IQ3_S_Q8_1_MMVQ, block_iq3_s);
+RD_MATVEC_TRAITS(TIQ3S_XORADD, vec_dot_iq3_s_q8_1_xoradd, 256, QI3_S, VDR_IQ3_S_Q8_1_MMVQ, block_iq3_s);
 RD_MATVEC_TRAITS(TIQ2XXS_PERM, vec_dot_iq2_xxs_q8_1_perm, 256, QI2_XXS, VDR_IQ2_XXS_Q8_1_MMVQ, block_iq2_xxs);
 RD_MATVEC_TRAITS(TIQ2XXS_PERM2, vec_dot_iq2_xxs_q8_1_perm2, 256, QI2_XXS, VDR_IQ2_XXS_Q8_1_MMVQ, block_iq2_xxs);
 RD_MATVEC_TRAITS(TIQ2XS_PERM2, vec_dot_iq2_xs_q8_1_perm2, 256, QI2_XS, VDR_IQ2_XS_Q8_1_MMVQ, block_iq2_xs);
@@ -566,11 +567,12 @@ inline bool matvec_launch_variant(int dt, const void *d_w, const block_q8_1 *d_a
     case 12: {  // iq3_s
       constexpr int R = MtShape<12>::rows, W = MtShape<12>::wpr, I = MtIlp<12>::value, QK = 256;
       switch (variant) {
-        case 0: return launch_gen<TIQ3S, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);
-        case 1: return launch_gen<TIQ3S_PERM, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);
-        case 2: return launch_gen<TIQ3S_NOSIGN, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);
-        case 3: return launch_gen<TIQ3S_LIN, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);
-        default: return launch_gen<TIQ3S_NOLOOKUP, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);
+        case 0: return launch_gen<TIQ3S_PERM, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);      // shipped
+        case 1: return launch_gen<TIQ3S_NOSIGN, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);    // DIAG
+        case 2: return launch_gen<TIQ3S, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);           // vendored
+        case 3: return launch_gen<TIQ3S_LIN, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);       // DIAG/ctrl
+        case 4: return launch_gen<TIQ3S_NOLOOKUP, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);  // DIAG
+        default: return launch_gen<TIQ3S_XORADD, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);   // cand
       }
     }
     case 13: {  // iq2_s
