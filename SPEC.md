@@ -59,9 +59,9 @@ prefill real.
 |---|---|---|---|---|---|
 | `UD-IQ3_S.gguf` | 11,21 GiB | 4096 / f16 | 11,87 GiB | 27,6 tok/s | sim, folgado |
 | `UD-IQ3_S.gguf` | | 32768 / f16 | 13,61 GiB | 14,8 tok/s¹ | sim |
-| `UD-IQ3_S.gguf` | | 65536 / f16 | ~15,6 GiB | 5,8 tok/s¹ | sim, apertado |
-| `UD-IQ3_S.gguf` | | 65536 / q4_0 | 12,73 GiB | 4,2 tok/s¹ | sim |
-| `UD-IQ3_S.gguf` | | 131072 / q4_0 | 13,86 GiB | 2,3 tok/s¹ | sim |
+| `UD-IQ3_S.gguf` | | 65536 / f16 | ~15,6 GiB | 6,6 tok/s¹ | sim, apertado |
+| `UD-IQ3_S.gguf` | | 65536 / q4_0 | 12,73 GiB | 6,4 tok/s¹ | sim |
+| `UD-IQ3_S.gguf` | | 131072 / q4_0 | 13,86 GiB | 3,7 tok/s¹ | sim |
 | `UD-IQ4_XS.gguf` | 13,27 GiB | 4096 / f16 | 13,91 GiB | 27,0 tok/s | sim |
 | `UD-IQ4_XS.gguf` | | 32768 / f16 | 15,66 GiB | 9,1 tok/s¹ | sim, apertado (0,26 GiB livres) |
 | `UD-IQ4_XS.gguf` | | 65536 / q4_0 | 14,79 GiB | 4,2 tok/s¹ | sim |
@@ -71,10 +71,11 @@ prefill real.
 linearmente com a posição e domina acima de ~8K (8,9 ms/token em 4K, 138 ms com f16 em
 64K). **Correção do M6:** a primeira versão desta tabela mostrava ~28 tok/s em 64K/131K;
 aquilo era decode na posição 5-40 com um cache grande apenas *alocado* (o `--fill-cache`
-não movia a posição) — um teste de caber, não de contexto longo. Com o mesmo contexto,
-**f16 é 38 % mais rápido que q4_0** (174 vs 239 ms/token em 64K): o kernel de atenção é
-limitado por *issue* na desquantização, não por banda (25 GB/s efetivos contra 600 GB/s
-medidos de DRAM), então `q4_0` é alavanca de VRAM, não de velocidade.
+não movia a posição) — um teste de caber, não de contexto longo. O M7 atacou isso (cargas vetorizadas + 32 warps por CTA, `docs/medicoes-m7.md`):
+64K f16 174 → 151 ms/token, 131K q4_0 441 → 273 ms. O kernel continua em 37-69 GB/s de
+~600 GB/s disponíveis, ou seja **limitado por latência/concorrência**, não por banda —
+o próximo passo é dividir a faixa de chaves entre CTAs. Com `q4_0` a desquantização
+custa mais que a banda, então `q4_0` é alavanca de VRAM, não de velocidade.
 
 **Correção da estimativa anterior desta seção:** a versão do M0 dizia que o IQ4_XS
 estouraria com 32K de contexto f16. Medido: 32K f16 **cabe** (15,66 GiB em uso,

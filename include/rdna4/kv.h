@@ -107,6 +107,73 @@ __device__ __forceinline__ float kv_load<KvType::Q4_0>(const void *row, int d) {
 }
 
 // ---------------------------------------------------------------------------
+// Device: load 8 CONSECUTIVE dims for one lane in a single (vectorized,
+// coalesced) access.
+//
+// The attention kernel gives lane L the dims [L*8, L*8+8). Loading those with the
+// scalar kv_load() above costs 8 separate 2-byte (F16) or 1-byte (Q4_0) loads per
+// lane per row, and across a warp those addresses are strided by 8 elements — so
+// every load instruction fans out over several cache lines. Measured effect
+// (tests/bench_attn_gpu.hip): the kernel moved the cache at **27 GB/s** (f16) and
+// 5.5 GB/s (q4_0) at 64K, i.e. ~20x below DRAM, purely on load inefficiency. With
+// the chunk loaded as one 16/8-byte access the warp's 32 lanes cover exactly one
+// 512-byte row contiguously, which is what the hardware wants.
+//
+// The returned values are identical to 8 kv_load() calls, in the same order, so
+// every kernel that switches to this keeps its arithmetic exactly.
+// ---------------------------------------------------------------------------
+template <KvType CT>
+__device__ __forceinline__ void kv_load8(const void *row, int lane, float out[8]);
+
+template <>
+__device__ __forceinline__ void kv_load8<KvType::F32>(const void *row, int lane, float out[8]) {
+  // 8 dims = 32 bytes = two 16-byte chunks; lane L covers bytes [L*32, L*32+32)
+  const float *p = (const float *)row + lane * 8;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) out[i] = p[i];
+}
+
+template <>
+__device__ __forceinline__ void kv_load8<KvType::F16>(const void *row, int lane, float out[8]) {
+  // lane L covers 16 bytes = 8 halves, i.e. exactly one uint4
+  const uint4 v = ((const uint4 *)row)[lane];
+  const std::uint16_t h[8] = {(std::uint16_t)(v.x & 0xFFFF), (std::uint16_t)(v.x >> 16),
+                              (std::uint16_t)(v.y & 0xFFFF), (std::uint16_t)(v.y >> 16),
+                              (std::uint16_t)(v.z & 0xFFFF), (std::uint16_t)(v.z >> 16),
+                              (std::uint16_t)(v.w & 0xFFFF), (std::uint16_t)(v.w >> 16)};
+#pragma unroll
+  for (int i = 0; i < 8; ++i) out[i] = __half2float(__ushort_as_half(h[i]));
+}
+
+template <>
+__device__ __forceinline__ void kv_load8<KvType::Q8_0>(const void *row, int lane, float out[8]) {
+  // 8 dims sit inside one 32-element block: qs[(lane%4)*8 .. +8), scale shared
+  const block_q8_0 *b = (const block_q8_0 *)row + (lane >> 2);
+  const std::uint64_t q = *(const std::uint64_t *)(b->qs + (lane & 3) * 8);
+  const float d = fp16_to_float(b->d);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) out[i] = d * (float)(std::int8_t)((q >> (8 * i)) & 0xFF);
+}
+
+template <>
+__device__ __forceinline__ void kv_load8<KvType::Q4_0>(const void *row, int lane, float out[8]) {
+  // lanes 0-3 cover one 32-element block: 8 low nibbles (lanes 0,1) or 8 high
+  // nibbles (lanes 2,3) of the same 8 qs bytes
+  // lane L covers dims [L*8, L*8+8): L&1 selects the low-nibble half (dims 0-15)
+  // or the high-nibble half (dims 16-31) of the same 16 qs bytes, L&2 the half
+  const block_q4_0 *b = (const block_q4_0 *)row + (lane >> 2);
+  const std::uint64_t q = *(const std::uint64_t *)(b->qs + (lane & 1) * 8);
+  const bool high = (lane & 2) != 0;
+  const float d = fp16_to_float(b->d);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int byte = (int)((q >> (8 * i)) & 0xFF);
+    const int nib = high ? (byte >> 4) : (byte & 0x0F);
+    out[i] = d * (float)(nib - 8);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Device: quantize one f32 row (head_dim elements) into the cache layout.
 // Q8_0 and Q4_0 reproduce ggml's reference quantizers byte for byte
 // (quantize_row_q8_0_ref: amax/127 + roundf + an fp16 scale; quantize_row_q4_0_ref:

@@ -79,7 +79,7 @@ inline bool rope_launch(float *d_x, int n_tokens, int n_heads, int head_dim, int
 // shuffle reduction, the accumulation is local, and the WPB slices are merged
 // through a small shared buffer at the end.
 // ---------------------------------------------------------------------------
-constexpr int kAttnWarpsPerBlock = 8;   // key slices per block
+constexpr int kAttnWarpsPerBlock = 8;  // key slices per block
 constexpr int kAttnMaxDimsPerLane = 16; // head_dim/32 <= 16 (head_dim <= 512)
 
 template <KvType KT, KvType VT>
@@ -111,8 +111,15 @@ __global__ void attn_kernel(const float *__restrict__ q, const void *__restrict_
 
   for (int j = w; j <= t; j += kAttnWarpsPerBlock) {
     const char *kr = (const char *)k + ((std::int64_t)j * n_head_kv + kvh) * krow;
+    float kk[kAttnMaxDimsPerLane];
+    if (dpw == 8) {
+      // the common case: one vectorized, coalesced load per lane per row
+      kv_load8<KT>(kr, lane, kk);
+    } else {
+      for (int i = 0; i < dpw; ++i) kk[i] = kv_load<KT>(kr, lane * dpw + i);
+    }
     float partial = 0.0f;
-    for (int i = 0; i < dpw; ++i) partial = fmaf(qv[i], kv_load<KT>(kr, lane * dpw + i), partial);
+    for (int i = 0; i < dpw; ++i) partial = fmaf(qv[i], kk[i], partial);
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) partial += __shfl_xor_sync(0xffffffffull, partial, off);
     const float score = partial * dscale;
@@ -127,7 +134,13 @@ __global__ void attn_kernel(const float *__restrict__ q, const void *__restrict_
     const float p = (m == -INFINITY) ? 0.0f : expf(score - m);
     l += p;
     const char *vr = (const char *)v + ((std::int64_t)j * n_head_kv + kvh) * vrow;
-    for (int i = 0; i < dpw; ++i) acc[i] = fmaf(p, kv_load<VT>(vr, lane * dpw + i), acc[i]);
+    float vv[kAttnMaxDimsPerLane];
+    if (dpw == 8) {
+      kv_load8<VT>(vr, lane, vv);
+    } else {
+      for (int i = 0; i < dpw; ++i) vv[i] = kv_load<VT>(vr, lane * dpw + i);
+    }
+    for (int i = 0; i < dpw; ++i) acc[i] = fmaf(p, vv[i], acc[i]);
   }
 
   // Merge the WPB key slices: every lane publishes its own dims, so the whole
