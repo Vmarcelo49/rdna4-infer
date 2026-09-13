@@ -93,6 +93,13 @@ RD_MATVEC_TRAITS(TIQ4XS, vec_dot_iq4_xs_q8_1, 256, QI4_XS, VDR_IQ4_XS_Q8_1_MMVQ,
 
 #undef RD_MATVEC_TRAITS
 
+// L2 prefetch (from llama.cpp mmvq.cu, MIT). Only used where measured to help.
+static __device__ __forceinline__ void rdna4_prefetch_l2(const void *p) {
+  // __builtin_prefetch instead of llama.cpp's inline asm: the asm form uses the
+  // "l" (64-bit register) constraint, which the host pass of amdclang++ rejects.
+  __builtin_prefetch(p, 0, 3);
+}
+
 // Generalized kernel: ROWS rows per CTA, WPR warps cooperating per row
 // (NWARPS = ROWS*WPR). Covers both shapes:
 //   (ROWS=4, WPR=1) -> the 4-warps-4-rows layout (best aggregate here)
@@ -100,9 +107,19 @@ RD_MATVEC_TRAITS(TIQ4XS, vec_dot_iq4_xs_q8_1, 256, QI4_XS, VDR_IQ4_XS_Q8_1_MMVQ,
 // Per-row-group indexing follows llama.cpp: kqs = vdr*(tg % (qi/vdr)),
 // slot = tg / (qi/vdr), blocks_per_iter = vdr*(WPR*32)/qi, where tg is the
 // thread index inside its row group.
-template <class T, int ROWS, int WPR>
-__global__ void matvec_kernel_gen(const void *__restrict__ vx, const block_q8_1 *__restrict__ vy,
-                                  float *__restrict__ dst, int64_t nrows, int64_t blocks_per_row) {
+// MINB > 0 emits __launch_bounds__(threads, MINB), which caps the register
+// budget so more warps fit per CU. The lookup-heavy IQ vec_dots otherwise use
+// 80-120 registers (iq4_xs: 119 -> only ~8 warps/CU) and become latency bound:
+// read-only walks of the same blocks run at 1700 GB/s while the matvec gets 196.
+template <class T, int ROWS, int WPR, int ILP = 1, bool PF = false, int MINB = 0>
+__global__ void
+#if defined(__HIP_DEVICE_COMPILE__)
+__launch_bounds__(ROWS * WPR * 32, MINB > 0 ? MINB : 1)
+#endif
+matvec_kernel_gen(const void *__restrict__ vx, const block_q8_1 *__restrict__ vy,
+                  float *__restrict__ dst, int64_t nrows, int64_t blocks_per_row) {
+  static_assert(ILP >= 1, "ILP must be >= 1");
+  constexpr int PF_DIST = 2;  // prefetch distance, in loop iterations
   constexpr int vdr = T::vdr;
   constexpr int qi = T::qi;
   constexpr int qk = T::qk;
@@ -125,11 +142,32 @@ __global__ void matvec_kernel_gen(const void *__restrict__ vx, const block_q8_1 
   const int kqs = vdr * (tg % slots_per_block);
   const int slot = tg / slots_per_block;
 
-  float sum = 0.0f;
-  for (int64_t kb = slot; kb < blocks_per_row; kb += blocks_per_iter) {
-    const int64_t kby = kb * (qk / QK8_1);
-    sum += T::dot((const void *)rowp, vy + kby, (const int)kb, kqs);
+  // ILP independent accumulators: the naive loop is one dependent chain of
+  // float adds, which leaves memory latency exposed.
+  float acc[ILP];
+#pragma unroll
+  for (int i = 0; i < ILP; ++i) acc[i] = 0.0f;
+
+  int64_t kb = slot;
+  for (; kb + (ILP - 1) * blocks_per_iter < blocks_per_row; kb += ILP * blocks_per_iter) {
+    if (PF) {
+      const int64_t kp = kb + PF_DIST * blocks_per_iter;
+      if (kp < blocks_per_row) {
+        rdna4_prefetch_l2((const char *)rowp + kp * (int64_t)sizeof(typename T::block_t));
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < ILP; ++u) {
+      const int64_t k = kb + u * blocks_per_iter;
+      acc[u] += T::dot((const void *)rowp, vy + k * (qk / QK8_1), (const int)k, kqs);
+    }
   }
+  for (; kb < blocks_per_row; kb += blocks_per_iter) {
+    acc[0] += T::dot((const void *)rowp, vy + kb * (qk / QK8_1), (const int)kb, kqs);
+  }
+  float sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < ILP; ++i) sum += acc[i];
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor(sum, off);
 
@@ -179,11 +217,14 @@ inline bool matvec_shape(int dt, MatvecShape &out) {
 
 // Matvec launch configuration: rows per CTA and warps cooperating per row.
 //
-// Measured on gfx1201 (RX 9070 XT) with `check-matvec-gpu --bench` on the
-// largest tensor of each type, averaged over 3 runs (values in GB/s in
-// PLAN.md "Passo 5"). Row shape matters as much as type: tensors with few
-// blocks per row (q8_0/iq4_nl) and very long rows (token_embd 248320 cols)
-// prefer different shapes, so this keys on the type of the tensor being run.
+// Chosen by measurement on gfx1201 (RX 9070 XT): `check-matvec-gpu --bench`
+// sweeps 8 shapes x 14 types on the largest tensor of each type, 3 runs
+// averaged (full table in PLAN.md "Passo 5").
+//
+// NOTE on benchmarking this GPU: it drops to a deep DPM state between kernels
+// (SCLK observed at 9-16 MHz), so a short warmup measures the clock ramp, not
+// the kernel. The bench warms up until ~300 ms of GPU time has elapsed and
+// then times 50 iterations; without that, every number here is ~1.5x too low.
 struct MatvecConfig {
   int rows;  // rows per CTA
   int wpr;   // warps cooperating per row
@@ -191,30 +232,31 @@ struct MatvecConfig {
 
 inline MatvecConfig matvec_default_config(int dt) {
   switch (dt) {
-    case 1:  return {4, 1};  // q8_0     (399; 1x1=407 within noise, better occupancy)
-    case 2:  return {2, 2};  // q2_K     (190)
-    case 3:  return {1, 4};  // q3_K     (187, long rows)
-    case 4:  return {2, 2};  // q4_K     (408)
-    case 5:  return {1, 2};  // q5_K     (493, long rows)
-    case 6:  return {1, 1};  // q6_K     (312)
-    case 7:  return {1, 1};  // iq2_xxs  (128)
-    case 8:  return {1, 1};  // iq2_xs   (146)
-    case 9:  return {8, 1};  // iq3_xxs  (193)
-    case 10: return {2, 2};  // iq1_s    (249)
-    case 11: return {8, 1};  // iq4_nl   (99)
-    case 12: return {1, 1};  // iq3_s    (215)
-    case 13: return {8, 1};  // iq2_s    (166)
-    case 14: return {8, 1};  // iq4_xs   (124)
+    case 1:  return {2, 1};  // q8_0     671 GB/s
+    case 2:  return {2, 1};  // q2_K     337
+    case 3:  return {1, 8};  // q3_K     321  (very long rows: token_embd)
+    case 4:  return {8, 1};  // q4_K     694
+    case 5:  return {4, 1};  // q5_K     610
+    case 6:  return {1, 4};  // q6_K     484
+    case 7:  return {4, 1};  // iq2_xxs  227
+    case 8:  return {2, 2};  // iq2_xs   248
+    case 9:  return {2, 1};  // iq3_xxs  336
+    case 10: return {1, 4};  // iq1_s    433
+    case 11: return {8, 1};  // iq4_nl   179
+    case 12: return {8, 1};  // iq3_s    374
+    case 13: return {2, 1};  // iq2_s    289
+    case 14: return {8, 1};  // iq4_xs   241
     default: return {4, 1};
   }
 }
 
-template <class T, int ROWS, int WPR>
+template <class T, int ROWS, int WPR, int ILP = 1, bool PF = false, int MINB = 0>
 inline bool launch_gen(const void *d_weights, const block_q8_1 *d_act, float *d_out, int64_t nrows,
                        int64_t bpr, hipStream_t stream) {
   const int grid = (int)((nrows + ROWS - 1) / ROWS);
   const int threads = ROWS * WPR * 32;
-  matvec_kernel_gen<T, ROWS, WPR><<<grid, threads, 0, stream>>>(d_weights, d_act, d_out, nrows, bpr);
+  matvec_kernel_gen<T, ROWS, WPR, ILP, PF, MINB>
+      <<<grid, threads, 0, stream>>>(d_weights, d_act, d_out, nrows, bpr);
   return hipGetLastError() == hipSuccess;
 }
 
@@ -255,9 +297,233 @@ inline bool matvec_launch_cfg(int dt, const void *d_w, const block_q8_1 *d_a, fl
 
 #undef RD_CFG_CASES
 
+template <int Dt> struct MtShape;             // { rows, wpr } per dtype ordinal
+template <> struct MtShape<1>  { static constexpr int rows = 2, wpr = 1; };  // q8_0
+template <> struct MtShape<2>  { static constexpr int rows = 2, wpr = 1; };  // q2_K
+template <> struct MtShape<3>  { static constexpr int rows = 1, wpr = 8; };  // q3_K
+template <> struct MtShape<4>  { static constexpr int rows = 8, wpr = 1; };  // q4_K
+template <> struct MtShape<5>  { static constexpr int rows = 4, wpr = 1; };  // q5_K
+template <> struct MtShape<6>  { static constexpr int rows = 1, wpr = 4; };  // q6_K
+template <> struct MtShape<7>  { static constexpr int rows = 4, wpr = 1; };  // iq2_xxs
+template <> struct MtShape<8>  { static constexpr int rows = 2, wpr = 2; };  // iq2_xs
+template <> struct MtShape<9>  { static constexpr int rows = 2, wpr = 1; };  // iq3_xxs
+template <> struct MtShape<10> { static constexpr int rows = 1, wpr = 4; };  // iq1_s
+template <> struct MtShape<11> { static constexpr int rows = 8, wpr = 1; };  // iq4_nl
+template <> struct MtShape<12> { static constexpr int rows = 8, wpr = 1; };  // iq3_s
+template <> struct MtShape<13> { static constexpr int rows = 2, wpr = 1; };  // iq2_s
+template <> struct MtShape<14> { static constexpr int rows = 8, wpr = 1; };  // iq4_xs
+
+// ILP (independent accumulators) per type, measured with --bench-tune.
+// Helps the latency-bound types a lot (q4_K 610->739 GB/s), does nothing or
+// slightly regresses the ALU-bound IQ types, so those stay at 1.
+template <int Dt> struct MtIlp { static constexpr int value = 1; };
+template <> struct MtIlp<1>  { static constexpr int value = 4; };  // q8_0
+template <> struct MtIlp<2>  { static constexpr int value = 2; };  // q2_K
+template <> struct MtIlp<3>  { static constexpr int value = 2; };  // q3_K
+template <> struct MtIlp<4>  { static constexpr int value = 2; };  // q4_K
+template <> struct MtIlp<5>  { static constexpr int value = 2; };  // q5_K
+template <> struct MtIlp<6>  { static constexpr int value = 2; };  // q6_K
+template <> struct MtIlp<7>  { static constexpr int value = 2; };  // iq2_xxs
+template <> struct MtIlp<8>  { static constexpr int value = 4; };  // iq2_xs
+template <> struct MtIlp<9>  { static constexpr int value = 1; };  // iq3_xxs
+template <> struct MtIlp<10> { static constexpr int value = 1; };  // iq1_s
+template <> struct MtIlp<11> { static constexpr int value = 1; };  // iq4_nl
+template <> struct MtIlp<12> { static constexpr int value = 1; };  // iq3_s
+template <> struct MtIlp<13> { static constexpr int value = 1; };  // iq2_s
+template <> struct MtIlp<14> { static constexpr int value = 2; };  // iq4_xs
+
+// Shipping path: shape and ILP are compile-time per type (both measured), so
+// this instantiates exactly one kernel per type.
 inline bool matvec_launch(int dt, const void *d_w, const block_q8_1 *d_a, float *d_o,
                           int64_t nrows, int64_t ncols, hipStream_t stream) {
-  return matvec_launch_cfg(dt, d_w, d_a, d_o, nrows, ncols, stream, matvec_default_config(dt));
+#define RD_SHIP(Traits, Dt, QK)                                                            \
+  case Dt:                                                                                 \
+    return launch_gen<Traits, MtShape<Dt>::rows, MtShape<Dt>::wpr, MtIlp<Dt>::value, false>(\
+        d_w, d_a, d_o, nrows, ncols / QK, stream);
+  switch (dt) {
+    RD_SHIP(TQ8_0, 1, 32)
+    RD_SHIP(TQ2K, 2, 256)
+    RD_SHIP(TQ3K, 3, 256)
+    RD_SHIP(TQ4K, 4, 256)
+    RD_SHIP(TQ5K, 5, 256)
+    RD_SHIP(TQ6K, 6, 256)
+    RD_SHIP(TIQ2XXS, 7, 256)
+    RD_SHIP(TIQ2XS, 8, 256)
+    RD_SHIP(TIQ3XXS, 9, 256)
+    RD_SHIP(TIQ1S, 10, 256)
+    RD_SHIP(TIQ4NL, 11, 32)
+    RD_SHIP(TIQ3S, 12, 256)
+    RD_SHIP(TIQ2S, 13, 256)
+    RD_SHIP(TIQ4XS, 14, 256)
+    default:
+      return false;  // no kernel: caller must fail loudly (SPEC 1.3)
+  }
+#undef RD_SHIP
+}
+
+
+// ---------------------------------------------------------------------------
+// Tuned dispatch: the shipping shape per type is a compile-time constant (it is
+// measured, see matvec_default_config) so that the ILP/prefetch knobs can be
+// selected without a runtime shape switch, keeping instantiations bounded.
+// ---------------------------------------------------------------------------
+template <class T, int ROWS, int WPR>
+inline bool launch_shape_tuned(const void *d_w, const block_q8_1 *d_a, float *d_o, int64_t nrows,
+                               int64_t bpr, hipStream_t stream, int ilp, bool pf) {
+  if (ilp == 1 && !pf) return launch_gen<T, ROWS, WPR, 1, false>(d_w, d_a, d_o, nrows, bpr, stream);
+  if (ilp == 2 && !pf) return launch_gen<T, ROWS, WPR, 2, false>(d_w, d_a, d_o, nrows, bpr, stream);
+  if (ilp == 4 && !pf) return launch_gen<T, ROWS, WPR, 4, false>(d_w, d_a, d_o, nrows, bpr, stream);
+  if (ilp == 1 &&  pf) return launch_gen<T, ROWS, WPR, 1, true >(d_w, d_a, d_o, nrows, bpr, stream);
+  if (ilp == 2 &&  pf) return launch_gen<T, ROWS, WPR, 2, true >(d_w, d_a, d_o, nrows, bpr, stream);
+  if (ilp == 4 &&  pf) return launch_gen<T, ROWS, WPR, 4, true >(d_w, d_a, d_o, nrows, bpr, stream);
+  return false;
+}
+
+// Sweeps the ILP/prefetch knobs on each type's shipping shape (bench use).
+inline bool matvec_launch_tuned(int dt, const void *d_w, const block_q8_1 *d_a, float *d_o,
+                                int64_t nrows, int64_t ncols, hipStream_t stream, int ilp, bool pf) {
+#define RD_TUNED(Traits, Dt, QK)                                                          \
+  case Dt:                                                                                \
+    return launch_shape_tuned<Traits, MtShape<Dt>::rows, MtShape<Dt>::wpr>(               \
+        d_w, d_a, d_o, nrows, ncols / QK, stream, ilp, pf);
+  switch (dt) {
+    RD_TUNED(TQ8_0, 1, 32)
+    RD_TUNED(TQ2K, 2, 256)
+    RD_TUNED(TQ3K, 3, 256)
+    RD_TUNED(TQ4K, 4, 256)
+    RD_TUNED(TQ5K, 5, 256)
+    RD_TUNED(TQ6K, 6, 256)
+    RD_TUNED(TIQ2XXS, 7, 256)
+    RD_TUNED(TIQ2XS, 8, 256)
+    RD_TUNED(TIQ3XXS, 9, 256)
+    RD_TUNED(TIQ1S, 10, 256)
+    RD_TUNED(TIQ4NL, 11, 32)
+    RD_TUNED(TIQ3S, 12, 256)
+    RD_TUNED(TIQ2S, 13, 256)
+    RD_TUNED(TIQ4XS, 14, 256)
+    default:
+      return false;  // no kernel: caller must fail loudly (SPEC 1.3)
+  }
+#undef RD_TUNED
+}
+
+
+// ---------------------------------------------------------------------------
+// Diagnostic: walks the exact same blocks as the matvec (same row/block/thread
+// mapping) but only reads the weights, so the measured bandwidth is the ceiling
+// of this access pattern. Used to tell "memory pattern" from "ALU" limits
+// (bench: check-matvec-gpu --bench-read).
+// ---------------------------------------------------------------------------
+template <class T, int ROWS, int WPR>
+__global__ void read_only_kernel(const void *__restrict__ vx, float *__restrict__ dst,
+                                 int64_t nrows, int64_t blocks_per_row) {
+  constexpr int qi = T::qi;
+  constexpr int vdr = T::vdr;
+  constexpr int slots_per_block = qi / vdr;
+  constexpr int blocks_per_iter = vdr * (WPR * 32) / qi;
+
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int row_group = warp / WPR;
+  const int w_in_group = warp % WPR;
+  const int tg = w_in_group * 32 + lane;
+
+  const int row_raw = (int)(blockIdx.x * ROWS + row_group);
+  const bool active = row_raw < nrows;
+  const int row = active ? row_raw : 0;
+  const char *rowp =
+      (const char *)vx + (int64_t)row * blocks_per_row * (int64_t)sizeof(typename T::block_t);
+  const int slot = tg / slots_per_block;
+  const int within = (tg % slots_per_block) * (int)sizeof(typename T::block_t) / slots_per_block;
+
+  uint32_t acc = 0;
+  for (int64_t kb = slot; kb < blocks_per_row; kb += blocks_per_iter) {
+    acc += *(const uint32_t *)(rowp + kb * (int64_t)sizeof(typename T::block_t) + within);
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off);
+  if (active && lane == 0 && w_in_group == 0) dst[row] = (float)acc;
+}
+
+template <class T, int ROWS, int WPR>
+inline bool launch_read_only(const void *d_w, float *d_o, int64_t nrows, int64_t bpr,
+                             hipStream_t stream) {
+  const int grid = (int)((nrows + ROWS - 1) / ROWS);
+  read_only_kernel<T, ROWS, WPR><<<grid, ROWS * WPR * 32, 0, stream>>>(d_w, d_o, nrows, bpr);
+  return hipGetLastError() == hipSuccess;
+}
+
+inline bool matvec_launch_read_only(int dt, const void *d_w, float *d_o, int64_t nrows,
+                                    int64_t ncols, hipStream_t stream) {
+#define RD_RO(Traits, Dt, QK)                                                              \
+  case Dt:                                                                                 \
+    return launch_read_only<Traits, MtShape<Dt>::rows, MtShape<Dt>::wpr>(                   \
+        d_w, d_o, nrows, ncols / QK, stream);
+  switch (dt) {
+    RD_RO(TQ8_0, 1, 32)
+    RD_RO(TQ2K, 2, 256)
+    RD_RO(TQ3K, 3, 256)
+    RD_RO(TQ4K, 4, 256)
+    RD_RO(TQ5K, 5, 256)
+    RD_RO(TQ6K, 6, 256)
+    RD_RO(TIQ2XXS, 7, 256)
+    RD_RO(TIQ2XS, 8, 256)
+    RD_RO(TIQ3XXS, 9, 256)
+    RD_RO(TIQ1S, 10, 256)
+    RD_RO(TIQ4NL, 11, 32)
+    RD_RO(TIQ3S, 12, 256)
+    RD_RO(TIQ2S, 13, 256)
+    RD_RO(TIQ4XS, 14, 256)
+    default: return false;
+  }
+#undef RD_RO
+}
+
+
+// Occupancy diagnostic: register/shared usage of each type's shipping kernel.
+inline bool matvec_kernel_attrs(int dt, hipFuncAttributes &attr) {
+#define RD_ATTR(Traits, Dt)                                                              \
+  case Dt: {                                                                             \
+    auto *fn = &matvec_kernel_gen<Traits, MtShape<Dt>::rows, MtShape<Dt>::wpr,           \
+                                  MtIlp<Dt>::value, false>;                               \
+    return hipFuncGetAttributes(&attr, (const void *)fn) == hipSuccess;                   \
+  }
+  switch (dt) {
+    RD_ATTR(TQ8_0, 1) RD_ATTR(TQ2K, 2) RD_ATTR(TQ3K, 3) RD_ATTR(TQ4K, 4) RD_ATTR(TQ5K, 5)
+    RD_ATTR(TQ6K, 6) RD_ATTR(TIQ2XXS, 7) RD_ATTR(TIQ2XS, 8) RD_ATTR(TIQ3XXS, 9)
+    RD_ATTR(TIQ1S, 10) RD_ATTR(TIQ4NL, 11) RD_ATTR(TIQ3S, 12) RD_ATTR(TIQ2S, 13)
+    RD_ATTR(TIQ4XS, 14)
+    default: return false;
+  }
+#undef RD_ATTR
+}
+
+
+// Sweeps __launch_bounds__ min-blocks (register budget) on each type's
+// shipping shape; used by the bench to see if capping registers buys occupancy.
+inline bool matvec_launch_minb(int dt, const void *d_w, const block_q8_1 *d_a, float *d_o,
+                               int64_t nrows, int64_t ncols, hipStream_t stream, int minb) {
+#define RD_MB(Traits, Dt, QK)                                                              \
+  case Dt: {                                                                               \
+    constexpr int R = MtShape<Dt>::rows, W = MtShape<Dt>::wpr, I = MtIlp<Dt>::value;       \
+    switch (minb) {                                                                        \
+      case 0: return launch_gen<Traits, R, W, I, false, 0>(d_w, d_a, d_o, nrows, ncols / QK, stream); \
+      case 2: return launch_gen<Traits, R, W, I, false, 2>(d_w, d_a, d_o, nrows, ncols / QK, stream); \
+      case 3: return launch_gen<Traits, R, W, I, false, 3>(d_w, d_a, d_o, nrows, ncols / QK, stream); \
+      case 4: return launch_gen<Traits, R, W, I, false, 4>(d_w, d_a, d_o, nrows, ncols / QK, stream); \
+      case 6: return launch_gen<Traits, R, W, I, false, 6>(d_w, d_a, d_o, nrows, ncols / QK, stream); \
+      default: return false;                                                               \
+    }                                                                                      \
+  }
+  switch (dt) {
+    RD_MB(TQ8_0, 1, 32)   RD_MB(TQ2K, 2, 256)    RD_MB(TQ3K, 3, 256)   RD_MB(TQ4K, 4, 256)
+    RD_MB(TQ5K, 5, 256)   RD_MB(TQ6K, 6, 256)    RD_MB(TIQ2XXS, 7, 256) RD_MB(TIQ2XS, 8, 256)
+    RD_MB(TIQ3XXS, 9, 256) RD_MB(TIQ1S, 10, 256) RD_MB(TIQ4NL, 11, 32) RD_MB(TIQ3S, 12, 256)
+    RD_MB(TIQ2S, 13, 256) RD_MB(TIQ4XS, 14, 256)
+    default: return false;
+  }
+#undef RD_MB
 }
 
 }  // namespace rdna4

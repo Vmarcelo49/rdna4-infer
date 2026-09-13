@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,17 @@ extern "C" bool rdna4_cpu_dequant_row(int dt, const void *src, float *dst, std::
 namespace {
 
 using rdna4::DType;
+
+// dtype ordinal -> short type name (as used in the tables/PLAN.md)
+inline const char *tc_name_of(int dt) {
+  switch (dt) {
+    case 1: return "q8_0";   case 2: return "q2_k";    case 3: return "q3_k";
+    case 4: return "q4_k";   case 5: return "q5_k";    case 6: return "q6_k";
+    case 7: return "iq2_xxs";case 8: return "iq2_xs";  case 9: return "iq3_xxs";
+    case 10: return "iq1_s"; case 11: return "iq4_nl"; case 12: return "iq3_s";
+    case 13: return "iq2_s"; case 14: return "iq4_xs"; default: return "?";
+  }
+}
 
 struct TypeCase {
   DType dt;
@@ -98,7 +110,16 @@ Stats compare(const std::vector<float> &a, const std::vector<float> &b) {
 // Bench mode: for each type, matvec the LARGEST usable tensor over ALL its
 // rows, timed with hipEvents. Decode is memory-bandwidth bound, so the
 // reported GB/s is the number that matters (weights are re-read per token).
-int run_bench(rdna4::GgufLoader &ld) {
+int run_bench(rdna4::GgufLoader &ld, int force_ilp = 0, int force_pf = 0) {
+  // force_ilp == 0 -> each type's shipping (measured) ILP.
+  auto launch = [&](int dt, const void *dw, const rdna4::block_q8_1 *da, float *dy,
+                    int64_t nrows, int64_t ncols) {
+    if (force_ilp > 0) {
+      return rdna4::matvec_launch_tuned(dt, dw, da, dy, nrows, ncols, nullptr, force_ilp,
+                                        force_pf != 0);
+    }
+    return rdna4::matvec_launch(dt, dw, da, dy, nrows, ncols, nullptr);
+  };
   double total_bytes = 0, total_sec = 0;
   static double bw_by_type[16] = {0};
   for (int i = 0; i < 16; ++i) bw_by_type[i] = 0;
@@ -137,16 +158,30 @@ int run_bench(rdna4::GgufLoader &ld) {
     hipMemcpy(d_x, x.data(), (std::size_t)ncols * sizeof(float), hipMemcpyHostToDevice);
     rdna4::quantize_q8_1_kernel<<<(unsigned)((ncols / QK8_1 + 3) / 4), 128>>>(d_x, d_a, ncols / QK8_1);
 
-    const int iters = 10;
+    const int iters = 50;
     hipEvent_t e0, e1;
     hipEventCreate(&e0); hipEventCreate(&e1);
+    // Clock-ramp aware: the GPU drops to a low DPM state (SCLK down to ~10 MHz)
+    // between kernels, so a short warmup measures the ramp, not the kernel.
+    // Warm up until ~300 ms of GPU time has elapsed, then time enough
+    // iterations to be stable.
     auto time_cfg = [&](rdna4::MatvecConfig c) {
-      for (int i = 0; i < 3; ++i) {
-        rdna4::matvec_launch_cfg((int)tc.dt, d_w, d_a, d_y, nrows, ncols, nullptr, c);
+      (void)c;
+      float warm = 0;
+      while (warm < 300.0f) {
+        hipEventRecord(e0, nullptr);
+        for (int i = 0; i < 20; ++i) {
+          launch((int)tc.dt, d_w, d_a, d_y, nrows, ncols);
+        }
+        hipEventRecord(e1, nullptr);
+        hipEventSynchronize(e1);
+        float ms = 0;
+        hipEventElapsedTime(&ms, e0, e1);
+        warm += ms;
       }
       hipEventRecord(e0, nullptr);
       for (int i = 0; i < iters; ++i) {
-        rdna4::matvec_launch_cfg((int)tc.dt, d_w, d_a, d_y, nrows, ncols, nullptr, c);
+        launch((int)tc.dt, d_w, d_a, d_y, nrows, ncols);
       }
       hipEventRecord(e1, nullptr);
       hipEventSynchronize(e1);
@@ -155,31 +190,18 @@ int run_bench(rdna4::GgufLoader &ld) {
       return (double)ms / iters;
     };
 
-    const rdna4::MatvecConfig kCfgs[] = {{4, 1}, {2, 1}, {1, 1}, {8, 1}, {1, 2}, {1, 4}, {1, 8}, {2, 2}};
-    double best_ms = 1e30;
-    rdna4::MatvecConfig best_cfg{0, 0};
-    char sweep[192] = {0};
-    for (const rdna4::MatvecConfig &c : kCfgs) {
-      const double ms = time_cfg(c);
-      char tmp[32];
-      std::snprintf(tmp, sizeof(tmp), "%dx%d:%.0f ", c.rows, c.wpr,
-                    (double)w.size() / (ms * 1e-3) / 1e9);
-      std::strncat(sweep, tmp, sizeof(sweep) - std::strlen(sweep) - 1);
-      if (ms < best_ms) { best_ms = ms; best_cfg = c; }
-    }
-    // Must run BEFORE the events are destroyed (time_cfg records into them).
-    const rdna4::MatvecConfig def = rdna4::matvec_default_config((int)tc.dt);
-    const double def_ms = time_cfg(def);
+    // Times exactly what ships (per-type shape + ILP), or a forced global
+    // (ILP, PF) when the caller asked for one.
+    const double ms = time_cfg(rdna4::matvec_default_config((int)tc.dt));
     hipEventDestroy(e0); hipEventDestroy(e1);
-    const double def_gbs = (double)w.size() / (def_ms * 1e-3) / 1e9;
-    const double gbs = (double)w.size() / (best_ms * 1e-3) / 1e9;
-    bw_by_type[(int)tc.dt] = def_gbs;   // decode estimate uses the SHIPPED default
+    const rdna4::MatvecConfig def = rdna4::matvec_default_config((int)tc.dt);
+    const double def_gbs = (double)w.size() / (ms * 1e-3) / 1e9;
+    bw_by_type[(int)tc.dt] = def_gbs;   // decode estimate uses the SHIPPED config
     total_bytes += (double)w.size();
     total_sec += (double)w.size() / (def_gbs * 1e9);
-    std::printf("%-9s %-22s %6lld x %6lld  best %dx%d: %6.1f GB/s  (default %dx%d: %.1f)\n",
-                tc.name, info.name.c_str(), (long long)nrows, (long long)ncols, best_cfg.rows,
-                best_cfg.wpr, gbs, def.rows, def.wpr, def_gbs);
-    std::printf("          [%s]\n", sweep);
+    std::printf("%-9s %-22s %6lld x %6lld  %2dx%d  %6.1f GB/s  (%.3f ms%s%s)\n", tc.name,
+                info.name.c_str(), (long long)nrows, (long long)ncols, def.rows, def.wpr, def_gbs,
+                ms, force_ilp > 0 ? ", forced ILP=" : "", force_ilp > 0 ? std::to_string(force_ilp).c_str() : "");
     hipFree(d_w); hipFree(d_a); hipFree(d_y); hipFree(d_x);
   }
   std::printf("\nbench total: %.2f GB of weights, %.2f ms -> %.1f GB/s aggregate\n",
@@ -203,8 +225,204 @@ int run_bench(rdna4::GgufLoader &ld) {
   }
   std::printf("decode estimate (matvec only): %.2f GB of weights in %.2f ms -> %.1f tok/s\n",
               model_bytes / 1e9, est_sec * 1e3, 1.0 / est_sec);
+
+  // Per-type breakdown of the estimated decode time: shows which types to
+  // optimise (the estimate is bytes / measured bandwidth for the largest
+  // tensor of that type).
+  {
+    struct Row { const char *name; double bytes; double sec; double bw; };
+    std::vector<Row> rows;
+    for (std::size_t i = 0; i < ld.n_tensors(); ++i) {
+      const auto dt = ld.dtype(i);
+      rdna4::MatvecShape sh{};
+      if (!rdna4::matvec_shape((int)dt, sh)) continue;
+      if (bw_by_type[(int)dt] <= 0) continue;
+      bool found = false;
+      for (auto &r : rows) {
+        if (r.name == std::string(tc_name_of((int)dt))) { r.bytes += (double)ld.tensor_bytes(i); found = true; break; }
+      }
+      if (!found) {
+        rows.push_back({tc_name_of((int)dt), (double)ld.tensor_bytes(i), 0, bw_by_type[(int)dt]});
+      }
+    }
+    for (auto &r : rows) r.sec = r.bytes / (r.bw * 1e9);
+    std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) { return a.sec > b.sec; });
+    std::printf("  where the time goes:\n");
+    for (const auto &r : rows) {
+      std::printf("    %-9s %6.2f GB  %8.2f ms  %6.1f GB/s  %5.1f%% of decode\n", r.name,
+                  r.bytes / 1e9, r.sec * 1e3, r.bw, 100.0 * r.sec / est_sec);
+    }
+  }
   std::printf("  (F32 / unsupported tensors skipped: %d; baseline Vulkan/RADV decode = 37-38 tok/s)\n",
               skipped);
+  return 0;
+}
+
+
+// Tuning sweep: ILP/prefetch knobs on each type's shipping shape.
+int run_bench_tune(rdna4::GgufLoader &ld) {
+  std::printf("%-9s %-22s %6s   %s\n", "type", "tensor", "shape", "GB/s per (ILP,PF)");
+  for (const TypeCase &tc : kCases) {
+    std::size_t best = std::size_t(-1);
+    std::uint64_t best_bytes = 0;
+    rdna4::MatvecShape shape{};
+    if (!rdna4::matvec_shape((int)tc.dt, shape)) continue;
+    for (std::size_t i = 0; i < ld.n_tensors(); ++i) {
+      if (ld.dtype(i) != tc.dt) continue;
+      const auto &d = ld.meta().tensors[i].dims;
+      if (d.size() != 2 || d[1] % shape.qk != 0 || d[0] <= 0) continue;
+      if (ld.tensor_bytes(i) > best_bytes) { best_bytes = ld.tensor_bytes(i); best = i; }
+    }
+    if (best == std::size_t(-1)) { std::printf("%-9s (absent)\n", tc.name); continue; }
+    const auto &info = ld.meta().tensors[best];
+    const int64_t ncols = info.dims[1], nrows = info.dims[0];
+    std::vector<std::uint8_t> w;
+    std::string err;
+    if (!ld.load_tensor(best, w, err)) continue;
+    std::vector<float> x;
+    fill_x(x, ncols, 4242u);
+    void *d_w = nullptr; rdna4::block_q8_1 *d_a = nullptr; float *d_y = nullptr; float *d_x = nullptr;
+    hipMalloc(&d_w, w.size());
+    hipMalloc(&d_a, (std::size_t)(ncols / QK8_1) * sizeof(rdna4::block_q8_1));
+    hipMalloc(&d_y, (std::size_t)nrows * sizeof(float));
+    hipMalloc(&d_x, (std::size_t)ncols * sizeof(float));
+    hipMemcpy(d_w, w.data(), w.size(), hipMemcpyHostToDevice);
+    hipMemcpy(d_x, x.data(), (std::size_t)ncols * sizeof(float), hipMemcpyHostToDevice);
+    rdna4::quantize_q8_1_kernel<<<(unsigned)((ncols / QK8_1 + 3) / 4), 128>>>(d_x, d_a, ncols / QK8_1);
+
+    hipEvent_t e0, e1;
+    hipEventCreate(&e0); hipEventCreate(&e1);
+    char line[256] = {0};
+    double best_gbs = 0;
+    int best_ilp = 0; bool best_pf = false;
+    for (int ilp : {1, 2, 4}) {
+      for (bool pf : {false, true}) {
+        float warm = 0;
+        while (warm < 200.0f) {  // clock ramp (see PLAN.md): short warmups lie
+          hipEventRecord(e0, nullptr);
+          for (int i = 0; i < 10; ++i)
+            rdna4::matvec_launch_tuned((int)tc.dt, d_w, d_a, d_y, nrows, ncols, nullptr, ilp, pf);
+          hipEventRecord(e1, nullptr);
+          hipEventSynchronize(e1);
+          float ms = 0; hipEventElapsedTime(&ms, e0, e1); warm += ms;
+        }
+        hipEventRecord(e0, nullptr);
+        for (int i = 0; i < 30; ++i)
+          rdna4::matvec_launch_tuned((int)tc.dt, d_w, d_a, d_y, nrows, ncols, nullptr, ilp, pf);
+        hipEventRecord(e1, nullptr);
+        hipEventSynchronize(e1);
+        float ms = 0; hipEventElapsedTime(&ms, e0, e1); ms /= 30;
+        const double gbs = (double)w.size() / (ms * 1e-3) / 1e9;
+        if (gbs > best_gbs) { best_gbs = gbs; best_ilp = ilp; best_pf = pf; }
+        char tmp[32];
+        std::snprintf(tmp, sizeof(tmp), "%d%s:%.0f ", ilp, pf ? "p" : "-", gbs);
+        std::strncat(line, tmp, sizeof(line) - std::strlen(line) - 1);
+      }
+    }
+    hipEventDestroy(e0); hipEventDestroy(e1);
+    const rdna4::MatvecConfig sc = rdna4::matvec_default_config((int)tc.dt);
+    std::printf("%-9s %-22s %2dx%-2d   %s | best ILP=%d PF=%d\n", tc.name, info.name.c_str(),
+                sc.rows, sc.wpr, line, best_ilp, best_pf ? 1 : 0);
+    hipFree(d_w); hipFree(d_a); hipFree(d_y); hipFree(d_x);
+  }
+  return 0;
+}
+
+
+// Diagnostic mode: matvec vs a weights-only walk with the same access pattern.
+int run_bench_read(rdna4::GgufLoader &ld) {
+  std::printf("%-9s %-22s %10s %10s %10s %8s\n", "type", "tensor", "read GB/s", "matvec", "ratio", "shape");
+  double tr = 0, tm = 0, tb = 0;
+  for (const TypeCase &tc : kCases) {
+    rdna4::MatvecShape shape{};
+    if (!rdna4::matvec_shape((int)tc.dt, shape)) continue;
+    std::size_t best = std::size_t(-1);
+    std::uint64_t best_bytes = 0;
+    for (std::size_t i = 0; i < ld.n_tensors(); ++i) {
+      if (ld.dtype(i) != tc.dt) continue;
+      const auto &d = ld.meta().tensors[i].dims;
+      if (d.size() != 2 || d[1] % shape.qk != 0 || d[0] <= 0) continue;
+      if (ld.tensor_bytes(i) > best_bytes) { best_bytes = ld.tensor_bytes(i); best = i; }
+    }
+    if (best == std::size_t(-1)) continue;
+    const auto &info = ld.meta().tensors[best];
+    const int64_t ncols = info.dims[1], nrows = info.dims[0];
+    std::vector<std::uint8_t> w;
+    std::string err;
+    if (!ld.load_tensor(best, w, err)) continue;
+    std::vector<float> x;
+    fill_x(x, ncols, 777u);
+    void *d_w = nullptr; rdna4::block_q8_1 *d_a = nullptr; float *d_y = nullptr; float *d_x = nullptr;
+    hipMalloc(&d_w, w.size());
+    hipMalloc(&d_a, (std::size_t)(ncols / QK8_1) * sizeof(rdna4::block_q8_1));
+    hipMalloc(&d_y, (std::size_t)nrows * sizeof(float));
+    hipMalloc(&d_x, (std::size_t)ncols * sizeof(float));
+    hipMemcpy(d_w, w.data(), w.size(), hipMemcpyHostToDevice);
+    hipMemcpy(d_x, x.data(), (std::size_t)ncols * sizeof(float), hipMemcpyHostToDevice);
+    rdna4::quantize_q8_1_kernel<<<(unsigned)((ncols / QK8_1 + 3) / 4), 128>>>(d_x, d_a, ncols / QK8_1);
+
+    hipEvent_t e0, e1;
+    hipEventCreate(&e0); hipEventCreate(&e1);
+    auto timeit = [&](bool ro) {
+      float warm = 0;
+      while (warm < 250.0f) {
+        hipEventRecord(e0, nullptr);
+        for (int i = 0; i < 10; ++i) {
+          if (ro) rdna4::matvec_launch_read_only((int)tc.dt, d_w, d_y, nrows, ncols, nullptr);
+          else rdna4::matvec_launch((int)tc.dt, d_w, d_a, d_y, nrows, ncols, nullptr);
+        }
+        hipEventRecord(e1, nullptr); hipEventSynchronize(e1);
+        float ms = 0; hipEventElapsedTime(&ms, e0, e1); warm += ms;
+      }
+      hipEventRecord(e0, nullptr);
+      for (int i = 0; i < 30; ++i) {
+        if (ro) rdna4::matvec_launch_read_only((int)tc.dt, d_w, d_y, nrows, ncols, nullptr);
+        else rdna4::matvec_launch((int)tc.dt, d_w, d_a, d_y, nrows, ncols, nullptr);
+      }
+      hipEventRecord(e1, nullptr); hipEventSynchronize(e1);
+      float ms = 0; hipEventElapsedTime(&ms, e0, e1);
+      return (double)ms / 30.0;
+    };
+    const double ms_ro = timeit(true);
+    const double ms_mv = timeit(false);
+    // __launch_bounds__ sweep: does capping registers (more warps/CU) help?
+    char mb_line[128] = {0};
+    for (int mb : {0, 2, 3, 4, 6}) {
+      float warm = 0;
+      while (warm < 150.0f) {
+        hipEventRecord(e0, nullptr);
+        for (int i = 0; i < 10; ++i)
+          rdna4::matvec_launch_minb((int)tc.dt, d_w, d_a, d_y, nrows, ncols, nullptr, mb);
+        hipEventRecord(e1, nullptr); hipEventSynchronize(e1);
+        float w = 0; hipEventElapsedTime(&w, e0, e1); warm += w;
+      }
+      hipEventRecord(e0, nullptr);
+      for (int i = 0; i < 30; ++i)
+        rdna4::matvec_launch_minb((int)tc.dt, d_w, d_a, d_y, nrows, ncols, nullptr, mb);
+      hipEventRecord(e1, nullptr); hipEventSynchronize(e1);
+      float m2 = 0; hipEventElapsedTime(&m2, e0, e1); m2 /= 30;
+      char tmp[24];
+      std::snprintf(tmp, sizeof(tmp), "%d:%.0f ", mb, (double)w.size() / (m2 * 1e-3) / 1e9);
+      std::strncat(mb_line, tmp, sizeof(mb_line) - std::strlen(mb_line) - 1);
+    }
+    hipEventDestroy(e0); hipEventDestroy(e1);
+    const double gro = (double)w.size() / (ms_ro * 1e-3) / 1e9;
+    const double gmv = (double)w.size() / (ms_mv * 1e-3) / 1e9;
+    const rdna4::MatvecConfig sc = rdna4::matvec_default_config((int)tc.dt);
+    hipFuncAttributes at{};
+    int regs = 0, maxthr = 0;
+    if (rdna4::matvec_kernel_attrs((int)tc.dt, at)) { regs = at.numRegs; maxthr = at.maxThreadsPerBlock; }
+    const int threads = sc.rows * sc.wpr * 32;
+    const int warps_per_cu = regs > 0 ? (regs <= 32 ? 64 : (regs <= 64 ? 32 : 16)) : 0;
+    std::printf("%-9s %-22s %10.1f %10.1f %9.2fx %5dx%d  regs=%3d  minb[%s]\n",
+                tc.name, info.name.c_str(), gro, gmv, gro / gmv, sc.rows, sc.wpr, regs, mb_line);
+    tr += (double)w.size() / (gro * 1e9);
+    tm += (double)w.size() / (gmv * 1e9);
+    tb += (double)w.size();
+    hipFree(d_w); hipFree(d_a); hipFree(d_y); hipFree(d_x);
+  }
+  std::printf("\nweights only: %.1f GB/s   matvec: %.1f GB/s   (read-only ceiling vs shipped kernel)\n",
+              tb / tr / 1e9, tb / tm / 1e9);
   return 0;
 }
 
@@ -225,8 +443,16 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  if (argc >= 3 && std::strcmp(argv[2], "--bench-read") == 0) {
+    return run_bench_read(ld);
+  }
+  if (argc >= 3 && std::strcmp(argv[2], "--bench-tune") == 0) {
+    return run_bench_tune(ld);
+  }
   if (bench) {
-    return run_bench(ld);
+    const int f_ilp = argc >= 4 ? std::atoi(argv[3]) : 0;
+    const int f_pf = argc >= 5 ? std::atoi(argv[4]) : 0;
+    return run_bench(ld, f_ilp, f_pf);
   }
 
   int failures = 0;
