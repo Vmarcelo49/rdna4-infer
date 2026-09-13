@@ -467,16 +467,21 @@ int run_bench_ab(rdna4::GgufLoader &ld, int rounds, int dt) {
   hipMemcpy(d_x, x.data(), (std::size_t)ncols * sizeof(float), hipMemcpyHostToDevice);
   rdna4::quantize_q8_1_kernel<<<(unsigned)((ncols / QK8_1 + 3) / 4), 128>>>(d_x, d_a, ncols / QK8_1);
 
-  const bool diag = (dt == 12);         // only iq3_s has the diagnostic variants
-  const int kVariants = diag ? 5 : 2;
+  const bool diag = (dt == 12);                 // iq3_s has 5 variants
+  const bool xx = (dt == 9);                    // iq3_xxs has 4
+  const int kVariants = diag ? 5 : (xx ? 4 : 2);
   const char *names[5] = {"shipping", "perm+lin (cand)", "DIAG-no-sign", "lin (candidate)",
                           "DIAG-no-lookup"};
+  if (xx) {
+    names[0] = "vendored"; names[1] = "perm2 (shipping)"; names[2] = "perm (mid)";
+    names[3] = "DIAG-no-sign";
+  }
   std::vector<std::vector<double>> times(kVariants);
   std::vector<std::vector<float>> out(kVariants);
 
   hipEvent_t e0, e1;
   hipEventCreate(&e0); hipEventCreate(&e1);
-  auto av_of = [&](int v) { return diag ? v : (v == 0 ? 0 : 1); };
+  auto av_of = [&](int v) { return (diag || xx) ? v : (v == 0 ? 0 : 1); };  // variant index == dispatch index
   auto measure = [&](int v) {
     const int av = av_of(v);
     hipEventRecord(e0, nullptr);
@@ -504,7 +509,8 @@ int run_bench_ab(rdna4::GgufLoader &ld, int rounds, int dt) {
 
   // capture each variant's output once (for the numeric check)
   for (int v = 0; v < kVariants; ++v) {
-    rdna4::matvec_launch_variant(dt, d_w, d_a, d_y, nrows, ncols, nullptr, diag ? v : (v == 0 ? 0 : 1));
+    const int avo = (diag || xx) ? v : (v == 0 ? 0 : 1);
+    rdna4::matvec_launch_variant(dt, d_w, d_a, d_y, nrows, ncols, nullptr, avo);
     out[v].resize(nrows);
     hipMemcpy(out[v].data(), d_y, (std::size_t)nrows * sizeof(float), hipMemcpyDeviceToHost);
   }

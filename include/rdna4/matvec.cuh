@@ -93,17 +93,22 @@ RD_MATVEC_TRAITS(TIQ4XS, vec_dot_iq4_xs_q8_1, 256, QI4_XS, VDR_IQ4_XS_Q8_1_MMVQ,
 RD_MATVEC_TRAITS(TIQ3S_LIN, vec_dot_iq3_s_q8_1_lin, 256, QI3_S, VDR_IQ3_S_Q8_1_MMVQ, block_iq3_s);
 RD_MATVEC_TRAITS(TIQ3S_PERM, vec_dot_iq3_s_q8_1_perm, 256, QI3_S, VDR_IQ3_S_Q8_1_MMVQ, block_iq3_s);
 RD_MATVEC_TRAITS(TIQ2XXS_PERM, vec_dot_iq2_xxs_q8_1_perm, 256, QI2_XXS, VDR_IQ2_XXS_Q8_1_MMVQ, block_iq2_xxs);
+RD_MATVEC_TRAITS(TIQ2XXS_PERM2, vec_dot_iq2_xxs_q8_1_perm2, 256, QI2_XXS, VDR_IQ2_XXS_Q8_1_MMVQ, block_iq2_xxs);
+RD_MATVEC_TRAITS(TIQ2XS_PERM2, vec_dot_iq2_xs_q8_1_perm2, 256, QI2_XS, VDR_IQ2_XS_Q8_1_MMVQ, block_iq2_xs);
+RD_MATVEC_TRAITS(TIQ2S_PERM2, vec_dot_iq2_s_q8_1_perm2, 256, QI2_S, VDR_IQ2_S_Q8_1_MMVQ, block_iq2_s);
 // Shipping traits for the sign-using IQ types: the perm+lin bodies below were
 // measured 1.26-2.02x faster than the vendored form and are bit-identical
 // (checked by check-matvec-gpu --bench-ab and the per-type CPU-oracle test).
-RD_MATVEC_TRAITS(TIQ2XXS_S, vec_dot_iq2_xxs_q8_1_perm, 256, QI2_XXS, VDR_IQ2_XXS_Q8_1_MMVQ, block_iq2_xxs);
-RD_MATVEC_TRAITS(TIQ2XS_S, vec_dot_iq2_xs_q8_1_perm, 256, QI2_XS, VDR_IQ2_XS_Q8_1_MMVQ, block_iq2_xs);
-RD_MATVEC_TRAITS(TIQ3XXS_S, vec_dot_iq3_xxs_q8_1_perm, 256, QI3_XXS, VDR_IQ3_XXS_Q8_1_MMVQ, block_iq3_xxs);
-RD_MATVEC_TRAITS(TIQ2S_S, vec_dot_iq2_s_q8_1_perm, 256, QI2_S, VDR_IQ2_S_Q8_1_MMVQ, block_iq2_s);
+RD_MATVEC_TRAITS(TIQ2XXS_S, vec_dot_iq2_xxs_q8_1_perm2, 256, QI2_XXS, VDR_IQ2_XXS_Q8_1_MMVQ, block_iq2_xxs);
+RD_MATVEC_TRAITS(TIQ2XS_S, vec_dot_iq2_xs_q8_1_perm2, 256, QI2_XS, VDR_IQ2_XS_Q8_1_MMVQ, block_iq2_xs);
+RD_MATVEC_TRAITS(TIQ3XXS_S, vec_dot_iq3_xxs_q8_1_perm2, 256, QI3_XXS, VDR_IQ3_XXS_Q8_1_MMVQ, block_iq3_xxs);
+RD_MATVEC_TRAITS(TIQ2S_S, vec_dot_iq2_s_q8_1_perm2, 256, QI2_S, VDR_IQ2_S_Q8_1_MMVQ, block_iq2_s);
 RD_MATVEC_TRAITS(TIQ3S_S, vec_dot_iq3_s_q8_1_perm, 256, QI3_S, VDR_IQ3_S_Q8_1_MMVQ, block_iq3_s);
 RD_MATVEC_TRAITS(TIQ2XS_PERM, vec_dot_iq2_xs_q8_1_perm, 256, QI2_XS, VDR_IQ2_XS_Q8_1_MMVQ, block_iq2_xs);
 RD_MATVEC_TRAITS(TIQ2S_PERM, vec_dot_iq2_s_q8_1_perm, 256, QI2_S, VDR_IQ2_S_Q8_1_MMVQ, block_iq2_s);
 RD_MATVEC_TRAITS(TIQ3XXS_PERM, vec_dot_iq3_xxs_q8_1_perm, 256, QI3_XXS, VDR_IQ3_XXS_Q8_1_MMVQ, block_iq3_xxs);
+RD_MATVEC_TRAITS(TIQ3XXS_PERM2, vec_dot_iq3_xxs_q8_1_perm2, 256, QI3_XXS, VDR_IQ3_XXS_Q8_1_MMVQ, block_iq3_xxs);
+RD_MATVEC_TRAITS(TIQ3XXS_NOSIGN, vec_dot_iq3_xxs_q8_1_diag_nosign, 256, QI3_XXS, VDR_IQ3_XXS_Q8_1_MMVQ, block_iq3_xxs);
 RD_MATVEC_TRAITS(TIQ3S_NOSIGN, vec_dot_iq3_s_q8_1_diag_nosign, 256, QI3_S, VDR_IQ3_S_Q8_1_MMVQ, block_iq3_s);
 RD_MATVEC_TRAITS(TIQ3S_NOLOOKUP, vec_dot_iq3_s_q8_1_diag_nolookup, 256, QI3_S, VDR_IQ3_S_Q8_1_MMVQ, block_iq3_s);
 
@@ -569,10 +574,14 @@ inline bool matvec_launch_variant(int dt, const void *d_w, const block_q8_1 *d_a
       return variant == 1 ? launch_gen<TIQ2XS_PERM, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream)
                           : launch_gen<TIQ2XS, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);
     }
-    case 9: {  // iq3_xxs
+    case 9: {  // iq3_xxs: 0 = vendored, 1 = perm2 (shipping), 2 = perm (intermediate), 3 = DIAG
       constexpr int R = MtShape<9>::rows, W = MtShape<9>::wpr, I = MtIlp<9>::value, QK = 256;
-      return variant == 1 ? launch_gen<TIQ3XXS_PERM, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream)
-                          : launch_gen<TIQ3XXS, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);
+      switch (variant) {
+        case 0: return launch_gen<TIQ3XXS, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);
+        case 1: return launch_gen<TIQ3XXS_PERM2, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);
+        case 2: return launch_gen<TIQ3XXS_PERM, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);
+        default: return launch_gen<TIQ3XXS_NOSIGN, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);
+      }
     }
     case 12: {  // iq3_s
       constexpr int R = MtShape<12>::rows, W = MtShape<12>::wpr, I = MtIlp<12>::value, QK = 256;

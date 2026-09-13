@@ -124,7 +124,18 @@ Objetivo: todo tipo do union M1 computando em GPU.
     O seletor sai de 4 bits de sinal espalhados para os bytes (`(t * 0x00810204) & 0x04040404 | 0x03020100`), sem `__vcmpne4`.
   - **Ganhos medidos (todos bit-identical, rel-L2 = 0,000e+00):** `iq3_s` **2,02×**, `iq2_xxs` **1,63×**, `iq3_xxs` 1,28×, `iq2_xs` 1,27×, `iq2_s` 1,26×.
   - **Resultado agregado (matvec-only, 12,02 GB):** ~29 ms → **22,3–24,0 ms** ⇒ **41,6–45,0 tok/s** (era 33,4–35,0; baseline Vulkan/RADV **37–38**). **Passamos o baseline** na parte de matvec.
-  - **Bottleneck atual:** `iq3_xxs` (~22% do decode, 369 GB/s), depois `iq3_s` (~15%, 757 GB/s) e `iq4_xs` (9%, 1008 GB/s).
+  - **Segunda rodada (seletor enxuto):** a variante `perm` ainda gastava com `unpack_ksigns` (broadcast por multiplicação) + `__vcmpne4` (máscara por byte). Pegando o **nibble de sinais direto** do byte empacotado (`sv ^= (popc(sv)&1)<<7`) e espalhando para os bytes do seletor (`(t * 0x00810204) & 0x04040404`), o custo de sinal praticamente zera — confirmado por diagnóstico: `iq3_xxs` com sinal = 386 GB/s, **sem sinal = 655 GB/s**, e a forma enxuta chega a ~690 GB/s (ou seja, sobrou ~6% para o sinal).
+  - **Ganhos finais por tipo (todos bit-identical, `rel-L2 = 0`):**
+    | tipo | antes (vendored) | depois (perm2 enxuto) |
+    |---|---|---|
+    | `iq3_s` | ~350 GB/s | **557–753 GB/s** |
+    | `iq3_xxs` | ~300–369 | **532–692** |
+    | `iq2_s` | ~259–364 | **455–591** |
+    | `iq2_xs` | ~226–310 | **471–488** |
+    | `iq2_xxs` | ~164–301 | **456–462** |
+    | `iq4_xs` | 196 (bug do perm) → **1008–1021** | (sem sinal; fora desta rodada) |
+  - **Resultado agregado (matvec-only, 12,02 GB):** **20,1–20,8 ms ⇒ 48,0–49,7 tok/s** (início desta otimização: 33,4–35,0; baseline Vulkan/RADV **37–38**). Ou seja, **~1,3× acima do baseline** só na parte de matvec.
+  - **Bottleneck atual:** `iq3_s` (~25–32% do decode, 557–753 GB/s), `iq3_xxs` (13–17%, 532–692), `iq4_xs` (12–13%, ~1010).
 - **Passo 5 — tuning do matvec: infraestrutura de config pronta, ganho pequeno ⚠️**:
   - Kernel generalizado `matvec_kernel_gen<T, ROWS, WPR>`: `ROWS` linhas por CTA × `WPR` warps por linha (cobre tanto 4 warps/4 linhas quanto o layout 1 linha/8 warps do `mmvq`). Redução intra-warp + shared memory quando `WPR > 1`.
   - `matvec_default_config(dt)` por tipo, escolhido por **medição** (sweep de 8 shapes × 14 tipos, 3 repetições, média). Valores medidos (GB/s) para o maior tensor de cada tipo:
