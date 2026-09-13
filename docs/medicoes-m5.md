@@ -101,34 +101,72 @@ ambiguity and localises any divergence to a single token.
 ## 4. VRAM and context (both files)
 
 `rdna4-infer bench` (32 decode tokens, 2 reps) and `info` (the pre-check budget).
-"fill" = the KV cache and recurrent state are pre-seeded (`--fill-cache`), so the
-decode step runs against a *synthetic* full cache without waiting for a long prefill
-(same trick as the M3 long-context test).
 
-| model | ctx | kv K/V | decode | VRAM in use | free |
+> **Correction (M6).** The first version of this table was wrong: `--fill-cache`
+> poisons the KV cache but the decode loop kept using `history.size()-1` as the
+> position, so those rows measured decode at position 5-40 with a large cache
+> *allocated* — a VRAM fit test, not long-context decode. `bench` gained
+> `--start-pos N` (seeding the cache, since the trunk reads positions 0..N-1) and the
+> table below is re-measured at the **end** of each context. The old claim "decode
+> speed is almost independent of context" was an artifact of that bug.
+
+Decode near the end of the context (positions `ctx-32 .. ctx-16`):
+
+| model | ctx | kv K/V | decode | ms/token |
+|---|---|---|---|---|
+| IQ3_S | 4 096 | f16 / f16 | 22.13 tok/s | 45 |
+| IQ3_S | 16 384 | f16 / f16 | 13.72 tok/s | 73 |
+| IQ3_S | 65 536 | **f16** / f16 | **5.76 tok/s** | 174 |
+| IQ3_S | 65 536 | q4_0 / q4_0 | 4.18 tok/s | 239 |
+| IQ3_S | 131 072 | q4_0 / q4_0 | 2.27 tok/s | 441 |
+| IQ4_XS | 4 096 | f16 / f16 | 21.53 tok/s | 46 |
+| IQ4_XS | 32 768 | f16 / f16 | 9.09 tok/s | 110 |
+| IQ4_XS | 65 536 | q4_0 / q4_0 | 4.18 tok/s | 239 |
+
+Subtracting the position-0 baseline (36.3 ms/token) isolates the attention:
+
+| position | f16 | q4_0 |
+|---|---|---|
+| 4 K | 8.9 ms | — |
+| 16 K | 37 ms | — |
+| 64 K | 138 ms | 203 ms |
+| 131 K | — | 405 ms |
+
+**f16 KV is 38 % faster than q4_0 at the same context** (174 vs 239 ms/token at 64K):
+the attention kernel is *issue-bound on dequantising the cache*, not bandwidth-bound —
+at 64K it moves 4.3 GB of f16 KV in 174 ms, i.e. **25 GB/s**, 24x below the measured
+DRAM rate. So `q4_0` is a VRAM lever, not a speed one: use `f16` wherever it fits.
+
+VRAM (allocation) per configuration:
+
+| model | ctx | kv K/V | VRAM in use | free | fits |
 |---|---|---|---|---|---|
-| IQ3_S | 4 096 | f16 / f16 | 27.57 tok/s | 11.87 GiB | 4.05 GiB |
-| IQ3_S | 16 384 | q8_0 / q8_0 | 28.60 tok/s | 12.15 GiB | 3.77 GiB |
-| IQ3_S | 24 576 | f16 / f16 | 28.55 tok/s | 13.11 GiB | 2.81 GiB |
-| IQ3_S | 32 768 | f16 / f16 | 28.21 tok/s | 13.61 GiB | 2.31 GiB |
-| IQ3_S | 65 536 | q4_0 / q4_0 (fill) | 28.74 tok/s | 12.73 GiB | 3.19 GiB |
-| IQ3_S | 131 072 | q4_0 / q4_0 (fill) | 28.59 tok/s | 13.86 GiB | 2.06 GiB |
-| IQ4_XS | 4 096 | f16 / f16 | 27.02 tok/s | 13.91 GiB | 2.01 GiB |
-| IQ4_XS | 16 384 | q8_0 / q8_0 | 26.63 tok/s | 14.19 GiB | 1.73 GiB |
-| IQ4_XS | 24 576 | f16 / f16 | 25.03 tok/s | 15.16 GiB | 0.76 GiB |
-| IQ4_XS | 32 768 | f16 / f16 | 25.38 tok/s | 15.66 GiB | 0.26 GiB |
-| IQ4_XS | 65 536 | q4_0 / q4_0 (fill) | 25.83 tok/s | 14.79 GiB | 1.13 GiB |
-| IQ4_XS | 131 072 | q4_0 / q4_0 (fill) | **fails** (`hipMalloc failed`) | — | — |
+| IQ3_S | 4 096 | f16 / f16 | 11.87 GiB | 4.05 GiB | yes |
+| IQ3_S | 16 384 | q8_0 / q8_0 | 12.15 GiB | 3.77 GiB | yes |
+| IQ3_S | 24 576 | f16 / f16 | 13.11 GiB | 2.81 GiB | yes |
+| IQ3_S | 32 768 | f16 / f16 | 13.61 GiB | 2.31 GiB | yes |
+| IQ3_S | 65 536 | q4_0 / q4_0 | 12.73 GiB | 3.19 GiB | yes |
+| IQ3_S | 131 072 | q4_0 / q4_0 | 13.86 GiB | 2.06 GiB | yes |
+| IQ4_XS | 4 096 | f16 / f16 | 13.91 GiB | 2.01 GiB | yes |
+| IQ4_XS | 16 384 | q8_0 / q8_0 | 14.19 GiB | 1.73 GiB | yes |
+| IQ4_XS | 24 576 | f16 / f16 | 15.16 GiB | 0.76 GiB | yes |
+| IQ4_XS | 32 768 | f16 / f16 | 15.66 GiB | 0.26 GiB | yes, tight |
+| IQ4_XS | 65 536 | q4_0 / q4_0 | 14.79 GiB | 1.13 GiB | yes |
+| IQ4_XS | 131 072 | q4_0 / q4_0 | — | — | **no** (`hipMalloc failed`) |
 
-Two things worth reading off that table:
+Still true from that table: **the weight stream dominates** — 11.87 GiB of the 11.87 GiB
+at 4K is weights + activations, and a 32x larger context adds only ~1.7 GiB, which is
+why the *allocation* barely moves. What moves is the attention work per token.
 
-- **Decode speed is almost independent of context and KV type** (25.0–28.7 tok/s
-  across a 32× context range): the weights (11.2 / 13.3 GiB) dominate the memory
-  traffic of a token, so the KV cache only matters for whether the model fits.
-- **Effective bandwidth is higher on IQ4_XS than on IQ3_S** (363.8 vs 336.2 GB/s,
-  computed as bytes-per-token ÷ time), which is why a file 18 % larger decodes at
-  nearly the same speed: IQ4_XS is mostly `q4_K`/`iq4_xs`, while IQ3_S is dominated by
-  `iq3_s`, the type M2 showed to be issue-bound (its byte-op emulation costs ~2.2×).
+**Effective bandwidth is higher on IQ4_XS than on IQ3_S** (363.8 vs 336.2 GB/s,
+bytes-per-token / time), which is why a file 18 % larger decodes at nearly the same
+speed: IQ4_XS is mostly `q4_K`/`iq4_xs`, while IQ3_S is dominated by `iq3_s`, the type
+M2 showed to be issue-bound.
+
+`info`'s budget check is deliberately conservative: for IQ4_XS at 32K f16 it refuses
+(need 16.27 GiB > 15.92 GiB) while the real run fits with 15.66 GiB in use — it
+assumes 1.00 GiB of overhead where the engine actually uses ~0.40 GiB. It is a
+pre-flight guard, not a measurement.
 
 Prefill (per-token path, 512-token prompt):
 

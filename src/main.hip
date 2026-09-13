@@ -174,6 +174,7 @@ int cmd_bench(int argc, char **argv) {
   bool fill_cache = false;
   std::uint64_t seed = 0;
   long long layers = -1;  // < 0 => all (diagnostic: attribute layer vs head cost)
+  long long start_pos = -1;  // >= 0 => decode starts at this position (see --fill-cache)
 
   for (int i = 1; i < argc; ++i) {
     const char *a = argv[i];
@@ -225,6 +226,9 @@ int cmd_bench(int argc, char **argv) {
       if (!v || !parse_kv_type(v, &kv_v)) return 1;
     } else if (std::strcmp(a, "--fill-cache") == 0) {
       fill_cache = true;
+    } else if (std::strcmp(a, "--start-pos") == 0) {
+      const char *v = need("--start-pos");
+      if (!v || !parse_i64(v, &start_pos) || start_pos < 0) return 1;
     } else if (std::strcmp(a, "--layers") == 0) {
       const char *v = need("--layers");
       if (!v || !parse_i64(v, &layers) || layers < 0) return 1;
@@ -233,8 +237,8 @@ int cmd_bench(int argc, char **argv) {
       if (!v || !parse_u64(v, &seed)) return 1;
     } else if (std::strcmp(a, "-h") == 0 || std::strcmp(a, "--help") == 0) {
       std::printf("usage: rdna4-infer bench -m model.gguf [-p TEXT] [-n DECODE] [--warmup N] "
-                  "[--reps N] [--prefill N] [--ctx-size N] [--cache-type-k T] [--cache-type-v T] "
-                  "[--fill-cache] [--seed N]\n");
+                  "[--reps N] [--prefill N] [--start-pos N] [--ctx-size N] [--cache-type-k T] "
+                  "[--cache-type-v T] [--fill-cache] [--seed N] [--layers N]\n");
       return 0;
     } else {
       std::fprintf(stderr, "rdna4-infer bench: unknown argument '%s'\n", a);
@@ -308,6 +312,13 @@ int cmd_bench(int argc, char **argv) {
 
   graph.set_want_hidden(false);  // the bench does not use `hidden`
   std::vector<float> hidden, logits;
+  // Decoding at position N requires the cache to hold something: the trunk reads
+  // positions 0..N-1, so seed it (the same synthetic-cache trick as
+  // check-kvctx-gpu). It is a COST measurement, not a quality one.
+  if (start_pos > 0 && !fill_cache) {
+    fill_cache = true;
+    std::fprintf(stderr, "rdna4-infer: --start-pos implies --fill-cache (seeding the cache)\n");
+  }
   if (fill_cache && !graph.debug_fill_caches((unsigned)seed, err)) {
     std::fprintf(stderr, "rdna4-infer: fill cache failed: %s\n", err.c_str());
     return 1;
@@ -326,17 +337,26 @@ int cmd_bench(int argc, char **argv) {
   std::vector<std::int32_t> history = ids;
   double sample_ms = 0.0;
   graph.reset_host_timing();
+  const std::size_t first_pos =
+      start_pos > 0 ? (std::size_t)start_pos : ids.size();
+  if (first_pos >= ctx_size) {
+    std::fprintf(stderr, "rdna4-infer bench: --start-pos %zu beyond ctx %llu\n", first_pos,
+                 (unsigned long long)ctx_size);
+    return 1;
+  }
   auto decode_pass = [&](long long n, double *ms_out, std::size_t *n_out) {
     const double a = now_s();
     std::size_t done = 0;
+    std::size_t pos = first_pos;
     for (long long i = 0; i < n; ++i) {
       const double s0 = now_s();
       const std::int32_t id = sampler.sample(logits.data(), history);
       sample_ms += (now_s() - s0) * 1000.0;
       if (id < 0) return false;
       history.push_back(id);
-      if ((std::size_t)history.size() >= ctx_size) break;
-      if (!graph.forward_tokens({id}, (int)history.size() - 1, hidden, logits, err)) return false;
+      if (pos >= ctx_size) break;
+      if (!graph.forward_tokens({id}, (int)pos, hidden, logits, err)) return false;
+      ++pos;
       ++done;
     }
     *ms_out = (now_s() - a) * 1000.0;
@@ -396,7 +416,9 @@ int cmd_bench(int argc, char **argv) {
   }
   std::printf("ctx %llu, kv %s/%s%s, load %.2f s\n", (unsigned long long)ctx_size,
               kv_type_cstr(kv_k), kv_type_cstr(kv_v),
-              fill_cache ? " (synthetic full cache)" : "", t_load);
+              fill_cache ? " (synthetic cache)" : "", t_load);
+  std::printf("decode positions: %zu..%zu%s\n", first_pos, first_pos + (std::size_t)best_n,
+              start_pos > 0 ? "  [synthetic keys/values: cost measurement, not quality]" : "");
   std::printf("vram in use: %.2f GiB (free %.2f of %.2f GiB)\n",
               (double)(tot_b - free_b) / gib, (double)free_b / gib, (double)tot_b / gib);
   std::printf("prefill %zu tokens: %.3f s (%.2f tok/s, per-token path)\n", ids.size(), t_prefill,
