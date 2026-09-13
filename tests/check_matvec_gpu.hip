@@ -23,6 +23,7 @@
 #include "rdna4/loader.h"
 
 extern "C" bool rdna4_cpu_dequant_row(int dt, const void *src, float *dst, std::int64_t nelem);
+extern "C" void rdna4_cpu_quantize_q8_1(const float *x, void *vy, std::int64_t nelem);
 
 namespace {
 
@@ -517,13 +518,24 @@ int main(int argc, char **argv) {
     void *d_w = nullptr;
     rdna4::block_q8_1 *d_a = nullptr;
     float *d_y = nullptr;
-    hipMalloc(&d_w, wbytes.size());
-    hipMalloc(&d_a, (std::size_t)nq8 * sizeof(rdna4::block_q8_1));
-    hipMalloc(&d_y, (std::size_t)rows * sizeof(float));
+    float *d_x = nullptr;
+    auto fail_alloc = [&](const char *what) {
+      std::fprintf(stderr, "%-9s hipMalloc(%s) failed: %s\n", tc.name, what,
+                   hipGetErrorString(hipGetLastError()));
+      if (d_w) hipFree(d_w);
+      if (d_a) hipFree(d_a);
+      if (d_y) hipFree(d_y);
+      if (d_x) hipFree(d_x);
+      return true;
+    };
+    if (hipMalloc(&d_w, wbytes.size()) != hipSuccess) { if (fail_alloc("weights")) { ++failures; continue; } }
+    if (hipMalloc(&d_a, (std::size_t)nq8 * sizeof(rdna4::block_q8_1)) != hipSuccess) { if (fail_alloc("act")) { ++failures; continue; } }
+    if (hipMalloc(&d_y, (std::size_t)rows * sizeof(float)) != hipSuccess) { if (fail_alloc("out")) { ++failures; continue; } }
     hipMemcpy(d_w, wbytes.data(), wbytes.size(), hipMemcpyHostToDevice);
 
-    float *d_x = nullptr;
-    hipMalloc(&d_x, (std::size_t)ncols * sizeof(float));
+    if (hipMalloc(&d_x, (std::size_t)ncols * sizeof(float)) != hipSuccess) {
+      if (fail_alloc("x")) { ++failures; continue; }
+    }
     hipMemcpy(d_x, x.data(), (std::size_t)ncols * sizeof(float), hipMemcpyHostToDevice);
     rdna4::quantize_q8_1_kernel<<<(unsigned)((nq8 + 3) / 4), 128>>>(d_x, d_a, nq8);
     hipError_t e = hipGetLastError();
@@ -544,6 +556,27 @@ int main(int argc, char **argv) {
     // pull the quantized activations back so the CPU side uses identical data
     std::vector<rdna4::block_q8_1> a_host(nq8);
     hipMemcpy(a_host.data(), d_a, (std::size_t)nq8 * sizeof(rdna4::block_q8_1), hipMemcpyDeviceToHost);
+
+    // Activation cross-check (independent of the matvec): compare against
+    // llama.cpp's quantize_row_q8_1_ref. d and qs must match bit-exactly; `s`
+    // follows mmvq's convention (fp16 of the raw float sum) instead of ggml's
+    // fp16(d*sum(qs)), so it is checked within fp16 precision and reported.
+    {
+      std::vector<rdna4::block_q8_1> a_ref(nq8);
+      rdna4_cpu_quantize_q8_1(x.data(), a_ref.data(), ncols);
+      long long d_bad = 0, qs_bad = 0, s_bad = 0;
+      for (std::int64_t b = 0; b < nq8; ++b) {
+        if ((a_host[b].ds & 0xFFFFu) != (a_ref[b].ds & 0xFFFFu)) ++d_bad;
+        if (std::memcmp(a_host[b].qs, a_ref[b].qs, QK8_1) != 0) ++qs_bad;
+        if ((a_host[b].ds >> 16) != (a_ref[b].ds >> 16)) ++s_bad;
+      }
+      const bool act_ok = (d_bad == 0 && qs_bad == 0 && s_bad == 0);
+      std::printf("          activation q8_1 vs quantize_row_q8_1_ref: d=%lld qs=%lld s=%lld mismatches"
+                  " (bit-exact)  %s\n",
+                  d_bad, qs_bad, s_bad, act_ok ? "OK" : "MISMATCH");
+      failures += act_ok ? 0 : 1;
+      if (!act_ok) continue;
+    }
 
     // ---- CPU reference ------------------------------------------------------
     std::vector<float> xq(ncols);
@@ -568,10 +601,17 @@ int main(int argc, char **argv) {
     }
 
     const Stats s = compare(y_cpu, y_gpu);
-    const bool ok = s.rel_l2 < tc.tol_rel_l2;
-    std::printf("%-9s %-24s rows=%3lld cols=%7lld  max|d|=%.3e  rel-L2=%.3e (tol %.0e)  %s\n",
+    // The kernel accumulates in f32 (per-thread partials + butterfly) while the
+    // reference is f64, so the accumulation-order difference grows with the
+    // number of terms. Scale the gate with the row length instead of using a
+    // fixed bound that a 248320-column row can approach on its own (this test
+    // compares 1-4 rows; a permutation of the thread->(block,slot) assignment is
+    // mathematically invisible here - only coverage bugs move the number).
+    const double tol = tc.tol_rel_l2 * std::max(1.0, std::sqrt((double)ncols / 256.0));
+    const bool ok = s.rel_l2 < tol;
+    std::printf("%-9s %-24s rows=%3lld cols=%7lld  max|d|=%.3e  rel-L2=%.3e (tol %.1e)  %s\n",
                 tc.name, info.name.c_str(), (long long)rows, (long long)ncols, s.max_abs, s.rel_l2,
-                tc.tol_rel_l2, ok ? "OK" : "MISMATCH");
+                tol, ok ? "OK" : "MISMATCH");
     failures += ok ? 0 : 1;
     ++tested;
 

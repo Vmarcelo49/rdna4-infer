@@ -136,11 +136,11 @@ expected_block_tensors(const Qwen35Config &cfg, std::uint32_t i) {
       out.push_back(std::move(e));
     }
     const std::int64_t emb = static_cast<std::int64_t>(cfg.embedding_length);
-    out.push_back(
-        {"nextn.eh_proj.weight",
-         {5 * static_cast<std::int64_t>(cfg.ssm_group_count) *
-                static_cast<std::int64_t>(cfg.ssm_state_size),
-          emb}});
+    // eh_proj maps concat(hidden, embed) -> hidden, i.e. [2*emb, emb]. For this
+    // model 2*emb == 5*group*state == 10240 by coincidence; use the real
+    // definition so a differently-shaped qwen35 MTP block fails for the right
+    // reason (review finding L4).
+    out.push_back({"nextn.eh_proj.weight", {2 * emb, emb}});
     out.push_back({"nextn.enorm.weight", {emb}});
     out.push_back({"nextn.hnorm.weight", {emb}});
     out.push_back({"nextn.shared_head_norm.weight", {emb}});
@@ -231,6 +231,55 @@ bool parse_qwen35_config(const gguf::File &f, Qwen35Config &cfg, std::string &er
   if (!kv_u64_vec(f, "qwen35.rope.dimension_sections", cfg.rope_dim_sections)) {
     err = "missing or wrong-type KV: qwen35.rope.dimension_sections";
     return false;
+  }
+  // Value validation (PLAN M1 item 2). Presence/type alone is not enough: a
+  // wrong block_count or MRoPE section split is accepted by the layout check
+  // (which only keys off the parsed values) and would silently break M3.
+  if (cfg.block_count < 2) {
+    err = "qwen35.block_count must be >= 2 (got " + std::to_string(cfg.block_count) + ")";
+    return false;
+  }
+  if (cfg.full_attention_interval < 1) {
+    err = "qwen35.full_attention_interval must be >= 1 (got " +
+          std::to_string(cfg.full_attention_interval) + ")";
+    return false;
+  }
+  if (cfg.nextn_predict_layers >= cfg.block_count) {
+    err = "qwen35.nextn_predict_layers (" + std::to_string(cfg.nextn_predict_layers) +
+          ") must be < block_count (" + std::to_string(cfg.block_count) + ")";
+    return false;
+  }
+  {
+    std::uint64_t sec_sum = 0;
+    for (std::uint64_t v : cfg.rope_dim_sections) sec_sum += v;
+    // MRoPE sections cover HALF the rotary dimensions (HF mrope_section
+    // semantics, applied per half): for this model 11+11+10+0 = 32 and
+    // dimension_count = 64. Asserting sum == dimension_count here would reject
+    // the real files, so the invariant is 2*sum == dimension_count.
+    if (cfg.rope_dim_count % 2 != 0 || sec_sum * 2 != cfg.rope_dim_count) {
+      err = "qwen35.rope.dimension_sections sums to " + std::to_string(sec_sum) +
+            " but dimension_count is " + std::to_string(cfg.rope_dim_count) +
+            " (expected 2*sections == dimension_count)";
+      return false;
+    }
+    // This model's MRoPE split (t, h, w, extra) as shipped in both UD files.
+    // NOTE: dimension_count is the rotary width (64 here), NOT the number of
+    // sections; the split has 4 sections [t,h,w,extra].
+    // The exact values are asserted only for the real 65-block qwen35 layout
+    // (the one validate_qwen35_layout is written for); synthetic/other shapes
+    // only have to satisfy the structural invariants.
+    if (cfg.block_count == 65 &&
+        (cfg.rope_dim_sections.size() != 4 || cfg.rope_dim_sections[0] != 11 ||
+         cfg.rope_dim_sections[1] != 11 || cfg.rope_dim_sections[2] != 10 ||
+         cfg.rope_dim_sections[3] != 0)) {
+      err = "unexpected qwen35 MRoPE layout: dimension_count=" + std::to_string(cfg.rope_dim_count) +
+            " sections=[" ;
+      for (std::size_t i = 0; i < cfg.rope_dim_sections.size(); ++i) {
+        err += std::to_string(cfg.rope_dim_sections[i]) + (i + 1 < cfg.rope_dim_sections.size() ? "," : "");
+      }
+      err += "] (expected 4 sections [11,11,10,0])";
+      return false;
+    }
   }
   double eps = 0.0, freq_base = 0.0;
   if (!kv_f64(f, "qwen35.attention.layer_norm_rms_epsilon", eps)) {

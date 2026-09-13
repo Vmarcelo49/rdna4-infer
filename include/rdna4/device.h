@@ -32,7 +32,10 @@ inline bool is_gfx1201(const char *arch) { return std::strstr(arch, "gfx1201") !
 // x (256+256) head dim). Bytes/token scale with the KV cache type:
 // F16 2.0 B/elem, Q8_0 ~1.06, Q4_0 ~0.56. M1/M3 replace the layer/head/dim
 // constants with real hparams from the GGUF.
-inline constexpr std::uint64_t kQwen35KvElemsPerToken = 17u * 4u * (256u + 256u);
+// 16 KV-bearing full-attention layers (i%4==3 for i in 0..63). The 65th
+// block is the MTP block, which v1 does not run, so it holds no KV.
+// (M1 layout validation: 16 full-attn + 48 GDN + 1 MTP.)
+inline constexpr std::uint64_t kQwen35KvElemsPerToken = 16u * 4u * (256u + 256u);
 
 inline double kv_bytes_per_elem(const char *kv_type) {
   if (std::strcmp(kv_type, "q8_0") == 0) {

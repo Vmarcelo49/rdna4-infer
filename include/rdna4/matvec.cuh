@@ -29,29 +29,27 @@ __device__ __forceinline__ void quantize_q8_1_block(const float *x, block_q8_1 *
   const int lane = threadIdx.x & 31;
   const float xi = x[lane];
   float amax = fabsf(xi);
-  float sum = xi;
+  // Only the max needs a reduction here; the sum of the QUANTIZED values is
+  // reduced further down, because that is what ggml's reference stores.
 #pragma unroll
-  for (int off = 16; off > 0; off >>= 1) {
-    amax = fmaxf(amax, __shfl_xor(amax, off));
-    sum += __shfl_xor(sum, off);
-  }
+  for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off));
   const float d = amax / 127.0f;
   const float id = d != 0.0f ? 1.0f / d : 0.0f;
-  const int q = (int)roundf(xi * id);  // ggml uses roundf (half away from zero)
+  const int q = (int)roundf(xi * id);  // ggml's ref uses roundf (half away from zero)
   y->qs[lane] = (int8_t)q;
-  if (lane == 0) {
-    const uint16_t dh = float_to_fp16(d);
-    // s = d * sum(qs): recompute the integer sum on the whole warp below
-    y->ds = (uint32_t)dh;
-  }
-  // warp-wide integer sum of the quantized values
+
   int qsum = q;
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) qsum += __shfl_xor(qsum, off);
   if (lane == 0) {
-    const uint16_t dh = (uint16_t)(y->ds & 0xFFFFu);
-    const uint16_t sh = float_to_fp16(fp16_to_float(dh) * (float)qsum);
-    y->ds = (uint32_t)dh | ((uint32_t)sh << 16);
+    // ds = {d, s} with s = d * sum(qs), reproducing ggml's
+    // quantize_row_q8_1_ref byte-for-byte (verified by the activation
+    // cross-check in check-matvec-gpu). NOTE: llama.cpp's CUDA mmvq instead
+    // stores make_half2(d, sum_of_raw_inputs) - a different value that only
+    // vec_dot_iq1_s_q8_1 reads, and only ~1% off on that one type. Matching the
+    // reference keeps the whole block_q8_1 bit-exact and the activation side
+    // independently verifiable, which is worth more than matching mmvq.
+    y->ds = (uint32_t)float_to_fp16(d) | ((uint32_t)float_to_fp16(d * (float)qsum) << 16);
   }
 }
 

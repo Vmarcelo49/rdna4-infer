@@ -6,9 +6,13 @@
 namespace rdna4 {
 namespace {
 
+// Overflow-checked product: a wrapped product could make the geometry check
+// below accept a corrupt tensor (review finding M3).
 std::uint64_t prod_dims(const std::vector<std::int64_t> &dims) {
   std::uint64_t n = 1;
   for (std::int64_t d : dims) {
+    if (d <= 0) return 0;  // rejected by the caller with a clear error
+    if (n > UINT64_MAX / static_cast<std::uint64_t>(d)) return 0;  // overflow
     n *= static_cast<std::uint64_t>(d);
   }
   return n;
@@ -63,9 +67,37 @@ bool GgufLoader::open(const char *path, std::string &err) {
       fp_ = nullptr;
       return false;
     }
+    // Dimension sanity + per-row block divisibility (review finding M7/M3):
+    // ggml sizes quantized tensors per row, so ne[0] must be a whole number of
+    // blocks. A non-multiple would make tensor_bytes() undercount and the
+    // geometry check pass while the dequant reads a wrong range. Also reject
+    // non-positive dims before the unsigned product below.
+    for (std::int64_t d : t.dims) {
+      if (d <= 0) {
+        err = "tensor '" + t.name + "': non-positive dimension " + std::to_string(d);
+        std::fclose(fp_);
+        fp_ = nullptr;
+        return false;
+      }
+    }
+    const std::uint32_t be = rdna4::dtype_block_elems(*dt);
+    if (!t.dims.empty() && be > 1 && (t.dims[0] % static_cast<std::int64_t>(be)) != 0) {
+      err = "tensor '" + t.name + "': ne0=" + std::to_string(t.dims[0]) +
+            " is not a multiple of the " + rdna4::dtype_name(*dt) + " block size " +
+            std::to_string(be);
+      std::fclose(fp_);
+      fp_ = nullptr;
+      return false;
+    }
     dtypes_[i] = *dt;
     elems_[i] = prod_dims(t.dims);
     bytes_[i] = rdna4::tensor_bytes(*dt, elems_[i]);
+    if (bytes_[i] == 0) {
+      err = "tensor '" + t.name + "': computed size is 0 (overflow or empty)";
+      std::fclose(fp_);
+      fp_ = nullptr;
+      return false;
+    }
     total_bytes_ += bytes_[i];
     // Unique names.
     if (index_.count(t.name)) {

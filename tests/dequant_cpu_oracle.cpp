@@ -102,6 +102,14 @@ extern "C" bool rdna4_cpu_dequant_row(int dt, const void *src, float *dst, std::
   }
 }
 
+// Independent reference for the activation quantization: llama.cpp's own
+// quantize_row_q8_1_ref (ggml-quants.c), exported by libggml-base. Without
+// this, the matvec test fed the CPU side the GPU's own activation bytes, so no
+// test could ever have caught a bug in quantize_q8_1_block.
+extern "C" void rdna4_cpu_quantize_q8_1(const float *x, void *vy, std::int64_t nelem) {
+  quantize_row_q8_1_ref(x, reinterpret_cast<block_q8_1 *>(vy), nelem);
+}
+
 // Compares every field offset (and size) of our block structs against
 // llama.cpp's originals. Returns the number of mismatches; a human-readable
 // description of each is appended to `buf`.
@@ -162,6 +170,17 @@ extern "C" int rdna4_audit_layout(char *buf, int bufsize) {
 
   AUDIT(block_iq4_nl, ::block_iq4_nl, d);
   AUDIT(block_iq4_nl, ::block_iq4_nl, qs);
+
+  // Activation block: our uint32 ds must sit exactly where llama.cpp's
+  // anonymous union {struct{d,s} data; half2 ds;} puts it.
+  if (sizeof(rdna4::block_q8_1) != sizeof(::block_q8_1)) {
+    report(buf, bufsize, "%-14s sizeof: ours=%zu theirs=%zu", "block_q8_1",
+           sizeof(rdna4::block_q8_1), sizeof(::block_q8_1));
+  }
+  if (offsetof(rdna4::block_q8_1, ds) != offsetof(::block_q8_1, ds) ||
+      offsetof(rdna4::block_q8_1, qs) != offsetof(::block_q8_1, qs)) {
+    report(buf, bufsize, "%-14s offsetof: ds/qs mismatch", "block_q8_1");
+  }
 
   AUDIT(block_iq4_xs, ::block_iq4_xs, d);
   AUDIT(block_iq4_xs, ::block_iq4_xs, scales_h);

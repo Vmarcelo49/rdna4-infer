@@ -27,7 +27,7 @@ KV = [
     (sval(b"qwen35.ssm.group_count"), i32(1)),
     (sval(b"qwen35.ssm.time_step_rank"), i32(8)),
     (sval(b"qwen35.ssm.inner_size"), i32(16)),
-    (sval(b"qwen35.rope.dimension_count"), i32(8)),
+    (sval(b"qwen35.rope.dimension_count"), i32(16)),
     (sval(b"qwen35.rope.dimension_sections"), arr_i32([2,2,2,2])),
     (sval(b"qwen35.attention.layer_norm_rms_epsilon"), f32(1e-6)),
     (sval(b"qwen35.rope.freq_base"), f32(1e7)),
@@ -45,7 +45,8 @@ FULL = [("attn_k.weight",(16,8)),("attn_k_norm.weight",(8,)),("attn_norm.weight"
         ("attn_output.weight",(16,16)),("attn_q.weight",(16,32)),("attn_q_norm.weight",(8,)),
         ("attn_v.weight",(16,8)),("ffn_down.weight",(32,16)),("ffn_gate.weight",(16,32)),
         ("ffn_up.weight",(16,32)),("post_attention_norm.weight",(16,))]
-NEXTN = [("nextn.eh_proj.weight",(40,16)),("nextn.enorm.weight",(16,)),
+# eh_proj maps concat(hidden, embed) -> hidden: [2*emb, emb] = [32,16]
+NEXTN = [("nextn.eh_proj.weight",(32,16)),("nextn.enorm.weight",(16,)),
          ("nextn.hnorm.weight",(16,)),("nextn.shared_head_norm.weight",(16,))]
 
 def build(path, drop=(), bad_dim=None, extra=()):

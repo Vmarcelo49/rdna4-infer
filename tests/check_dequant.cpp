@@ -186,6 +186,13 @@ bool dequant_prefix(const rdna4::GgufLoader &ld, std::size_t i, std::uint32_t ma
   const std::uint64_t nblocks =
       std::min<std::uint64_t>(max_blocks, total_blocks ? total_blocks : 1);
   const std::uint64_t nbytes = nblocks * bb;
+  // Guards the dequant length: dequantize_row_* requires a whole number of
+  // blocks and this test sizes its buffer as nblocks*bb, so a non-multiple
+  // would read past the loaded vector (review finding M6).
+  if ((nblocks * be) % be != 0) {
+    err = "internal: element count is not a whole number of blocks";
+    return false;
+  }
   if (!ld.load_tensor_range(i, 0, nbytes, raw, err)) {
     return false;
   }
@@ -247,11 +254,15 @@ int main(int argc, char **argv) {
       ok = false;
       continue;
     }
+    // NOTE (review finding M6): this gate is deliberately weak - a wrong-but-
+    // plausible byte layout still yields finite, small floats. The falsifiable
+    // gates in this test are the sizeof bridge (1) and the Q8_0 bit-exact
+    // pipeline (3); this one is reported as INFORMATIONAL.
     const Stats s = check_stats(f32.data(), static_cast<std::int64_t>(f32.size()), 32.0f);
     const bool good = s.all_finite && s.in_range;
     std::printf("%-10s %-40s %5llu elems  min=%+.4g max=%+.4g mean=%+.4g  %s\n", t.name,
                 f1.tensors[idx].name.c_str(), (unsigned long long)f32.size(), s.vmin, s.vmax,
-                s.mean, good ? "OK" : "BAD");
+                s.mean, good ? "OK (informational)" : "BAD");
     ok = ok && good;
     // (3) Q8_0: bit-exact vs inline d*qs[i].
     if (t.dt == DType::Q8_0) {

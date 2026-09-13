@@ -120,8 +120,10 @@ int run_case(const char *label, DType dt, const std::uint8_t *src, std::int64_t 
              int nthreads, bool q8_variant) {
   const std::uint32_t be = rdna4::dtype_block_elems(dt);
   const std::uint32_t bb = rdna4::dtype_block_bytes(dt);
-  const std::int64_t nelem = nblocks * (std::int64_t)be;
-  const std::size_t nbytes = (std::size_t)nblocks * bb;
+  // nblocks counts 256-element units for the q8_0=false path; the q8_0 kernel
+  // uses 32-element blocks with 16 threads.
+  const std::int64_t nelem = q8_variant ? nblocks * 32 : nblocks * 256;
+  const std::size_t nbytes = (std::size_t)(nelem / be) * bb;
 
   std::vector<float> cpu(nelem);
   if (!rdna4_cpu_dequant_row((int)dt, src, cpu.data(), nelem)) {
@@ -255,10 +257,17 @@ int main(int argc, char **argv) {
     }
     const std::uint32_t be = rdna4::dtype_block_elems(tc.dt);
     const std::uint32_t bb = rdna4::dtype_block_bytes(tc.dt);
-    const std::int64_t total = (std::int64_t)(ld.tensor_elems(idx) / be);
-    const std::int64_t nb = total < nblocks_req ? total : nblocks_req;
+    // dequant_kernel_256 processes ONE 256-element unit per iteration for every
+    // type in kCases. For IQ4_NL that unit is 8 ggml blocks (32 elems each) --
+    // sizing the buffer by the ggml block (as this test used to) makes the
+    // kernel read/write 8x past the end of both allocations.
+    constexpr std::int64_t kUnit = 256;
+    const std::int64_t total_units = (std::int64_t)(ld.tensor_elems(idx) / kUnit);
+    const std::int64_t nb = total_units < nblocks_req ? total_units : nblocks_req;
+    const std::int64_t nelem = nb * kUnit;                       // floats the kernel writes
+    const std::uint64_t nbytes = (std::uint64_t)(nelem / be) * bb;  // bytes it reads
     std::vector<std::uint8_t> raw;
-    if (!ld.load_tensor_range(idx, 0, (std::uint64_t)nb * bb, raw, err)) {
+    if (!ld.load_tensor_range(idx, 0, nbytes, raw, err)) {
       std::fprintf(stderr, "%-9s load failed: %s\n", tc.name, err.c_str());
       ++failures;
       continue;
