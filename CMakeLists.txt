@@ -166,3 +166,8 @@ target_include_directories(oracle-next-token PRIVATE ${LLAMA_CPP_SRC}/include
                           ${LLAMA_CPP_SRC}/ggml/include)
 target_link_libraries(oracle-next-token PRIVATE ${LLAMA_CPP_BUILD}/bin/libllama.so ${AMDHIP64})
 set_target_properties(oracle-next-token PROPERTIES BUILD_RPATH "${LLAMA_CPP_BUILD}")
+
+# M4: CLI streaming helper (CPU-only, no HIP): the UTF-8 boundary logic that
+# keeps the engine from writing half a multibyte character to stdout.
+add_executable(check-stream tests/check_stream.cpp)
+target_include_directories(check-stream PRIVATE include)

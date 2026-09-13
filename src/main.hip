@@ -24,6 +24,7 @@
 #include "rdna4/loader.h"
 #include "rdna4/model.h"
 #include "rdna4/sampler.h"
+#include "rdna4/stream.h"
 #include "rdna4/tokenizer.h"
 
 namespace {
@@ -116,26 +117,6 @@ const char *kv_type_cstr(rdna4::KvType t) {
     case rdna4::KvType::Q4_0: return "q4_0";
   }
   return "?";
-}
-
-// Length of the longest prefix of `s` that ends on a UTF-8 sequence boundary.
-// A multibyte character split across two tokens must not be written to stdout
-// half-formed; the bytes are kept back until the rest arrives.
-std::size_t utf8_keep_len(const std::string &s) {
-  if (s.empty()) return 0;
-  std::size_t i = s.size();
-  std::size_t cont = 0;
-  while (i > 0 && cont < 3) {
-    const unsigned char c = static_cast<unsigned char>(s[i - 1]);
-    if (c < 0x80 || c >= 0xC0) break;
-    --i;
-    ++cont;
-  }
-  if (i == 0) return s.size();  // only continuation bytes: nothing to trim against
-  const unsigned char c = static_cast<unsigned char>(s[i - 1]);
-  const std::size_t need = c < 0x80 ? 1 : (c >= 0xF0 ? 4 : (c >= 0xE0 ? 3 : 2));
-  const std::size_t have = 1 + (s.size() - i);
-  return have >= need ? s.size() : i - 1;
 }
 
 double now_s() {
@@ -550,7 +531,7 @@ int cmd_run(int argc, char **argv) {
     // Stream: re-decode the generated prefix and emit whatever is new and ends
     // on a UTF-8 boundary (a multibyte character can span two tokens).
     const std::string all = tk.decode(generated, /*skip_special=*/true);
-    const std::size_t keep = utf8_keep_len(all);
+    const std::size_t keep = rdna4::utf8_keep_len(all);
     if (keep > emitted.size()) {
       std::fwrite(all.data() + emitted.size(), 1, keep - emitted.size(), stdout);
       std::fflush(stdout);
