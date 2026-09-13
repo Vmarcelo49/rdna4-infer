@@ -159,10 +159,11 @@ int main(int argc, char **argv) {
       return 1;
     }
     const double t_init = now_ms() - t0;
-    std::printf("ctx=%d kv=%s (%.2f B/elem): init %.1f ms, KV caches %.1f MiB (%d layers x %.1f MiB)\n",
+    const double layer_mib = (double)g.kv_layer_bytes() / (1024.0 * 1024.0);
+    std::printf("ctx=%d kv=%s (%.2f B/elem): init %.1f ms, KV caches %.1f MiB "
+                "(%d layers x K+V %.1f MiB)\n",
                 ctx, rdna4::kv_type_name(kv), rdna4::kv_bytes_per_elem(kv), t_init,
-                (double)g.kv_layer_bytes() * g.n_full_attn() / (1024.0 * 1024.0), g.n_full_attn(),
-                (double)g.kv_layer_bytes() / (1024.0 * 1024.0));
+                2.0 * layer_mib * g.n_full_attn(), g.n_full_attn(), 2.0 * layer_mib);
 
     // The embeddings are the same 8 rows; the cache/state are filled with a
     // deterministic pattern so the attention really walks the whole context.

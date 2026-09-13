@@ -8,6 +8,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include "rdna4/kv.h"  // KvType + kv_bytes_per_elem (single source of truth)
+
 namespace rdna4 {
 
 // Returns 0 on success and fills total_vram + arch name; nonzero on failure.
@@ -37,14 +39,12 @@ inline bool is_gfx1201(const char *arch) { return std::strstr(arch, "gfx1201") !
 // (M1 layout validation: 16 full-attn + 48 GDN + 1 MTP.)
 inline constexpr std::uint64_t kQwen35KvElemsPerToken = 16u * 4u * (256u + 256u);
 
+// Bytes per cache element for a cache-type name. Delegates to kv.h so the CLI
+// budget and the graph cannot drift apart (the engine stores the rows itself).
 inline double kv_bytes_per_elem(const char *kv_type) {
-  if (std::strcmp(kv_type, "q8_0") == 0) {
-    return 34.0 / 32.0;
-  }
-  if (std::strcmp(kv_type, "q4_0") == 0) {
-    return 18.0 / 32.0;
-  }
-  return 2.0;  // f16 default
+  KvType t = KvType::F16;  // llama.cpp's default
+  if (kv_type_parse(kv_type, &t) != nullptr) return 0.0;
+  return kv_bytes_per_elem(t);
 }
 inline constexpr std::uint64_t kOverheadBytes = 1u << 30;  // kernels, buffers, fragmentation
 
