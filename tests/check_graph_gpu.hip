@@ -104,6 +104,8 @@ struct Accum {
   bool print_samples = false;
   bool last_token_only = false;
   int n_mismatch = 0;
+  int n_bad_sample = 0;
+  int n_bad_sum = 0;
   int n_compared = 0;
   double worst_rel = 0.0;
   std::string worst_name;
@@ -184,6 +186,15 @@ struct Accum {
             max_adiff, (double)std::fabs((double)v[v.size() - 3 + i] - (double)r.sampled[3 + i]));
       }
     }
+    double max_ref = 1e-3;
+    for (float x : r.sampled) max_ref = std::max(max_ref, (double)std::fabs(x));
+    // Two independent criteria, because neither works everywhere: the element
+    // sum is meaningless for nodes whose values cancel (roughly half of them,
+    // e.g. post-RoPE Q), while the sampled values are limited by the dump's 4
+    // decimals for nodes whose samples are small.
+    const double sample_rel = std::max(0.0, max_adiff - 1e-4) / max_ref;
+    if (sample_rel > 0.2) ++n_bad_sample;
+    if (rel > 1e-2) ++n_bad_sum;
     if (rel > worst_rel) {
       worst_rel = rel;
       worst_name = k;
@@ -598,8 +609,10 @@ int main(int argc, char **argv) {
   }
 
   acc.compare_all();
-  std::printf("node comparison: %d compared, %d beyond the 1e-3/1e-2 reporting threshold, worst sum rel %.3e (%s)\n",
-              acc.n_compared, acc.n_mismatch, acc.worst_rel, acc.worst_name.c_str());
+  std::printf("node comparison: %d compared | %d nodes with sampled values off by >20%% | "
+              "%d nodes with a sum error >1e-2 | worst sum rel %.3e (%s)\n",
+              acc.n_compared, acc.n_bad_sample, acc.n_bad_sum, acc.worst_rel,
+              acc.worst_name.c_str());
   // first divergence in graph order: everything before it matches the oracle
   // within the reporting threshold, so a wrong layout would show up here.
   if (use_oracle) {
