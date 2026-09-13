@@ -109,6 +109,22 @@ Objetivo: todo tipo do union M1 computando em GPU.
   - **Correção:** remover o `#if defined(GGML_USE_HIP)` e manter só o corpo HIP (este motor tem um único alvo, gfx1201). Agora a ISA mostra `v_perm_b32` ✓.
   - **Efeito: `iq4_xs` 196 → ~1000 GB/s (5×)**; e a estimativa de decode **~26 → 33,4–35,0 tok/s** (3 execuções), contra o baseline Vulkan/RADV de 37–38 → **~92% do baseline**. `iq4_xs` caiu de 32% para ~9% do tempo de decode; agora o gargalo é `iq3_s` (~35%, 337–375 GB/s).
   - **Estado do matvec (matvec-only):** 12,02 GB em ~28,9 ms → 33,4–35,0 tok/s. O teto de leitura medido (mesma travessia, todos os bytes) é 619 GB/s agregado.
+- **Passo 4c — iq3_s: o sign handling era o gargalo; `v_perm_b32` + linearidade do dp4a ✅✅**:
+  - **Atribuição por variantes (A/B intercalado, mesmo processo):** um harness `--bench-ab` mede variantes **pareadas** (o ruído entre execuções desta GPU é ~20%, então só medição intercalada é confiável). Resultado em `iq3_s`:
+    | variante | GB/s | vs shipping |
+    |---|---|---|
+    | shipping (`__vcmpne4` + `__vsub4`) | 333–349 | 1,00× |
+    | **DIAG sem sign** (errada de propósito) | 745–770 | **2,2×** |
+    | DIAG sem lookup do grid | 276–331 | 0,95× |
+    | só linearidade (`2·dp4a(g&~m) − dp4a(g)`) | 418–424 | 1,20× |
+    | **perm + linearidade** | **689–705** | **2,0×** |
+  - **Conclusão da atribuição:** o sign handling custava **>50% do tempo do kernel**; o lookup do grid é praticamente grátis (0,95×). O `__vsub4`/`__vcmpne4` do llama.cpp para HIP são emulações por byte (a ISA mostra dezenas de `v_sub_nc_i16`/`v_lshlrev_b16`).
+  - **A otimização (bit-identical!):** um único `V_PERM_B32` por grupo seleciona o byte do grid **ou** um byte zero (índices 0-3 = bytes do grid, 4-7 = dword zero), e a linearidade exata do `dp4a` substitui a negação por byte:
+    `Σ (±g)·u = 2·Σ(g & ~m)·u − Σ g·u` → `sumi = 2*sumi_pos − sumi_all`.
+    O seletor sai de 4 bits de sinal espalhados para os bytes (`(t * 0x00810204) & 0x04040404 | 0x03020100`), sem `__vcmpne4`.
+  - **Ganhos medidos (todos bit-identical, rel-L2 = 0,000e+00):** `iq3_s` **2,02×**, `iq2_xxs` **1,63×**, `iq3_xxs` 1,28×, `iq2_xs` 1,27×, `iq2_s` 1,26×.
+  - **Resultado agregado (matvec-only, 12,02 GB):** ~29 ms → **22,3–24,0 ms** ⇒ **41,6–45,0 tok/s** (era 33,4–35,0; baseline Vulkan/RADV **37–38**). **Passamos o baseline** na parte de matvec.
+  - **Bottleneck atual:** `iq3_xxs` (~22% do decode, 369 GB/s), depois `iq3_s` (~15%, 757 GB/s) e `iq4_xs` (9%, 1008 GB/s).
 - **Passo 5 — tuning do matvec: infraestrutura de config pronta, ganho pequeno ⚠️**:
   - Kernel generalizado `matvec_kernel_gen<T, ROWS, WPR>`: `ROWS` linhas por CTA × `WPR` warps por linha (cobre tanto 4 warps/4 linhas quanto o layout 1 linha/8 warps do `mmvq`). Redução intra-warp + shared memory quando `WPR > 1`.
   - `matvec_default_config(dt)` por tipo, escolhido por **medição** (sweep de 8 shapes × 14 tipos, 3 repetições, média). Valores medidos (GB/s) para o maior tensor de cada tipo:

@@ -427,6 +427,116 @@ int run_bench_read(rdna4::GgufLoader &ld) {
   return 0;
 }
 
+
+// ---------------------------------------------------------------------------
+// A/B mode: interleaved paired timing of iq3_s kernel variants, in ONE process,
+// so that clock drift (this GPU varies ~20% run-to-run) cancels out.
+// Variant 0 = shipping, 1 = diag no-sign, 2 = diag no-lookup, 3 = lin candidate.
+// Diagnostic variants are wrong on purpose; only their TIMING is meaningful, and
+// candidates (3) are compared numerically against variant 0.
+// ---------------------------------------------------------------------------
+int run_bench_ab(rdna4::GgufLoader &ld, int rounds, int dt) {
+  // largest iq3_s tensor
+  rdna4::MatvecShape shape{};
+  if (!rdna4::matvec_shape(dt, shape)) return 1;
+  std::size_t best = std::size_t(-1);
+  std::uint64_t best_bytes = 0;
+  for (std::size_t i = 0; i < ld.n_tensors(); ++i) {
+    if ((int)ld.dtype(i) != dt) continue;
+    const auto &d = ld.meta().tensors[i].dims;
+    if (d.size() != 2 || d[1] % shape.qk != 0 || d[0] <= 0) continue;
+    if (ld.tensor_bytes(i) > best_bytes) { best_bytes = ld.tensor_bytes(i); best = i; }
+  }
+  if (best == std::size_t(-1)) { std::printf("no usable iq3_s tensor\n"); return 1; }
+  const auto &info = ld.meta().tensors[best];
+  const int64_t ncols = info.dims[1], nrows = info.dims[0];
+  std::printf("A/B on %s %s  %lld x %lld  (%.1f MB)\n", tc_name_of(dt), info.name.c_str(), (long long)nrows,
+              (long long)ncols, ld.tensor_bytes(best) / 1e6);
+
+  std::vector<std::uint8_t> w;
+  std::string err;
+  if (!ld.load_tensor(best, w, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+  std::vector<float> x;
+  fill_x(x, ncols, 31337u);
+  void *d_w = nullptr; rdna4::block_q8_1 *d_a = nullptr; float *d_y = nullptr; float *d_x = nullptr;
+  hipMalloc(&d_w, w.size());
+  hipMalloc(&d_a, (std::size_t)(ncols / QK8_1) * sizeof(rdna4::block_q8_1));
+  hipMalloc(&d_y, (std::size_t)nrows * sizeof(float));
+  hipMalloc(&d_x, (std::size_t)ncols * sizeof(float));
+  hipMemcpy(d_w, w.data(), w.size(), hipMemcpyHostToDevice);
+  hipMemcpy(d_x, x.data(), (std::size_t)ncols * sizeof(float), hipMemcpyHostToDevice);
+  rdna4::quantize_q8_1_kernel<<<(unsigned)((ncols / QK8_1 + 3) / 4), 128>>>(d_x, d_a, ncols / QK8_1);
+
+  const bool diag = (dt == 12);         // only iq3_s has the diagnostic variants
+  const int kVariants = diag ? 5 : 2;
+  const char *names[5] = {"shipping", "perm+lin (cand)", "DIAG-no-sign", "lin (candidate)",
+                          "DIAG-no-lookup"};
+  std::vector<std::vector<double>> times(kVariants);
+  std::vector<std::vector<float>> out(kVariants);
+
+  hipEvent_t e0, e1;
+  hipEventCreate(&e0); hipEventCreate(&e1);
+  auto av_of = [&](int v) { return diag ? v : (v == 0 ? 0 : 1); };
+  auto measure = [&](int v) {
+    const int av = av_of(v);
+    hipEventRecord(e0, nullptr);
+    for (int i = 0; i < 25; ++i) {
+      if (!rdna4::matvec_launch_variant(dt, d_w, d_a, d_y, nrows, ncols, nullptr, av)) {
+        std::fprintf(stderr, "variant launch failed: dt=%d variant=%d\n", dt, av);
+        std::exit(3);
+      }
+    }
+    hipEventRecord(e1, nullptr);
+    hipEventSynchronize(e1);
+    float ms = 0;
+    hipEventElapsedTime(&ms, e0, e1);
+    return (double)ms / 25.0;
+  };
+
+  // clock ramp
+  float warm = 0;
+  while (warm < 300.0f) {
+    hipEventRecord(e0, nullptr);
+    for (int i = 0; i < 10; ++i) rdna4::matvec_launch_variant(dt, d_w, d_a, d_y, nrows, ncols, nullptr, 0);
+    hipEventRecord(e1, nullptr); hipEventSynchronize(e1);
+    float ms = 0; hipEventElapsedTime(&ms, e0, e1); warm += ms;
+  }
+
+  // capture each variant's output once (for the numeric check)
+  for (int v = 0; v < kVariants; ++v) {
+    rdna4::matvec_launch_variant(dt, d_w, d_a, d_y, nrows, ncols, nullptr, diag ? v : (v == 0 ? 0 : 1));
+    out[v].resize(nrows);
+    hipMemcpy(out[v].data(), d_y, (std::size_t)nrows * sizeof(float), hipMemcpyDeviceToHost);
+  }
+
+  for (int r = 0; r < rounds; ++r) {
+    // rotate the starting variant so no variant is always measured first
+    for (int k = 0; k < kVariants; ++k) {
+      const int v = (k + r) % kVariants;
+      times[v].push_back(measure(v));
+    }
+  }
+  hipEventDestroy(e0); hipEventDestroy(e1);
+
+  auto median = [](std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+  };
+  const double gb = (double)w.size() / 1e9;
+  const double base = median(times[0]);
+  std::printf("\n%-16s %10s %10s %8s   %s\n", "variant", "median ms", "GB/s", "vs ship", "numeric vs shipping");
+  for (int v = 0; v < kVariants; ++v) {
+    const double m = median(times[v]);
+    const Stats st = compare(out[0], out[v]);
+    std::printf("%-16s %10.3f %10.1f %7.2fx   max|d|=%.3e rel-L2=%.3e %s\n", names[v], m,
+                gb / (m * 1e-3), base / m, st.max_abs, st.rel_l2,
+                v == 0 ? "" : (v == 1 ? (st.rel_l2 < 1e-5 ? "(matches)" : "(MISMATCH!)")
+                                    : (st.rel_l2 < 1e-5 ? "(matches)" : "(expected to differ)")));
+  }
+  hipFree(d_w); hipFree(d_a); hipFree(d_y); hipFree(d_x);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -444,6 +554,9 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  if (argc >= 3 && std::strcmp(argv[2], "--bench-ab") == 0) {
+    return run_bench_ab(ld, argc >= 4 ? std::atoi(argv[3]) : 9, argc >= 5 ? std::atoi(argv[4]) : 12);
+  }
   if (argc >= 3 && std::strcmp(argv[2], "--bench-read") == 0) {
     return run_bench_read(ld);
   }

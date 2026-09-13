@@ -89,6 +89,24 @@ RD_MATVEC_TRAITS(TIQ1S, vec_dot_iq1_s_q8_1, 256, QI1_S, VDR_IQ1_S_Q8_1_MMVQ, blo
 RD_MATVEC_TRAITS(TIQ4NL, vec_dot_iq4_nl_q8_1, 32, QI4_NL, VDR_IQ4_NL_Q8_1_MMVQ, block_iq4_nl);
 RD_MATVEC_TRAITS(TIQ4XS, vec_dot_iq4_xs_q8_1, 256, QI4_XS, VDR_IQ4_XS_Q8_1_MMVQ, block_iq4_xs);
 
+// iq3_s A/B variants (bench only; see vecdotq.cuh)
+RD_MATVEC_TRAITS(TIQ3S_LIN, vec_dot_iq3_s_q8_1_lin, 256, QI3_S, VDR_IQ3_S_Q8_1_MMVQ, block_iq3_s);
+RD_MATVEC_TRAITS(TIQ3S_PERM, vec_dot_iq3_s_q8_1_perm, 256, QI3_S, VDR_IQ3_S_Q8_1_MMVQ, block_iq3_s);
+RD_MATVEC_TRAITS(TIQ2XXS_PERM, vec_dot_iq2_xxs_q8_1_perm, 256, QI2_XXS, VDR_IQ2_XXS_Q8_1_MMVQ, block_iq2_xxs);
+// Shipping traits for the sign-using IQ types: the perm+lin bodies below were
+// measured 1.26-2.02x faster than the vendored form and are bit-identical
+// (checked by check-matvec-gpu --bench-ab and the per-type CPU-oracle test).
+RD_MATVEC_TRAITS(TIQ2XXS_S, vec_dot_iq2_xxs_q8_1_perm, 256, QI2_XXS, VDR_IQ2_XXS_Q8_1_MMVQ, block_iq2_xxs);
+RD_MATVEC_TRAITS(TIQ2XS_S, vec_dot_iq2_xs_q8_1_perm, 256, QI2_XS, VDR_IQ2_XS_Q8_1_MMVQ, block_iq2_xs);
+RD_MATVEC_TRAITS(TIQ3XXS_S, vec_dot_iq3_xxs_q8_1_perm, 256, QI3_XXS, VDR_IQ3_XXS_Q8_1_MMVQ, block_iq3_xxs);
+RD_MATVEC_TRAITS(TIQ2S_S, vec_dot_iq2_s_q8_1_perm, 256, QI2_S, VDR_IQ2_S_Q8_1_MMVQ, block_iq2_s);
+RD_MATVEC_TRAITS(TIQ3S_S, vec_dot_iq3_s_q8_1_perm, 256, QI3_S, VDR_IQ3_S_Q8_1_MMVQ, block_iq3_s);
+RD_MATVEC_TRAITS(TIQ2XS_PERM, vec_dot_iq2_xs_q8_1_perm, 256, QI2_XS, VDR_IQ2_XS_Q8_1_MMVQ, block_iq2_xs);
+RD_MATVEC_TRAITS(TIQ2S_PERM, vec_dot_iq2_s_q8_1_perm, 256, QI2_S, VDR_IQ2_S_Q8_1_MMVQ, block_iq2_s);
+RD_MATVEC_TRAITS(TIQ3XXS_PERM, vec_dot_iq3_xxs_q8_1_perm, 256, QI3_XXS, VDR_IQ3_XXS_Q8_1_MMVQ, block_iq3_xxs);
+RD_MATVEC_TRAITS(TIQ3S_NOSIGN, vec_dot_iq3_s_q8_1_diag_nosign, 256, QI3_S, VDR_IQ3_S_Q8_1_MMVQ, block_iq3_s);
+RD_MATVEC_TRAITS(TIQ3S_NOLOOKUP, vec_dot_iq3_s_q8_1_diag_nolookup, 256, QI3_S, VDR_IQ3_S_Q8_1_MMVQ, block_iq3_s);
+
 #undef RD_MATVEC_TRAITS
 
 // L2 prefetch (from llama.cpp mmvq.cu, MIT). Only used where measured to help.
@@ -345,13 +363,13 @@ inline bool matvec_launch(int dt, const void *d_w, const block_q8_1 *d_a, float 
     RD_SHIP(TQ4K, 4, 256)
     RD_SHIP(TQ5K, 5, 256)
     RD_SHIP(TQ6K, 6, 256)
-    RD_SHIP(TIQ2XXS, 7, 256)
-    RD_SHIP(TIQ2XS, 8, 256)
-    RD_SHIP(TIQ3XXS, 9, 256)
+    RD_SHIP(TIQ2XXS_S, 7, 256)
+    RD_SHIP(TIQ2XS_S, 8, 256)
+    RD_SHIP(TIQ3XXS_S, 9, 256)
     RD_SHIP(TIQ1S, 10, 256)
     RD_SHIP(TIQ4NL, 11, 32)
-    RD_SHIP(TIQ3S, 12, 256)
-    RD_SHIP(TIQ2S, 13, 256)
+    RD_SHIP(TIQ3S_S, 12, 256)
+    RD_SHIP(TIQ2S_S, 13, 256)
     RD_SHIP(TIQ4XS, 14, 256)
     default:
       return false;  // no kernel: caller must fail loudly (SPEC 1.3)
@@ -530,6 +548,50 @@ inline bool matvec_launch_minb(int dt, const void *d_w, const block_q8_1 *d_a, f
     default: return false;
   }
 #undef RD_MB
+}
+
+
+// A/B variants for iq3_s only (bench use; see vecdotq.cuh for what each means).
+//   variant 0 = shipping, 1 = diagnostic no-sign, 2 = diagnostic no-lookup,
+//   3 = correct dp4a-linearity candidate.
+inline bool matvec_launch_variant(int dt, const void *d_w, const block_q8_1 *d_a, float *d_o,
+                                  int64_t nrows, int64_t ncols, hipStream_t stream, int variant) {
+  // variant 0 = shipping kernel; 1 = perm+lin candidate; for iq3_s only:
+  // 2 = DIAG-no-sign, 3 = lin-only, 4 = DIAG-no-lookup.
+  switch (dt) {
+    case 7: {  // iq2_xxs
+      constexpr int R = MtShape<7>::rows, W = MtShape<7>::wpr, I = MtIlp<7>::value, QK = 256;
+      return variant == 1 ? launch_gen<TIQ2XXS_PERM, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream)
+                          : launch_gen<TIQ2XXS, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);
+    }
+    case 8: {  // iq2_xs
+      constexpr int R = MtShape<8>::rows, W = MtShape<8>::wpr, I = MtIlp<8>::value, QK = 256;
+      return variant == 1 ? launch_gen<TIQ2XS_PERM, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream)
+                          : launch_gen<TIQ2XS, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);
+    }
+    case 9: {  // iq3_xxs
+      constexpr int R = MtShape<9>::rows, W = MtShape<9>::wpr, I = MtIlp<9>::value, QK = 256;
+      return variant == 1 ? launch_gen<TIQ3XXS_PERM, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream)
+                          : launch_gen<TIQ3XXS, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);
+    }
+    case 12: {  // iq3_s
+      constexpr int R = MtShape<12>::rows, W = MtShape<12>::wpr, I = MtIlp<12>::value, QK = 256;
+      switch (variant) {
+        case 0: return launch_gen<TIQ3S, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);
+        case 1: return launch_gen<TIQ3S_PERM, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);
+        case 2: return launch_gen<TIQ3S_NOSIGN, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);
+        case 3: return launch_gen<TIQ3S_LIN, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);
+        default: return launch_gen<TIQ3S_NOLOOKUP, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);
+      }
+    }
+    case 13: {  // iq2_s
+      constexpr int R = MtShape<13>::rows, W = MtShape<13>::wpr, I = MtIlp<13>::value, QK = 256;
+      return variant == 1 ? launch_gen<TIQ2S_PERM, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream)
+                          : launch_gen<TIQ2S, R, W, I, false>(d_w, d_a, d_o, nrows, ncols / QK, stream);
+    }
+    default:
+      return false;  // no variants for this type
+  }
 }
 
 }  // namespace rdna4
