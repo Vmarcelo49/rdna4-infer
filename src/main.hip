@@ -254,7 +254,8 @@ int cmd_bench(int argc, char **argv) {
       }
     } else if (std::strcmp(a, "--ctx-size") == 0) {
       const char *v = need("--ctx-size");
-      if (!v || !parse_u64(v, &ctx_size) || ctx_size == 0) {
+      if (!v || !parse_u64(v, &ctx_size) || ctx_size == 0 ||
+          ctx_size > rdna4::kMaxCtxSize) {
         return 1;
       }
     } else if (std::strcmp(a, "--cache-type-k") == 0) {
@@ -593,7 +594,10 @@ int cmd_ppl(int argc, char **argv) {
       corpus = v;
     } else if (std::strcmp(a, "--ctx-size") == 0 || std::strcmp(a, "-c") == 0) {
       const char *v = need("--ctx-size");
-      if (!v || !parse_u64(v, &ctx_size) || ctx_size == 0) return 1;
+      if (!v || !parse_u64(v, &ctx_size) || ctx_size == 0 ||
+          ctx_size > rdna4::kMaxCtxSize) {
+        return 1;
+      }
     } else if (std::strcmp(a, "--stride") == 0) {
       const char *v = need("--stride");
       if (!v || !parse_u64(v, &stride) || stride == 0 || stride % 2 != 0) return 1;
@@ -822,7 +826,8 @@ int cmd_info(int argc, char **argv) {
     if (std::strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
       model_path = argv[++i];
     } else if (std::strcmp(argv[i], "--ctx-size") == 0 && i + 1 < argc) {
-      if (!parse_u64(argv[++i], &ctx_size) || ctx_size == 0) {
+      if (!parse_u64(argv[++i], &ctx_size) || ctx_size == 0 ||
+          ctx_size > rdna4::kMaxCtxSize) {
         usage_info();
         return 1;
       }
@@ -1034,7 +1039,8 @@ int cmd_run(int argc, char **argv) {
       sp.seed = v;
     } else if (std::strcmp(a, "--ctx-size") == 0) {
       const char *v = need_arg("--ctx-size");
-      if (!v || !parse_u64(v, &ctx_size) || ctx_size == 0) {
+      if (!v || !parse_u64(v, &ctx_size) || ctx_size == 0 ||
+          ctx_size > rdna4::kMaxCtxSize) {
         usage_run();
         return 1;
       }

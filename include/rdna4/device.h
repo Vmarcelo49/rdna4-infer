@@ -48,6 +48,13 @@ inline double kv_bytes_per_elem(const char *kv_type) {
 }
 inline constexpr std::uint64_t kOverheadBytes = 1u << 30;  // kernels, buffers, fragmentation
 
+// Upper bound for any --ctx-size, enforced by every command that takes one
+// (run/bench/ppl/serve). The graph takes the context as an int, so a larger
+// value would be truncated before any budget check could reject it, and the
+// KV cache would be sized from the truncated number (review finding M5;
+// `serve` was capped first, the CLI commands had the same hole).
+inline constexpr std::uint64_t kMaxCtxSize = 1u << 24;
+
 // Bytes held by the KV cache at `ctx_size`. kQwen35KvElemsPerToken counts the K
 // *and* the V elements of a token, so each side holds half of it. Review finding
 // M4: `serve` sized the budget with kv_bytes_per_elem(kv_k) over the full

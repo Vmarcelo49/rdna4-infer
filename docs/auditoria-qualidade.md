@@ -1162,3 +1162,25 @@ corpo cru porque `json.dumps(float('inf'))` escreveria `Infinity`, que não é J
 tem de mandar o literal `1e400`. O `check_server.sh` roda esses casos na próxima sessão de
 GPU; os pedidos normais do mesmo script (temperatura 0, seed fixo) são o controle de que a
 validação nova não rejeita o que era aceito.
+
+### 7.5 O teto de `--ctx-size` valia só no `serve` (fechado depois)
+
+O M5 deste relatório apontou o `static_cast<int>(ctx_size)` do `serve`. Ao corrigir,
+faltou olhar os outros comandos — e eles tinham o mesmo buraco: `run` (`main.hip:1036`),
+`bench` (`:255`) e `ppl` (`:594`) aceitavam qualquer `u64` e só rejeitavam `0`, então
+`--ctx-size 99999999` era truncado para `int` antes de qualquer checagem de orçamento
+(as três chamadas `graph.init((int)ctx_size, …)` em `:339`, `:693` e `:1169`) e o cache KV
+era dimensionado pelo número truncado. Agora existe **uma** constante,
+`rdna4::kMaxCtxSize = 2^24` em `include/rdna4/device.h`, usada pelos quatro comandos
+(`run`, `bench`, `ppl`, `serve`) e pelo `info`; o `serve` deixou de ter a cópia local.
+Verificado sem GPU (a recusa acontece na análise dos argumentos):
+
+```
+$ ./build/rdna4-infer run   -m x.gguf --ctx-size 99999999   -> usage: ... run (rc 1)
+$ ./build/rdna4-infer info  -m x.gguf --ctx-size 99999999   -> usage: ... info (rc 1)
+$ ./build/rdna4-infer bench -m x.gguf --ctx-size 99999999   -> recusa (rc 1)
+$ ./build/rdna4-infer serve -m x.gguf --ctx-size 99999999   -> "must be in 1..16777216"
+```
+
+Lição de método: corrigir a instância que o relatório citou não é corrigir a classe. Os
+quatro sítios foram varridos por `grep '"--ctx-size"'` depois da correção do `serve`.

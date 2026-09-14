@@ -69,10 +69,6 @@ using rdna4::server::json::Value;
 // with a 400 instead of failing inside the renderer.
 constexpr const char *kEfforts[] = {"xhigh", "high", "medium", "low"};
 
-// Upper bound for --ctx-size. The graph takes the context as an int, so anything
-// above this would be cast before the VRAM budget could reject it (review
-// finding M5). It is also ~16x the largest context that fits in 16 GiB.
-constexpr std::uint64_t kMaxCtxSize = 1u << 24;
 
 // ---------------------------------------------------------------------------
 // CLI (small local copies of main.hip's helpers: main.hip is shared with two
@@ -186,9 +182,9 @@ int parse_serve_args(int argc, char **argv, ServeArgs *a) {
       // an int, so an unchecked huge value would be cast to a negative/odd
       // context before the VRAM budget ever saw it (review finding M5).
       if (s == nullptr || !parse_u64(s, &a->ctx_size) || a->ctx_size == 0 ||
-          a->ctx_size > kMaxCtxSize) {
+          a->ctx_size > rdna4::kMaxCtxSize) {
         std::fprintf(stderr, "rdna4-infer serve: --ctx-size must be in 1..%llu\n",
-                     (unsigned long long)kMaxCtxSize);
+                     (unsigned long long)rdna4::kMaxCtxSize);
         return 1;
       }
     } else if (std::strcmp(v, "--cache-type-k") == 0) {
