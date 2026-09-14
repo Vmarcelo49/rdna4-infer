@@ -353,6 +353,7 @@ class Engine {
   std::string model_id_;
   std::uint64_t ctx_size_ = 8192;
   long long n_predict_default_ = 512;
+  bool argmax_only_ = false;       // greedy fast path for this request
   float presence_penalty_ = 0.0f;   // per request, used by the penalty pass
   float frequency_penalty_ = 0.0f;  // "
   mutable std::vector<std::int32_t> penalty_seen_;   // n_vocab counters
@@ -481,6 +482,15 @@ bool Engine::generate(const std::vector<std::int32_t> &prompt_ids, const GenRequ
   res.prompt_ids = prompt_ids;
   presence_penalty_ = r.presence_penalty;
   frequency_penalty_ = r.frequency_penalty;
+  // Greedy fast path (same rule as the CLI): with temp <= 0, no repeat penalty and
+  // no OpenAI penalties, the whole sampler chain is "first strict maximum in id
+  // order" (Sampler::filter, temp <= 0 branch; apply_openai_penalties returns early
+  // when both are 0), so the device can answer it and the 993 KB logits vector
+  // never crosses the bus. Anything else keeps the host path untouched.
+  argmax_only_ = r.sp.temp <= 0.0f &&
+                 (r.sp.repeat_penalty == 1.0f || r.sp.repeat_last_n <= 0) &&
+                 presence_penalty_ == 0.0f && frequency_penalty_ == 0.0f;
+  graph_->set_want_argmax(argmax_only_);
 
   // A fresh sequence: zeroes the recurrent (GDN) state. The KV cache needs no
   // clearing (attention is causal and every row is rewritten as the new
@@ -524,8 +534,12 @@ bool Engine::generate(const std::vector<std::int32_t> &prompt_ids, const GenRequ
       res.finish_reason = "cancelled";
       break;
     }
-    apply_openai_penalties(logits.data(), history);
-    const std::int32_t id = sampler_.sample(logits.data(), history);
+    if (!argmax_only_) apply_openai_penalties(logits.data(), history);
+    // argmax_only_: the token was computed on the device by the forward that
+    // produced the logits we are sampling from (the prefill, or the previous
+    // step), so this is the same id the host chain would return.
+    const std::int32_t id =
+        argmax_only_ ? graph_->last_argmax() : sampler_.sample(logits.data(), history);
     if (id < 0) {
       err = "the sampler produced no token (empty candidate set)";
       return false;

@@ -272,6 +272,153 @@ inline bool attn_launch(const float *d_q, const void *d_k, const void *d_v, floa
 
 
 // ---------------------------------------------------------------------------
+// BATCHED PREFILL (feat/noite-prefill): the unsplit kernel above, with all the
+// query tokens of one forward_batch chunk in blockIdx.y.
+//
+// The body is attn_kernel's, element for element -- same warp-sliced key walk
+// (j = w; j <= t; j += WPB), same online softmax, same in-CTA merge across WPB
+// slices, same expf/1/l rounding -- with only the query/output addressing moved
+// from "the single token" to "token qt of the batch". Each (qt, h) CTA therefore
+// computes exactly what the per-token launch computed for that token, which is
+// what keeps tests/check_batch_gpu.hip BIT-EXACT.
+//
+// Precondition (checked by the caller): every query token in the batch uses the
+// UNSPLIT path (keys < kAttnSplitMin). A token whose key range would be split
+// across CTAs sums its slices in a different order (attn.cuh:289), so for those
+// chunks the per-token loop is kept and this kernel is not used.
+// ---------------------------------------------------------------------------
+template <KvType KT, KvType VT, int WPB = kAttnWarpsPerBlock>
+__global__ void attn_batch_kernel(const float *__restrict__ q, const void *__restrict__ k,
+                                  const void *__restrict__ v, float *__restrict__ out,
+                                  const int *__restrict__ pos, int n_head, int n_head_kv,
+                                  int head_dim, float dscale) {
+  extern __shared__ float smem[];
+
+  const int h = blockIdx.x;
+  const int qt = blockIdx.y;
+  const int t = pos[qt];  // this query token's position == the last key it attends
+  const int w = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int kvh = h / (n_head / n_head_kv);
+  const int dpw = head_dim / 32;  // dims per lane
+  float *pm = smem + (std::int64_t)w * (2 + head_dim);
+
+  const std::uint64_t krow = kv_row_bytes(KT, head_dim);
+  const std::uint64_t vrow = kv_row_bytes(VT, head_dim);
+  const float *qp = q + ((std::int64_t)qt * n_head + h) * head_dim;
+  float *op = out + ((std::int64_t)qt * n_head + h) * head_dim;
+
+  float qv[kAttnMaxDimsPerLane];
+  for (int i = 0; i < dpw; ++i) qv[i] = qp[lane * dpw + i];
+
+  float m = -INFINITY;
+  float l = 0.0f;
+  float acc[kAttnMaxDimsPerLane];
+  for (int i = 0; i < dpw; ++i) acc[i] = 0.0f;
+
+  for (int j = w; j <= t; j += kAttnWarpsPerBlock) {
+    const char *kr = (const char *)k + ((std::int64_t)j * n_head_kv + kvh) * krow;
+    float kk[kAttnMaxDimsPerLane];
+    if (dpw == 8) {
+      kv_load8<KT>(kr, lane, kk);
+    } else {
+      for (int i = 0; i < dpw; ++i) kk[i] = kv_load<KT>(kr, lane * dpw + i);
+    }
+    float partial = 0.0f;
+    for (int i = 0; i < dpw; ++i) partial = fmaf(qv[i], kk[i], partial);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) partial += __shfl_xor_sync(0xffffffffull, partial, off);
+    const float score = partial * dscale;
+
+    if (score > m) {
+      const float corr = (m == -INFINITY) ? 0.0f : expf(m - score);
+      l *= corr;
+      for (int i = 0; i < dpw; ++i) acc[i] *= corr;
+      m = score;
+    }
+    const float p = (m == -INFINITY) ? 0.0f : expf(score - m);
+    l += p;
+    const char *vr = (const char *)v + ((std::int64_t)j * n_head_kv + kvh) * vrow;
+    float vv[kAttnMaxDimsPerLane];
+    if (dpw == 8) {
+      kv_load8<VT>(vr, lane, vv);
+    } else {
+      for (int i = 0; i < dpw; ++i) vv[i] = kv_load<VT>(vr, lane * dpw + i);
+    }
+    for (int i = 0; i < dpw; ++i) acc[i] = fmaf(p, vv[i], acc[i]);
+  }
+
+  if (lane == 0) {
+    pm[0] = m;
+    pm[1] = l;
+  }
+  for (int i = 0; i < dpw; ++i) pm[2 + lane * dpw + i] = acc[i];
+  __syncthreads();
+
+  float mm = -INFINITY;
+  for (int s = 0; s < kAttnWarpsPerBlock; ++s) mm = fmaxf(mm, smem[(std::int64_t)s * (2 + head_dim)]);
+  if (mm == -INFINITY) {  // no keys at all
+    for (int i = 0; i < dpw; ++i) op[lane * dpw + i] = 0.0f;
+    return;
+  }
+  float ll = 0.0f;
+  for (int s = 0; s < kAttnWarpsPerBlock; ++s) {
+    const float *ps = smem + (std::int64_t)s * (2 + head_dim);
+    ll += ps[1] * expf(ps[0] - mm);
+  }
+  const float inv = (ll > 0.0f) ? 1.0f / ll : 0.0f;
+  for (int i = 0; i < dpw; ++i) {
+    float a = 0.0f;
+    for (int s = 0; s < kAttnWarpsPerBlock; ++s) {
+      const float *ps = smem + (std::int64_t)s * (2 + head_dim);
+      a += ps[2 + lane * dpw + i] * expf(ps[0] - mm);
+    }
+    op[lane * dpw + i] = a * inv;
+  }
+}
+
+template <KvType KT, KvType VT, int WPB = kAttnWarpsPerBlock>
+inline bool attn_batch_launch_typed(const float *d_q, const void *d_k, const void *d_v,
+                                    float *d_out, const int *d_pos, int n_tok, int n_head,
+                                    int n_head_kv, int head_dim, float scale, hipStream_t stream) {
+  if (head_dim % 32 != 0 || head_dim / 32 > kAttnMaxDimsPerLane) return false;
+  const int threads = WPB * 32;
+  const std::size_t smem = (std::size_t)WPB * (2 + (std::size_t)head_dim) * sizeof(float);
+  dim3 grid((unsigned)n_head, (unsigned)n_tok);
+  attn_batch_kernel<KT, VT, WPB><<<grid, threads, smem, stream>>>(d_q, d_k, d_v, d_out, d_pos,
+                                                                 n_head, n_head_kv, head_dim,
+                                                                 scale);
+  return hipGetLastError() == hipSuccess;
+}
+
+inline bool attn_batch_launch(const float *d_q, const void *d_k, const void *d_v, float *d_out,
+                              const int *d_pos, int n_tok, int n_head, int n_head_kv, int head_dim,
+                              float scale, KvType kt, KvType vt, hipStream_t stream = nullptr) {
+#define RD_ATTN_B_CASE(K, V)                                                                      \
+  if (kt == KvType::K && vt == KvType::V)                                                          \
+  return attn_batch_launch_typed<KvType::K, KvType::V>(d_q, d_k, d_v, d_out, d_pos, n_tok, n_head, \
+                                                       n_head_kv, head_dim, scale, stream)
+  RD_ATTN_B_CASE(F32, F32);
+  RD_ATTN_B_CASE(F32, F16);
+  RD_ATTN_B_CASE(F32, Q8_0);
+  RD_ATTN_B_CASE(F32, Q4_0);
+  RD_ATTN_B_CASE(F16, F32);
+  RD_ATTN_B_CASE(F16, F16);
+  RD_ATTN_B_CASE(F16, Q8_0);
+  RD_ATTN_B_CASE(F16, Q4_0);
+  RD_ATTN_B_CASE(Q8_0, F32);
+  RD_ATTN_B_CASE(Q8_0, F16);
+  RD_ATTN_B_CASE(Q8_0, Q8_0);
+  RD_ATTN_B_CASE(Q8_0, Q4_0);
+  RD_ATTN_B_CASE(Q4_0, F32);
+  RD_ATTN_B_CASE(Q4_0, F16);
+  RD_ATTN_B_CASE(Q4_0, Q8_0);
+  RD_ATTN_B_CASE(Q4_0, Q4_0);
+#undef RD_ATTN_B_CASE
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Split-KV attention (M7 step 2): the same flash-style kernel with the key range
 // ALSO split across CTAs.
 //

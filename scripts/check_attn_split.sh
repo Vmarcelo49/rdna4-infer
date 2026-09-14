@@ -59,3 +59,31 @@ if rel > 0.005:
     sys.exit(1)
 print("check-attn-split: OK")
 PY
+
+# ---------------------------------------------------------------------------
+# The wide-CTA end of the two-ended WPB rule (>=16 splits -> 16 warps) had NO gate
+# on real text: the only test that touched it ran against a synthetic cache with a
+# 5e-2 tolerance, so a wrong merge order there would have gone unnoticed (review
+# finding F5, docs/adversarial-noite.md). RD_ATTN_SPLITS forces the split count, and
+# 16 splits is exactly where the rule switches the CTA to 16 warps -- so this case
+# exercises the shipped wide combination against the unsplit reference on real text.
+# It costs two short runs at CTX (the same as the case above), not a 8K context.
+if [ "${WIDE:-1}" = 1 ]; then
+  wide="$(run 16)"
+  echo "PPL wide    (16 CTAs/head -> 16 warps/CTA, the shipped long-context rule): $wide"
+  if [ -z "$wide" ]; then
+    echo "check-attn-split: FAILED (no PPL for the wide case)"
+    exit 1
+  fi
+  python3 - "$base" "$wide" <<'PY' || exit 1
+import sys
+a, b = float(sys.argv[1]), float(sys.argv[2])
+rel = abs(a - b) / a
+print(f"wide vs unsplit: {rel*100:.3f}% (limit 0.5%)")
+if rel > 0.005:
+    print("check-attn-split: FAILED (the wide-CTA rule is not numerically equivalent")
+    print("                  to the unsplit path on real text)")
+    sys.exit(1)
+print("check-attn-split: OK (wide rule included)")
+PY
+fi
