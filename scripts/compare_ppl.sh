@@ -25,6 +25,15 @@
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Serialise GPU access (docs/gpu-queue.md rule 1). A caller that already holds the
+# lock exports GPU_LOCK_HELD=1: flock is not reentrant across processes, so
+# re-locking from inside a locked run would block until the waiter times out and
+# the gate would fail for the wrong reason.
+if [ "${GPU_LOCK_HELD:-0}" != 1 ]; then
+  export GPU_LOCK_HELD=1
+  exec "$ROOT/scripts/gpu-lock.sh" "$0" "$@"
+fi
 BIN="${BIN:-$ROOT/build/rdna4-infer}"
 ORACLE="${ORACLE:-$ROOT/build/oracle-next-token}"
 TOKORACLE="${TOKORACLE:-$ROOT/build/oracle-tokenize}"

@@ -55,7 +55,8 @@ if [ "$PHASE" = all ]; then
   fi
 
   echo "== B. GPU gates under a single lock =="
-  if ! "$ROOT/scripts/gpu-lock.sh" env CHECK_ALL_PHASE=gpu "$0" "$MODEL" $(quick_arg); then
+  if ! "$ROOT/scripts/gpu-lock.sh" env GPU_LOCK_HELD=1 CHECK_ALL_PHASE=gpu \
+         "$0" "$MODEL" $(quick_arg); then
     fail=1
   fi
 

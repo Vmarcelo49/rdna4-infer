@@ -42,4 +42,10 @@ fi
 args+=("$@")
 
 echo "== check_server.sh: $(basename "$MODEL"), port $PORT, ctx $CTX =="
+# Same rule as the other gates: take the lock unless the caller already holds
+# it (scripts/check_all.sh runs this one outside its locked block on purpose).
+if [ "${GPU_LOCK_HELD:-0}" = 1 ]; then
+  exec "${args[@]}"
+fi
+export GPU_LOCK_HELD=1
 exec "$ROOT/scripts/gpu-lock.sh" "${args[@]}"
