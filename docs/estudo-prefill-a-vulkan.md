@@ -657,3 +657,15 @@ O que **não** ficou determinado:
    compartilhada, e é o microbench que falta.
 4. **A repartição L1/L2/IC dos ~4 TB/s de pedidos de carga** do nosso kernel em lote — `rocprof`
    e `omniperf` não estão instalados (`journal-lote.md` já registra isso como o que faltou).
+
+---
+
+## Nota do coordenador (14/09, tarde) — correção de integridade
+
+Os números de `pp512` que eu (coordenador) passei para esta frente e que aparecem no §0.1 vinham
+de um binário do llama.cpp **modificado localmente** (`ggml-vulkan.cpp:5462`, `rm_kq = 2 -> 1`,
+patch de 2026-09-10, binário linkado 73 s depois). O worktree limpo (`/tmp/llama-clean`, commit
+`df03399b8`) dá: **pp512 default 1054,29 ± 11,93** (não 1196,49), **coopmat desligado 426,03 ±
+0,72** (não 478,38). A **razão** do coopmat praticamente não muda (2,47× contra 2,50×), e é a
+razão que sustenta o §1.3 — mas qualquer leitura de valor absoluto neste documento deve usar os
+números do binário limpo. Detalhe completo: `docs/estudo-prefill.md` §0.

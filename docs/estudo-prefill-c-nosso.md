@@ -703,3 +703,23 @@ GB/s de roofline medido) enquanto o mesmo kernel no caminho por token usa 79-82 
    é iq3_xxs de 98 B, e é *outro* tipo). **Não é contradição do motor** — é uma armadilha para
    quem for escrever o microbench de N > 16: escolha o tensor e o `sizeof` do tipo dele, não um
    `sizeof` genérico.
+
+---
+
+## Nota do coordenador (14/09, tarde) — correção de integridade
+
+O `llama-bench` usado nas comparações desta frente vinha de um binário **modificado localmente**
+(`ggml-vulkan.cpp:5462`, `rm_kq = 2 -> 1`, patch de 2026-09-10). Remedido com worktree limpo
+(`/tmp/llama-clean`, `df03399b8`):
+
+| micro-lote | binário local (usado no doc) | **limpo** |
+|---|---|---|
+| 16 | 199,27 | **170,43** |
+| 64 | 663,77 | **553,97** |
+| 128 | 1007,95 | **872,58** |
+| 512 | 1168,49 | **1054,29** |
+
+Consequências: o gap no micro-lote igual é **170,43/123,4 = 1,38×** (não 1,62×) e o gap total é
+**8,54×** (não 9,0×). O fator do micro-lote (6,19× limpo contra 5,84× local) e todas as
+*atribuições* do §1 continuam de pé; só a âncora absoluta cai ~11-14 %. Detalhe:
+`docs/estudo-prefill.md` §0.

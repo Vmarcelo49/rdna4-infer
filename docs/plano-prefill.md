@@ -9,12 +9,12 @@ que o sustenta; nenhuma escolha é por preferência. O que **não** está medido
 
 | degrau | o que muda | ganho medido/derivado | prefill esperado |
 |---|---|---|---|
-| **hoje** | chunk 16 + GEMV em lote (dp4a, 1 saída/thread, sem LDS) | — | **123,4 tok/s** = 3,0-3,2 T-MAC/s (7 % do pico de dp4a medido) |
+| **hoje** | chunk 16 + GEMV em lote (dp4a, 1 saída/thread, sem LDS) | gap real **8,54×** (não 9,7×: ver nota de integridade em `estudo-prefill.md` §0) | **123,4 tok/s** = 3,0-3,2 T-MAC/s (7 % do pico de dp4a medido) |
 | ~~D1~~ | chunk maior com o MESMO kernel | **MEDIDO E REPROVADO**: −18 % em N=32, −71 % em N=64 (§0.1) | **não fazer** |
 | **D2** | GEMM tilejado com staging na LDS, **M=64-128** | dois protótipos independentes: **10,3-13,7 T-MAC/s = 3,2-4,3×** | **~400-530 tok/s** |
 | **D3** | D2 + **caminho de dados consertado** (BK=128/linha de cache cheia, ordem k-maior, mais warps) | não medido; é o que destrava os dois caminhos (hoje 58-94 % do tempo é staging, a 280 GB/s de 633) | a medir |
 | **D4** | D2/D3 + laço interno na **unidade de matriz** | teto medido: WMMA int8 **182 T-MAC/s** (364 TOPS) contra 44 do dp4a = **4,2×** | alvo llama.cpp: 32,7 T-MAC/s = **~1100 tok/s** |
-| referência | llama.cpp Vulkan, `-ub 512` | 32,7 T-MAC/s (74 % do pico de dp4a, 37 % do teto f16-WMMA) | 1170-1196 tok/s |
+| referência | llama.cpp Vulkan, `-ub 512` (build **limpo**) | 32,7 T-MAC/s (74 % do pico de dp4a, 37 % do teto f16-WMMA) | **1054,3 tok/s** |
 
 Os degraus não são independentes: **D2 não rende nada sem D1** (medido: o mesmo GEMM tilejado em
 M=16 dá 3,46 T MAC/s = 1,08× o kernel de hoje; em M=128 dá 10,34 T = 3,24×). E **D3 não existe

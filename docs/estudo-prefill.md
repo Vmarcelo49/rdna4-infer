@@ -4,13 +4,47 @@ Pergunta do usuário, literal: *"how does llama.cpp prefill is 9 to 10 times fas
 did we skip? what should we port or optimize?"*. Este arquivo é o documento-síntese do dia; cada
 frente tem o seu relatório (`docs/estudo-prefill-{a-vulkan,b-mmq,c-nosso,d-wmma}.md`).
 
+## 0. NOTA DE INTEGRIDADE (14/09, tarde) — a referência estava 11 % otimista
+
+**Achado, e é uma correção que vale para todo o estudo**: o checkout
+`/home/marcelo/Projetos/llama.cpp` tinha **uma linha modificada localmente**
+(`ggml-vulkan.cpp:5462`, `rm_kq = 2` → `1`, patch de **2026-09-10 19:49**), e o binário
+`build/bin/llama-bench` foi **linkado 73 s depois** — ou seja, todas as medições da manhã saíram
+de um llama.cpp **modificado**, não do upstream. Quem editou não foi nenhum agente de hoje (a data
+é de quatro dias atrás). O patch está salvo em `/tmp/llama-rmkq.patch` e o binário antigo em
+`/tmp/llama-bench-patched`; a árvore do usuário **não** foi tocada — eu construí um worktree
+limpo em `/tmp/llama-clean` a partir de `df03399b8`.
+
+| `pp512` | binário local (patch `rm_kq=1`) | **limpo (`rm_kq=2`, upstream)** | delta |
+|---|---|---|---|
+| default (`-ub 512`) | 1196,49 ± 1,72 | **1054,29 ± 11,93** | **−11,9 %** |
+| `GGML_VK_DISABLE_COOPMAT=1/2` | 478,38 ± 0,64 | **426,03 ± 0,72** | −10,9 % |
+| `-ub 16` | 199,27 | **170,43** | −14,5 % |
+| `-ub 64` | 663,77 | **553,97** | −16,5 % |
+| `-ub 128` | 1007,95 | **872,58** | −13,4 % |
+
+**Números corrigidos, que substituem os do resto deste documento e dos relatórios das frentes A e
+C** (os das frentes continuam válidos em *razão*, que é como eles são usados):
+
+- o gap do prefill é **8,54×** (1054,29 contra 123,4), não 9,0-9,7×;
+- decomposição: **1,38× estrutura de kernel em micro-lote igual** (170,43/123,4) × **2,50×
+  micro-lote** (426,03/170,43) × **2,47× unidades de matriz** (1054,29/426,03) = **8,52×**;
+- a curva do micro-lote continua com joelho em 128 (170 → 554 → 873 → 1054);
+- alvo do plano: **~1050 tok/s**, não 1200.
+
+O que **não** muda: a razão do coopmat (2,47× contra 2,50×), a ordem de grandeza de todos os
+fatores, e nenhuma conclusão — só a âncora absoluta cai 11 %. A lição de processo fica registrada:
+**um build de referência com uma linha local modificada contamina toda a comparação**, e o
+`git status` do diretório de referência deveria ter sido a primeira checagem do dia.
+
+
 ## TL;DR — o gap tem três fatores medidos, e o maior é o tamanho do lote
 
 | fator | de → para | ganho | como foi medido |
 |---|---|---|---|
-| **1. micro-lote** | chunk de 16 → 512 tokens | **2,39×** | `llama-bench -b/-ub`: o próprio llama.cpp cai de 1168,49 para **200,25 tok/s** quando o micro-lote desce para 16 (frente C) |
-| **2. caminho de dados** | GEMV em lote → GEMM tilejado com staging na LDS | **3,2-4,3×** em M=64-128 | dois protótipos independentes: **12,74 T-MAC/s** (int8/dp4a, M=512, verificado contra oráculo) e 10,3-13,7 (WMMA f16, M=64) contra 3,0-3,2 do motor |
-| **3. unidades de matriz** | dp4a → WMMA | teto **4,2×** (182 contra 44 T-MAC/s) | A/B do llama.cpp (`GGML_VK_DISABLE_COOPMAT`: 1196 → 478) + pico medido no cartão (frente D) |
+| **1. micro-lote** | chunk de 16 → 512 tokens | **2,50×** (limpo: 426,03 → 1054,29) | `llama-bench -b/-ub`: o próprio llama.cpp cai de **1054,29 para 170,43 tok/s** quando o micro-lote desce para 16 |
+| **2. caminho de dados** | GEMV em lote → GEMM tilejado com staging na LDS | **3,2-4,3×** em M=64-128 (e 1,38× no micro-lote igual, do lado deles) | dois protótipos independentes: **12,74 T-MAC/s** (int8/dp4a, M=512, verificado contra oráculo) e 10,3-13,7 (WMMA f16, M=64) contra 3,0-3,2 do motor |
+| **3. unidades de matriz** | dp4a → WMMA | **2,47×** medido no llama.cpp (1054,29 vs 426,03); teto **4,2×** no cartão (182 contra 44 T-MAC/s) | A/B do binário limpo (`GGML_VK_DISABLE_COOPMAT`) + pico medido (frente D) |
 
 E a frase que corrige o plano que eu tinha escrito de manhã, dita pela própria frente D:
 **"WMMA compra teto, não velocidade."** Com o caminho de dados como está, trocar a instrução não

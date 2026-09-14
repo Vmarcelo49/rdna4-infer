@@ -245,32 +245,60 @@ __global__ void __launch_bounds__((BM / RM) * (BN / RN)) gemm_iq3s_f16_kernel(
 // ---------------------------------------------------------------------------
 // 4. O oraculo de GPU: um warp por elemento de saida
 // ---------------------------------------------------------------------------
-// Reusa `dequantize_iq3_s` do MOTOR, sem reescrita: 32 lanes cobrem os 256
+// Reusa `dequantize_iq3_s` do MOTOR, sem reescrita: as 32 lanes cobrem os 256
 // pesos do super-bloco (8 valores cada). O produto com a ativacao f16 e' em
 // fp32, entao a diferenca contra o kernel tilejado e' (i) o arredondamento do
 // peso para f16 e (ii) a ordem das somas -- exatamente as duas coisas que o
 // degrau D2 introduz.
+//
+// ATENCAO (bug real que esta bancada pegou): `dequantize_iq3_s` escreve nas
+// posicoes 32*(lane%8) + 8*(lane/8) + [0,8) do SUPER-BLOCO inteiro, e nao num
+// buffer de 8 floats por lane -- com um `float w[8]` local isso estoura a pilha
+// e o oraculo devolve NaN (medido: 59961 de 69632 saidas nao-finitas). Por isso
+// o destino e' um buffer de 256 floats por warp, na LDS.
 __global__ void ref_gemm_kernel(const __half *__restrict__ A, const block_iq3_s *__restrict__ W,
                                 float *__restrict__ C, const int M, const int N, const int K) {
+  __shared__ float s_w[8][kQK];
+  const int warp = (int)(threadIdx.x >> 5);
   const int lane = (int)(threadIdx.x & 31u);
-  const std::int64_t out = (std::int64_t)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
-  if (out >= (std::int64_t)M * N) return;
-  const int m = (int)(out / N);
-  const int n = (int)(out % N);
+  const std::int64_t out = (std::int64_t)blockIdx.x * (blockDim.x >> 5) + warp;
+  const bool active = out < (std::int64_t)M * N;
+  // Linha valida mesmo quando inativo: os __syncthreads() tem de ser uniformes.
+  const int m = active ? (int)(out / N) : 0;
+  const int n = active ? (int)(out % N) : 0;
   const int bpr = K / kQK;
   const block_iq3_s *row = W + (std::int64_t)n * bpr;
   const __half *a = A + (std::int64_t)m * K;
   const int kk = 32 * (lane % 8) + 8 * (lane / 8);  // offset que o dequant cobre
   float acc = 0.f;
   for (int ib = 0; ib < bpr; ++ib) {
-    float w[8];
-    rdna4::dequantize_iq3_s(row, ib, w, lane);
+    rdna4::dequantize_iq3_s(row, ib, s_w[warp], lane);
+    __syncthreads();
 #pragma unroll
-    for (int j = 0; j < 8; ++j) acc += w[j] * __half2float(a[ib * kQK + kk + j]);
+    for (int j = 0; j < 8; ++j) acc += s_w[warp][kk + j] * __half2float(a[ib * kQK + kk + j]);
+    __syncthreads();
   }
 #pragma unroll
   for (int off = 16; off; off >>= 1) acc += __shfl_xor_sync(0xffffffffull, acc, off);
-  if (lane == 0) C[out] = acc;
+  if (active && lane == 0) C[out] = acc;
+}
+
+// Deposito do staging ISOLADO: um thread por sub-bloco de 32 pesos, do mesmo
+// jeito que o kernel faz (mesma funcao `stage_iq3s_32`), mas escrevendo o
+// resultado na global em vez da LDS. E' o que separa "o staging esta' certo" de
+// "o GEMM esta' certo" -- sem isto, um erro de staging apareceria disfarcado de
+// erro de f16 na comparacao contra o oraculo.
+__global__ void dump_stage_kernel(const block_iq3_s *__restrict__ W, __half *__restrict__ out,
+                                  const int nrow, const int bpr, const int nsub) {
+  const int t = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (t >= nsub) return;
+  const int ib = t / 8;
+  const int s = t % 8;
+  __half2 tmp[16];
+  stage_iq3s_32(W + (std::int64_t)nrow * bpr + ib, s, tmp);
+  __half2 *o = (__half2 *)(out + (std::size_t)t * 32);
+#pragma unroll
+  for (int i = 0; i < 16; ++i) o[i] = tmp[i];
 }
 
 // Copia a LUT do DEVICE para a memoria global: o oraculo de CPU usa a MESMA
@@ -604,6 +632,41 @@ int main(int argc, char **argv) {
         "oraculo de CPU (M=%d, N=%d, K=%lld; dequant do motor em fp64 no acumulador):\n"
         "  max |ref| = %.6g ; max |gpu-cpu| = %.3g ; max rel = %.3g\n",
         Mc, Nc, (long long)K, max_mag, max_abs, max_rel);
+
+    // ---- staging ISOLADO contra o mesmo oraculo ---------------------------
+    // Primeiros `nchk` sub-blocos de 32 pesos da linha 0: o kernel de staging
+    // escreve o que ele poe na LDS e a comparacao e' peso a peso (nao soma).
+    const int nsub = 64;  // 8 super-blocos = K 2048
+    __half *dStage = nullptr;
+    if (hipMalloc(&dStage, (std::size_t)nsub * 32 * sizeof(__half)) != hipSuccess) return 1;
+    dump_stage_kernel<<<(nsub + 63) / 64, 64>>>(Wblk, dStage, 0, (int)bpr, nsub);
+    if (!launch_ok("dump_stage")) return 1;
+    (void)hipDeviceSynchronize();
+    std::vector<uint16_t> staged((std::size_t)nsub * 32);
+    (void)hipMemcpy(staged.data(), dStage, staged.size() * sizeof(uint16_t), hipMemcpyDeviceToHost);
+    double w_rel = 0, w_abs = 0, w_ref = 0;
+    int w_bitdiff = 0;
+    for (int t = 0; t < nsub; ++t) {
+      const unsigned char *blk = w_raw.data() + (std::size_t)(t / 8) * kBlockBytes;
+      for (int j = 0; j < 32; ++j) {
+        const double want = (double)cpu_iq3s_weight(blk, (t % 8) * 32 + j, lut.data());
+        const double gotw = (double)rdna4::fp16_to_float(staged[(std::size_t)t * 32 + j]);
+        w_abs = std::max(w_abs, std::fabs(gotw - want));
+        w_ref = std::max(w_ref, std::fabs(want));
+        if (std::fabs(want) > 0) w_rel = std::max(w_rel, std::fabs(gotw - want) / std::fabs(want));
+        if (staged[(std::size_t)t * 32 + j] != rdna4::float_to_fp16((float)want)) ++w_bitdiff;
+      }
+    }
+    std::printf(
+        "check do staging (%d sub-blocos = %d pesos da linha 0, contra o oraculo de CPU):\n"
+        "  max |w| = %.5g ; max |dw| = %.3g ; max rel = %.3g (f16: 2^-11 = 4,9e-4)\n"
+        "  bits diferentes do arredondamento f16 esperado (RN, feito no host): %d de %d\n",
+        nsub, nsub * 32, w_ref, w_abs, w_rel, w_bitdiff, nsub * 32);
+    (void)hipFree(dStage);
+    if (w_bitdiff) {
+      std::printf("  REPROVADO: o staging nao reproduz o dequant do motor\n");
+      return 1;
+    }
     if (max_abs > 1e-3) {
       std::printf("  REPROVADO: o oraculo de GPU nao concorda com o de CPU\n");
       return 1;
