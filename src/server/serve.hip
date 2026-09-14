@@ -69,6 +69,11 @@ using rdna4::server::json::Value;
 // with a 400 instead of failing inside the renderer.
 constexpr const char *kEfforts[] = {"xhigh", "high", "medium", "low"};
 
+// Upper bound for --ctx-size. The graph takes the context as an int, so anything
+// above this would be cast before the VRAM budget could reject it (review
+// finding M5). It is also ~16x the largest context that fits in 16 GiB.
+constexpr std::uint64_t kMaxCtxSize = 1u << 24;
+
 // ---------------------------------------------------------------------------
 // CLI (small local copies of main.hip's helpers: main.hip is shared with two
 // other agents and the contract for this branch is that it only gains the two
@@ -177,8 +182,13 @@ int parse_serve_args(int argc, char **argv, ServeArgs *a) {
       a->port = static_cast<int>(p);
     } else if (std::strcmp(v, "--ctx-size") == 0) {
       const char *s = need("--ctx-size");
-      if (s == nullptr || !parse_u64(s, &a->ctx_size) || a->ctx_size == 0) {
-        std::fprintf(stderr, "rdna4-infer serve: --ctx-size must be > 0\n");
+      // Upper bound as well: ctx_size is carried as uint64_t but the graph takes
+      // an int, so an unchecked huge value would be cast to a negative/odd
+      // context before the VRAM budget ever saw it (review finding M5).
+      if (s == nullptr || !parse_u64(s, &a->ctx_size) || a->ctx_size == 0 ||
+          a->ctx_size > kMaxCtxSize) {
+        std::fprintf(stderr, "rdna4-infer serve: --ctx-size must be in 1..%llu\n",
+                     (unsigned long long)kMaxCtxSize);
         return 1;
       }
     } else if (std::strcmp(v, "--cache-type-k") == 0) {
@@ -371,10 +381,12 @@ bool Engine::init(const ServeArgs &a, std::string &err) {
     return false;
   }
   // Budget check before the (slow) load, like `info` does: a context that does
-  // not fit must fail with a message, not with hipMalloc.
+  // not fit must fail with a message, not with hipMalloc. The K and V types are
+  // counted separately (device.h) — using kv_k for both was exactly right only
+  // while they were equal, and under-counted a K/V mix until the load died in
+  // hipMalloc (review finding M4).
   const std::uint64_t kv_bytes =
-      2 * (std::uint64_t)a.ctx_size * rdna4::kQwen35KvElemsPerToken *
-      rdna4::kv_bytes_per_elem(a.kv_k) / 2;
+      rdna4::kv_cache_bytes(a.ctx_size, a.kv_k, a.kv_v);
   const std::uint64_t need = static_cast<std::uint64_t>(st.st_size) + kv_bytes +
                              rdna4::kOverheadBytes;
   if (need > total_vram) {
@@ -659,6 +671,13 @@ class ServeApp {
   }
 
   // ---- request parsing --------------------------------------------------
+  // Every numeric field below is validated on *both* ends and for finiteness.
+  // get_number() returns the raw strtod() result, so a request can deliver inf
+  // or NaN: `1e400` used to be accepted as `temperature = inf` (every logit
+  // becomes logit/inf = 0, so the softmax is uniform and the answer is
+  // deterministic garbage) and as `seed = inf`, where the cast to uint64_t is
+  // undefined behaviour. NaN slips through one-sided comparisons because every
+  // comparison with NaN is false (review finding H1).
   bool parse_sampling(const Value &body, GenRequest *gr, ApiError *e) const {
     *gr = GenRequest();
     gr->sp = engine_->sampling_defaults();
@@ -666,16 +685,17 @@ class ServeApp {
     long long i = 0;
 
     if (body.get_number("temperature", &d)) {
-      if (d < 0.0) {
-        *e = {400, "temperature must be >= 0", "invalid_request_error", "invalid_temperature",
-              "temperature"};
+      if (!std::isfinite(d) || d < 0.0 || d > 1e6) {
+        *e = {400, "temperature must be a finite number in [0, 1e6]",
+              "invalid_request_error", "invalid_temperature", "temperature"};
         return false;
       }
       gr->sp.temp = static_cast<float>(d);
     }
     if (body.get_number("top_p", &d)) {
-      if (d > 1.0) {
-        *e = {400, "top_p must be <= 1", "invalid_request_error", "invalid_top_p", "top_p"};
+      if (!std::isfinite(d) || d > 1.0) {
+        *e = {400, "top_p must be a finite number <= 1", "invalid_request_error", "invalid_top_p",
+              "top_p"};
         return false;
       }
       // <= 0 means "off" for several harnesses; the engine spells that as >= 1.
@@ -690,8 +710,9 @@ class ServeApp {
       gr->sp.top_k = i <= 0 ? 0 : static_cast<int>(i);
     }
     if (body.get_number("min_p", &d)) {
-      if (d < 0.0) {
-        *e = {400, "min_p must be >= 0", "invalid_request_error", "invalid_min_p", "min_p"};
+      if (!std::isfinite(d) || d < 0.0 || d > 1e6) {
+        *e = {400, "min_p must be a finite number in [0, 1e6]", "invalid_request_error",
+              "invalid_min_p", "min_p"};
         return false;
       }
       gr->sp.min_p = static_cast<float>(d);
@@ -699,9 +720,9 @@ class ServeApp {
     // llama.cpp's spelling first, then the OpenAI-ish one as an alias.
     const char *rp_key = body.has("repeat_penalty") ? "repeat_penalty" : "repetition_penalty";
     if (body.get_number(rp_key, &d)) {
-      if (d <= 0.0) {
-        *e = {400, std::string(rp_key) + " must be > 0", "invalid_request_error",
-              "invalid_repeat_penalty", rp_key};
+      if (!std::isfinite(d) || d <= 0.0 || d > 1e6) {
+        *e = {400, std::string(rp_key) + " must be a finite number in (0, 1e6]",
+              "invalid_request_error", "invalid_repeat_penalty", rp_key};
         return false;
       }
       gr->sp.repeat_penalty = static_cast<float>(d);
@@ -715,24 +736,26 @@ class ServeApp {
       gr->sp.repeat_last_n = static_cast<int>(i);
     }
     if (body.get_number("presence_penalty", &d)) {
-      if (d < -2.0 || d > 2.0) {
-        *e = {400, "presence_penalty must be in [-2, 2]", "invalid_request_error",
+      if (!std::isfinite(d) || d < -2.0 || d > 2.0) {
+        *e = {400, "presence_penalty must be a finite number in [-2, 2]", "invalid_request_error",
               "invalid_presence_penalty", "presence_penalty"};
         return false;
       }
       gr->presence_penalty = static_cast<float>(d);
     }
     if (body.get_number("frequency_penalty", &d)) {
-      if (d < -2.0 || d > 2.0) {
-        *e = {400, "frequency_penalty must be in [-2, 2]", "invalid_request_error",
+      if (!std::isfinite(d) || d < -2.0 || d > 2.0) {
+        *e = {400, "frequency_penalty must be a finite number in [-2, 2]", "invalid_request_error",
               "invalid_frequency_penalty", "frequency_penalty"};
         return false;
       }
       gr->frequency_penalty = static_cast<float>(d);
     }
     if (body.get_number("seed", &d)) {
-      if (d < 0.0) {
-        *e = {400, "seed must be >= 0", "invalid_request_error", "invalid_seed", "seed"};
+      // 1e15 < 2^53, so the value is exact in a double and the cast is defined.
+      if (!std::isfinite(d) || d < 0.0 || d > 1e15) {
+        *e = {400, "seed must be a finite number in [0, 1e15]", "invalid_request_error",
+              "invalid_seed", "seed"};
         return false;
       }
       gr->sp.seed = static_cast<std::uint64_t>(d);

@@ -284,7 +284,7 @@ int main(int argc, char **argv) {
       // and the argmax preserved), which is why the *gating* comparison uses real
       // text: scripts/check_attn_split.sh.
       const bool ok = rel < 5e-2 && am_ref == am_split;
-      std::printf("attention splits (%d) vs unsplit at ctx %zu: logits rel-L2 %.3e max|d| %.3e, "
+      std::printf("attention splits (%d) vs unsplit at ctx %d: logits rel-L2 %.3e max|d| %.3e, "
                   "argmax %zu vs %zu  %s (synthetic cache: informative, see the comment)\n",
                   forced, ctx, rel, maxd, am_ref, am_split, ok ? "OK" : "FAIL");
       if (!ok) {

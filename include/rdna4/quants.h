@@ -12,7 +12,12 @@
 #define QK_K  256
 #define QK8_0 32
 #define K_SCALE_SIZE 12
+// Same value as llama.cpp's ggml-common.h (QK_K/64) but spelled differently, so
+// a TU that includes both headers (tests/dequant_cpu_oracle.cpp) reported a
+// macro redefinition in every target that links it (review finding B2).
+#ifndef IQ3S_N_SCALE
 #define IQ3S_N_SCALE 4
+#endif
 #define QK4_NL 32
 
 namespace rdna4 {

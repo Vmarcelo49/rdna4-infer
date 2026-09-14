@@ -133,11 +133,23 @@ bool Tokenizer::init(const gguf::File &f, std::string &err) {
   auto add_eog = [&](std::int32_t id) {
     if (id >= 0 && (std::size_t)id < eog_.size()) eog_[(std::size_t)id] = true;
   };
+  // The DeepSeek spelling is "<" U+FF5C "end" U+2581 "of" U+2581 "sentence"
+  // U+FF5C ">" (27 bytes). It is written as adjacent literals on purpose: a hex
+  // escape swallows every hex digit that follows it, so "\x9Cend" is *not*
+  // 0x9C followed by "end" but a single 0x9CE character (truncated to 0xCE)
+  // followed by "nd" - a different string that still compiles silently. The
+  // static_assert fails the build if that trap comes back (review finding E1;
+  // the wrong bytes were proven present in the shipped binary).
+  static const char kDeepSeekEog[] = "<\xEF\xBD\x9C"
+                                     "end\xE2\x96\x81"
+                                     "of\xE2\x96\x81"
+                                     "sentence\xEF\xBD\x9C>";
+  static_assert(sizeof(kDeepSeekEog) - 1 == 27, "EOG literal byte count changed");
   static const char *kEogTexts[] = {
       "<|eot_id|>", "<|im_end|>", "<|end|>", "<|return|>", "<|call|>", "<|flush|>",
       "<|calls|>", "<end_of_turn>", "<|endoftext|>", "</s>", "<|eom_id|>", "<EOT>",
       "_<EOT>", "[EOT]", "[EOS]", "<|end_of_text|>", "<end_of_utterance>", "<eos>",
-      "<turn|>", "<|tool_response>", "<\xEF\xBD\x9Cend\xE2\x96\x81of\xE2\x96\x81sentence\xEF\xBD\x9C>",
+      "<turn|>", "<|tool_response>", kDeepSeekEog,
       "[e~[",
   };
   for (const char *txt : kEogTexts) {

@@ -48,13 +48,8 @@ bool kv_f64(const gguf::File &f, const char *key, double &out) {
   return false;
 }
 
-std::uint64_t prod(const std::vector<std::int64_t> &dims) {
-  std::uint64_t n = 1;
-  for (std::int64_t d : dims) {
-    n *= static_cast<std::uint64_t>(d);
-  }
-  return n;
-}
+// (an unchecked `prod()` used to live here: the checked product is
+// loader.cpp's prod_dims(), which is the one the geometry guards rely on.)
 
 using Expect = std::pair<std::string, std::vector<std::int64_t>>;
 

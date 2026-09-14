@@ -48,11 +48,35 @@ inline double kv_bytes_per_elem(const char *kv_type) {
 }
 inline constexpr std::uint64_t kOverheadBytes = 1u << 30;  // kernels, buffers, fragmentation
 
+// Bytes held by the KV cache at `ctx_size`. kQwen35KvElemsPerToken counts the K
+// *and* the V elements of a token, so each side holds half of it. Review finding
+// M4: `serve` sized the budget with kv_bytes_per_elem(kv_k) over the full
+// constant, which is twice the K bytes — exactly right only while K and V have
+// the same type, and wrong (too small, i.e. hipMalloc at load time) as soon as
+// they differ.
+inline std::uint64_t kv_cache_bytes(std::uint64_t ctx_size, KvType kv_k, KvType kv_v) {
+  const double half = static_cast<double>(kQwen35KvElemsPerToken) / 2.0;
+  return static_cast<std::uint64_t>(static_cast<double>(ctx_size) * half *
+                                    (kv_bytes_per_elem(kv_k) + kv_bytes_per_elem(kv_v)));
+}
+inline std::uint64_t kv_cache_bytes(std::uint64_t ctx_size, const char *kv_k, const char *kv_v) {
+  KvType k = KvType::F16;  // llama.cpp's default
+  KvType v = KvType::F16;
+  if (kv_type_parse(kv_k, &k) != nullptr || kv_type_parse(kv_v, &v) != nullptr) return 0;
+  return kv_cache_bytes(ctx_size, k, v);
+}
+
 inline std::uint64_t required_bytes(std::uint64_t file_bytes, std::uint64_t ctx_size,
                                     const char *kv_type) {
   const auto kv =
       static_cast<std::uint64_t>(ctx_size * kQwen35KvElemsPerToken * kv_bytes_per_elem(kv_type));
   return file_bytes + kv + kOverheadBytes;
+}
+
+// Same, with independent K and V cache types.
+inline std::uint64_t required_bytes(std::uint64_t file_bytes, std::uint64_t ctx_size,
+                                    const char *kv_k, const char *kv_v) {
+  return file_bytes + kv_cache_bytes(ctx_size, kv_k, kv_v) + kOverheadBytes;
 }
 
 }  // namespace rdna4

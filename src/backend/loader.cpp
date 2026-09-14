@@ -3,6 +3,8 @@
 
 #include <sys/stat.h>
 
+#include <exception>
+
 namespace rdna4 {
 namespace {
 
@@ -18,6 +20,13 @@ std::uint64_t prod_dims(const std::vector<std::int64_t> &dims) {
   return n;
 }
 
+// Overflow-checked sum (review finding M7).
+bool add_checked(std::uint64_t a, std::uint64_t b, std::uint64_t &out) {
+  if (a > UINT64_MAX - b) return false;
+  out = a + b;
+  return true;
+}
+
 }  // namespace
 
 GgufLoader::~GgufLoader() {
@@ -27,6 +36,10 @@ GgufLoader::~GgufLoader() {
 }
 
 bool GgufLoader::open(const char *path, std::string &err) {
+  if (fp_) {  // reopening: a second open() used to leak the previous FILE*
+    std::fclose(fp_);
+    fp_ = nullptr;
+  }
   fp_ = std::fopen(path, "rb");
   if (!fp_) {
     err = "cannot open file";
@@ -34,7 +47,19 @@ bool GgufLoader::open(const char *path, std::string &err) {
   }
   path_ = path;
 
-  if (!gguf::read(fp_, f_, err)) {
+  // The header is file-controlled, so its parse can throw (std::bad_alloc /
+  // std::length_error from the string and vector allocations). Translate that
+  // into the normal error path instead of letting the process abort: the
+  // per-field caps in gguf.cpp bound each length, not their sum (review finding
+  // M8).
+  bool parsed = false;
+  try {
+    parsed = gguf::read(fp_, f_, err);
+  } catch (const std::exception &ex) {
+    err = std::string("cannot parse GGUF header: ") + ex.what();
+    parsed = false;
+  }
+  if (!parsed) {
     std::fclose(fp_);
     fp_ = nullptr;
     return false;
@@ -98,6 +123,17 @@ bool GgufLoader::open(const char *path, std::string &err) {
       fp_ = nullptr;
       return false;
     }
+    // tensor_bytes() rounds up and multiplies without an overflow check, so a
+    // wrapped product can land on a small non-zero value. A tensor can never be
+    // larger than the file that holds it, which makes file_size a sound and
+    // cheap upper bound (review finding M7).
+    if (bytes_[i] > file_size) {
+      err = "tensor '" + t.name + "': computed size " + std::to_string(bytes_[i]) +
+            " exceeds the " + std::to_string(file_size) + "-byte file";
+      std::fclose(fp_);
+      fp_ = nullptr;
+      return false;
+    }
     total_bytes_ += bytes_[i];
     // Unique names.
     if (index_.count(t.name)) {
@@ -111,12 +147,34 @@ bool GgufLoader::open(const char *path, std::string &err) {
 
   // Geometry: no tensor may overflow the span until the next tensor (or EOF),
   // and each tensor end must be aligned. Mirrors scripts/check_geometry.py.
+  //
+  // All three operands of the sums below come from the file, so the sums are
+  // checked: unsigned wrap would make a forged offset pass both guards and the
+  // later fseek would land in the GGUF header, loading header bytes as weights
+  // (review finding M7).
   const std::uint64_t doff = f_.data_offset;
   const std::size_t align = f_.alignment;
+  if (doff > file_size) {
+    err = "data section offset " + std::to_string(doff) + " is past the end of the " +
+          std::to_string(file_size) + "-byte file";
+    std::fclose(fp_);
+    fp_ = nullptr;
+    return false;
+  }
   for (std::size_t i = 0; i < n; ++i) {
-    const std::uint64_t abs_end = doff + f_.tensors[i].offset + bytes_[i];
-    const std::uint64_t bound =
-        (i + 1 < n) ? doff + f_.tensors[i + 1].offset : file_size;
+    const gguf::TensorInfo &t = f_.tensors[i];
+    std::uint64_t start = 0;
+    std::uint64_t abs_end = 0;
+    std::uint64_t bound = file_size;
+    const bool sums_ok =
+        add_checked(doff, t.offset, start) && add_checked(start, bytes_[i], abs_end) &&
+        (i + 1 >= n || add_checked(doff, f_.tensors[i + 1].offset, bound));
+    if (!sums_ok) {
+      err = "tensor '" + t.name + "': offset/size sum overflows 64 bits";
+      std::fclose(fp_);
+      fp_ = nullptr;
+      return false;
+    }
     if (abs_end > bound) {
       err = "tensor '" + f_.tensors[i].name +
             "': size overflows into next tensor / EOF";
@@ -150,11 +208,17 @@ bool GgufLoader::load_tensor_range(std::size_t i, std::uint64_t off,
     return false;
   }
   const gguf::TensorInfo &t = f_.tensors[i];
-  if (off + count > bytes_[i]) {
+  std::uint64_t end = 0;
+  if (!add_checked(off, count, end) || end > bytes_[i]) {
     err = "range out of tensor bounds";
     return false;
   }
-  const long where = static_cast<long>(f_.data_offset + t.offset + off);
+  std::uint64_t abs = 0;
+  if (!add_checked(f_.data_offset, t.offset, abs) || !add_checked(abs, off, abs)) {
+    err = "tensor offset overflows 64 bits";
+    return false;
+  }
+  const long where = static_cast<long>(abs);
   if (std::fseek(fp_, where, SEEK_SET) != 0) {
     err = "seek to tensor failed";
     return false;

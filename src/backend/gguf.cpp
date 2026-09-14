@@ -8,9 +8,20 @@ namespace rdna4 {
 namespace gguf {
 namespace {
 
+// Upper bounds for two lengths that come straight from the file and are used as
+// allocation sizes. Without them a corrupt header aborts the process inside
+// std::string::resize / std::vector::resize (std::bad_alloc or
+// std::length_error, neither caught) instead of failing with `err`. Both are far
+// above what a real GGUF carries: the largest string is a chat template (tens of
+// KB) and the largest array here is tokenizer.ggml.tokens with 248,320 entries
+// (review finding M8).
+constexpr std::uint64_t kMaxStrBytes = 1u << 26;  // 64 MiB
+constexpr std::uint64_t kMaxArrElems = 1u << 24;  // 16.7M elements
+
 struct Cursor {
   FILE *fp = nullptr;
   bool ok = true;
+  std::uint64_t file_size = 0;  // 0 when it could not be determined
 
   void read(void *dst, std::size_t n) {
     if (!ok || std::fread(dst, 1, n, fp) != n) {
@@ -29,6 +40,11 @@ struct Cursor {
     if (!ok) {
       return s;
     }
+    // `n` is file-controlled and used directly as an allocation size.
+    if (n > kMaxStrBytes || n > remaining()) {
+      ok = false;
+      return s;
+    }
     s.resize(n);
     if (n > 0) {
       read(s.data(), n);
@@ -38,6 +54,16 @@ struct Cursor {
   std::uint64_t pos() {
     const long p = std::ftell(fp);
     return p < 0 ? 0 : static_cast<std::uint64_t>(p);
+  }
+  // Bytes left in the file from the current position (UINT64_MAX when the size
+  // is unknown). Every element of every array occupies at least one byte on
+  // disk, so this is a hard upper bound for any length read from the header.
+  std::uint64_t remaining() {
+    if (file_size == 0) {
+      return UINT64_MAX;
+    }
+    const std::uint64_t p = pos();
+    return p <= file_size ? file_size - p : 0;
   }
 };
 
@@ -87,8 +113,11 @@ bool read_value(Cursor &c, ValueType type, Value &out) {
     case ARRAY: {
       out.arr_type = static_cast<ValueType>(c.get<std::int32_t>());
       const std::uint64_t n = c.get<std::uint64_t>();
-      if (n > (1u << 28)) {
-        c.ok = false;  // sanity cap: 256M elements
+      // Same guard as get_str(): each element occupies at least one byte on
+      // disk and ~80 bytes in memory, so a file-controlled count would reserve
+      // gigabytes before the first element is read.
+      if (!c.ok || n > c.remaining() || n > kMaxArrElems) {
+        c.ok = false;  // implausible element count
         break;
       }
       out.arr.resize(n);
@@ -129,7 +158,17 @@ const char *ggml_type_name(std::uint32_t dtype) {
 // (and must close) the file.
 bool read(FILE *fp, File &out, std::string &err) {
   File f;
-  Cursor c{fp, true};
+  // File size up front: the two length guards above need to know how many bytes
+  // are still available. The cursor consumes from position 0.
+  std::uint64_t fsz = 0;
+  if (std::fseek(fp, 0, SEEK_END) == 0) {
+    const long end = std::ftell(fp);
+    if (end > 0) {
+      fsz = static_cast<std::uint64_t>(end);
+    }
+  }
+  std::fseek(fp, 0, SEEK_SET);
+  Cursor c{fp, true, fsz};
 
   char magic[4] = {};
   c.read(magic, 4);

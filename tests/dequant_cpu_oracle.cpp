@@ -12,6 +12,13 @@
 //                              (this actually happened for block_q5_K: qh/qs).
 #include "rdna4/quants.h"
 
+// llama.cpp's ggml-common.h defines IQ3S_N_SCALE as QK_K/64 (same value, and it
+// has no include guard around it), so its definition would be reported as a
+// redefinition of ours in every target that links this TU (review finding B2).
+// Our block structs already expanded the macro above, so dropping it here only
+// affects llama.cpp's headers.
+#undef IQ3S_N_SCALE
+
 #include "ggml-quants.h"
 
 #include <cstdarg>

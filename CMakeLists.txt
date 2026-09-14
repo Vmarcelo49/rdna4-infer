@@ -47,6 +47,12 @@ target_include_directories(check-dtype PRIVATE include)
 add_executable(check-loader tests/check_loader.cpp src/backend/gguf.cpp
                    src/backend/loader.cpp src/backend/model.cpp)
 target_include_directories(check-loader PRIVATE include)
+# Loader hardening probe: a forged GGUF header must be rejected cleanly instead
+# of loading header bytes as weights or aborting in an allocation (audit
+# findings M7/M8). Driven by scripts/check_hardening.sh.
+add_executable(check-forge tests/check_forge.cpp src/backend/gguf.cpp
+                 src/backend/loader.cpp)
+target_include_directories(check-forge PRIVATE include)
 add_executable(check-model tests/check_model.cpp src/backend/gguf.cpp
                  src/backend/loader.cpp src/backend/model.cpp)
 target_include_directories(check-model PRIVATE include)

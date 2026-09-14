@@ -1053,7 +1053,6 @@ inline bool Graph::forward_batch(const std::vector<std::int32_t> &tokens, int st
     }
   }
 
-  const int L = n_layer();
   for (int il = 0; il < debug_layer_limit(); ++il) {
     if (!forward_batch_layer(il, n, start_pos, err)) {
       err = "layer " + std::to_string(il) + ": " + err;
@@ -1288,6 +1287,12 @@ inline void Graph::release() {
   for (float *p : ptrs) {
     if (p) (void)hipFree(p);
   }
+  // `ptrs` holds copies, so nulling the members is a separate step. Without it a
+  // second release() freed the same 18 addresses again (the batch and the other
+  // pointers below were already nulled) — review finding M1.
+  d_x_ = d_xn_ = d_proj_ = d_ffnout_ = d_attnout_ = d_attngate_ = nullptr;
+  d_qkv_ = d_conv_ = d_z_ = d_alpha_ = d_beta_ = nullptr;
+  d_gate_ = d_state_ = d_convst_ = d_ffn_a_ = d_ffn_b_ = d_kstage_ = d_vstage_ = nullptr;
   if (d_k_) (void)hipFree(d_k_);
   if (d_v_) (void)hipFree(d_v_);
   d_k_ = nullptr;

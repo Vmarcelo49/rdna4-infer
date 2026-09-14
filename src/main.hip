@@ -899,14 +899,13 @@ int cmd_info(int argc, char **argv) {
     return 0;
   }
   const double gib = static_cast<double>(1u << 30);
-  const auto kv_k = static_cast<std::uint64_t>(ctx_size * rdna4::kQwen35KvElemsPerToken *
-                                               rdna4::kv_bytes_per_elem(kt) / 2);
-  const auto kv_v = static_cast<std::uint64_t>(ctx_size * rdna4::kQwen35KvElemsPerToken *
-                                               rdna4::kv_bytes_per_elem(vt) / 2);
-  const std::uint64_t need = file_bytes + kv_k + kv_v + rdna4::kOverheadBytes;
+  // One source of truth for the K + V budget (device.h), the same call serve
+  // makes before loading: this used to be two hand-rolled half-constant sums.
+  const std::uint64_t kv_bytes = rdna4::kv_cache_bytes(ctx_size, kt, vt);
+  const std::uint64_t need = file_bytes + kv_bytes + rdna4::kOverheadBytes;
   std::printf("model: %.2f GiB + kv(ctx=%llu, k=%s/v=%s): %.2f GiB + overhead: %.2f GiB = need %.2f GiB\n",
               file_bytes / gib, (unsigned long long)ctx_size, cache_k, cache_v,
-              (kv_k + kv_v) / gib, rdna4::kOverheadBytes / gib, need / gib);
+              kv_bytes / gib, rdna4::kOverheadBytes / gib, need / gib);
   if (need > total_vram) {
     std::fprintf(stderr, "rdna4-infer: insufficient VRAM (need %.2f GiB)\n", need / gib);
     return 3;

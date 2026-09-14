@@ -1047,3 +1047,71 @@ lançamento em produção (35 linhas), 32 launchers, 19/19 `hipMalloc` checados,
 47 linhas de alargamento implícito, 137 `int64_t` crus contra 280
 `std::int64_t`, 27/28 headers com `#pragma once`, 19 alvos `check-*`,
 1 304 avisos com `-Wall -Wextra`.
+
+---
+
+## 7. Correções aplicadas (coordenador, após o merge das seis frentes)
+
+Os quatro CRITICOS e três IMPORTANTES de baixo risco foram corrigidos na `main`,
+cada um com a prova antes/depois medida — não com "deve funcionar". O que **não**
+foi corrigido está listado no fim com o motivo.
+
+### 7.1 Prova antes/depois (`scripts/check_hardening.sh`)
+
+`tests/gen_forged_gguf.py` forja quatro cabeçalhos a partir do modelo falso válido
+(`tests/gen_fake_qwen35.py`), cada um com **um** campo reescrito, e
+`tests/check_forge.cpp` (novo alvo CPU `check-forge`) abre o arquivo, diz se o
+loader aceitou e, quando aceitou, devolve os primeiros bytes do tensor pedido.
+Rodado contra as fontes pré-correção (worktree `feat/medicoes-gpu`, commit
+`aa15eea`) e contra a árvore corrigida:
+
+| arquivo forjado | antes (pré-correção) | depois |
+|---|---|---|
+| `ok.gguf` (controle) | aceito, `token_embd.weight` = floats do modelo | aceito, idêntico |
+| `forge_offset_wrap.gguf` | **aceito**: `offset=18446744073709548768`, 512 bytes lidos, cabeça `71 77 65 6e 33 35` = **ASCII `qwen35`** (bytes do KV), `f32[0]=1,78e+28` | rejeitado: `offset/size sum overflows 64 bits` |
+| `forge_dim_huge.gguf` | rejeitado por acidente (`end not aligned`) | rejeitado: `computed size 18446744073709551612 exceeds the 29312-byte file` |
+| `forge_str_len.gguf` | **`exit 134`, `terminate called after throwing 'std::bad_alloc'`** | rejeitado: `truncated or corrupt header` |
+| `forge_arr_len.gguf` | rejeitado | rejeitado |
+
+Correção de alcance em relação ao M7 deste relatório: o wrap **não** é aceito em
+qualquer tensor. O limite (`bound`) do tensor `i-1` é `doff + offset[i]`, então um
+offset enorme em qualquer posição que não a primeira faz a guarda do *anterior*
+disparar antes — medido nas variantes de meio de tabela e de último tensor, ambas
+rejeitadas pelo código antigo. O caso silencioso é exatamente **o primeiro
+tensor**, que não tem antecessor; é o que o arquivo forjado explora, e é o que a
+soma checada elimina.
+
+### 7.2 O que mudou
+
+| # | achado | mudança |
+|---|---|---|
+| E1 | escape hexadecimal corrompia o literal de EOG | `src/backend/tokenizer.cpp`: literais adjacentes + `static_assert` de 27 bytes (o build passa a falhar se a armadilha voltar) |
+| M8 | comprimento do arquivo vira tamanho de alocação | `src/backend/gguf.cpp`: teto absoluto (64 MiB / 16,7 M elementos) **e** teto pelos bytes restantes do arquivo; `GgufLoader::open` traduz `bad_alloc`/`length_error` em `err` |
+| M7 | overflow nas somas de geometria | `src/backend/loader.cpp`: `add_checked()` nas três somas, `bytes_[i] > file_size` rejeitado, e `open()` não vaza mais o `FILE*` num reabrir |
+| H1 | números do JSON sem teste de finitude | `src/server/serve.hip`: `std::isfinite` + teto explícito em `temperature`, `top_p`, `min_p`, `repeat_penalty`, `presence/frequency_penalty` e `seed` |
+| M4 | orçamento de VRAM do `serve` ignorava o cache V | `include/rdna4/device.h`: `kv_cache_bytes(ctx, k, v)` (fonte única, usada por `info` e pelo `serve`) |
+| M5 | `-(int)` de `ctx_size` | `src/server/serve.hip`: `--ctx-size` limitado a `1..2^24` |
+| M1 | `release()` não era idempotente | `include/rdna4/graph.cuh`: os 18 ponteiros de `ptrs[]`/`batch_ptrs[]` são zerados (o array guarda cópias, então zerar o array não bastava) |
+| B2 | avisos reais do build padrão | `quants.h` guarda `IQ3S_N_SCALE`; `dequant_cpu_oracle.cpp` faz `#undef` antes do header do llama.cpp (colisão de macro, 5 alvos); `check_kvctx_gpu.hip:287` tinha `%zu` com argumento `int` (`ctx`) |
+| — | código morto que o compilador apontava | `graph.cuh`: `const int L = n_layer()` não usado (era o único `-Wunused-variable`); `model.cpp` e `unicode.cpp`: as duas funções estáticas sem uso (`prod`, `unicode_cpts_to_utf8`) foram apagadas — a primeira era um produto **sem** checagem de overflow ao lado do `prod_dims()` checado do loader |
+
+Gate novo: `scripts/check_hardening.sh [worktree-pré-correção]` (CPU puro, não pega
+o lock da GPU) e `make check-forge`. Nada aqui depende do modelo real.
+
+### 7.3 O que ficou de fora, e por quê
+
+- **B1 (`-Wall -Wextra`)**: medido por TU nesta árvore **depois** das correções
+  acima — `src/backend/*.cpp` = 0 avisos, `src/main.hip` = 0, e
+  `src/server/serve.hip` = 104 avisos que são **3 linhas**: 98 iguais de
+  `-Wsign-compare` em `attn.cuh:392` (`threadIdx.x < head_dim`, `unsigned` contra
+  `int`) mais `-Wunused-parameter` em `attn.cuh:402` (`n_head`),
+  `gdn.cuh:60` (`n_v_heads`) e `graph.cuh:619` (`t`). Ligar as flags antes de
+  corrigir essas três linhas só produziria ruído. A ordem é: corrigir a
+  cauda/`WPB` de `attn.cuh` (M2/E2 deste relatório — muda o kernel, então foi
+  adiado para depois do merge da frente de autotuning), marcar os três parâmetros
+  não usados, e só então ligar `-Wall -Wextra` no motor e no servidor.
+- **H2/H3/H4, M3, M9-M10, E2-E12**: não são CRITICOS e vários exigem mexer nos
+  mesmos arquivos que a frente de autotuning está editando (`attn.cuh`,
+  `graph.cuh`, `matvec.cuh`). Ficam registrados aqui com `file:line`.
+- **H7 (422 `nodiscard` nos testes)**: é ruído de teste, não caminho de produção
+  (19/19 `hipMalloc` e 41/41 lançamentos de produção já são checados).
