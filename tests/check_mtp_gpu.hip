@@ -565,11 +565,9 @@ int main(int argc, char **argv) {
   std::printf("   score     : %lld/%lld drafts matched (%.1f%%), %d draft steps\n", s_score.accepted,
               s_score.drafted, s_score.acceptance() * 100.0, s_score.draft_steps);
   std::printf("   spec(D=%d) : %lld/%lld drafts matched (%.1f%%) in %d rounds, %d trunk steps, "
-              "%d draft steps, trunk %.2f ms/step, draft %.2f ms/step\n",
+              "%d draft steps\n",
               draft_n, s_spec.accepted, s_spec.drafted, s_spec.acceptance() * 100.0, s_spec.rounds,
-              s_spec.trunk_steps, s_spec.draft_steps,
-              s_spec.trunk_steps ? s_spec.trunk_ms / s_spec.trunk_steps : 0.0,
-              s_spec.draft_steps ? s_spec.draft_ms / s_spec.draft_steps : 0.0);
+              s_spec.trunk_steps, s_spec.draft_steps);
   std::printf("   wall clock: plain %.2f s (%.2f tok/s), score %.2f s (%.2f tok/s, %+.1f%%), "
               "spec(D=%d) %.2f s (%.2f tok/s, %+.1f%%)\n",
               s_plain.wall_ms / 1000.0, ids_plain.size() / (s_plain.wall_ms / 1000.0),
@@ -634,7 +632,9 @@ int main(int argc, char **argv) {
     const double ms_synced = (t_hi1 - t_hi0) * 1000.0 / n_rep;
     std::printf("== draft step cost (%.1f MiB of weights) ==\n",
                 (double)mtp.weight_bytes() / (1024.0 * 1024.0));
-    std::printf("   %.2f ms/step back to back, %.2f ms/step with a sync per step\n",
+    std::printf("   %.2f ms/step back to back, %.2f ms/step with a sync per step "
+                "(the per-mode numbers above only measure host queueing: the graph is "
+                "asynchronous)\n",
                 ms_pipelined, ms_synced);
     std::printf("   a trunk step at 4K is ~%.1f ms (measured plain runs above), so a\n",
                 s_plain.wall_ms / (double)std::max(1, (int)ids_plain.size()));
