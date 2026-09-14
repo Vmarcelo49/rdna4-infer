@@ -229,6 +229,52 @@ MACs) e que, com o chunk de 16, não consegue amortizar nem o peso nem a ativaç
 **32× menos** peso por token e transforma isso em 8,5× mais velocidade: o número que separa os dois
 não é banda, é *forma*.
 
+## 3h. Atenção e KV no prefill: medidos, e um BUG no alvo
+
+Frente I (`docs/estudo-prefill-i-atencao.md`), medida com o binário oficial e com o caminho de
+produção:
+
+| | 512 tokens | 2048 | 4096 |
+|---|---|---|---|
+| bloco de atenção (16 camadas, com projeções) | **8,5 %** do prefill | 10,5 % | 12,9 % |
+| **kernel de atenção sozinho** | **1,1 %** | 3,2 % | **5,6 %** |
+| llama.cpp, nó `FLASH_ATTN_EXT` | **0,34 %** do chunk deles | 1,06 % | — |
+
+- **O crescimento do custo por token de 64 → 4096 (+6,2 %) é o kernel de atenção**: +0,521 dos
+  +0,581 ms/token = **89,7 %**. As projeções e a escrita do KV estão dentro do ruído. Ou seja: o que
+  cresce com o contexto no prefill é o produto Q·Kᵀ, não o resto.
+- **Atenção não é alavanca**: zerá-la daria +1,2 % a 512 e +5,9 % a 4096. O matvec é 83-88 %.
+- **Quantizar o KV é neutro para o prefill** (105,11 tok/s `f16`, 105,01 `q8_0`, 104,79 `q4_0` a 512)
+  e **piora o kernel** (+24 % com `q4_0` a 2048): no prefill o formato quantizado é **custo de
+  instrução, não economia de banda** — o inverso do decode noturno.
+
+### BUG CRÍTICO, e cai no alvo: `K=q5_0`/`V=q4_1` faz PAGE FAULT no prefill em lote
+
+**Reproduzido por mim**, com o binário de produção, depois de a frente I achar:
+
+```
+./build/rdna4-infer bench -m MODEL --prefill 64 --prefill-reps 1 --cache-type-k q5_0 --cache-type-v q4_1
+  -> Memory access fault by GPU node-1 ... Reason: Page not present or supervisor privilege.
+./build/rdna4-infer bench -m MODEL --prefill 64 --prefill-reps 1 --cache-type-k q5_0 --cache-type-v q4_0
+  -> prefill 64 tokens: 0.888 s (72.09 tok/s, batched N<=16)     [passa]
+```
+
+Matriz da frente I (binário oficial **e** `rdna4-infer`): falha `K ∈ {f16, q5_0}` **com `V = q4_1`**;
+passam `q4_0/q4_1`, `q8_0/q4_1`, `q4_1/q4_1`, `q5_0/q5_0`, `q5_0/f16`, `q4_1/q5_0`.
+- **Não é o caminho por token**: decode com `q5_0/q4_1` funciona (23,10 tok/s).
+- **É o caminho em lote**: falha já com `--prefill 16` (um único chunk).
+- `bench-attn-gpu q5_0` também quebra a partir de `t=256` (`HG=3 rel-L2 nan`, depois fault) — dois
+  tools independentes apontam para o mesmo caminho, e ele **não** passa por escrita de KV.
+- O par `(Q5_0, Q4_1)` **está** instanciado na atenção em lote (`attn.cuh:465`), então não é
+  `switch` incompleto. Suspeitos registrados: o `kv_write_batch` passa **o mesmo `width`**
+  (`n_tok*NKV*HD`) para K e V com **ponteiros de tamanhos de linha diferentes**
+  (`graph.cuh:873-877`), e/ou o caminho de leitura da atenção em lote para `V=q4_1`.
+
+**Isto não é tuning: é um bug de corretude na configuração que a rodada noturna recomendou**
+(K=`q5_0`, V=`q4_1`) para os 131K. Ou ele é corrigido, ou o par sai da lista permitida — não pode
+ficar como está, porque o alvo do usuário é exatamente esse par. Está no backlog como o item de
+maior prioridade de corretude.
+
 ## 4. O que nós não temos, em uma tabela (e é isto que foi "pulado")
 
 ### Atenção e KV no prefill (frente J, código a código)

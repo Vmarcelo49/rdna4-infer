@@ -385,3 +385,22 @@ Além dessas, os achados `F11` (números do README contra os docs, 5 de 12 com p
 - **FALTOU**: profiler (`rocprof`/`omniperf` não estão instalados) — sem ele a separação
   "throughput saturado × latência com ocupação máxima" fica por conta de experimentos dentro do
   kernel, e a sondagem de duas streams só mostra que não há slot de CTA livre (1,93× de 2,00×).
+
+---
+
+## P0 DE CORRETUDE, achado em 14/09 (tarde) — o KV do alvo quebra o prefill
+
+- **`K=q5_0`/`V=q4_1` faz PAGE FAULT no prefill em lote** (`Memory access fault ... Page not present
+  or supervisor privilege`). Reproduzido por mim com o binário de produção
+  (`rdna4-infer bench --prefill 64 --cache-type-k q5_0 --cache-type-v q4_1`); passa com
+  `--cache-type-v q4_0` (72,09 tok/s). Matriz completa da frente I: falha **`K ∈ {f16, q5_0}` com
+  `V = q4_1`**; passam `q4_0/q4_1`, `q8_0/q4_1`, `q4_1/q4_1`, `q5_0/q5_0`, `q5_0/f16`, `q4_1/q5_0`.
+- **Escopo**: só o caminho EM LOTE (decode com `q5_0/q4_1` funciona, 23,10 tok/s; falha já com
+  `--prefill 16`). `bench-attn-gpu q5_0` quebra em `t=256` **sem** escrita de KV ⇒ o suspeito nº 1
+  passa a ser a leitura da atenção em lote, e o nº 2 o `kv_write_batch`, que passa o **mesmo `width`**
+  para K e V com tamanhos de linha diferentes (`graph.cuh:873-877`).
+- **Por que é P0**: é exatamente o par que a rodada noturna recomendou (K `q5_0`, V `q4_1`) para os
+  131K — o alvo do usuário. Corrigir ou vetar explicitamente; não deixar como está.
+- Ferramenta que fecha: `compute-sanitizer`/`hip-memcheck` (ausentes no sistema), ou leitura de
+  `attn.cuh` (`attn_batch_kernel`/`attn_split_batch_kernel`) + `kv.h` (`kv_load*`) com um caso
+  mínimo `--prefill 16`.
