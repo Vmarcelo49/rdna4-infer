@@ -41,3 +41,27 @@ exporta `GPU_LOCK_HELD=1` na sua fase B, que roda a bateria inteira com **um** l
 Lição de método que vale para o próximo lote: um gate vermelho por contenção é pior que um
 gate não rodado, porque vira conclusão errada no relatório. Por isso todo número medido
 neste lote precisa dizer se a janela estava limpa.
+
+## Resultado do lote (fechamento)
+
+| # | frente | branch | commit | merge na `main` | estado |
+|---|---|---|---|---|---|
+| 1 | auditoria de qualidade | `feat/audit-qualidade` | `cee8fcc` | `c674656` | completo (4 CRÍTICOS + 19 IMPORTANTES); 7 achados corrigidos com prova antes/depois, §7 do doc |
+| 2 | kernels do Qwen + matrix cores | `feat/quants-kernels` | `8d1493e` | `6e7e286` | completo |
+| 3 | Vulkan (llama.cpp) vs HIP | `feat/vulkan-vs-hip` | `8e8c639` | `ff3e009` | completo; a incerteza nº 1 do doc fechada depois (§8) |
+| 4 | inventário de quantizações | `feat/quants-kernels` | `2d21662` | `6e7e286` | completo + a metade medida (`docs/quants-precisao.md`) |
+| 5 | cache KV e orçamento de tráfego | `feat/build-repro` | `3835833` | `95dc7f1` | completo |
+| 2/5 | medições de GPU | `feat/medicoes-gpu` | `277a0dd` | `9cf4de7` | 552 + 290 linhas, orçamento por fase, roofline, penhasco de GTT |
+| 6/7 | autotuning + regressão | `feat/autotuning` | `9ef1526` | `51ce975` | tabela única em `tuning.h`, 2 gates novos, controle negativo colado |
+| 8 | build reprodutível | `feat/build-repro` | `f007fb2` | `95dc7f1` | completo |
+| 9 | README | — | `ab83416`, `a40e663` | — | reescrito com os números medidos, tabela final na árvore mergeada |
+
+Conflitos de merge: **um**, em `CMakeLists.txt` (os dois lados fazem append no fim), resolvido
+mantendo os dois blocos — exatamente o que a regra 2 previu. Nenhum conflito de código.
+
+Verificação final na árvore mergeada, uma janela limpa e **um** lock (`scripts/check_all.sh`):
+10 gates de CPU + 15 de GPU, **todos verdes**, incluindo `check-graph-gpu` (oráculo por nó),
+`check-batch-gpu` (bit-exato), `check-mtp-gpu`, `check_golden_run.sh`,
+`compare_llama_greedy.sh 32`, `check_attn_split.sh` (PPL 0,125 %), `compare_ppl.sh`,
+`check_server.sh` (com os 12 casos novos de parâmetro inválido), `check-hardening.sh`,
+`check-tuning` e a suíte de regressão (79 s).
