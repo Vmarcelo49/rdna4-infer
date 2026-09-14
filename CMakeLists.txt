@@ -246,6 +246,14 @@ target_compile_options(rdna4_serve PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-a
 target_compile_options(rdna4_serve PRIVATE ${RDNA4_WARNINGS})
 target_link_options(rdna4_serve PRIVATE --offload-arch=gfx1201)
 target_link_libraries(rdna4_serve PRIVATE ${AMDHIP64})
+# PIC for the shared library, explicitly and for BOTH passes. The trap: this header
+# set keeps small host-side tables in headers (kv.h's type-name table, the attention
+# WPB knob earlier), and a HIP TU that carries a PC32 relocation to one of them from
+# its device pass fails the shared link with "recompile with -fPIC" -- which is what
+# happened when the new KV types changed which translation unit instantiates the
+# table. Making the whole target PIC removes the class instead of chasing tables.
+set_target_properties(rdna4_serve PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_options(rdna4_serve PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-fPIC>)
 target_link_libraries(rdna4-infer PRIVATE rdna4_serve)
 
 # M8 (estudo ROCm) — bench do matvec por forma real: quanto custa cada tensor do

@@ -112,13 +112,22 @@ inline const char *kv_type_name(KvType t) {
 }
 
 // nullptr for an unknown name (the caller reports the error).
+// Namespace-scope, not a function-local static: this header is included by HIP
+// translation units and a function-local static here is referenced from device code,
+// which breaks the link of the shared library with "relocation R_X86_64_PC32 cannot
+// be used against symbol ... -- recompile with -fPIC". It linked until the new types
+// changed which TU instantiates it; the same trap bit the RD_ATTN_WPB knob earlier
+// tonight, so the rule is now: no function-local statics in device-visible headers.
+struct KvTypeName {
+  const char *name;
+  KvType t;
+};
+inline constexpr KvTypeName kKvTypeNames[] = {
+    {"f32", KvType::F32},   {"f16", KvType::F16},   {"q8_0", KvType::Q8_0},
+    {"q4_0", KvType::Q4_0}, {"q5_0", KvType::Q5_0}, {"q4_1", KvType::Q4_1}};
+
 inline const char *kv_type_parse(const char *name, KvType *out) {
-  static const struct {
-    const char *name;
-    KvType t;
-  } kTable[] = {{"f32", KvType::F32},   {"f16", KvType::F16},   {"q8_0", KvType::Q8_0},
-                {"q4_0", KvType::Q4_0}, {"q5_0", KvType::Q5_0}, {"q4_1", KvType::Q4_1}};
-  for (const auto &e : kTable) {
+  for (const auto &e : kKvTypeNames) {
     if (std::strcmp(e.name, name) == 0) {
       *out = e.t;
       return nullptr;
