@@ -108,6 +108,105 @@ Stats compare(const std::vector<float> &a, const std::vector<float> &b) {
 }
 
 
+// ---------------------------------------------------------------------------
+// `--check-lds`: bit-exatidao do caminho com a LUT em LDS contra o caminho de
+// producao, tipo a tipo, com o tensor REAL do inventario.
+//
+// Por que este gate existe separado: a LUT em LDS nao muda nenhuma operacao (a
+// LDS recebe os mesmos bytes da tabela global), entao o resultado tem que ser
+// BIT-IDENTICO -- nao "dentro da tolerancia do oraculo de CPU", que e' frouxa
+// para os tipos IQ (a referencia exata em f32 difere do vec_dot inteiro por
+// 1e-5..1e-4 de proposito). Comparar com memcmp e' o unico jeito de provar
+// isso; uma tolerancia aceitaria uma tabela errada.
+//
+// Anti-teste-vazio: exige pelo menos um tipo com kernel de LDS testado; se
+// nenhum tipo do modelo tiver tensor usavel, ele FALHA em vez de passar vazio.
+// ---------------------------------------------------------------------------
+int run_check_lds(rdna4::GgufLoader &ld) {
+  int tested = 0, failures = 0;
+  std::printf("check-lds: LUT em LDS vs LUT global, bit-exatidao por tipo\n");
+  for (int dt = 1; dt <= 14; ++dt) {
+    if (!rdna4::matvec_has_lut_lds(dt)) continue;
+    rdna4::MatvecShape shape{};
+    if (!rdna4::matvec_shape(dt, shape)) continue;
+    std::size_t idx = std::size_t(-1);
+    std::uint64_t best = 0;
+    for (std::size_t i = 0; i < ld.n_tensors(); ++i) {
+      if ((int)ld.dtype(i) != dt) continue;
+      const auto &d = ld.meta().tensors[i].dims;
+      if (d.size() != 2 || d[1] % shape.qk != 0 || d[0] <= 0) continue;
+      if (ld.tensor_bytes(i) > best) { best = ld.tensor_bytes(i); idx = i; }
+    }
+    if (idx == std::size_t(-1)) {
+      std::printf("  %-9s sem tensor usavel no modelo\n", tc_name_of(dt));
+      continue;
+    }
+    const auto &info = ld.meta().tensors[idx];
+    // convencao do loader/Graph::proj: dims[0] = ncols (dim de reducao),
+    // dims[1] = nrows. Trocar isso aqui mediria uma forma que nao existe.
+    const int64_t ncols = info.dims[0];
+    const int64_t nrows = std::min<int64_t>(info.dims[1], 256);  // 256 linhas bastam
+    std::vector<std::uint8_t> w;
+    std::string err;
+    const std::uint64_t row_bytes = (std::uint64_t)(ncols / shape.qk) * shape.block_bytes;
+    if (!ld.load_tensor_range(idx, 0, row_bytes * (std::uint64_t)nrows, w, err)) {
+      std::printf("  %-9s carga falhou: %s\n", tc_name_of(dt), err.c_str());
+      ++failures;
+      continue;
+    }
+    std::vector<float> x;
+    fill_x(x, ncols, 777u + (unsigned)dt);
+    const int64_t nq8 = ncols / QK8_1;
+    void *d_w = nullptr;
+    rdna4::block_q8_1 *d_a = nullptr;
+    float *d_x = nullptr;
+    float *d_y0 = nullptr, *d_y1 = nullptr;
+    if (hipMalloc(&d_w, w.size()) != hipSuccess ||
+        hipMalloc(&d_a, (std::size_t)nq8 * sizeof(rdna4::block_q8_1)) != hipSuccess ||
+        hipMalloc(&d_x, (std::size_t)ncols * sizeof(float)) != hipSuccess ||
+        hipMalloc(&d_y0, (std::size_t)nrows * sizeof(float)) != hipSuccess ||
+        hipMalloc(&d_y1, (std::size_t)nrows * sizeof(float)) != hipSuccess) {
+      std::printf("  %-9s hipMalloc falhou\n", tc_name_of(dt));
+      ++failures;
+      continue;
+    }
+    hipMemcpy(d_w, w.data(), w.size(), hipMemcpyHostToDevice);
+    hipMemcpy(d_x, x.data(), (std::size_t)ncols * sizeof(float), hipMemcpyHostToDevice);
+    rdna4::quantize_q8_1_kernel<<<(unsigned)((nq8 + 3) / 4), 128>>>(d_x, d_a, nq8);
+    const bool ok0 = rdna4::matvec_launch(dt, d_w, d_a, d_y0, nrows, ncols, nullptr);
+    const bool ok1 = rdna4::matvec_launch_lut_lds(dt, d_w, d_a, d_y1, nrows, ncols, nullptr);
+    hipDeviceSynchronize();
+    if (!ok0 || !ok1) {
+      std::printf("  %-9s lancamento falhou (global %d lds %d)\n", tc_name_of(dt), (int)ok0, (int)ok1);
+      ++failures;
+    } else {
+      std::vector<float> y0(nrows), y1(nrows);
+      hipMemcpy(y0.data(), d_y0, (std::size_t)nrows * sizeof(float), hipMemcpyDeviceToHost);
+      hipMemcpy(y1.data(), d_y1, (std::size_t)nrows * sizeof(float), hipMemcpyDeviceToHost);
+      const bool same = std::memcmp(y0.data(), y1.data(), (std::size_t)nrows * sizeof(float)) == 0;
+      double maxd = 0;
+      for (int64_t i = 0; i < nrows; ++i) maxd = std::fmax(maxd, (double)std::fabs(y0[i] - y1[i]));
+      std::printf("  %-9s %s  %lld x %lld  %s  max|d| %.3e  (regra de producao usa LDS: %s)\n",
+                  tc_name_of(dt), info.name.c_str(), (long long)nrows, (long long)ncols,
+                  same ? "BIT-IDENTICO" : "DIFERE", maxd,
+                  rdna4::matvec_lut_lds_ok(dt, nrows, ncols) ? "sim" : "nao");
+      if (!same) ++failures;
+      ++tested;
+    }
+    hipFree(d_w); hipFree(d_a); hipFree(d_x); hipFree(d_y0); hipFree(d_y1);
+  }
+  if (tested == 0) {
+    std::printf("check-lds: FAIL: nenhum tipo testado (teste vazio)\n");
+    return 1;
+  }
+  if (failures) {
+    std::printf("check-lds: FAIL: %d falha(s) em %d tipo(s)\n", failures, tested);
+    return 1;
+  }
+  std::printf("check-lds: OK (%d tipos bit-identicos entre LUT global e LDS)\n", tested);
+  return 0;
+}
+
 // Bench mode: for each type, matvec the LARGEST usable tensor over ALL its
 // rows, timed with hipEvents. Decode is memory-bandwidth bound, so the
 // reported GB/s is the number that matters (weights are re-read per token).
@@ -560,6 +659,9 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  if (argc >= 3 && std::strcmp(argv[2], "--check-lds") == 0) {
+    return run_check_lds(ld);
+  }
   if (argc >= 3 && std::strcmp(argv[2], "--bench-ab") == 0) {
     return run_bench_ab(ld, argc >= 4 ? std::atoi(argv[3]) : 9, argc >= 5 ? std::atoi(argv[4]) : 12);
   }

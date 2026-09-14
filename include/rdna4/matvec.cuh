@@ -91,12 +91,35 @@ inline bool quantize_q8_1_batch_launch(const float *d_x, block_q8_1 *d_y,
 // Per-type traits: block size, quants-per-int, values-per-dot, byte size,
 // and the vec_dot entry point.
 // ---------------------------------------------------------------------------
+// Nada a hoistar (tipos sem dequantizacao cara por token no lote).
+struct NoPrep {};
+
 #define RD_MATVEC_TRAITS(Name, Vd, QK, QI, VDR, BlockT)                                 \
   struct Name {                                                                         \
     static constexpr int qk = QK, qi = QI, vdr = VDR;                                   \
     using block_t = BlockT;                                                             \
     static __device__ __forceinline__ float dot(const void *vbq, const block_q8_1 *a,   \
                                                 const int &kbx, const int &iqs) {       \
+      return Vd(vbq, a, kbx, iqs);                                                      \
+    }                                                                                   \
+    /* dot com a LUT vinda de um ponteiro (LDS). Aqui a tabela nao existe: a LUT     */ \
+    /* global e ignorada, o que mantem UMA assinatura para o kernel todo.            */ \
+    static __device__ __forceinline__ float dot_lut(const void *vbq, const block_q8_1 *a, \
+                                                    const int &kbx, const int &iqs,     \
+                                                    const void * /*lut*/) {             \
+      return Vd(vbq, a, kbx, iqs);                                                      \
+    }                                                                                   \
+    /* Caminho em lote: por omissao nao ha' nada a hoistar, entao o par            */ \
+    /* prep/dot_prep reproduz EXATAMENTE a chamada de hoje (bit-exato).            */ \
+    using prep_t = NoPrep;                                                              \
+    static __device__ __forceinline__ const void *lut_source() { return nullptr; }        \
+    static __device__ __forceinline__ prep_t prep(const void * /*vbq*/, const int &/*kbx*/, \
+                                                  const int &/*iqs*/, const void */*lut*/) { \
+      return prep_t{};                                                                  \
+    }                                                                                   \
+    static __device__ __forceinline__ float dot_prep(const prep_t &, const void *vbq,   \
+                                                     const block_q8_1 *a, const int &kbx, \
+                                                     const int &iqs, const void */*lut*/) { \
       return Vd(vbq, a, kbx, iqs);                                                      \
     }                                                                                   \
   }
@@ -142,6 +165,115 @@ RD_MATVEC_TRAITS(TIQ3S_NOLOOKUP, vec_dot_iq3_s_q8_1_diag_nolookup, 256, QI3_S, V
 
 #undef RD_MATVEC_TRAITS
 
+// ---------------------------------------------------------------------------
+// LUT em LDS (docs/journal-kernels.md; docs/vulkan-vs-hip.md §1.3/§4.2: o
+// backend Vulkan poe a iq3s_grid em `shared` e cobra os 2 KB no orcamento de
+// LDS do GEMM). Aqui a MESMA tabela e copiada para a LDS uma vez por CTA e o
+// `vec_dot` le de la em vez de fazer 8 `global_load_b32` por chamada.
+//
+// Bit-exato por construcao: a LDS recebe exatamente os mesmos bytes da tabela
+// global (copiada com `LUT::src_words()`), e o corpo do `vec_dot` nao muda --
+// so o endereco de onde o valor vem. Gate: `check-matvec-gpu --check-lds`
+// (memcmp do resultado tipo a tipo contra o caminho de producao).
+//
+// `words` = palavras de 32 bits a copiar (0 = tipo sem LUT => a LDS nao existe
+// e o kernel e' identico ao de producao).
+struct NoLut {
+  static constexpr int words = 0;
+  static __device__ __forceinline__ const uint32_t *src_words() { return nullptr; }
+};
+
+#define RD_LUT(Name, Words, Table, ElemT)                                              \
+  struct Name {                                                                        \
+    static constexpr int words = Words;                                                \
+    static __device__ __forceinline__ const uint32_t *src_words() {                    \
+      return (const uint32_t *)Table;                                                  \
+    }                                                                                  \
+    using elem_t = ElemT;                                                              \
+  }
+
+RD_LUT(LutIq3S,   512,  iq3s_grid,    uint32_t);   //  2 KB
+RD_LUT(LutIq3XXS, 256,  iq3xxs_grid,  uint32_t);   //  1 KB
+RD_LUT(LutIq2XXS, 512,  iq2xxs_grid,  uint64_t);   //  2 KB
+RD_LUT(LutIq2XS,  1024, iq2xs_grid,   uint64_t);   //  4 KB
+RD_LUT(LutIq2S,   2048, iq2s_grid,    uint64_t);   //  8 KB
+#undef RD_LUT
+
+// Traits que leem a LUT de um ponteiro (a LDS) -- mesmo corpo de vec_dot.
+#define RD_MATVEC_TRAITS_LDS(Name, Vd, VdLut, QK, QI, VDR, BlockT)                      \
+  struct Name {                                                                         \
+    static constexpr int qk = QK, qi = QI, vdr = VDR;                                   \
+    using block_t = BlockT;                                                             \
+    static __device__ __forceinline__ float dot(const void *vbq, const block_q8_1 *a,   \
+                                                const int &kbx, const int &iqs) {       \
+      return Vd(vbq, a, kbx, iqs);                                                      \
+    }                                                                                   \
+    static __device__ __forceinline__ float dot_lut(const void *vbq, const block_q8_1 *a, \
+                                                    const int &kbx, const int &iqs,     \
+                                                    const void *lut) {                  \
+      return VdLut(vbq, a, kbx, iqs, lut);                                              \
+    }                                                                                   \
+  }
+
+RD_MATVEC_TRAITS_LDS(TIQ3S_LDS,   vec_dot_iq3_s_q8_1_perm,      vec_dot_iq3_s_q8_1_perm_lut,      256, QI3_S,   VDR_IQ3_S_Q8_1_MMVQ,   block_iq3_s);
+RD_MATVEC_TRAITS_LDS(TIQ3XXS_LDS, vec_dot_iq3_xxs_q8_1_perm2,   vec_dot_iq3_xxs_q8_1_perm2_lut,   256, QI3_XXS, VDR_IQ3_XXS_Q8_1_MMVQ, block_iq3_xxs);
+RD_MATVEC_TRAITS_LDS(TIQ2XXS_LDS, vec_dot_iq2_xxs_q8_1_perm2,   vec_dot_iq2_xxs_q8_1_perm2_lut,   256, QI2_XXS, VDR_IQ2_XXS_Q8_1_MMVQ, block_iq2_xxs);
+RD_MATVEC_TRAITS_LDS(TIQ2XS_LDS,  vec_dot_iq2_xs_q8_1_perm2,    vec_dot_iq2_xs_q8_1_perm2_lut,    256, QI2_XS,  VDR_IQ2_XS_Q8_1_MMVQ,  block_iq2_xs);
+RD_MATVEC_TRAITS_LDS(TIQ2S_LDS,   vec_dot_iq2_s_q8_1_perm2,     vec_dot_iq2_s_q8_1_perm2_lut,     256, QI2_S,   VDR_IQ2_S_Q8_1_MMVQ,   block_iq2_s);
+#undef RD_MATVEC_TRAITS_LDS
+
+// Traits do caminho em LOTE com a dequantizacao hoistada (ver o bloco "prep" em
+// vecdotq.cuh): o gather da LUT + a mascara de sinal + o V_PERM saem do laco por
+// token. Mesma aritmetica, mesma ordem -> bit-exato (check-matmul-gpu /
+// check-batch-gpu).
+#define RD_MATVEC_TRAITS_PREP(Name, Vd, VdLut, PrepT, PrepFn, DotPrepFn, QK, QI, VDR, BlockT, \
+                              LutSrc)                                                   \
+  struct Name {                                                                         \
+    static constexpr int qk = QK, qi = QI, vdr = VDR;                                   \
+    using block_t = BlockT;                                                             \
+    using prep_t = PrepT;                                                               \
+    static __device__ __forceinline__ float dot(const void *vbq, const block_q8_1 *a,   \
+                                                const int &kbx, const int &iqs) {       \
+      return Vd(vbq, a, kbx, iqs);                                                      \
+    }                                                                                   \
+    static __device__ __forceinline__ float dot_lut(const void *vbq, const block_q8_1 *a, \
+                                                    const int &kbx, const int &iqs,     \
+                                                    const void *lut) {                  \
+      return VdLut(vbq, a, kbx, iqs, lut);                                              \
+    }                                                                                   \
+    static __device__ __forceinline__ const void *lut_source() { return (const void *)LutSrc; } \
+    static __device__ __forceinline__ prep_t prep(const void *vbq, const int &kbx,      \
+                                                  const int &iqs, const void *lut) {    \
+      return PrepFn(vbq, kbx, iqs, lut);                                                \
+    }                                                                                   \
+    static __device__ __forceinline__ float dot_prep(const prep_t &w, const void *vbq,  \
+                                                     const block_q8_1 *a, const int &kbx, \
+                                                     const int &iqs, const void *lut) { \
+      return DotPrepFn(w, vbq, a, kbx, iqs, lut);                                       \
+    }                                                                                   \
+  }
+
+RD_MATVEC_TRAITS_PREP(TIQ3S_PREP, vec_dot_iq3_s_q8_1_perm, vec_dot_iq3_s_q8_1_perm_lut,
+                      iq3s_prep_t, vec_prep_iq3_s_q8_1_perm, vec_dot_prep_iq3_s_q8_1_perm,
+                      256, QI3_S, VDR_IQ3_S_Q8_1_MMVQ, block_iq3_s, iq3s_grid);
+RD_MATVEC_TRAITS_PREP(TIQ3XXS_PREP, vec_dot_iq3_xxs_q8_1_perm2, vec_dot_iq3_xxs_q8_1_perm2_lut,
+                      iq3xxs_prep_t, vec_prep_iq3_xxs_q8_1_perm2,
+                      vec_dot_prep_iq3_xxs_q8_1_perm2, 256, QI3_XXS, VDR_IQ3_XXS_Q8_1_MMVQ,
+                      block_iq3_xxs, iq3xxs_grid);
+#undef RD_MATVEC_TRAITS_PREP
+
+// O caminho em lote le a LUT global (no lote o gather ja' e' amortizado em N
+// tokens, entao a LDS nao e' o que decide ali).
+struct LutGlobal {
+  static constexpr int words = 0;
+  static __device__ __forceinline__ const uint32_t *src_words() { return nullptr; }
+};
+
+// Tipos que TEM kernel com LUT em LDS (os que carregam 60 % dos bytes do matvec).
+inline bool matvec_has_lut_lds(int dt) {
+  return dt == 7 || dt == 8 || dt == 9 || dt == 12 || dt == 13;
+}
+
 // L2 prefetch (from llama.cpp mmvq.cu, MIT).
 //
 // WARNING (measured, docs/rocha-estudo): `__builtin_prefetch` compiles to
@@ -183,7 +315,12 @@ static __device__ __forceinline__ void rdna4_prefetch_l2(const void *p) {
 // sum += dot(...)), so memory latency is not hidden"). ILP does NOT have this
 // property: it changes the summation order, so it stays a measured per-type
 // constant.
-template <class T, int ROWS, int WPR, int ILP = 1, bool PF = false, int MINB = 0, int UNROLL = 1>
+// LUT = NoLut (producao ate hoje) ou uma das LutIq* acima: nesse caso a tabela do
+// tipo e' copiada para a LDS uma vez por CTA e o vec_dot le de la. Tudo o mais
+// (ROWS/WPR/ILP/UNROLL, ordem das somas) e' identico -- e' o unico jeito de
+// atribuir uma diferenca medida a fonte da LUT e nao a outro knob.
+template <class T, int ROWS, int WPR, int ILP = 1, bool PF = false, int MINB = 0, int UNROLL = 1,
+          class LUT = NoLut>
 __global__ void
 #if defined(__HIP_DEVICE_COMPILE__)
 __launch_bounds__(ROWS * WPR * 32, MINB > 0 ? MINB : 1)
@@ -216,6 +353,16 @@ matvec_kernel_gen(const void *__restrict__ vx, const block_q8_1 *__restrict__ vy
   const int kqs = vdr * (tg % slots_per_block);
   const int slot = tg / slots_per_block;
 
+  // LUT em LDS: copia cooperativa no inicio do CTA (nenhum numero muda -- a LDS
+  // recebe os mesmos bytes da tabela global) e uma barreira. Nao ha retorno
+  // divergente acima deste ponto, entao a barreira e' segura.
+  __shared__ uint32_t s_lut[LUT::words > 0 ? LUT::words : 1];
+  if (LUT::words > 0) {
+    const uint32_t *src = LUT::src_words();
+    for (int i = tid; i < LUT::words; i += ROWS * WPR * 32) s_lut[i] = src[i];
+    __syncthreads();
+  }
+
   // ILP independent accumulators: the naive loop is one dependent chain of
   // float adds, which leaves memory latency exposed.
   float acc[ILP];
@@ -234,7 +381,8 @@ matvec_kernel_gen(const void *__restrict__ vx, const block_q8_1 *__restrict__ vy
 #pragma unroll
       for (int u = 0; u < ILP; ++u) {
         const int64_t k = kb + u * blocks_per_iter;
-        acc[u] += T::dot((const void *)rowp, vy + k * (qk / QK8_1), (const int)k, kqs);
+        acc[u] += T::dot_lut((const void *)rowp, vy + k * (qk / QK8_1), (const int)k, kqs,
+                             (const void *)s_lut);
       }
     }
   } else {
@@ -251,12 +399,14 @@ matvec_kernel_gen(const void *__restrict__ vx, const block_q8_1 *__restrict__ vy
 #pragma unroll
       for (int u = 0; u < UNROLL; ++u) {
         const int64_t k = kb + u * blocks_per_iter;
-        acc[0] += T::dot((const void *)rowp, vy + k * (qk / QK8_1), (const int)k, kqs);
+        acc[0] += T::dot_lut((const void *)rowp, vy + k * (qk / QK8_1), (const int)k, kqs,
+                             (const void *)s_lut);
       }
     }
   }
   for (; kb < blocks_per_row; kb += blocks_per_iter) {
-    acc[0] += T::dot((const void *)rowp, vy + kb * (qk / QK8_1), (const int)kb, kqs);
+    acc[0] += T::dot_lut((const void *)rowp, vy + kb * (qk / QK8_1), (const int)kb, kqs,
+                         (const void *)s_lut);
   }
   float sum = 0.0f;
 #pragma unroll
@@ -331,24 +481,35 @@ matvec_kernel_batch(const void *__restrict__ vx, const block_q8_1 *__restrict__ 
     for (int i = 0; i < ILP; ++i) acc[n][i] = 0.0f;
   }
 
+  // AMPLIFICACAO EM LOTE: a dequantizacao do peso (gather da LUT, mascara de sinal,
+  // V_PERM) e' feita UMA vez por bloco com `T::prep` e o resultado em registrador e'
+  // consumido pelas N linhas de ativacao com `T::dot_prep` -- so' o dp4a e' por
+  // token. Para os tipos sem prep (`NoPrep`), `prep`/`dot_prep` chamam exatamente o
+  // `dot` de antes, entao a sequencia de operacoes e' IDENTICA e o resultado segue
+  // bit-exato (gate: check-matmul-gpu e check-batch-gpu, os dois memcmp/rel-L2 0).
   int64_t kb = slot;
   for (; kb + (ILP - 1) * blocks_per_iter < blocks_per_row; kb += ILP * blocks_per_iter) {
 #pragma unroll
     for (int u = 0; u < ILP; ++u) {
       const int64_t k = kb + u * blocks_per_iter;
       const block_q8_1 *abase = vy + k * (qk / QK8_1);
+      const typename T::prep_t pre =
+          T::prep((const void *)rowp, (const int)k, kqs, (const void *)T::lut_source());
 #pragma unroll
       for (int n = 0; n < N; ++n) {
-        acc[n][u] +=
-            T::dot((const void *)rowp, abase + (int64_t)n * act_stride, (const int)k, kqs);
+        acc[n][u] += T::dot_prep(pre, (const void *)rowp, abase + (int64_t)n * act_stride,
+                                 (const int)k, kqs, (const void *)T::lut_source());
       }
     }
   }
   for (; kb < blocks_per_row; kb += blocks_per_iter) {
     const block_q8_1 *abase = vy + kb * (qk / QK8_1);
+    const typename T::prep_t pre =
+        T::prep((const void *)rowp, (const int)kb, kqs, (const void *)T::lut_source());
 #pragma unroll
     for (int n = 0; n < N; ++n) {
-      acc[n][0] += T::dot((const void *)rowp, abase + (int64_t)n * act_stride, (const int)kb, kqs);
+      acc[n][0] += T::dot_prep(pre, (const void *)rowp, abase + (int64_t)n * act_stride,
+                               (const int)kb, kqs, (const void *)T::lut_source());
     }
   }
 
@@ -431,12 +592,13 @@ struct MatvecConfig {
 };
 
 
-template <class T, int ROWS, int WPR, int ILP = 1, bool PF = false, int MINB = 0, int UNROLL = 1>
+template <class T, int ROWS, int WPR, int ILP = 1, bool PF = false, int MINB = 0, int UNROLL = 1,
+          class LUT = NoLut>
 inline bool launch_gen(const void *d_weights, const block_q8_1 *d_act, float *d_out, int64_t nrows,
                        int64_t bpr, hipStream_t stream) {
   const int grid = (int)((nrows + ROWS - 1) / ROWS);
   const int threads = ROWS * WPR * 32;
-  matvec_kernel_gen<T, ROWS, WPR, ILP, PF, MINB, UNROLL>
+  matvec_kernel_gen<T, ROWS, WPR, ILP, PF, MINB, UNROLL, LUT>
       <<<grid, threads, 0, stream>>>(d_weights, d_act, d_out, nrows, bpr);
   return hipGetLastError() == hipSuccess;
 }
@@ -553,8 +715,17 @@ inline int matvec_default_ilp(int dt) {
 
 // Shipping path: shape and ILP are compile-time per type (both measured), so
 // this instantiates exactly one kernel per type.
+inline bool matvec_launch_lut_lds(int dt, const void *d_w, const block_q8_1 *d_a, float *d_o,
+                                  int64_t nrows, int64_t ncols, hipStream_t stream);
+inline bool matvec_lut_lds_ok(int dt, int64_t nrows, int64_t ncols);
+
 inline bool matvec_launch(int dt, const void *d_w, const block_q8_1 *d_a, float *d_o,
                           int64_t nrows, int64_t ncols, hipStream_t stream) {
+  // LUT em LDS quando ela e' pequena em relacao aos pesos lidos por CTA: medido
+  // 1,070x em iq3_s e 1,182x em iq3_xxs, bit-exato (check-matvec-gpu --check-lds
+  // compara com memcmp). iq2_*/iq2_s ficam de fora pela razao -- ver
+  // matvec_lut_lds_ok. Nada mais muda: mesma forma, mesma aritmetica.
+  if (matvec_lut_lds_ok(dt, nrows, ncols)) return matvec_launch_lut_lds(dt, d_w, d_a, d_o, nrows, ncols, stream);
 #define RD_SHIP(Traits, Dt, QK)                                                            \
   case Dt:                                                                                 \
     return launch_gen<Traits, MtShape<Dt>::rows, MtShape<Dt>::wpr, MtIlp<Dt>::value, false, \
@@ -578,6 +749,107 @@ inline bool matvec_launch(int dt, const void *d_w, const block_q8_1 *d_a, float 
       return false;  // no kernel: caller must fail loudly (SPEC 1.3)
   }
 #undef RD_SHIP
+}
+
+// ---------------------------------------------------------------------------
+// Caminho com a LUT do tipo em LDS. Mesma forma (ROWS/WPR/ILP/UNROLL) do caminho
+// de producao: a unica diferenca e' de onde vem a tabela, o que e' o que torna a
+// medicao atribuivel (e o resultado bit-exato -- ver `check-matvec-gpu
+// --check-lds`, que compara os dois caminhos com memcmp).
+//
+// Tipos cobertos: os IQ que usam LUT e carregam os bytes de verdade
+// (iq3_s, iq3_xxs, iq2_s, iq2_xs, iq2_xxs = 60 % do trafego do matvec). Os
+// outros caem no caminho de producao, entao chamar isto para qualquer dt e'
+// seguro.
+// ---------------------------------------------------------------------------
+// Bytes da LUT de cada tipo IQ (0 = sem kernel de LDS). Ver `LutIq*` acima.
+inline int matvec_lut_bytes(int dt) {
+  switch (dt) {
+    case 7:  return 256 * 8;    // iq2_xxs
+    case 8:  return 512 * 8;    // iq2_xs
+    case 9:  return 256 * 4;    // iq3_xxs
+    case 12: return 512 * 4;    // iq3_s
+    case 13: return 1024 * 8;   // iq2_s
+    default: return 0;
+  }
+}
+
+// A LDS so' compensa quando a tabela e' pequena em relacao aos pesos que CADA
+// CTA le: a copia e' por CTA (ROWS*bpr*block_bytes de peso). Medido no
+// inventario real (docs/journal-kernels.md §2, piso de ruido 0,999x):
+//   iq3_s    2 KB de LUT vs 17,6 KB de peso por CTA -> 1,070x   (GANHO)
+//   iq3_xxs  1 KB        vs  3,9 KB                 -> 1,182x   (GANHO)
+//   iq2_xxs  2 KB        vs  1,3 KB                 -> 0,914x   (perde)
+//   iq2_xs   4 KB        vs  1,5 KB                 -> 0,680x   (perde)
+//   iq2_s    8 KB        vs  3,3 KB                 -> 0,601x   (perde)
+// O corte em 2x separa exatamente os dois grupos (razoes 3,9x/8,8x contra
+// 0,37x/0,41x/0,66x) e e' conservador: ele so' impede um caso que ja' foi medido
+// como perda.
+inline bool matvec_lut_lds_ok(int dt, int64_t nrows, int64_t ncols) {
+  const int lut_bytes = matvec_lut_bytes(dt);
+  if (lut_bytes == 0 || nrows <= 0) return false;
+  MatvecShape shape{};
+  if (!matvec_shape(dt, shape) || shape.qk <= 0) return false;
+  const int64_t bpr = ncols / shape.qk;
+  const int64_t rows = matvec_default_config(dt).rows;
+  const int64_t weights_per_cta = rows * bpr * shape.block_bytes;
+  return weights_per_cta >= 2 * (int64_t)lut_bytes;
+}
+
+inline bool matvec_launch_lut_lds(int dt, const void *d_w, const block_q8_1 *d_a, float *d_o,
+                                  int64_t nrows, int64_t ncols, hipStream_t stream) {
+#define RD_LDS(TraitsLds, Dt, QK, LutT)                                                        \
+  case Dt: {                                                                                    \
+    constexpr int R = MtShape<Dt>::rows, W = MtShape<Dt>::wpr, I = MtIlp<Dt>::value,            \
+                  U = MtUnroll<Dt>::value;                                                      \
+    return launch_gen<TraitsLds, R, W, I, false, 0, U, LutT>(d_w, d_a, d_o, nrows, ncols / QK,   \
+                                                             stream);                           \
+  }
+  switch (dt) {
+    RD_LDS(TIQ2XXS_LDS, 7, 256, LutIq2XXS)
+    RD_LDS(TIQ2XS_LDS, 8, 256, LutIq2XS)
+    RD_LDS(TIQ3XXS_LDS, 9, 256, LutIq3XXS)
+    RD_LDS(TIQ3S_LDS, 12, 256, LutIq3S)
+    RD_LDS(TIQ2S_LDS, 13, 256, LutIq2S)
+    default:
+      return matvec_launch(dt, d_w, d_a, d_o, nrows, ncols, stream);
+  }
+#undef RD_LDS
+}
+
+// Mesmo caminho, forcando UNROLL (blocos por iteracao no MESMO acumulador; a
+// alavanca bit-exata de paralelismo de memoria). Existe para medir se o unroll
+// que a tabela rejeitou com a LUT GLOBAL passa a compensar com a LUT na LDS --
+// o orcamento de registradores e de espera de load muda quando o gather sai do
+// caminho global (ver docs/journal-kernels.md §1.3).
+inline bool matvec_launch_lut_lds_unroll(int dt, const void *d_w, const block_q8_1 *d_a,
+                                         float *d_o, int64_t nrows, int64_t ncols,
+                                         hipStream_t stream, int unroll) {
+#define RD_LDSU(TraitsLds, Dt, QK, LutT)                                                       \
+  case Dt: {                                                                                   \
+    constexpr int R = MtShape<Dt>::rows, W = MtShape<Dt>::wpr;                                  \
+    switch (unroll) {                                                                          \
+      case 1: return launch_gen<TraitsLds, R, W, 1, false, 0, 1, LutT>(d_w, d_a, d_o, nrows,    \
+                                                                       ncols / QK, stream);    \
+      case 2: return launch_gen<TraitsLds, R, W, 1, false, 0, 2, LutT>(d_w, d_a, d_o, nrows,    \
+                                                                       ncols / QK, stream);    \
+      case 4: return launch_gen<TraitsLds, R, W, 1, false, 0, 4, LutT>(d_w, d_a, d_o, nrows,    \
+                                                                       ncols / QK, stream);    \
+      default: return false;                                                                   \
+    }                                                                                          \
+  }
+  switch (dt) {
+    RD_LDSU(TIQ2XXS_LDS, 7, 256, LutIq2XXS)
+    RD_LDSU(TIQ2XS_LDS, 8, 256, LutIq2XS)
+    RD_LDSU(TIQ3XXS_LDS, 9, 256, LutIq3XXS)
+    RD_LDSU(TIQ3S_LDS, 12, 256, LutIq3S)
+    RD_LDSU(TIQ2S_LDS, 13, 256, LutIq2S)
+    default:
+      // Tipo sem kernel de LDS: medir o caminho de producao (senao o bench
+      // cronometraria um lancamento que nao acontece e reportaria "12x").
+      return matvec_launch(dt, d_w, d_a, d_o, nrows, ncols, stream);
+  }
+#undef RD_LDSU
 }
 
 
@@ -612,10 +884,10 @@ inline bool matvec_launch_batch_n(int dt, const void *d_w, const block_q8_1 *d_a
     RD_BATCH(TQ6K, 6, 256)
     RD_BATCH(TIQ2XXS_S, 7, 256)
     RD_BATCH(TIQ2XS_S, 8, 256)
-    RD_BATCH(TIQ3XXS_S, 9, 256)
+    RD_BATCH(TIQ3XXS_S, 9, 256)  // PREP: ver comentario abaixo
     RD_BATCH(TIQ1S, 10, 256)
     RD_BATCH(TIQ4NL, 11, 32)
-    RD_BATCH(TIQ3S_S, 12, 256)
+    RD_BATCH(TIQ3S_S, 12, 256)  // PREP: ver comentario abaixo
     RD_BATCH(TIQ2S_S, 13, 256)
     RD_BATCH(TIQ4XS, 14, 256)
     default:
@@ -623,6 +895,22 @@ inline bool matvec_launch_batch_n(int dt, const void *d_w, const block_q8_1 *d_a
   }
 #undef RD_BATCH
 }
+
+// ---------------------------------------------------------------------------
+// NAO LIGADO -- e a leitura de ISA mostra que NAO DEVE ser ligado: o compilador
+// JA FAZ esse hoist. Medido com `--save-temps` no kernel em lote com N=16
+// (docs/journal-kernels.md §10): por bloco, `v_perm_b32` aparece 8x (nao 8x16) e
+// as cargas da LUT 8x (nao 8x16), enquanto `v_dot4_i32_iu8` e as cargas de
+// ativacao escalam exatamente 16x. Ou seja: o lado do peso (gather da LUT,
+// mascara de sinal, V_PERM) ja esta fora do laco por token, e o teto desta
+// mudanca e' ~0 -- nao os ~10 % da contagem de instrucoes do §8.
+//
+// O par `T::prep`/`T::dot_prep` fica no arquivo como registro do beco sem saida
+// (e como ponto de partida se um dia o `T::dot` deixar de ser CSE-ado pelo
+// compilador), com o fallback `NoPrep` identico ao codigo anterior nos outros 12
+// tipos. O que limita o lote e' o que NAO pode ser amortizado (dp4a + cargas de
+// ativacao por token) e a latencia dessas cargas: IPC implicito ~0,15 do pico.
+// ---------------------------------------------------------------------------
 
 // `n_tokens` must be <= matvec_batch_cap(); d_a holds `n_tokens` activation rows
 // of `act_stride` q8_1 blocks each (act_stride >= ncols / 32).

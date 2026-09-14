@@ -425,3 +425,31 @@ if(EXISTS "/opt/rocm/include")
 endif()
 target_link_libraries(check-kvquality-gpu PRIVATE ${AMDHIP64})
 set_target_properties(check-kvquality-gpu PROPERTIES HIP_ARCHITECTURES "gfx1201")
+# frente kernels de decode (noite 2026-09-14): bench isolado da `delta_rule` do
+# GDN. Mede variantes do kernel na mesma cadeia de 100 lançamentos (o protocolo
+# de docs/medicoes-banda-e-gargalos.md §4.2), com A/B intercalado, piso de ruído
+# do próprio harness e checagem de bit-exatidão contra o kernel que embarca.
+# Diário: docs/journal-kernels.md.
+add_executable(bench-delta-gpu tests/bench_delta_gpu.hip)
+target_compile_options(bench-delta-gpu PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_link_options(bench-delta-gpu PRIVATE --offload-arch=gfx1201)
+target_include_directories(bench-delta-gpu PRIVATE include)
+if(EXISTS "/opt/rocm/include")
+  target_include_directories(bench-delta-gpu PRIVATE /opt/rocm/include)
+endif()
+target_link_libraries(bench-delta-gpu PRIVATE ${AMDHIP64})
+
+# ---------------------------------------------------------------------------
+# frente kernels de decode (noite 2026-09-14): bench isolado das normas do
+# decode (rms_norm/l2_norm). O `attn_norm`/`post_norm` de 1x5120 custa 10,9 us
+# por lançamento contra um piso de despacho de 2,2 us e roda 128x por token.
+# Cadeia de 100 lançamentos, A/B antigo vs novo no mesmo harness, piso de ruído
+# do próprio harness e memcmp de bit-exatidão. Diário: docs/journal-kernels.md.
+add_executable(bench-norm-gpu tests/bench_norm_gpu.hip)
+target_compile_options(bench-norm-gpu PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_link_options(bench-norm-gpu PRIVATE --offload-arch=gfx1201)
+target_include_directories(bench-norm-gpu PRIVATE include)
+if(EXISTS "/opt/rocm/include")
+  target_include_directories(bench-norm-gpu PRIVATE /opt/rocm/include)
+endif()
+target_link_libraries(bench-norm-gpu PRIVATE ${AMDHIP64})
