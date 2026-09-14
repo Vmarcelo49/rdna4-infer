@@ -577,6 +577,54 @@ int main(int argc, char **argv) {
       std::printf("\n");
     }
 
+    // Per-type breakdown of the marginal cost. This is the experiment that
+    // separates the two stories the totals cannot separate, and it works because
+    // bits-per-weight differ: per byte, a 1.5 bpw type carries 2.3x the ELEMENTS
+    // of a 3.4 bpw one, and the activation volume per token is
+    // sum(nrows*ncols) -- the element count, not the byte count. So:
+    //   - if the marginal cost per token is proportional to ELEMENTS, it is the
+    //     activation-load side (L1/L2/IC traffic or its instruction count);
+    //   - if it is proportional to BYTES, it is the weight side.
+    // Slope from N=2 to N=16 (14 extra tokens), so the per-launch floor and the
+    // shared weight pass land in the intercept and cancel out.
+    std::printf("\nper-type marginal cost (slope of N=2 -> N=16, 14 extra tokens):\n");
+    std::printf("%-10s %7s %9s %10s %12s %14s %14s\n", "type", "tensors", "bytes_MB", "bpw",
+                "marg_ms/tok", "ms/tok per TB", "ms/tok per Telem");
+    for (int dt = 1; dt <= 14; ++dt) {
+      std::vector<const Tensor *> sub;
+      double bytes = 0, elems = 0;
+      for (const Tensor &t : sel)
+        if (t.dt == dt) {
+          sub.push_back(&t);
+          bytes += t.bytes;
+          elems += (double)t.nrows * (double)t.ncols;
+        }
+      if (sub.size() < 2) continue;
+      auto spass = [&](int N) {
+        (void)ev([&] {
+          for (const Tensor *t2 : sub)
+            (void)rdna4::matvec_launch_batch(t2->dt, t2->d_w, d_ab, d_yb, t2->nrows, t2->ncols,
+                                             t2->bpr, N, nullptr);
+        });
+        double best = 1e9;
+        for (int r = 0; r < reps; ++r) {
+          best = std::min(best, ev([&] {
+                             for (const Tensor *t2 : sub)
+                               (void)rdna4::matvec_launch_batch(t2->dt, t2->d_w, d_ab, d_yb,
+                                                                t2->nrows, t2->ncols, t2->bpr, N,
+                                                                nullptr);
+                           }));
+        }
+        return best;
+      };
+      const double m2 = spass(2), m16 = spass(16);
+      const double slope = (m16 - m2) / 14.0;  // ms per extra token
+      const double bpw = bytes > 0 && elems > 0 ? bytes * 8.0 / elems : 0.0;
+      std::printf("%-10s %7zu %9.1f %10.2f %12.4f %14.2f %14.3f\n", dt_name(dt), sub.size(),
+                  bytes / 1e6, bpw, slope, slope / (bytes / 1e12) / 1e3,
+                  slope / (elems / 1e12));
+    }
+
     // Register/local/shared usage per (type, N): the cheap way to rule out "the
     // batched kernel spills to scratch" before blaming traffic.
     std::printf("\nbatch kernel resources (hipFuncGetAttributes): type  N  regs  local  smem  threads\n");
