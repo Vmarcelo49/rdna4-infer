@@ -385,3 +385,158 @@ Isto responde ao "cace cada GiB": **10,877 (tronco) + 0,158 (buffers) + KV** e m
 nada. Não há buffer duplicado, padding de pesos (0 bytes entre tensores) nem
 alocação morta no caminho do tronco. O único desperdício real era o de 128 MiB do
 item 1.
+
+---
+
+## 5. `required_bytes` — o orçamento que recusava o que cabe (tarefa do coordenador)
+
+- **Referência**: pedido do coordenador às 03:10, a partir do meu §4.1/§4.2.
+- **Hipótese**: `device.h:76-87` somava `file_bytes + kv + kOverheadBytes(1 GiB)`.
+  Os dois primeiros termos erram: o ficheiro tem 11,214 GiB mas o tronco sobe
+  10,877 GiB (os 0,327 GiB de `blk.64.*` são o MTP, que só sobe com `--mtp`), e
+  1 GiB de overhead não existe (medido: 157,98 MiB). Erro de ~1,18 GiB **para
+  cima**, o que faz `info`/`serve` recusarem configurações que cabem — 131K com
+  `q8_0/q8_0` (15,281 GiB) entre elas. Ou seja: "131K só com q4_0" era falso.
+- **Implementação** (tudo em `device.h` + os dois chamadores):
+  - `GraphBufferShape` + `graph_buffer_bytes(shape)`: espelha `graph.cuh:518-585`
+    linha a linha (ativações 1-token, bloco de batch em `kMaxBatch`, parciais do
+    split-KV, estado GDN, conv state, scratch q8, logits, `d_pos_`).
+  - `graph_buffer_shape(cfg, vocab)`: monta a forma a partir do config, sem
+    incluir `model.h` (duck-typed).
+  - `uploaded_weight_bytes(loader, mtp_layer, use_mtp)`: soma os tensores que o
+    `up()` de fato sobe, com **as mesmas** `tensor_bytes`/`dtype_block_bytes`
+    (`dtype.h`) que ele usa para dimensionar o `hipMalloc`, então não pode
+    discordar do alocador.
+  - `required_bytes(weights, ctx, kt, vt, buffers)` — assinatura nova, sem
+    `file_bytes`.
+  - `kOverheadBytes` deixou de ser 1 GiB: agora são duas constantes nomeadas,
+    `kAllocatorMarginBytes = 256 MiB` (arredondamento do alocador do HIP sobre
+    ~150 alocações de peso + fragmentação) e `kRuntimeReserveBytes = 64 MiB`
+    (contexto/módulo/fila do HIP). Margem pequena e explicada em vez de um
+    gigabyte que decide sozinho se um contexto cabe.
+- **Gate**: `tests/check_kvtype.hip` agora **exige 165 658 660 B** para a forma do
+  IQ3_S — um refactor que mude uma alocação em `graph.cuh` (ou o espelho) quebra
+  ali, não em silêncio. Foi o que pegou dois bugs meus durante a escrita: eu havia
+  misturado floats com bytes no bloco de batch (`per_token` em floats somado com
+  `aq_blocks*36` em bytes) e esquecido o termo `n_head*2*head_dim` (o `d_proj_` do
+  caminho 1-token e o `d_qb_` do batch). Sem o número fixo do teste, os dois
+  passariam e o orçamento ficaria 0,8 MiB baixo — o suficiente para aceitar um
+  contexto que morre no `hipMalloc`.
+- **Resultado**: `graph_buffer_bytes` = 165 658 660 B (157,98 MiB), igual à soma
+  feita à mão de `graph.cuh`. `required_bytes` a 131K com `q5_0/q4_1` = 13,969 GiB
+  (13,656 de pesos+buffers+KV + 320 MiB de margem). `info` imprime agora as duas
+  contas (a honesta e a antiga) para a diferença ficar visível.
+- **Veredito**: MANTIDO. **Muda o que o motor aceita**: 131K com `q8_0/q8_0` passa
+  a ser aceito pelo orçamento (15,281 GiB + 0,31 de margem = 15,59 GiB de 15,90)
+  em vez de recusado — a medição em §6 diz se ele de fato roda.
+- **Nota de merge**: `device.h` ganhou `#include "rdna4/dtype.h"` e
+  `#include <string>`; `serve.hip` passou a abrir o GGUF **antes** da checagem de
+  orçamento (só o cabeçalho, não os pesos) para ter a forma do modelo. Se outra
+  frente mexer no `serve.hip`, é essa a mudança de ordem a preservar.
+
+---
+
+## 6. Números de 131K medidos (o alvo do enunciado)
+
+**Comando exato** (uma tomada de lock, janela verificada antes e depois):
+
+```
+./scripts/gpu-lock.sh bash /tmp/kv-big1.sh     # timeout DENTRO do lock (regra 1.2)
+./build/rdna4-infer bench -m <IQ3_S> --ctx-size 131072 --start-pos 131000 \
+    --fill-cache -n 16 --reps 2 --cache-type-k <K> --cache-type-v <V>
+```
+
+**Janela**: limpa. `mem_info_vram_used` = 198 156 288 B (189 MiB, só Xwayland +
+plasmashell + firefox, nenhum modelo) e `mem_info_gtt_used` = 30 208 000 B antes;
+`flock` sem outros waiters além do meu no momento da medida. Janela de
+`date -Is` = 03:12:13 → 03:14:48.
+
+| K / V | decode tok/s | vram in use | livre | GTT durante a corrida | veredito |
+|---|---:|---:|---:|---:|---|
+| **q5_0/q4_1** | **13,73** | 14,25 GiB | 1,68 GiB | 30,2 MB → 30,2 MB | **roda** |
+| q8_0/q4_1 | 14,32 | 15,00 GiB | 0,93 GiB | 30,2 → 30,2 MB | roda |
+| q8_0/q8_0 | **14,34** | **15,87 GiB** | **0,05 GiB** | 30,2 → **75,5 MB** | roda, no talo |
+| q4_0/q4_0 | 14,08 | 13,87 GiB | 2,05 GiB | 75,4 → 75,5 MB | roda |
+| f16/f16 | — | — | — | — | **NÃO roda**: `graph init failed: hipMalloc failed (kv cache)` |
+
+Cada corrida imprime `vram in use` do próprio `hipMemGetInfo`; "GTT durante a
+corrida" é `mem_info_gtt_used` lido imediatamente depois de cada bench.
+
+### 6.1 O achado que muda a conversa: a 131K o formato do KV NÃO muda a velocidade
+
+q4_0/q4_0 (2,25 GiB de KV) faz **14,08** tok/s e q8_0/q8_0 (4,25 GiB de KV) faz
+**14,34** tok/s: o cache quase 2x maior é **1,9% mais rápido**, não mais lento. O
+tráfego por token é 10,88 (pesos) + KV, ou seja 13,13 GiB contra 15,13 GiB — se a
+atenção fosse limitada por banda, o q4_0 deveria ser ~15% mais rápido. Não é: a
+131K o decode é limitado por **latência/ocupação do kernel de atenção**, não por
+banda. O `bench` calcula a "effective bandwidth" só sobre os pesos (11,20 GiB por
+token) e reporta 165-172 GB/s nos quatro casos, o que é 27-29% da banda de pico
+desta placa.
+
+Consequência prática: **escolher o KV pelo critério de velocidade a 131K não faz
+sentido neste motor** — os quatro formatos que rodam entregam o mesmo ~14 tok/s.
+A decisão tem de ser por qualidade (§7) e por folga de VRAM (§6.3).
+
+### 6.2 Piso de ruído
+
+Dentro de uma corrida, `--reps 2` dá spread ~0,01 tok/s (ex. q5_0/q4_1: best
+13,73 / mean 13,72). **Entre corridas o piso não foi medido com esta config** — a
+repetição do mesmo comando está na §6.5. Como as diferenças entre formatos são de
+0,26 tok/s (1,9%) e o spread dentro da corrida é de 0,01, é provável que as
+diferenças **entre formatos** estejam acima do ruído; o que **não** está medido é a
+variação entre processos (a primeira corrida de cada combinação paga diferenças de
+aquecimento de DPM e de cache). Registrado como incerteza, não como resultado.
+
+Também não é confiável nesta tabela o `prefill 5 tokens` (0,349 / 0,235 / 0,151 /
+0,141 s): são 5 tokens medidos logo depois de um `--fill-cache` de 2,25-4,25 GiB,
+então o número está contaminado pelo dreno assíncrono do preenchimento. **Não usar.**
+
+### 6.3 A conta de VRAM fecha — e calibra a margem
+
+Comparando o modelo do §4 com o `vram in use` medido:
+
+| K / V | previsto (pesos+buffers+KV+desktop) | medido | diferença |
+|---|---:|---:|---:|
+| q4_0/q4_0 | 13,48 GiB | 13,87 GiB | **+0,39** |
+| q5_0/q4_1 | 13,85 GiB | 14,25 GiB | **+0,40** |
+| q8_0/q4_1 | 14,60 GiB | 15,00 GiB | **+0,40** |
+| q8_0/q8_0 | 15,48 GiB | 15,87 GiB | **+0,39** |
+
+A diferença é **constante** (0,39-0,40 GiB) e não proporcional ao tamanho do cache,
+logo é custo fixo: o arredondamento do alocador do HIP sobre as ~150 alocações de
+peso + o contexto/módulo do HIP. Por isso `kAllocatorMarginBytes` foi calibrado de
+256 MiB para **384 MiB** (+64 de runtime = **448 MiB**), em vez do 1 GiB chutado de
+antes. Com 448 MiB o orçamento prevê 123 MiB livres para q8_0/q8_0 a 131K contra 51
+MiB medidos — conservador na direção certa e sem recusar o que roda.
+
+O modelo de VRAM do §4 está, portanto, **validado por medição** nas quatro
+combinações, com erro residual < 2%.
+
+### 6.4 `info` antes/depois — a diferença que o conserto do orçamento faz
+
+Comando: `./build/rdna4-infer info -m <IQ3_S> --ctx-size 131072 --cache-type-k K
+--cache-type-v V` (lido de [D] no log; a coluna "file-based" é a estimativa antiga
+impressa pelo próprio `info` para a diferença ficar visível).
+
+| K / V | pesos | buffers | KV | margem | need | estimativa antiga | antigo decidia |
+|---|---:|---:|---:|---:|---:|---:|---|
+| q5_0/q4_1 | 10,88 | 157,98 MiB | 2,62 | 448 MiB | **13,97 GiB** | 14,84 GiB | aceita |
+| q8_0/q4_1 | 10,88 | 157,98 MiB | 3,38 | 448 MiB | 14,72 GiB | 15,59 GiB | aceita |
+| q8_0/q8_0 | 10,88 | 157,98 MiB | 4,25 | 448 MiB | **15,72 GiB** | **16,46 GiB** | **RECUSAVA** |
+| f16/f16 | 10,88 | 157,98 MiB | 8,00 | 448 MiB | 19,34 GiB | 20,21 GiB | recusa (correto) |
+
+O ponto: `q8_0/q8_0` a 131K **cabe e roda** (medido: 15,87 GiB em uso, 51 MiB
+livres, 14,34 tok/s), mas o orçamento antigo o recusava. A frase "a 131K só cabe
+com q4_0" era falsa e vinha de contar o ficheiro em vez dos tensores.
+
+### 6.5 Repetição e o que ficou de fora
+
+_(preenchido pelo log de [G])_
+
+**Combinações que eu decidi não medir, e por quê**: `q5_0/q5_0` e `q4_1/q4_1` saíram
+do bench depois do aviso do coordenador sobre a fila do lock (havia 12-13 waiters e
+a placa ocupada por outra frente). As duas são medições de *custo*, e o §6.1 mostra
+que a 131K o custo é insensível ao formato (spread de 1,9% entre 2,25 e 4,25 GiB de
+cache) — o que decide é qualidade, e essa é medida na §7 com a sonda de KL, que
+cobre os dois. O mesmo vale para `q8_0/q4_1`, que eu **mantive** no bench por ser a
+opção de melhor qualidade recomendada pelo coordenador e precisar do número de VRAM.

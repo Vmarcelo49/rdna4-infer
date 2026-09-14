@@ -129,13 +129,20 @@ inline std::uint64_t graph_buffer_bytes(const GraphBufferShape &s) {
   return single + batch + partial + state + convst + q8 + logits + 4 /* d_pos_ */;
 }
 
-// HIP rounds every large hipMalloc up to its own granularity, and the engine
-// makes ~150 weight allocations plus the caches. 256 MiB is the explicit margin
-// for that rounding + fragmentation. Deliberately NOT a gigabyte: the number is
-// meant to be small enough that it does not by itself decide whether a context
-// fits, and large enough to cover what was measured.
-inline constexpr std::uint64_t kAllocatorMarginBytes = 256u << 20;
-// HIP context / module / queue / kernel argument buffers. Small and fixed.
+// HIP rounds every large hipMalloc up to its own granularity and the engine makes
+// ~150 weight allocations plus the caches; the context/module/queue structures
+// add a small fixed cost on top. 384 + 64 MiB is MEASURED, not guessed: at 131K
+// the engine's real footprint minus (weights + graph buffers + KV) came out at a
+// constant 0.40 GiB across four cache types —
+//   q4_0/q4_0   measured 13.87 GiB vs 13.48 predicted (+0.39)
+//   q5_0/q4_1   measured 14.25 GiB vs 13.85 predicted (+0.40)
+//   q8_0/q4_1   measured 15.00 GiB vs 14.60 predicted (+0.40)
+//   q8_0/q8_0   measured 15.87 GiB vs 15.48 predicted (+0.39)
+// (docs/journal-kv.md §6.4; the desktop's ~0.19 GiB is inside the measured
+// figure and in the predictions, so it cancels in the difference.)
+// Deliberately NOT a gigabyte: a blanket GiB is what made the old budget refuse
+// configurations that fit.
+inline constexpr std::uint64_t kAllocatorMarginBytes = 384u << 20;
 inline constexpr std::uint64_t kRuntimeReserveBytes = 64u << 20;
 // Kept as a name so no caller silently loses the margin, but no longer 1 GiB.
 inline constexpr std::uint64_t kOverheadBytes = kAllocatorMarginBytes + kRuntimeReserveBytes;

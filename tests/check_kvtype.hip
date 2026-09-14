@@ -202,8 +202,10 @@ int main() {
                                                      rdna4::KvType::Q5_0, rdna4::KvType::Q4_1, got);
     std::printf("   131K q5_0/q4_1 with the honest terms: %.3f GiB\n",
                 (double)need / 1073741824.0);
-    ok(need == 11678877696ull + got + 2818572288ull + (256ull << 20) + (64ull << 20),
+    ok(need == 11678877696ull + got + 2818572288ull + rdna4::kOverheadBytes,
        "required_bytes = weights + buffers + kv + the named margin (no flat gigabyte)");
+    ok(rdna4::kOverheadBytes == (448ull << 20),
+       "the margin is 448 MiB: 0.40 GiB measured at 131K, rounded up (was a flat 1 GiB)");
     ok(need < 15900000000ull, "131K q5_0/q4_1 fits in the 15.900 GB hipMemGetInfo reports");
   }
 
