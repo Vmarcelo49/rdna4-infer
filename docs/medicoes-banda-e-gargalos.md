@@ -251,7 +251,19 @@ o total de 11,12 GB daquele estudo está certo, o rótulo do componente não). O
 acima** da real: 345,3 GB/s impressos contra **321,9 GB/s** reais
 (`11,133 GB / 0,03458 s`).
 
-Por token, sem contar cache: pesos 11,133 GB + KV + ativações.
+**Ativações e estado recorrente** (a terceira parcela, medida pela mesma
+ferramenta e pela geometria do `gdn.cuh`):
+
+| parcela | bytes/token | como |
+|---|---|---|
+| estado do GDN (48 camadas × 3,15 MB × 4 passadas) | **604,8 MB** | `delta_rule_kernel` lê a linha 2× e escreve 2× por thread (`gdn.cuh:57-85`); a ferramenta imprime o estado por camada |
+| fluxo residual (E=5120 floats × ~6 passadas por camada × 64) | ~7,9 MB | `attn_norm`, residual, `post_norm`, residual do FFN |
+| logits (escrita no device + cópia D2H de 1 MB) | ~2,0 MB | 248320 floats × 4 B × 2 |
+| `kv_write` (16 camadas × 4 cabeças × 512 B × 2) | 0,07 MB | desprezível |
+| **total de ativações/estado** | **~615 MB** | — |
+
+Ou seja: a 4K, **o estado recorrente do GDN (604,8 MB/token) é 2,3× o tráfego
+único de KV (268 MB/token)** — e é o item mais caro depois dos pesos.
 
 ### 2.2 Banda efetiva e fração do roofline
 
@@ -269,6 +281,7 @@ scripts/gpu-lock.sh ./build/bench-phases-gpu IQ3_S --ctx 4096 --pos 4090 --token
 | banda efetiva **dentro do matvec** | **436,4 GB/s** = **69% do pico** | bucket `matvec` corrigido: 11,133 GB / 25,51 ms |
 | LM head isolado | **~620 GB/s** = **98% do pico** | 0,874 GB / 1,41 ms (bucket `head:matvec`) |
 | banda efetiva com o KV junto (4K) | **314 GB/s = 50% do pico** | (11,133 + 0,268) GB / 36,29 ms (`bench`, 4K de atenção) |
+| **inventário completo** (pesos + KV + ativações/estado) | **12,02 GB/token → 331 GB/s = 52% do pico** | 11,133 + 0,268 + 0,615 GB em 36,29 ms |
 
 Leitura: **o motor está a 69% do roofline na parte que importa (os matvecs) e a
 98% no LM head**; os 31% que faltam no matvec são *issue-bound*, não banda — a
@@ -397,7 +410,7 @@ terceiro.
   ~0,6 ms/token (1,7%). Gate: `check-matvec-gpu` (por tipo) + `check-graph-gpu`
   (oráculo por nó) + `scripts/check_golden_run.sh`.
 
-### 2. Recorrência GDN (`delta_rule`): 3,97 ms/token (11%), a 116 GB/s
+### 2. Recorrência GDN (`delta_rule`): 3,97 ms/token (11%), a 152 GB/s
 
 - Prova dupla: bucket `gdn_delta` corrigido = 3,97 ms/token nas 48 camadas
   (**83 µs por camada**, dentro do grafo) e o **mesmo kernel medido isolado em
@@ -405,12 +418,15 @@ terceiro.
   lançamento** — 67 µs acima do piso de despacho de 2,2 µs. A medida dentro do
   grafo não é artefato de instrumentação (a diferença de 13 µs é a dependência com
   o `conv1d`/`l2_norm` que precede o kernel no grafo).
-- Tráfego: estado = 3,15 MB por camada, lido+escrito 2× = **12,6 MB por camada**,
-  604 MB por token ⇒ **116 GB/s efetivos** (5,4× abaixo do pico de DRAM, 13× abaixo
-  do Infinity Cache). É **latência**: 48 CTAs de 128 threads = 9% de ocupação, e
-  cada thread faz duas passadas seriais de 128 elementos com dependência
-  (`gdn.cuh:57-85`).
-- Piso teórico: 12,6 MB / 633 GB/s ≈ **20 µs por camada** (0,96 ms/token).
+- Tráfego: estado = 3,15 MB por camada, lido+escrito 2× = **12,6 MB por camada**
+  (4 passadas sobre a linha), **604,8 MB por token** ⇒ **152 GB/s efetivos** (4,2×
+  abaixo do pico de DRAM medido, 10× abaixo do Infinity Cache). É **latência**: 48
+  CTAs de 128 threads = 9% de ocupação da placa, e cada thread faz duas passadas
+  seriais de 128 elementos com dependência (`gdn.cuh:57-85`). Confirmação
+  independente: o mesmo kernel isolado, em cadeia, dá **69,6 µs por lançamento**
+  contra um piso de memória de 12,6 MB / 632,9 GB/s ≈ **20 µs**.
+- Piso teórico: 12,6 MB / 632,9 GB/s ≈ **20 µs por camada** (0,96 ms/token) — o
+  medido é 69,6 µs isolado e 83 µs dentro do grafo, **3,5-4,2× acima do piso**.
 - Mudança concreta: `include/rdna4/gdn.cuh`, `delta_rule_kernel` — 4 threads por
   linha com 32 elementos em registrador (ou 2 acumuladores + `float4`), mantendo a
   ordem de soma documentada; ganho de até **~3 ms/token (8%)**. Gate:
@@ -466,10 +482,15 @@ terceiro.
   (1,31 ms/camada), contra 1,38 ms a 4K. Tráfego emitido 7,25 GB/token a
   **346 GB/s** (o Infinity Cache medido dá 1.500).
 - Piso teórico: 1,21 GB únicos / 633 GB/s = **1,9 ms** (10% do medido).
-- Mudança concreta: leitura vetorizada/LDS no caminho `q4_0` de `include/rdna4/kv.h`
-  (`kv_load8<KvType::Q4_0>`) — **atenção: `kv.h` pertence a outro agente nesta
-  rodada**; a alternativa dentro deste escopo é medir `q8_0` a 64K (sem
-  desempacotamento de nibble, linha 272 B), que promete ser mais rápido por byte.
+- **A alternativa foi medida**: `q8_0` no KV a 64K (linha de 272 B, sem
+  desempacotamento de nibble) faz a mesma atenção em **19,87 ms** (contra 21,03 do
+  `q4_0`) com **13,7 GB emitidos a 690 GB/s** contra 7,25 GB a 346 GB/s, e o token
+  inteiro fica em 54,45 ms (18,36 tok/s) contra 55,02 (18,17) — **o dobro da
+  precisão do KV pelo mesmo tempo**, com 2,18 GiB de folga de VRAM. É a troca de
+  uma linha no CLI/servidor e não precisa de `kv.h`.
+- Mudança de kernel (para quem for dono de `kv.h`): leitura vetorizada/LDS no
+  caminho `q4_0` (`kv_load8<KvType::Q4_0>`) — 346 GB/s emitidos contra 690 do
+  `q8_0` mostram que o gargalo é o **desempacotamento por elemento**, não os bytes.
 
 ### 5. Transbordo para GTT a 64K f16: **8× de queda**, de 18,1 para 2,2-8,0 tok/s
 
@@ -480,11 +501,14 @@ terceiro.
 - Piso: o mesmo trabalho com `q4_0` (55,02 ms/token, 18,17 tok/s) — ou seja, há
   **~6,7× de ganho imediato** trocando o tipo de KV a 64K.
 - Mudança concreta: (a) a política de KV por contexto no CLI/servidor
-  (`src/main.hip`, escolher `q4_0` automaticamente quando o KV f16 não couber com
-  margem — o dado que falta é o `hipMemGetInfo` antes do `Graph::init`, que já é
-  chamado no `cmd_bench`/`cmd_run`); (b) descontar o bloco MTP (0,351 GB) quando
-  `--mtp` está desligado; (c) gate: `check-kvctx-gpu` + um teste novo que compare
-  `vram in use` contra o total e falhe se sobrar < 0,5 GiB.
+  (`src/main.hip`, escolher sozinho `f16` até 48K, `q8_0` acima — **o `q8_0` a 64K
+  é medidamente igual ou melhor que o `q4_0` e tem o dobro da precisão do KV**;
+  a decisão precisa do `hipMemGetInfo` antes do `Graph::init`, que já é chamado no
+  `cmd_bench`/`cmd_run`); (b) descontar o bloco MTP (0,351 GB) e a linha única de
+  `token_embd` da conta de VRAM quando `--mtp` está desligado; (c) gate:
+  `check-kvctx-gpu` + um teste que compare `vram in use` contra o total e falhe se
+  sobrar < 0,5 GiB (o ponto de falha é medido: 48K f16 = 1,30 GiB livres OK, 64K
+  f16 = 0,30 GiB livres → transbordo).
 
 ---
 
@@ -496,7 +520,7 @@ terceiro.
 | LM head (`output.weight`, 874 MB) | 1,39 ms (627 GB/s) | **1,43 ms (620 GB/s)** | **confere** (98% do teto) |
 | atenção 4K, 16 camadas, com split | 1,2 ms (8 splits) | **1,38 ms** (7-8 splits) | **confere** |
 | embeddings + norm final + cópia + sampler | ~0,5 ms | **0,44 ms de sampler + 0,23 ms de cópia/dreno + 0,02 de norm** | **confere** |
-| "resto" (normas, GDN, rope, `kv_write`, quantizações, ~1900 kernels) | ~2-3 ms | **~9,5 ms** (GDN 5,63 — dos quais 3,97 são a `delta_rule` — + normas/rope 2,96 + `act_quant` 0,88) | **NÃO confere**: o estudo tratou como "~2-3 ms de trabalho desprezível" o que é (a) a `delta_rule` a 116 GB/s (3,97 ms) e (b) ~1440 lançamentos pequenos no piso de despacho (~4,0 ms) |
+| "resto" (normas, GDN, rope, `kv_write`, quantizações, ~1900 kernels) | ~2-3 ms | **~9,5 ms** (GDN 5,63 — dos quais 3,97 são a `delta_rule` — + normas/rope 2,96 + `act_quant` 0,88) | **NÃO confere**: o estudo tratou como "~2-3 ms de trabalho desprezível" o que é (a) a `delta_rule` a 152 GB/s (3,97 ms) e (b) ~1440 lançamentos pequenos no piso de despacho (~4,0 ms) |
 | **gaps de despacho** | **~7 ms** (2200 lançamentos × 3,5 µs), marcado como estimativa | **~4,0 ms medidos** para os ~1440 lançamentos pequenos (2,2-3,5 µs cada, medidos em cadeia) + ~1,1 ms de latência de `rms_norm` acima do piso; contagem real de lançamentos: **1940** (derivada do código, e 1479 marcas medidas no grafo) | **a magnitude confere (4-5 ms contra os ~7 ms estimados), a contagem não**: são 1940 lançamentos, não 2200, e o "gap" não é uniforme — 497 matvecs de 47 µs escondem o próprio despacho |
 | "a 64K a atenção está em ~1,56 TB/s de L2 por causa da redundância 6×" | estimativa coerente | **1,32 TB/s emitidos a 16K e 1,17 TB/s a 4K** (`f16`, medidos); a 64K `q4_0` cai para 346 GB/s | **confere a 4K/16K**, mas **não** a 64K: lá o kernel é issue-bound, não cache-bound |
 | pico de DRAM ~619 GB/s (M5) | 619 GB/s | **632,9-634,5 GB/s** | confere (medido com buffer de 3 GiB e ILP) |
