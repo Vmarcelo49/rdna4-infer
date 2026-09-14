@@ -28,6 +28,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -94,6 +95,10 @@ int oracle_draft_argmax(const char *path) {
     return std::atoi(line.c_str() + p + 16);
   }
   return -1;
+}
+
+double now_s() {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 bool all_finite(const std::vector<float> &v) {
@@ -568,6 +573,45 @@ int main(int argc, char **argv) {
                 ids == ids_plain ? "==" : "!=");
     ok(ids == ids_plain, (std::string("D=") + std::to_string(D) +
                           " speculative ids are still plain greedy's").c_str());
+  }
+
+  // ------------------------------------------------- what a draft step costs
+  // The decode loop never synchronises, so its per-step numbers only measure
+  // host-side queueing. These two measure the block itself: 24 steps back to
+  // back (throughput) and the same with a sync after each one (latency, which is
+  // what the loop actually pays because it reads the drafted token back).
+  {
+    const int n_rep = 24;
+    auto sync = [] { (void)hipDeviceSynchronize(); };
+    double t_lo0 = now_s();
+    for (int i = 0; i < n_rep; ++i) {
+      if (!mtp.step_host(hidden.data(), prompt.back(), i, nullptr, nullptr, err)) {
+        std::fprintf(stderr, "cost step: %s\n", err.c_str());
+        return 1;
+      }
+    }
+    sync();
+    const double t_lo1 = now_s();
+    double t_hi0 = now_s();
+    for (int i = 0; i < n_rep; ++i) {
+      if (!mtp.step_host(hidden.data(), prompt.back(), i, nullptr, nullptr, err)) {
+        std::fprintf(stderr, "cost step: %s\n", err.c_str());
+        return 1;
+      }
+      sync();
+    }
+    const double t_hi1 = now_s();
+    const double ms_pipelined = (t_lo1 - t_lo0) * 1000.0 / n_rep;
+    const double ms_synced = (t_hi1 - t_hi0) * 1000.0 / n_rep;
+    std::printf("== draft step cost (%.1f MiB of weights) ==\n",
+                (double)mtp.weight_bytes() / (1024.0 * 1024.0));
+    std::printf("   %.2f ms/step back to back, %.2f ms/step with a sync per step\n",
+                ms_pipelined, ms_synced);
+    std::printf("   a trunk step at 4K is ~%.1f ms (measured plain runs above), so a\n",
+                s_plain.wall_ms / (double)std::max(1, (int)ids_plain.size()));
+    std::printf("   draft step costs %.1f%%-%.1f%% of a trunk step\n",
+                100.0 * ms_pipelined / (s_plain.wall_ms / (double)std::max(1, (int)ids_plain.size())),
+                100.0 * ms_synced / (s_plain.wall_ms / (double)std::max(1, (int)ids_plain.size())));
   }
 
   std::printf("%s (%d failure%s)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail, g_fail == 1 ? "" : "s");
