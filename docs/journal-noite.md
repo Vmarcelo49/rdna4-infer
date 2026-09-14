@@ -19,6 +19,59 @@ máximo de desempenho que couber na noite.
 Este arquivo é atualizado pelo coordenador conforme os merges entram: no fim da noite ele tem
 o estado final, os números medidos e o que ficou de fora com o motivo.
 
+## Diário do coordenador
+
+### C0. Premissa do alvo: `q5_0`/`q4_1` não existem neste motor (verificado, 02:00)
+- **Referência**: o enunciado da rodada ("achado bom: K q5_0 / V q4_1").
+- **Hipótese**: é um resultado deste motor.
+- **Verificação**: `include/rdna4/kv.h` só tem `f32/f16/q8_0/q4_0` (`kv_type_parse`, linha 40).
+  O achado vem do llama.cpp (que tem 6 tipos de KV), não daqui.
+- **Veredito**: tratado como **hipótese a implementar e medir** pela frente KV, não como fato.
+  A conta preliminar (21 504 B/token ⇒ 2,625 GiB a 131K) foi confirmada pela frente KV com
+  aritmética medida e virou asserção em `check-kvtype`.
+
+### C1. Argmax no device no caminho greedy (MANTIDO, +0,9 % e uma sincronia a menos)
+- **Referência**: `docs/vulkan-vs-hip.md` §4 item 3 ("argmax no device no caminho greedy,
+  bit-exato, ~0,5 ms = 1,5 %"); orçamento por fase: cópia de logits 0,21 ms + sampler 0,44 ms.
+- **Hipótese**: com `temp <= 0` e sem penalidade de repetição, o sampler inteiro reduz a
+  "primeiro máximo estrito em ordem de id" (`Sampler::filter`, ramo `temp <= 0`), que o device
+  calcula sem trazer os 993 KB de logits para o host a cada token.
+- **Comando**: `./scripts/gpu-lock.sh ./build/rdna4-infer bench -m IQ3_S -n 32 --reps 3`.
+- **Resultado**: `per token: 32,64 ms = launch loop 30,83 + tail 1,80 + **sample 0,00**` (o
+  sampler do host saiu do caminho); decode 30,64 tok/s contra 30,38 da janela limpa anterior
+  (+0,9 %, dentro do ruído da máquina carregada — a evidência direta é a fase `sample` ir a
+  zero). Gates: `check_golden_run.sh` OK (ids greedy idênticos nas 4 configurações de KV),
+  `run --greedy` e `run --greedy --repeat-penalty 1.1` preservados (o caminho com penalidade
+  continua no host, intocado).
+- **Veredito**: MANTIDO. Arquivos: `include/rdna4/nn.cuh` (kernel `argmax_kernel`),
+  `include/rdna4/graph.cuh` (`set_want_argmax`/`last_argmax`), `src/main.hip` (run e bench).
+  Limitação conhecida: o servidor OpenAI ainda não usa o caminho rápido (fácil de ligar).
+
+### C2. Correções da revisão adversarial aplicadas na `main` (MANTIDO)
+- **`check_all.sh` mentia (F3, P0)**: `[ -x bin ] && step` sem `set -e` ⇒ com um binário
+  ausente a bateria imprimia PASS com 9 dos 10 gates. Consertado: gate ausente = FAIL + lista.
+  Verificado movendo `build/check-tuning` (`check_all (CPU half): FAIL`).
+- **Banda 8,2 % otimista (F4)**: `main.hip` usava `loader.total_bytes()` (12,030 GB, o
+  arquivo) como tráfego por token; o real é 11,122 GB (10,36 GiB). Corrigido com a mesma regra
+  de exclusão do inventário. Efeito nos números publicados: 352 GB/s → **325 GB/s = 51 %** da
+  roofline.
+- **README**: tabela de fases somava 37,9 contra os 36,0 declarados (LM head em duas linhas);
+  64K `q8_0` tinha três valores no mesmo documento. Ambos corrigidos.
+- **Lock aninhado**: `gpu-lock.sh` agora exporta `GPU_LOCK_HELD=1` para o filho (um wrapper
+  ad-hoc meu fez o `check_golden_run.sh` esperar 18 min pelo lock do próprio pai).
+
+### C3. Repasses feitos às frentes (para o relatório da manhã)
+- KV: portas do F6 (fechadas pela própria frente, com achado extra: `kv_fill_launch` respondia
+  `true` para tipo desconhecido), evidência de KLD do PR #21038 (K mais sensível ~1,5×, nunca
+  `q4_1` em K), rotação de Hadamard como alavanca de qualidade, e a interação de VRAM com os
+  planos de estado do MTP.
+- MTP: o alvo honesto é 1,3-1,5× com **D=4** (o `cf(N)` medido é 1,16/1,68/1,75/3,27/6,11 para
+  N=2/3/4/8/16 — a projeção de 2,5× assume cf=1) e a atenção batelada tem **dono único** (a
+  frente de prefill); mais o bug de orçamento do `alloc_kv` do MTP.
+- Prefill: é o dono único da atenção multi-linha causal + scan de GDN multi-token; o `cf(N)`
+  é o número que decide o N da verificação do MTP; e o gate que falta da regra de WPB larga.
+- Kernels: o literal `16` em `attn.cuh` (F1) e a varredura de warps do caminho sem split (E2).
+
 ## Estado do alvo (atualizado pelo coordenador)
 
 - **131K**: ainda não medido nesta rodada. No baseline, 131K com KV `q4_0` roda a 14,0 tok/s
