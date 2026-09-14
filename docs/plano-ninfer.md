@@ -12,8 +12,8 @@ gate antes de cronometrar, e número medido no lugar de adjetivo.
 
 | item do ninfer | veredito aqui | por quê |
 |---|---|---|
-| **1. GQA fundido no decode** (1 CTA por cabeça de KV, 6 cabeças do grupo dentro) | **JÁ TESTADO E REFUTADO na nossa forma** | protótipo C: com a mesma grade `(4,S)`, cortar o tráfego de K/V em 6× deixou o kernel **1,25× (4K) e 1,82× (16K) MAIS LENTO** — 68 VGPR + 400 B de derrame no `HG=6` contra 56 VGPR/0 B no `HG=1` (`docs/journal-longctx.md` §4.1). A releitura 6× é absorvida pelo cache; o custo de servir 6 cabeças por CTA é maior que os bytes economizados. **Mas a estrutura do ninfer é outra** (SIMT, dot-product-major, T pequeno, 6 cabeças em registrador) → vira **pesquisa**, não implementação, e só depois um experimento novo se a estrutura diferir onde importa (§1 N1). |
-| **2. Dequant LDS→registrador dentro do laço de consumo, nunca LDS→LDS** | **VIVO** — é o item de maior valor imediato | nosso `gemm_i8_kernel` faz global→reg→decodifica→**LDS int8**→reg (`include/rdna4/gemm.cuh:307-332` e `:384`): duas voltas pela LDS e a decodificação *antes* da barreira. O ninfer estagia os bytes crus com `cp_async<16>` e decodifica no laço de FMA (`q4_rowsplit_gemm_simt.cuh:77-110` stage, `:112-159` consume). Staging é 18-61 % do nosso kernel dependendo da variante (frentes F/G/H). |
+| **1. GQA fundido no decode** (1 CTA por cabeça de KV, 6 cabeças do grupo dentro) | **E0: FECHA a 4K, REABRE a 16K** | protótipo C: com a mesma grade `(4,S)`, cortar o tráfego de K/V em 6× deixou o kernel **1,25× (4K) e 1,82× (16K) MAIS LENTO** — 68 VGPR + 400 B de derrame no `HG=6` contra 56 VGPR/0 B no `HG=1` (`docs/journal-longctx.md` §4.1). A releitura 6× é absorvida pelo cache; o custo de servir 6 cabeças por CTA é maior que os bytes economizados. **Mas a estrutura do ninfer é outra** (SIMT, dot-product-major, T pequeno, 6 cabeças em registrador) → vira **pesquisa**, não implementação, e só depois um experimento novo se a estrutura diferir onde importa (§1 N1). |
+| **2. Dequant LDS→registrador dentro do laço de consumo, nunca LDS→LDS** | **MEDIDO NEGATIVO (N3)** — ver §1 | nosso `gemm_i8_kernel` faz global→reg→decodifica→**LDS int8**→reg (`include/rdna4/gemm.cuh:307-332` e `:384`): duas voltas pela LDS e a decodificação *antes* da barreira. O ninfer estagia os bytes crus com `cp_async<16>` e decodifica no laço de FMA (`q4_rowsplit_gemm_simt.cuh:77-110` stage, `:112-159` consume). Staging é 18-61 % do nosso kernel dependendo da variante (frentes F/G/H). |
 | **3. `ColsPerTile ≤ 8` com `static_assert`, paralelismo em warps** | **VIVO e alinhado** | é exatamente a regra que faltou ao nosso D1: subir N levou de 62 para 133 VGPR e custou +71 % (`docs/plano-prefill.md` §0.1). O limiar deles (`T ≤ 16 → SIMT, T > 16 → tensor core`, `q4_dispatch.cpp:14-17`) é o mesmo do nosso despacho. |
 | **4. GDN em blocos de 64 com três estágios** | **VIVO, e é o segundo maior** | ataca 0,852 ms/token de recorrência (`docs/estudo-prefill-c-nosso.md` §5) — o maior custo de andaime que sobra depois do matvec. A matemática (block-WY) **não foi validada termo a termo** pela frente do ninfer → vira pesquisa antes de virar código (§1 N2). |
 | **5. Launcher por T exato com K dividido entre warps** | **VIVO, e é o item do MTP** | ataca o coeficiente `6,04 ms/token` de `pass_ms ≈ 13,9 + 6,04·N` e o custo marginal da verificação. |
@@ -54,7 +54,21 @@ estágios, shapes, workspace, onde entra o estado, e o que muda na ordem das som
   declarada + `check-regression-gpu`, e o caminho antigo atrás de `RD_GDN_CHUNKED=0`.
 Entregável: `docs/estudo-ninfer-gdn.md`.
 
-### N3 — Implementação: tirar a volta dupla pela LDS do `gemm_i8_kernel` (GPU)
+### N3 — FECHADO: medido NEGATIVO (1,7-4,8× mais lento), com o mecanismo
+A reestruturação foi implementada, verificada e medida contra a produção **na mesma corrida**:
+estagiar bytes crus e decodificar no laço de consumo perde **4,17× em M=16** e **2,07× em M=128**
+(iq3_s), 1,67-1,75× no iq4_xs. **Mecanismo medido**: o nosso staging **já é vetorial**
+(`ds_store_b128`) e **limitado por tráfego de DRAM** (76,6 MB em 0,134 ms = **572 GB/s ≈ 90 % do
+pico de 633**), então decodificar no staging é de graça (o staging cru tem **2,25× menos
+instruções** — 198 contra 446 na ISA — e **não** é mais rápido); o custo migra para o consumo, onde
+a LUT passa a ser consultada por **TM=16 threads em vez de 1** (8 → 136 consultas por janela, 17×)
+e as instruções vivas por janela vão de 1126 para 3114 (**+177 %**). Bit-exatidão preservada nos
+dois caminhos, ISA de produção **byte-idêntica**, os três gates bit-exatos. O variant fica no
+arquivo como `cfg 9-12`, alcançável só pelo bench.
+**Lição**: o padrão do ninfer pressupõe um kernel **limitado por instrução**; o nosso é limitado
+por tráfego, e nesse regime mover trabalho para o consumo só pode piorar.
+
+### N3 (histórico) — o que eu tinha pedido, para referência
 Reescrever o staging/consumo de `include/rdna4/gemm.cuh` no padrão do ninfer: estagiar os
 **bytes crus** (não o int8 já decodificado) e mover a decodificação para dentro do laço de
 consumo; a escala continua dobrada sobre o tile de colunas.
@@ -82,6 +96,26 @@ mesmo no caminho ganancioso (`src/backend/sampler.cpp:56-95`); a diferença
 **já tem** o `argmax_kernel`/`last_argmax` (C1/R9 da noite) — é trocar o caminho ganancioso do laço
 pelo device, mantendo o host para `temp > 0`. Alvo: **2-5 ms/token** e o break-even de aceitação
 caindo ~5-10 pontos; o gate é o md5 do `--mtp` igual ao ganancioso, que a noite já estabeleceu.
+
+### N-GDN — Implementação pronta para decidir (especificada em `docs/estudo-ninfer-gdn.md`)
+O port é **exato** (float64: 1,0e-15…1,7e-15 para B ∈ {8,16,32,64}; fp32: 5,0e-7…1,0e-6, a mesma
+ordem do nosso sequencial), **não** amplifica (cond(I−A) ≤ 6,2) e o layout do estado é **idêntico
+ao nosso** (fp32 `[valor][chave]`, sem conversão). **Mas ele quebra o contrato bit-exato do caminho
+em lote** (`tests/check_batch_gpu.hip` exige `BIT-EXACT`) — é a mesma classe de decisão que fixou o
+chunk default em 16. Saídas honestas, as duas registradas: (a) cobrir **todos** os tamanhos de lote
+com o caminho em blocos + preenchimento inerte do último bloco (a aritmética passa a depender só da
+posição, não do corte — resolve CLI/servidor/MTP de uma vez); (b) ficar atrás de `RD_GDN_CHUNKED=0`
+por padrão. Barra proposta: `gdn_delta` de **0,625 → ≤0,30 ms/token**. Custo de infraestrutura:
+workspace novo (789 504 B com n=16/B=16) + espelho em `device.h` + pino de `check-kvtype`
+(172 258 340 → 173 047 844 B). **Decisão do dono do repo, não minha.**
+
+### N-POL — Implementação imediata e gratuita: a política de splits do kernel que embarca
+O E0 mediu, em A/B intercalado de 15 rodadas com a ordem trocada, que **o próprio kernel que
+embarca prefere MENOS CTAs a 16K: S=8 (192 CTAs) ganha de S=16 (384 CTAs) por 0,2434 contra
+0,2485 ms — 15/15 rodadas**. A nossa política (`attn_splits_for`, `graph.cuh:432-445`) escolhe
+`keys/kAttnSplitMin`, ou seja S=16 a 16K. Trocar a política é **bit-exato** (mesmo kernel) e não
+tem risco de contrato: é um sweep da política em 4K/8K/16K/32K/64K para achar o S ótimo por
+contexto, e depois a tabela. **Ganho a medir**: até ~2 % a 16K (e possivelmente mais a 32K/64K).
 
 ### N5 — Implementação: launcher small-T com K dividido entre warps (depois de N4)
 Padrão do ninfer `q4_small_t_mma`: `kKWarps=8`, `kTileKPerWarp=64`, `kRowsPerCta=16`, redução na
