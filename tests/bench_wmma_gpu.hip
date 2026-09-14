@@ -384,14 +384,19 @@ __global__ void peak_fma_kernel(int iters, float *out) {
 // Copia LDS->LDS com int4 (16 B por lane, endereco consecutivo por lane: sem
 // conflito de banco). Le 16 B e escreve 16 B por iteracao por thread.
 __global__ void lds_copy_kernel(int iters, int *out) {
-  extern __shared__ int4 sm[];
-  const int t = threadIdx.x;
+  // LDS estatica de 16 KB (a versao com extern __shared__ media um tempo
+  // constante de ~1,4 s por lancamento, independente de `iters`: ficou
+  // registrado como anomalia daquele caminho de alocacao, nao como medida).
+  __shared__ __align__(16) int4 sm[1024];
+  const int t = threadIdx.x & 255;
+  for (int i = t; i < 1024; i += 256) sm[i] = make_int4(i, 0, 0, 0);
+  __syncthreads();
   int4 v = sm[t & 1023];
   for (int i = 0; i < iters; ++i) {
     v = sm[(t + i) & 1023];
     sm[(t + 512 + i) & 1023] = v;
   }
-  out[t] = v.x;
+  out[blockIdx.x * blockDim.x + threadIdx.x] = v.x;
 }
 
 // ===========================================================================
@@ -1132,7 +1137,10 @@ int main(int argc, char **argv) {
             for (int n = 0; n < 16; ++n)
               if (got[m * 16 + n] != 0) {
                 ++nz;
-                ii = (which == 0) ? m : n;
+                // which==0: o byte aceso esta' em B -> a celula nao nula e' a
+                // COLUNA n (todos os m aparecem); which==1: esta' em A -> e' a
+                // LINHA m. O valor em qualquer delas e' k_verdadeiro+1.
+                ii = (which == 0) ? n : m;
                 jj = got[m * 16 + n] - 1;
               }
           if (nz != 16)
@@ -1156,15 +1164,16 @@ int main(int argc, char **argv) {
           seen[i][j] = true;
         }
       std::printf("  mapa %s: (i,j) duplicados %d, fora do tile %d (esperado 0/0)\n",
-                  which == 0 ? "A(16x16)" : "B(16x16)", dup, oob);
+                  which == 0 ? "B(16x16)" : "A(16x16)", dup, oob);
     }
-    std::printf("   lane byte ->  A: (m,k)      B: (n,k)\n");
+    std::printf("   lane byte ->  A: (m,k)      B: (n,k)\n"
+                "   (A vem do probe which=1 e B do which=0 -- ver o comentario)\n");
     const int show[8] = {0, 1, 7, 8, 15, 16, 17, 31};
     for (int s = 0; s < 8; ++s) {
       const int L = show[s];
       for (int p = 0; p < 8; ++p)
-        std::printf("   %4d %4d ->  m=%2d k=%2d       n=%2d k=%2d\n", L, p, imap[0][L][p],
-                    jmap[0][L][p], imap[1][L][p], jmap[1][L][p]);
+        std::printf("   %4d %4d ->  m=%2d k=%2d       n=%2d k=%2d\n", L, p, imap[1][L][p],
+                    jmap[1][L][p], imap[0][L][p], jmap[0][L][p]);
     }
     HIPCHECK(hipFree(d_C));
     std::printf("\n");
@@ -1412,8 +1421,9 @@ int main(int argc, char **argv) {
     const size_t smem = 1024 * sizeof(int4);  // 16 KB (o kernel indexa & 1023)
     int *d_i = nullptr;
     HIPCHECK(hipMalloc(&d_i, (size_t)nthreads * sizeof(int)));
+    (void)smem;
     std::function<void(int)> launch = [&](int iters) {
-      lds_copy_kernel<<<blocks, threads, smem>>>(iters, d_i);
+      lds_copy_kernel<<<blocks, threads>>>(iters, d_i);
     };
     int iters = iters_override;
     if (!iters) {

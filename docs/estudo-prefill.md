@@ -198,6 +198,36 @@ Depende do P0: sem o tile e a LDS, a instrução nova não tem de onde ler.
 
 **P4 — f16 no caminho vetorial** (normas, elementwise, atenção): 1,5× no FMA deste cartão.
 
+## 3d. O andaime, o despacho e as fusões — medidos pela frente C (e a hipótese da fusão MORTA)
+
+Números da frente C (`docs/estudo-prefill-c-nosso.md`), dentro do grafo, nível 2:
+
+| componente | ms/token | % do prefill |
+|---|---|---|
+| **matvec em lote** | **7,103** (113,6 ms por chunk de 16 no grafo contra 110,70 isolado = **+2,6 %**) | **83,7 %** |
+| GDN (48 camadas) | 2,824 (0,852 recorrência + 1,972 projeção) | 34,3 % |
+| FFN | 4,523 | 54,9 % |
+| atenção + qk_norm_rope_kv + attn_gate_out (16 camadas) | 0,642 (0,031 é o kernel de atenção) | 7,8 % |
+| andaime total (norms, resíduos, quantização de ativação, despacho) | 1,141 | ~14 % |
+
+E o número que mata uma hipótese que estava no plano desde a noite:
+
+- **916 lançamentos por chunk** de 16 tokens (20/camada de atenção × 16 + 12/camada GDN × 48 +
+  16 embeddings + 2 do head), contados no código;
+- piso medido de **2,253 µs** por kernel vazio enfileirado ⇒ **2,06 ms/chunk = 0,129 ms/token =
+  1,58 % do prefill**;
+- copiar **todas as sete fusões nomeadas do Vulkan** (`ggml-vulkan.cpp:18149-18327`) remove 640
+  desses 916 lançamentos ⇒ **1,1 % do prefill**.
+
+**Conclusão: para o prefill, fusão de kernels não é alavanca.** Ela continua valendo no decode,
+onde o custo é por token e não amortizado por 16 — mas o plano do prefill não deve gastar um dia
+nela. Isso contradiz a ordem que eu mesmo tinha escrito de manhã (P2 = fusões) e fica corrigido
+aqui.
+
+**Teto independente, pela frente C**: se o matvec em lote rodasse na banda medida de 633 GB/s, o
+prefill a 512 tokens seria **446 tok/s** contra os 123,4 nossos — **3,6× de espaço, todo ele na
+*forma* do kernel** (o protótipo do P0 chegou a 12,74 T MAC/s = 3,99× em M=512).
+
 ## 5b. Até onde vai o caminho vetorial (o muro de issue) — e por que a saída é a unidade de matriz
 
 A frente B fechou a conta que o protótipo sugeria: os 12,74 T MAC/s do `bench-gemm-gpu` são

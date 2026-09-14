@@ -25,7 +25,11 @@ diz o comando e a janela (VRAM antes, se a placa estava ocupada). Logs brutos em
    (0,641 ms/token = 43,9 % de toda a gordura), `act_quant` (0,227 = 15,5 %) e
    `qk_norm_rope_kv`+`attention`+`attn_gate_out` (0,088 = 6,0 %) — juntos **0,956 ms/token =
    66 % de tudo que não é matvec e 11,8 % do prefill**. O resto é matvec.
-5. O motor roda a **1-2 % do teto do próprio kernel** (o prefill medido e o previsto pela soma
+5. **O chunk de 16 é ótimo, medido até N=64** (o agente irmão destravou N=32/64 no lançador):
+   7,93 ms/token em N=16, **9,23 em N=32 (+16 %)** e **12,48 em N=64 (+57 %)** — `acc[N]` leva os
+   registradores de 63 a 133 com a grade fixa em 2 176 CTAs. O modelo `13,9 + 6,04·N` previa
+   ~6,05 ms/token em N=64: refutado pelo dobro.
+6. O motor roda a **1-2 % do teto do próprio kernel** (o prefill medido e o previsto pela soma
    das fases concordam em 1 %). O teto com o kernel na banda medida desta placa (633 GB/s)
    seria **446 tok/s a 512 tokens**: o caminho tiled/int8 tem **3,6× de espaço medido**.
 
@@ -301,44 +305,62 @@ estudo que precise fechar ao 1 % tem de rodar matvec e prefill na **mesma** pass
 
 ---
 
-### 3.3 O matvec é sublinear no tamanho do chunk? O teto de 16 é de compilação (e o que falta)
+### 3.3 O chunk de 16 é ótimo? Medido até N=64: **sim, 16 é o melhor**
 
-`matvec_launch_batch` (`include/rdna4/matvec.cuh:1002-1013`) só instancia N ∈ {2,3,4,8,16} e
-devolve `false` para qualquer outro — o comentário da linha 1011 diz literalmente *"N is a
-compile-time instantiation, not a runtime knob"*. **`kMaxBatch = 16` (`graph.cuh:189`) é um
-teto de compilação, não um ótimo medido.** A prova mais direta está na própria ferramenta que
-já existe: pedir `--batch 32` a `bench-matvec-shapes-gpu` produz `pass_ms = 0,005` e
-`2 376 494 GB/s` — o lançamento não aconteceu, nada rodou, e o harness reporta o zero.
+`matvec_launch_batch` (`include/rdna4/matvec.cuh:1002-1013`) instanciava só N ∈ {2,3,4,8,16}:
+**`kMaxBatch = 16` (`graph.cuh:189`) era um teto de compilação, não um ótimo medido.** Durante
+esta medição um agente irmão acrescentou `case 32` e `case 64` ao lançador
+(`matvec.cuh`, diff de 08:26, `matvec_batch_cap() 16 -> 64`) exatamente para medir esse degrau;
+com o binário reconstruído (`cmake --build build -j8 --target bench-matvec-shapes-gpu`,
+08:31), a pergunta ficou respondida:
 
-**A medida que fecharia isto não fechou**, e o registro honesto é este:
+```
+./scripts/gpu-lock.sh timeout 900 ./build/bench-matvec-shapes-gpu MODEL \
+  --batch 1,8,16,32,64 --reps 3
+```
 
-- **v1** (`/tmp/scratch/mb_batch_n.hip`) derivou a geometria do GGUF e levantou
-  *Memory access fault ... Page not present* — geometria errada, leitura fora da alocação.
-- **v2** (`mb_batch_n2.hip`) usou `sizeof(block_iq3_s) = 110` B para o tensor
-  `blk.0.ffn_down.weight`, que na verdade é **iq3_xxs de 98 B/bloco** (o próprio
-  `blk.0.ffn_down` é iq3_xxs; `sizeof(block_iq3_s)` *é* 110 B, confirmado por
-  `/tmp/scratch/sz.cpp`). Resultado: 12 % de erro no tamanho do buffer e uma varredura inteira
-  medida sobre 38 MB, isto é, dentro da Infinity Cache — as bandas saíram em 2 500 GB/s, acima
-  do roofline de 633 GB/s, o que denuncia o erro. A linha `floor: ... / 633 GB/s = ...` que
-  entrou na v2 é o que pegou isso.
-- **v3** (`mb_batch_n3.hip`) leu a geometria do arquivo, replicou o tensor para 8,7 GB para
-  forçar leitura de DRAM e compara com o lançador de produção nos mesmos buffers — mas o
-  tempo da frente acabou antes de a correção rodar.
+| N | pass_ms | ms/token | vs GEMV | GB/s (passagem) | GB/s por token-eq | reuso de ativação |
+|---|---|---|---|---|---|---|
+| 1 (GEMV) | 26,258 | 26,258 | 1,00× | 423,6 | 423,6 | — |
+| 8 | 64,130 | 8,016 | 3,28× | 173,4 | 1387,4 | 92,8 % |
+| **16** | **126,830** | **7,927** | **3,31×** | 87,7 | 1403,1 | 95,4 % |
+| 32 | 295,490 | **9,234** | 2,84× | 37,6 | 1204,5 | 90,1 % |
+| 64 | 798,762 | **12,481** | 2,10× | 13,9 | 891,1 | 84,1 % |
 
-O que **está** medido, e responde à pergunta por outro caminho:
+**N=16 é o mínimo, e a degradação depois dele é grande:** de 16 para 32 o custo por token sobe
+**+16,5 %**, de 32 para 64 **+35,2 %**, e N=64 custa **57 % mais por token** que N=16. O modelo
+de custo `13,9 + 6,04·N` previa ~6,05 ms/token em N=64 (o comentário do agente irmão registra
+"+10 %"); **mediu 12,48 — o dobro da previsão, modelo refutado.**
 
-1. **O teto de 16 é verificável no código e no comportamento da ferramenta** (acima).
-2. **O efeito de escala de chunk é grande e está medido no llama.cpp**: o GEMM tiled dele sai
-   de **1168,49 tok/s** (prompt inteira em 1 lote de 512) para **200,25 tok/s** (16 por lote) —
-   §1.3. Um chunk pequeno custa 5,84× **mesmo no kernel mais rápido que existe nesta placa**.
-3. **O nosso ponto de partida está medido**: 305 matvecs por chunk de 16 leem 11,133 GB e
-   custam **113,6 ms dentro do grafo** (7,103 ms/token), contra um piso de roofline de
-   11,133/0,633 = **17,6 ms**. Há 6,5× entre o medido e o piso de banda.
+A curva de custo marginal completo, juntando as duas corridas (`--batch 1,2,4,8,16` de 08:17 e
+`--batch 1,8,16,32,64` de 08:31; janelas diferentes, por isso os valores de N ≤ 16 diferem
+~9 % entre as duas):
 
-O caminho que fecha isto são ~30 linhas: instanciar `matvec_kernel_batch` para N = 24/32/48/64
-num alvo novo **appendado no fim do `CMakeLists.txt`** (regra §6.2 de `docs/noite-regras.md`),
-sem tocar no motor. A frente recebeu instrução explícita de não modificar o motor, então ficou
-como experimento nomeado com o número que o justifica.
+| N | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|
+| pass_ms (08:17) | 62,814 | 111,637 | — | — |
+| pass_ms (08:31) | 64,130 | 126,830 | 295,490 | 798,762 |
+| **marginal ms/token** (16 → N) | — | 6,11 | **9,73** | **11,77** |
+
+(O marginal sai de `(pass(N) − pass(16)) / (N − 16)` com a corrida de 08:31.)
+
+**Mecanismo, medido sem GPU adicional:** `acc[N][ILP]` são `N` acumuladores em registrador, e
+`hipFuncGetAttributes` mostra o preço — para `iq3_s`: **55 reg (N=8), 63 (N=16), 79 (N=32),
+133 (N=64)**, `localSizeBytes = 0` em todos (não é spill, é **ocupação**). Com `rows/CTA = 8`
+a grade é de **2 176 CTAs fixos** — não cresce com N — então o paralelismo que o lote compra é
+*mais trabalho por thread*, não mais threads; a partir de N≈16 o kernel vira latência/issue-bound
+e o ganho de amortização é revertido.
+
+**Consequência para o briefing:** a política de chunk do motor
+(`src/main.hip:162-183`, `kMaxBatch = 16`) **é ótima dentro do que o kernel oferece**. Aumentar
+o chunk não é uma alavanca: custa 16-57 % mais por token. O espaço que sobra está em mudar a
+forma aritmética do kernel (tiled/LDS/int8/WMMA), não em alimentá-lo com mais tokens.
+
+**O que continua não medido:** o prefill **de ponta a ponta** com chunks de 32/64. O `forward_batch`
+recusa `n > kMaxBatch = 16` (`graph.cuh:1349-1352`) e `prefill_ids` nunca gera chunk maior, então
+o número acima é do kernel isolado sobre o inventário real — a mesma forma de medir que produziu
+o `13,9 + 6,04·N` original, e diretamente comparável a ele. Como o andaime é ~0,09 ms/token,
+o efeito no prefill seria **−14 % (N=32) e −37 % (N=64)**: medido no kernel, derivado no prefill.
 
 ### 3.4 De onde vêm os 6,0 ms/token: custo marginal por tipo (medido)
 
@@ -597,7 +619,7 @@ Referência: llama.cpp 1113,96 tok/s = **0,898 ms/token**. Nosso: 8,104 ms/token
 | componente | nosso ms | llama.cpp ms (implícito) | delta | origem |
 |---|---|---|---|---|
 | **projeções/matvec (305 lançamentos por chunk)** | **7,103** | ≤ 0,898 | ≥ **+6,21** | nosso: *medido* (nível 2, N=128). llama: *derivado* — 0,898 ms/token é o teto do total dele, então a projeção dele é ≤ isso |
-| projeção do LM head (1 GEMV de `output.weight` por chunk, `graph.cuh:1416`) | **0,056** (*derivado*: intercepto de 0,163 s do §5.1 = 32 chunks × 5,1 ms de embeddings+head+norm+cópia, dos quais ~1,79 ms/chunk são o head) | ≤ 0,898 (contido na linha acima) | — | nosso: *derivado*. llama: *desconhecido* |
+| parte **fixa por chunk** fora do laço de camadas (embeddings, LM head de 1 token, `output_norm`, cópia dos logits) | **0,32** (*derivado*: intercepto de 0,163 s do §5.1 ÷ 32 chunks ÷ 16 tokens) | *desconhecido* | — | nosso: *derivado de medição* (ablação por `--layers`). llama: *desconhecido* |
 | `act_quant` (190 lançamentos por chunk) | 0,227 | *desconhecido* | — | nosso: *medido* (nível 2) |
 | `gdn_delta` | 0,641 | *desconhecido* | — | nosso: *medido* |
 | resto do GDN (`gdn_conv`, `gdn_l2norm`, `gdn_scalars`, `gdn_norm_silu`) | 0,242 | *desconhecido* | — | nosso: *medido* |
@@ -654,12 +676,14 @@ GB/s de roofline medido) enquanto o mesmo kernel no caminho por token usa 79-82 
    As colunas "llama.cpp" de §7.2/§7.3 são o **total medido** (200,25 ou 1168,49 tok/s) e nada
    além dele. Separar o GEMM do andaime lá exige profiler de GPU ou instrumentar o llama.cpp —
    nenhum dos dois foi feito.
-2. **O custo marginal de `matvec_kernel_batch` em N > 16 não foi medido.** O teto é de
-   compilação (`matvec.cuh:1011`, confirmado por `--batch 32` devolver pass_ms = 0,005). A
-   tentativa com um binário scratch (`/tmp/scratch/mb_batch_n*.hip`) falhou três vezes por
-   geometria do tensor sintético (ver §3.3) e o tempo da frente acabou. **O experimento que
-   fecha**: instanciar o mesmo kernel para N = 24/32/48/64 num alvo novo appendado no
-   `CMakeLists.txt` — ~30 linhas, sem tocar no motor.
+2. **O prefill de ponta a ponta com chunks de 32/64 não foi medido** — só o kernel isolado
+   (§3.3, medido depois de um agente irmão instanciar N=32/64 no lançador). `forward_batch`
+   recusa `n > kMaxBatch = 16` (`graph.cuh:1349-1352`) e `prefill_ids` nunca gera chunk maior,
+   então "N=64 custa +57 % por token no kernel" vira "−37 % no prefill" só por derivação
+   (andaime medido de 0,09 ms/token). Medir o prefill com chunk de 64 exigiria mexer em
+   `kMaxBatch`/`prefill_ids` — código do motor, fora do escopo desta frente.
+   A tentativa de fazer isso por fora (binário scratch, `/tmp/scratch/mb_batch_n*.hip`) falhou
+   três vezes por geometria do tensor sintético e está registrada em §3.3.
 3. **Nível 2 a 512 tokens não é executável** (460 800 `hipEvent_t`, o harness recusa). O matvec
    a 512 é o medido a 128, transferido porque o chunk é o mesmo.
 4. **Não há separação ablada de atenção × GDN dentro do `forward_batch`**: o modelo não tem
