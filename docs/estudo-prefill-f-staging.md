@@ -63,14 +63,18 @@ Consumo mínimo no lugar da conta: 8 leituras de LDS com índice dependente de `
 registrador que só é escrito sob uma guarda impossível — assim o compilador não pode provar que a
 LDS é desnecessária e apagar o staging (era o risco desta medição virar ficção).
 
-| M | tile | t_staging (modo 1) | G pesos/s | GB/s fonte | GB/s LDS (escrita) | G pesos/s por CTA | B/peso no LDS |
+| M | tile | t_staging (modo 1) | G pesos/s | GB/s fonte | GB/s fonte por CTA | GB/s LDS (escrita) | B/peso no LDS |
 |---|---|---|---|---|---|---|---|
-| 16 | BM16 BN128 BK64 | 0,214 ms | **417,2** | 179,3 | 834,4 | 3,07 | 2,0 |
-| 64 | BM64 BN128 BK64 | 0,255 ms | **349,2** | 150,1 | 698,5 | 2,57 | 2,0 |
-| 128 | BM128 BN128 BK64 | 0,514 ms | **173,5** | 74,6 | 347,0 | 1,28 | 2,0 |
-| 128 | BM64 × 2 fatias, BK64 | 0,441 ms | **404,6** (2× o peso) | 173,8 | 1 394,0 | — | 4,0 |
-| 128 | BM128, BK32 | 0,370 ms | **240,2** | 103,2 | 461,5 | — | 2,0 |
-| 512 | BM128 × 4 fatias, BK64 | 1,468 ms | **242,8** (4× o peso) | 104,3 | 485,6 | 0,45 | 8,0 |
+| 16 | BM16 BN128 BK64 | 0,214 ms | **417,2** | 179,3 | 1,32 | 834,4 | 2,0 |
+| 64 | BM64 BN128 BK64 | 0,255 ms | **349,2** | 150,1 | 1,10 | 698,5 | 2,0 |
+| 128 | BM128 BN128 BK64 | 0,514 ms | **173,5** | 74,6 | 0,55 | 347,0 | 2,0 |
+| 128 | BM64 × 2 fatias, BK64 | 0,441 ms | **404,6** (2× o peso/linha) | 173,8 | 0,64 | 1 394,0 | 4,0 |
+| 128 | BM128, BK32 | 0,370 ms | **240,2** | 103,2 | 0,76 | 461,5 | 2,0 |
+| 512 | BM128 × 4 fatias, BK64 | 1,468 ms | **242,8** (4× o peso/linha) | 104,3 | 0,19 | 485,6 | 8,0 |
+
+`t_staging` é o modo 1 (ativação + peso). Com BM < M o peso de cada linha é estagiado de novo por
+fatia de M, então a coluna de G pesos/s conta o trabalho **total** da passada — é o número que decide
+o custo, e é por isso que BM=64 aparece com o dobro de pesos estagiados em 0,44 ms.
 
 Leituras (todas com o comando da tabela acima, `--reps 5`, mínimo de 5):
 
@@ -110,9 +114,14 @@ operando). Grade: 136 CTAs por fatia de M.
 | 64 | BM64 BN128 BK64 RM4 RN8 | 0,688 | **8,29** | 16,6 | 2,61× | 68 % |
 | **128** | BM128 BN128 BK64 RM8 RN8 | 1,236 | **9,23** | 18,5 | **2,90×** | 75 % |
 | 128 | BM64 BN128 BK64 (2 fatias) | **1,165** | **9,79** | 19,6 | **3,08×** | 80 % |
-| 128 | BM128 BK32 | 1,242 | 9,19 | 18,4 | 2,89× | 75 % |
+| 128 | BM128 BK32 | 1,239 | 9,21 | 18,4 | 2,90× | 75 % |
 | 128 | BM128 BK32 + duplo buffer | 1,178 | 9,69 | 19,4 | 3,05× | 79 % |
 | 512 | BM128 BN128 BK64 (4 fatias) | 3,891 | **11,73** | 23,5 | 3,69× | 96 % |
+
+**Ruído entre janelas: ±1,5 %.** O mesmo binário, em outra janela de lock, deu 1,219 ms / 9,36 T em
+M=128 (contra 1,236 / 9,23), 3,815 / 11,96 em M=512 (contra 3,891 / 11,73) e 0,512 ms de staging
+(contra 0,514); dentro de uma mesma janela a repetição é de 0,1 % (medido em `--m 128,128,128`).
+Todos os números deste arquivo são o mínimo de 5 repetições depois de 600 ms de aquecimento.
 
 O melhor tile em M=128 é BM=64 e ele se repete entre janelas dentro de 1 % (9,79 T com verificação
 completa; 9,89 T numa janela posterior, com o mesmo binário). A geometria menor tem teto de issue

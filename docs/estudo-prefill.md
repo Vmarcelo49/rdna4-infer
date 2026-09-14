@@ -286,6 +286,38 @@ aqui.
 prefill a 512 tokens seria **446 tok/s** contra os 123,4 nossos — **3,6× de espaço, todo ele na
 *forma* do kernel** (o protótipo do P0 chegou a 12,74 T MAC/s = 3,99× em M=512).
 
+## 3e. O protótipo com os blocos REAIS (frente F) — e por que o staging é o alvo
+
+`tests/bench_gemm_quant_gpu.hip` (frente F) pegou o `blk.3.ffn_up.weight` real (iq3_s, 38,3 MB,
+**0,4297 B/peso**), dequantizou para **f16 na LDS** e rodou o laço interno em `v_dot2_f32_f16` com
+acumulador f32:
+
+| M | T-MAC/s | vs o motor (3,18 T) |
+|---|---|---|
+| 16 | 4,45 | 1,40× |
+| 64 | 8,29 | 2,61× |
+| **128** | **9,23** (melhor tile: 9,79) | **2,90-3,08×** |
+| 512 | 11,73 | 3,69× |
+
+| achado | número |
+|---|---|
+| **staging real** | **0,514 ms de um kernel de 1,165 ms em M=128 = 42 %**, 173,5 G pesos/s, 74,6 GB/s de fonte contra 633 do cartão |
+| natureza do staging | **latência**, não banda nem issue: ocupa ~2 % dos slots de issue |
+| f16-dot2 × int8-dp4a (A/B na mesma janela) | **9,23 contra 10,11 T em M=128 (−8,7 %)**, 11,73 contra 12,76 em M=512 (−8,1 %), 4,45 contra 3,62 em M=16 (+23 %) |
+| miolo f16 | 18,84 T em M=512 = **97 % do teto de issue do `dot2`** naquele tile (0,625 instrução/MAC) |
+| miolo dp4a | 12,76 T = **33 % do teto dele** (39,0 T) |
+| precisão do staging f16 | reproduz o dequant do motor **bit a bit** depois do arredondamento f16 (0/2048 bits), erro relativo máx 4,32e-4 = 2⁻¹¹; GEMM ponta a ponta rel-L2 2,07e-4 |
+
+Duas conclusões que fecham o desenho do D2/D4:
+
+1. **No caminho vetorial, f16 não ganha do int8** — e o f16 já está a 97 % do muro dele, enquanto o
+   dp4a está a 33 % do dele. Ou seja: **o D2 deve ser int8/dp4a** (que também é o caminho
+   bit-exato), e o f16 só se justifica como ponte para o WMMA f16 — que por sua vez é 1,9× mais
+   lento que o WMMA int8 neste cartão.
+2. **O alvo a atacar chama-se staging**: 42 % do kernel, limitado por latência. É o degrau D3, e é
+   ele que decide se o caminho de dados chega perto dos 32,7 T-MAC/s do llama.cpp ou para nos
+   10-13 T.
+
 ## 5b. Até onde vai o caminho vetorial (o muro de issue) — e por que a saída é a unidade de matriz
 
 A frente B fechou a conta que o protótipo sugeria: os 12,74 T MAC/s do `bench-gemm-gpu` são
