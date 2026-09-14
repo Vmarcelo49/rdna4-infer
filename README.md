@@ -447,34 +447,29 @@ Ordered by how much they cost the user, with the number that justifies each. Not
    anyone not spending that headroom on MTP. Note that **perplexity does not order these
    formats**: `q5_0`/`q4_0` beats `q5_0`/`q4_1` on PPL (5.932 vs 5.958) while having 23 % more
    KL and nearly double the greedy divergence — PPL is blind to this, KL is not.
-3. **MTP (block 64) now pays, modestly and honestly: 1.18× at 4K, 1.14× at 16K, with the
-   output byte-identical to greedy.** The NextN head drafts at 67.9 % acceptance; the missing
-   piece was **batched verification**, and it is what the night built: draft `k` tokens, verify
-   all `k+1` rows in **one** `forward_batch_all` (the weight pass is shared), accept the longest
-   prefix, and roll the recurrent state back with a device-to-device snapshot when a draft is
-   rejected.
+3. **MTP (block 64) works and is exact, but whether it pays depends on the *batched* path
+   being fast — and on the final tree it does not, yet.** Batched verification exists and is
+   correct: `--mtp` output is **byte-identical to plain greedy** (`md5` of stdout, every mode,
+   every prompt tested), the recurrent-state rollback is bit-exact (`max|d| = 0`) at 0.54 ms
+   per snapshot+restore pair, and a verified row costs 8.0 ms against 34.4 ms for a whole
+   per-token step. Two sets of measurements disagree about the payoff, and both are in the repo:
 
-   | context | mode | tok/s | vs greedy | acceptance | rows/round |
-   |---|---|---|---|---|---|
-   | 4K | plain greedy | 29.37 | 1.00× | — | — |
-   | 4K | `--mtp --draft 2` (batched) | **34.56** | **1.18×** | 67.9 % | 2.96 |
-   | 4K | `--mtp --draft 3` (batched) | 30.11 | 1.03× | 52.1 % | 3.92 |
-   | 4K | `--mtp --draft 3 --mtp-serial` | 25.85 | 0.88× | 58.2 % | — |
-   | 16K | `--mtp --draft 3` (batched) | **30.53** | **1.14×** | 67.7 % | 3.95 |
+   | measured on | greedy | `--mtp --draft 2` | `--draft 3` | note |
+   |---|---|---|---|---|
+   | the MTP branch (before the kernel merge) | 29.37 | **35.69 = 1.22×** | 30.11 = 1.03× | 3996-token prompt, 68 % acceptance |
+   | the final merged tree (this table's tree) | 32.27 | **31.03 = 0.96×** | 25.69 = 0.80× | 3683-token prompt, same md5 output |
 
-   Exactness is checked by `md5` of stdout, not by eye: `--mtp` and plain greedy produce the
-   same bytes at 4K and at 16K, in every variant. The pieces are measured too: the state
-   snapshot/restore is bit-exact (`max|d| = 0`, same argmax) at 0.53 ms per pair, an extra
-   verified row costs 7.0-7.2 ms against 32.7 ms for a whole per-token step, and the contrast
-   `0.88×` (serial, the only path that existed before tonight) → `1.18×` (batched) is the
-   evidence that the win comes from batching the verification, not from the draft.
-
-   **A warning about this number, because it was wrong once tonight.** An earlier measurement
-   in the same session reported 1.71-1.75×: it compared against a baseline broken by the bug
-   below, and the degenerate text that baseline produced ("actor actor actor…") *inflated the
-   acceptance rate* from 67.9 % to 88.9 %. Two lessons are now in the repo: a speedup is only
-   as good as the baseline it was measured against, and the acceptance rate is a quality proxy
-   that a broken engine can game. `docs/mtp.md`, `docs/medicoes-m8.md`.
+   They are both real, and the difference has a cause: the kernel work landed **after** the MTP
+   measurement and made the **per-token** path 17 % faster without making the **batched** path
+   faster — the batched matvec still reads 12 GB per 16-token chunk at 109 GB/s against 446 GB/s
+   for the same weights per token. MTP's verify is a batched forward, so its advantage shrank
+   from 1.22× to 0.96× while the machine got faster. That also explains the one case where the
+   mechanism clearly wins today: on code-like text the draft acceptance is 95 % and the same
+   code measures **2.03×** (61.7 vs 30.1 tok/s); on prose the acceptance is 68 % and every
+   rejected round pays a second trunk pass.
+   **Conclusion for the next session:** MTP's multiplier is gated on the batched matvec, not on
+   the MTP machinery — fix `matvec_kernel_batch` (the open item below) and the 1.2-2.0× becomes
+   visible on prose too. `docs/mtp.md`, `docs/journal-mtp.md` §9.
 4. **Long context works but the GQA re-read is still per query head**: with a 6:1 ratio each
    K/V row is read **6 times** per token (25.77 GB of logical KV traffic at 64K against
    4.295 GB of unique bytes). The attention kernel saturates ~1.35 TB/s of L2, so the L2 hides

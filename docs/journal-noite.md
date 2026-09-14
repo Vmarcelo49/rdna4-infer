@@ -263,6 +263,27 @@ diferença vinha de um chute de 1 GiB de overhead e de contar o bloco MTP que n�
   constante em 24 ms/token, e a banda emitida cai para 378 GB/s a 131K `q4_0` — confirma que ali
   a atenção é *issue*, não banda.
 
+### C14. MTP: 1,22× numa árvore e 0,96× na árvore final — e a causa é o caminho em lote
+- **Frente MTP (medido antes do merge dos kernels)**: 4K, prompt de 3996 tokens, ganancioso
+  29,37 tok/s → `--draft 2` **35,69 (1,22×)**, `--draft 3` 30,11 (1,03×), serial 25,85 (0,88×);
+  16K → `--draft 3` **30,53 (1,14×)**. No corpus de regressão: `kCode` **2,03×** com aceitação
+  de 95,2 %, `short` 1,50×, `kCjk` 1,16×, `kProse` 1,11×. Exatidão por md5 em todas as linhas.
+- **Coordenador (árvore final, com todos os merges)**: mesmo prompt de wiki (3683 tokens, ctx
+  4096, 64 tokens gerados): ganancioso **32,27** → `--draft 2` **31,03 (0,96×)** → `--draft 3`
+  **25,69 (0,80×)**, com **md5 idêntico** nos três (exatidão confirmada de novo).
+- **A causa, e ela é coerente**: o merge dos kernels (+17 % no decode por token: LUT em LDS,
+  `delta_rule` float4, `rms_norm`) veio **depois** da medição da frente MTP e **não toca o
+  caminho em lote** — o matvec em lote continua lendo 12 GB por chunk de 16 a 109 GB/s contra
+  446 GB/s por token. A verificação do MTP é um forward em lote, então o ganho relativo caiu de
+  1,22× para 0,96× **enquanto a máquina ficava mais rápida**.
+- **O que isso significa**: o multiplicador do MTP está preso ao **matvec em lote**, não à
+  maquinaria do MTP (que está correta e bit-exata). Com aceitação de 95 % (texto de código) o
+  mesmo código mede 2,03×. O item aberto mais valioso da noite passa a ser duplo: ele destrava
+  o prefill (83,7 % do custo) **e** o MTP.
+- **Veredito**: a tarefa 2 entrega o mecanismo funcionando e exato, com o teto **medido** nos
+  dois regimes; o ganho em prosa depende do item acima, e isso está escrito no README com as
+  duas medições lado a lado, em vez de escolher a mais conveniente.
+
 ## Estado do alvo (atualizado pelo coordenador)
 
 - **131K**: ainda não medido nesta rodada. No baseline, 131K com KV `q4_0` roda a 14,0 tok/s
