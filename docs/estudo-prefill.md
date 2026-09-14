@@ -4,17 +4,29 @@ Pergunta do usuário, literal: *"how does llama.cpp prefill is 9 to 10 times fas
 did we skip? what should we port or optimize?"*. Este arquivo é o documento-síntese do dia; cada
 frente tem o seu relatório (`docs/estudo-prefill-{a-vulkan,b-mmq,c-nosso,d-wmma}.md`).
 
-## TL;DR — o gap tem TRÊS fatores, todos medidos nesta máquina
+## TL;DR — o gap tem três fatores medidos, e o maior é o tamanho do lote
 
 | fator | de → para | ganho | como foi medido |
 |---|---|---|---|
-| **1. tamanho do micro-lote** | chunk de 16 → 512 tokens | **2,39×** | `llama-bench -b/-ub`: o **próprio llama.cpp** cai de 1168,49 para **200,25 tok/s** quando o micro-lote desce de 512 para 16 (frente C) |
-| **2. estrutura do kernel** | GEMV em lote → GEMM tilejado com LDS | **1,62×** (em M=16) / **3,9×** (em M≥128) | protótipo `bench-gemm-gpu` verificado: 3,46 T MACs/s em M=16 (1,08× o nosso!) contra **12,74 T em M=512** (104 % do llama.cpp sem coopmat) |
-| **3. unidades de matriz** | dp4a → coopmat/WMMA | **2,50×** | `GGML_VK_DISABLE_COOPMAT=1`: 1196,49 → **478,38 tok/s** (mesma forma de tile, mesma precisão de referência) |
+| **1. micro-lote** | chunk de 16 → 512 tokens | **2,39×** | `llama-bench -b/-ub`: o próprio llama.cpp cai de 1168,49 para **200,25 tok/s** quando o micro-lote desce para 16 (frente C) |
+| **2. caminho de dados** | GEMV em lote → GEMM tilejado com staging na LDS | **3,2-4,3×** em M=64-128 | dois protótipos independentes: **12,74 T-MAC/s** (int8/dp4a, M=512, verificado contra oráculo) e 10,3-13,7 (WMMA f16, M=64) contra 3,0-3,2 do motor |
+| **3. unidades de matriz** | dp4a → WMMA | teto **4,2×** (182 contra 44 T-MAC/s) | A/B do llama.cpp (`GGML_VK_DISABLE_COOPMAT`: 1196 → 478) + pico medido no cartão (frente D) |
 
-1,62 × 2,39 × 2,50 = **9,68×**, contra os **9,66×** medidos de ponta a ponta (1196,49 contra
-123,68). **A maior alavanca isolada não é o kernel: é o chunk de 16 tokens** — e ela é
-*pré-requisito* da segunda, porque em M=16 um GEMM tilejado não ganha nada (medido: 1,08×).
+E a frase que corrige o plano que eu tinha escrito de manhã, dita pela própria frente D:
+**"WMMA compra teto, não velocidade."** Com o caminho de dados como está, trocar a instrução não
+acelera nada — 58-94 % do tempo dos dois protótipos é *staging*, e o staging roda a **280 GB/s de
+633** porque lê 64 B por linha de peso com stride de 5120 B. A ordem certa é **dados primeiro,
+instrução depois** — mas a instrução é necessária no fim, porque o llama.cpp faz **32,7 T-MAC/s =
+74 % do pico do dp4a** deste cartão, e nenhum protótipo de dp4a passou de 29 %.
+
+### Os picos medidos neste cartão (frente D, dentro da mesma corrida)
+
+| laço | T-MAC/s | TOPS | nota |
+|---|---|---|---|
+| WMMA int8 16×16×16 | **182** | 364 | 4,2× o dp4a; **1,9× o f16** |
+| WMMA f16 16×16×16 (acc f32) | 89,6 | 179 | é o que o Vulkan usa no prefill |
+| dp4a (`v_dot4_i32_iu8`) | **44** | 88 | o que nós usamos |
+| misto (1 WMMA + 8 dp4a) | — | — | 1,00-1,16× a soma: **não são pipes separados** |
 
 ### A frase que resume o "o que foi pulado"
 
