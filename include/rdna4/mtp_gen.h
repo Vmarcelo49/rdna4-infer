@@ -200,9 +200,14 @@ inline bool mtp_generate(Graph &g, MtpHead *mtp, const std::function<bool(std::i
     hs.push_back(h_prev);
 
     // A round commits 1..D_eff+1 tokens at positions pos+1..pos+1+len(decisions),
-    // so it needs D_eff+2 free positions.
+    // so it needs D_eff+2 free positions — and it must not commit past
+    // n_predict, or the CLI would stream bytes the plain path never produces
+    // (found by the wikitext A/B: the streaming callback fires on commit, so an
+    // overshooting round cannot be fixed up by truncating `gen` afterwards).
     const int room = ctx_size - (pos + 1);
-    const int D_eff = std::min(D, std::max(0, room - 1));
+    const int room_pred = (int)((long long)p.n_predict - (long long)gen.size());
+    const int D_eff =
+        std::min(D, std::min(std::max(0, room - 1), std::max(0, room_pred - 1)));
     std::vector<std::int32_t> draft((std::size_t)std::max(1, D_eff), 0);
     if (D_eff == 0) {
       // no room left to verify a draft: keep the block's cache in step and
@@ -294,9 +299,11 @@ inline bool mtp_generate(Graph &g, MtpHead *mtp, const std::function<bool(std::i
 
   st.wall_ms = (now_s() - wall0) * 1000.0;
   if ((long long)gen.size() > (long long)p.n_predict) {
-    // a speculative round can overshoot the request; every committed token is
-    // the trunk's own greedy token, so truncating keeps the prefix identical
-    gen.resize((std::size_t)p.n_predict);
+    // The round clamp above makes this unreachable; if it ever fires, truncating
+    // would silently hide a mismatch with plain greedy decode, so fail loudly.
+    err = "mtp_generate: a round overshot n_predict (" + std::to_string(gen.size()) + " > " +
+          std::to_string(p.n_predict) + ")";
+    return false;
   }
   return true;
 }
