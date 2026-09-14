@@ -107,3 +107,61 @@ Interruptor de A/B **no binário**: `RD_PREFILL_BATCH=0` volta ao andaime por to
 (ver §2.4 — preenchido com a corrida `/tmp/ab-prefill.log`)
 
 ---
+
+## 3. Orçamento por fase do prefill em lote (DEPOIS do §2) — o matvec é 70 %
+
+- **Comando**: `./build/bench-phases-gpu IQ3_S --prefill 16|64 --level 2` e `--count-only`
+  (janela: VRAM em repouso 198 MB antes; durante a série houve atividade de outra frente em
+  parte das corridas — anotado; as duas passadas de cada configuração concordam dentro de
+  0,5 %, então o número é utilizável).
+- **Resultado** (N=16, passada limpa 9,505 ms/token = 105,2 tok/s; instrumentada 9,957 ms/token,
+  inflação +4,8 % com 93,1 marcas/token; um `hipEventRecord` custa 4,04 µs nesta medição):
+
+  | bucket | ms/token | % | marcas/token | o que é |
+  |---|---|---|---|---|
+  | **matvec** | **6,926** | **70,4 %** | 31,0 | 496 matvecs em lote por chunk de 16 + o head |
+  | **gdn_delta** | **2,186** | **22,2 %** | 3,0 | `delta_rule_batch` nas 48 camadas GDN |
+  | act_quant | 0,200 | 2,0 % | 20,1 | 322 quantizações em lote por chunk |
+  | ffn_residual | 0,089 | 0,9 % | 4,0 | |
+  | post_norm | 0,084 | 0,9 % | 4,0 | |
+  | gdn_l2norm | 0,070 | 0,7 % | 3,0 | |
+  | gdn_scalars / norm_silu / conv | 0,052 / 0,052 / 0,051 | 1,5 % | 3,0 cada | |
+  | qk_norm_rope_kv / attention / attn_gate_out | 0,032 / 0,030 / 0,012 | 0,8 % | 1,0 cada | |
+  | ffn_gate_up / ffn_down / gdn_proj / gdn_out_proj / qkv_proj / attn_out_proj | ≤ 0,017 cada | 0,7 % | | |
+
+  Contagem de lançamentos: **93,1 marcas/token = 1490 por chunk de 16** (era 13 168 por chunk
+  antes, ou 823/token). O andaime deixou de ser "muitos lançamentos curtos" e virou
+  "dois kernels grandes".
+- **Leitura** (a parte que muda o plano da noite): o gargalo do prefill **não é mais o andaime**,
+  é o **matvec em lote**. 496 matvecs de lote por chunk custam 110 ms para ler 12,0 GB de pesos
+  ⇒ **109 GB/s efetivos**, contra **446 GB/s** do mesmo matvec no caminho por token (24,94 ms
+  para 11,13 GB). Ou seja: o kernel em lote amortiza a LEITURA do peso entre 16 tokens (ganho
+  medido 3,6× por token), mas o **trabalho de ALU por byte multiplica por 16** e ele fica
+  limitado por issue, não por banda — 4× abaixo da eficiência que o mesmo código tem no decode.
+  Consequência para a noite: o teto do prefill com este matvec é ~105 tok/s; para passar disso é
+  preciso o caminho tiled/MMQ (int8/WMMA), que **não** é desta frente (`matvec.cuh` pertence à
+  frente de kernels) — este parágrafo é o pedido de encaminhamento.
+- **Veredito**: medido. O bucket `gdn_delta` (22 %) é o que sobra na minha mão e é o §4.
+
+---
+
+## 4. `delta_rule` em lote: linha do estado com float4
+
+- **Referência**: `include/rdna4/gdn.cuh` (estado transposto: `M[j*S+i]`, uma thread por linha `j`)
+  e a medida de §3 (`gdn_delta` = 2,19 ms/token = 22 % do prefill).
+- **Hipótese**: thread `j` lê `row[i]` e as 32 threads da warp leem endereços a **512 B** de
+  distância: cada acesso de 4 B puxa um setor de 32 B ⇒ **8× de amplificação**, e a linha é
+  varrida 2× por token (leitura+escrita em cada passada). Quatro elementos por acesso (float4)
+  derrubam a amplificação para 2× e o número de instruções do laço serial por 4, **sem tocar na
+  aritmética**: as quatro FMAs de um vetor continuam saindo em ordem crescente de `i`, então o
+  arredondamento da soma é o mesmo. Ganho esperado: o bucket de 2,19 ms/token cai para ~0,6-1,1.
+- **Comando**: `./build/check-batch-gpu` + `./build/rdna4-infer bench --prefill 512
+  --prefill-reps 3` + `bench-phases-gpu --prefill 16 --level 2` (janela: ver §4.1).
+- **Resultado**: ver §4.1 (preenchido com `/tmp/vec-check.log`).
+- **Veredito**: ver §4.1.
+
+### 4.1 Números
+
+(ver §4.1 na corrida `/tmp/vec-check.log`)
+
+---

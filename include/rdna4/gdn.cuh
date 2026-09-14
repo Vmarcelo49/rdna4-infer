@@ -182,7 +182,15 @@ inline bool conv1d_state_batch_launch(const float *d_qkv, const float *d_w, floa
 //
 // Per token, per row, the body is the per-token kernel's body word for word:
 //   S *= exp(gate); delta = (v - <M,k>) * beta; M += k*delta; out = <M,q>/sqrt(S)
-template <int ROWS>
+//
+// VEC=true walks the row with float4 loads/stores: thread j owns row j, so a
+// warp's 32 lanes touch addresses 512 B apart and each 4-byte access pulls a
+// whole 32 B sector (8x amplification, and the row is walked twice per token).
+// Four elements per access cuts that to 2x and cuts the instruction count of the
+// serial i-loop by 4 without touching the arithmetic: the four FMAs of one vector
+// are still issued in increasing i order, so the accumulation rounds exactly as
+// the scalar loop did.
+template <int ROWS, bool VEC>
 __global__ void delta_rule_batch_rows_kernel(const float *__restrict__ qk,
                                              const float *__restrict__ v,
                                              const float *__restrict__ gate,
@@ -190,26 +198,55 @@ __global__ void delta_rule_batch_rows_kernel(const float *__restrict__ qk,
                                              float *__restrict__ state, float *__restrict__ out,
                                              int n_k_heads, int S, int n_vh, int key_dim,
                                              int d_inner, int n) {
-  const int h = blockIdx.x;                 // value head
+  const int h = blockIdx.x;                       // value head
   const int j = blockIdx.y * ROWS + threadIdx.x;  // row index (value dim)
   if (j >= S) return;
-  const int kh = h % n_k_heads;             // repeated key head
+  const int kh = h % n_k_heads;  // repeated key head
   const float *kb = qk + key_dim + (std::int64_t)kh * S;
   const float *qb = qk + (std::int64_t)kh * S;
   float *row = state + ((std::int64_t)h * S + j) * S;
+  const int i4n = VEC ? (S & ~3) : 0;
+
   for (int t = 0; t < n; ++t) {
     const float *kd = kb + (std::int64_t)t * 2 * key_dim;
     const float *qd = qb + (std::int64_t)t * 2 * key_dim;
     const float g = expf(gate[(std::int64_t)t * n_vh + h]);
     const float b = beta[(std::int64_t)t * n_vh + h];
     float sum = 0.0f;
-    for (int i = 0; i < S; ++i) {
+    for (int i = 0; i < i4n; i += 4) {
+      float4 r = *reinterpret_cast<const float4 *>(row + i);
+      const float4 kk = *reinterpret_cast<const float4 *>(kd + i);
+      r.x *= g;
+      r.y *= g;
+      r.z *= g;
+      r.w *= g;
+      *reinterpret_cast<float4 *>(row + i) = r;
+      sum = fmaf(r.x, kk.x, sum);
+      sum = fmaf(r.y, kk.y, sum);
+      sum = fmaf(r.z, kk.z, sum);
+      sum = fmaf(r.w, kk.w, sum);
+    }
+    for (int i = i4n; i < S; ++i) {
       row[i] *= g;
       sum = fmaf(row[i], kd[i], sum);
     }
     const float delta = (v[(std::int64_t)t * d_inner + (std::int64_t)h * S + j] - sum) * b;
     float acc = 0.0f;
-    for (int i = 0; i < S; ++i) {
+    for (int i = 0; i < i4n; i += 4) {
+      const float4 kk = *reinterpret_cast<const float4 *>(kd + i);
+      const float4 qq = *reinterpret_cast<const float4 *>(qd + i);
+      float4 r = *reinterpret_cast<const float4 *>(row + i);
+      r.x = fmaf(kk.x, delta, r.x);
+      r.y = fmaf(kk.y, delta, r.y);
+      r.z = fmaf(kk.z, delta, r.z);
+      r.w = fmaf(kk.w, delta, r.w);
+      *reinterpret_cast<float4 *>(row + i) = r;
+      acc = fmaf(r.x, qq.x, acc);
+      acc = fmaf(r.y, qq.y, acc);
+      acc = fmaf(r.z, qq.z, acc);
+      acc = fmaf(r.w, qq.w, acc);
+    }
+    for (int i = i4n; i < S; ++i) {
       row[i] = fmaf(kd[i], delta, row[i]);
       acc = fmaf(row[i], qd[i], acc);
     }
@@ -217,17 +254,22 @@ __global__ void delta_rule_batch_rows_kernel(const float *__restrict__ qk,
   }
 }
 
-// rows per CTA: S when S <= 128 (one CTA per head, the per-token geometry), else
-// split. 32 rows = 16 KiB of state per CTA, which is what keeps the row working
-// set inside L1/L2 for the whole chunk.
+// rows per CTA: 32 rows = 16 KiB of state per CTA, which is what keeps the row
+// working set inside L1/L2 for the whole chunk.
 inline bool delta_rule_batch_launch(const float *d_qk, const float *d_v, const float *d_gate,
                                     const float *d_beta, float *d_state, float *d_out,
                                     int n_v_heads, int n_k_heads, int S, int n_vh, int key_dim,
                                     int d_inner, int n, hipStream_t stream = nullptr) {
   constexpr int kRows = 32;
   const unsigned ny = (unsigned)((S + kRows - 1) / kRows);
-  delta_rule_batch_rows_kernel<kRows><<<dim3((unsigned)n_v_heads, ny), kRows, 0, stream>>>(
-      d_qk, d_v, d_gate, d_beta, d_state, d_out, n_k_heads, S, n_vh, key_dim, d_inner, n);
+  const dim3 grid((unsigned)n_v_heads, ny);
+  if ((S & 3) == 0) {
+    delta_rule_batch_rows_kernel<kRows, true><<<grid, kRows, 0, stream>>>(
+        d_qk, d_v, d_gate, d_beta, d_state, d_out, n_k_heads, S, n_vh, key_dim, d_inner, n);
+  } else {
+    delta_rule_batch_rows_kernel<kRows, false><<<grid, kRows, 0, stream>>>(
+        d_qk, d_v, d_gate, d_beta, d_state, d_out, n_k_heads, S, n_vh, key_dim, d_inner, n);
+  }
   return hipGetLastError() == hipSuccess;
 }
 
