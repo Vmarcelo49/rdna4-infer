@@ -42,7 +42,7 @@ fatores, e nenhuma conclusão — só a âncora absoluta cai 11 %. A lição de 
 
 | fator | de → para | ganho | como foi medido |
 |---|---|---|---|
-| **1. micro-lote** | chunk de 16 → 512 tokens | **2,50×** (limpo: 426,03 → 1054,29) | `llama-bench -b/-ub`: o próprio llama.cpp cai de **1054,29 para 170,43 tok/s** quando o micro-lote desce para 16 |
+| **1. micro-lote** | chunk de 16 → 512 tokens | **2,50×** (limpo: 170,43 → 426,03, com o coopmat desligado dos dois lados) | `llama-bench -b/-ub`: o próprio llama.cpp cai de **1054,29 para 170,43 tok/s** quando o micro-lote desce para 16 |
 | **2. caminho de dados** | GEMV em lote → GEMM tilejado com staging na LDS | **3,2-4,3×** em M=64-128 (e 1,38× no micro-lote igual, do lado deles) | dois protótipos independentes: **12,74 T-MAC/s** (int8/dp4a, M=512, verificado contra oráculo) e 10,3-13,7 (WMMA f16, M=64) contra 3,0-3,2 do motor |
 | **3. unidades de matriz** | dp4a → WMMA | **2,47×** medido no llama.cpp (1054,29 vs 426,03); teto **4,2×** no cartão (182 contra 44 T-MAC/s) | A/B do binário limpo (`GGML_VK_DISABLE_COOPMAT`) + pico medido (frente D) |
 
