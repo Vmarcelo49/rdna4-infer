@@ -400,15 +400,22 @@ Ordered by how much they cost the user, with the number that justifies each. Not
    overestimate the second one by 3.7×. The matvec is *not* the whole
    story: inside `forward_batch` the weight pass is shared across the 16-token chunk, but the
    attention, the GDN recurrence, the norms and the elementwise chains still run **per token**
-   (~11 ms/token of scaffolding, measured in `docs/medicoes-banda-e-gargalos.md` §1), which is
-   ~80 % of prefill time. Even with an infinitely fast matvec that scaffolding caps prefill
-   near 145 tok/s — a bound the night already beat by batching, which moved the ceiling too.
-   What is left is the batched matvec itself: it re-runs the dequantization/LUT/sign assembly
-   once per token (`matvec.cuh` `matvec_kernel_batch`), reading 12 GB per 16-token chunk at
-   **109 GB/s** against 446 GB/s for the same weights on the per-token path. Hoisting the
-   block dequantization out of the token loop is bit-exact and worth an estimated 2-2.5×
-   (≈200 tok/s); past that the route is a tiled MMQ-style int8 kernel (weights in LDS, WMMA
-   int8 — possible on this card, gives up bit-exactness, needs numeric gating).
+   (~11 ms/token of scaffolding, measured in `docs/medicoes-banda-e-gargalos.md` §1).
+   **Where prefill time actually goes was measured on the real inventory of 497 tensors**
+   (`docs/journal-lote.md`, `bench-matvec-shapes-gpu --batch`): the batched pass costs
+   **`13.9 ms + 6.04 ms per token`**. The weight side is already near the roofline (11.1 GB per
+   pass at ~800 GB/s effective, partly Infinity-Cache-served) and **does not improve with N**;
+   what does not amortize is the 6.04 ms per token — 85.6 % of the measured 8.08 ms/token of
+   prefill. At 512 tokens in 32 sub-batches of 16 that is 3.54 s of matvec out of 4.14 s.
+   Three candidate causes were measured and **refuted**: the activation re-read traffic
+   (letting all 16 tokens share one L1-resident activation row buys 5 %), the bit-exact
+   `UNROLL` MLP knob that won on the per-token path (5.6 % **worse** at N=16), and register
+   spilling (`localSizeBytes = 0` on all 14 types × N ≤ 16). Earlier estimates in this repo
+   that blamed per-token re-dequantization or a hoist worth 2-2.5× are **wrong** — the ISA
+   showed the compiler already hoists the whole weight side once per block. What is left is a
+   different arithmetic shape: a register tile in M (one activation load feeding several output
+   rows, bit-exact by the same argument that makes `ROWS` free) or `WMMA i32_16x16x16_iu8`
+   (possible on this card, unlike MFMA — no bit-exactness, needs numeric gating).
 2. **The KV cache has a cliff, not a curve — and at 131K the format buys quality, not
    speed.** IQ3_S + `f16` KV fits to 48K; at 64K it spills ~2.1 GB into GTT and decode
    collapses from ~18 to **2.16-7.97 tok/s** with no error message, and `f16` at 131K does
@@ -461,15 +468,22 @@ Ordered by how much they cost the user, with the number that justifies each. Not
 
    They are both real, and the difference has a cause: the kernel work landed **after** the MTP
    measurement and made the **per-token** path 17 % faster without making the **batched** path
-   faster — the batched matvec still reads 12 GB per 16-token chunk at 109 GB/s against 446 GB/s
-   for the same weights per token. MTP's verify is a batched forward, so its advantage shrank
-   from 1.22× to 0.96× while the machine got faster. That also explains the one case where the
-   mechanism clearly wins today: on code-like text the draft acceptance is 95 % and the same
-   code measures **2.03×** (61.7 vs 30.1 tok/s); on prose the acceptance is 68 % and every
-   rejected round pays a second trunk pass.
-   **Conclusion for the next session:** MTP's multiplier is gated on the batched matvec, not on
-   the MTP machinery — fix `matvec_kernel_batch` (the open item below) and the 1.2-2.0× becomes
-   visible on prose too. `docs/mtp.md`, `docs/journal-mtp.md` §9.
+   faster. The batched matvec was then measured properly, and the cost model is
+   **`pass_ms ≈ 13.9 + 6.04·N`** over the real 497-tensor inventory: the weights amortize into a
+   fixed 13.9 ms per pass, but **every extra token still costs 6.04 ms** and that part does not
+   amortize. That single number predicts both MTP results: verifying 2 tokens costs 23.96 ms
+   against 21.32 ms for one per-token step (**1.12×**), so the break-even acceptance is 56 % —
+   prose sits at 68 % (1.22×) and code at 95 % (2.03×). MTP's multiplier is therefore
+   `2·acceptance / 1.12`, not a mystery and not a bug in the MTP machinery.
+   **Conclusion for the next session:** MTP's multiplier is gated on the **marginal** per-token
+   cost of the batched matvec, not on the MTP machinery. The obvious fixes were tried and
+   refuted (`docs/journal-lote.md`): the activation re-read traffic is **not** the limit (forcing
+   all 16 tokens to share one L1-resident activation row buys only 5 %), the bit-exact `UNROLL`
+   that won on the per-token path is **5.6 % worse** here, and no instantiation spills a single
+   byte to scratch. What is left is changing the arithmetic shape — a register tile in M so one
+   activation load feeds several output rows, or `WMMA i32_16x16x16_iu8` (present on gfx1201,
+   unlike MFMA) — not further tuning of this kernel. `docs/mtp.md`, `docs/journal-mtp.md` §9,
+   `docs/journal-lote.md`.
 4. **Long context works but the GQA re-read is still per query head**: with a 6:1 ratio each
    K/V row is read **6 times** per token (25.77 GB of logical KV traffic at 64K against
    4.295 GB of unique bytes). The attention kernel saturates ~1.35 TB/s of L2, so the L2 hides

@@ -360,3 +360,28 @@ Além dessas, os achados `F11` (números do README contra os docs, 5 de 12 com p
 - **Os 196 itens com `v = M`**: foram extraídos mecanicamente com grep por linha (não inventei
   nenhum ponteiro), mas eu não os re-li um a um. Os 39 com `v = V` são os que sustentam o topo do
   ranking e o meu próprio trabalho.
+
+---
+
+## Fechado/refutado em 14/09 08:40 (depois do fechamento da noite) — `docs/journal-lote.md`
+
+- **FECHADO COM CAUSA**: `matvec_kernel_batch` (item de maior valor do backlog). O modelo medido
+  é `pass_ms ≈ 13,9 + 6,04·N` sobre os 497 tensores reais: o peso amortiza, o token não. O custo
+  marginal de 6,04 ms/token é 85,6 % do prefill e explica o multiplicador do MTP
+  (`2·aceitação/1,12`). Ferramenta nova: `bench-matvec-shapes-gpu --batch/--batch-unroll/--batch-cap`.
+- **REFUTADO (não voltar sem medida nova)**: (a) staging de ativação em LDS como alavanca nº 2 do
+  `journal-kernels.md` §10 — o controle `act_stride=0` (16 tokens na MESMA linha residente na L1)
+  dá 95,0 %, não metade; (b) `UNROLL` bit-exato no lote — 62,61/62,96/63,18 ms (N=8) e
+  110,17/**116,87**/111,44 ms (N=16) contra 110,70 do shipping, ou seja 5,6 % PIOR; (c) transbordo
+  de registrador — `localSizeBytes = 0` em 14 tipos × N ∈ {2,4,8,16}.
+- **NOVO, nomeado com o número**: custo marginal por token por tipo de quantização (filtro
+  `--only-dt` no bench). Se o custo marginal for proporcional ao número de *elementos* (volume de
+  ativação = `Σ nrows×K` ≈ 30 GB por token), `iq1_s` (1,5 bit/peso) custa ~2,3× mais por byte que
+  `iq3_s`; se for proporcional aos *bytes*, custa igual. É o experimento que separa "L2/IC
+  saturada pelas cargas de ativação" de "throughput de outro recurso".
+- **NOVO, forma aritmética**: tile de registrador em M (`RM` linhas por thread — 1 carga de
+  ativação para RM linhas; bit-exato pela mesma razão que `ROWS` é livre) e, como rota longa,
+  `WMMA i32_16x16x16_iu8` (existe no gfx1201; 4096 MACs por instrução contra 4 do dp4a).
+- **FALTOU**: profiler (`rocprof`/`omniperf` não estão instalados) — sem ele a separação
+  "throughput saturado × latência com ocupação máxima" fica por conta de experimentos dentro do
+  kernel, e a sondagem de duas streams só mostra que não há slot de CTA livre (1,93× de 2,00×).

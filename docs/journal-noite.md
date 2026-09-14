@@ -15,6 +15,7 @@ máximo de desempenho que couber na noite.
 | Kernels gfx1201 | `feat/noite-kernels` | `../rdna4-wt-noite-kernels` | `docs/journal-kernels.md` | a começar |
 | Contexto longo / RoPE / qualidade | `feat/noite-longctx` | `../rdna4-wt-noite-longctx` | `docs/journal-longctx.md` | a começar |
 | Levantamento de referências | `feat/noite-refs` | `../rdna4-wt-noite-refs` | `docs/journal-refs.md` | **mergeada** (1014 linhas; cf(N) medido, Hadamard, veredito K/V) |
+| **Matvec em lote (pós-fechamento)** | `main` | — | **`docs/journal-lote.md`** | **medido**: o peso amortiza (13,9 ms), o token não (6,04 ms/token); ativação e MLP refutados |
 
 Este arquivo é atualizado pelo coordenador conforme os merges entram: no fim da noite ele tem
 o estado final, os números medidos e o que ficou de fora com o motivo.
@@ -326,6 +327,12 @@ diferença vinha de um chute de 1 GiB de overhead e de contar o bloco MTP que n�
    kernels), e o que resta é o trabalho por token que o lote não amortiza (16 `dp4a` + 3 cargas
    de ativação por bloco por token) mais a re-leitura da ativação por linha de peso
    (≈5,6 GB por tensor por chunk) — banda amortizada × issue/ocupação, **não decidido**.
+   → **DECIDIDO depois do fechamento, em `docs/journal-lote.md`**: `pass_ms ≈ 13,9 + 6,04·N`
+   (o peso amortiza, o token não); a hipótese da ativação está **refutada** (o controle de
+   reuso da ativação dá 95,0 %, não metade), o UNROLL bit-exato está **refutado** no lote
+   (+5,6 % PIOR em N=16) e não há transbordo de registrador nenhum. As duas alavancas que
+   estavam nesta lista (LDS de ativação, MLP) estão mortas; o que sobra é mudar a forma
+   aritmética (tile de registrador em M, ou WMMA `i16x16x16_iu8`).
 2. **Atenção dividida em lote com o KV do alvo**: o despacho foi completado e o `switch` avisa,
    mas o par `q5_0`/`q4_1` a ≥1024 chaves ainda não tem medição própria de ponta a ponta (o gate
    cobre o caso de 1104 chaves com `f16`).

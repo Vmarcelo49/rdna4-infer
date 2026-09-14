@@ -156,7 +156,10 @@ int main(int argc, char **argv) {
     std::fprintf(stderr,
                  "usage: bench-matvec-shapes-gpu <model.gguf> [--budget-mib N] [--reps N] "
                  "[--rows a,b,c] [--minb a,b,c] [--unroll 2,4] [--pf] [--ilp 1,2,4] "
-                 "[--repeat-ship] [--land] [--lut-lds] [--lut-lds-unroll 1,2,4] [--no-ab]\n");
+                 "[--repeat-ship] [--land] [--lut-lds] [--lut-lds-unroll 1,2,4] [--no-ab]\n"
+                 "       [--batch 1,2,4,8,16]  (sweep tokens-per-weight-pass; N=1 = GEMV)\n"
+                 "       [--batch-unroll 2,4]  (bit-exact MLP knob inside the batch kernel)\n"
+                 "       [--batch-cap]         (same pass on two streams: spare capacity?)\n");
     return 1;
   }
   double budget_mib = 12000.0;
@@ -168,6 +171,8 @@ int main(int argc, char **argv) {
   bool lut_lds = false;
   std::vector<int> lut_lds_unroll;
   std::vector<int> row_variants, minb_variants, unroll_variants, ilp_variants;
+  std::vector<int> batch_list, unroll_list;
+  bool cap_probe = false;
   for (int i = 2; i < argc; ++i) {
     auto list = [&](std::vector<int> &out) {
       const char *v = argv[++i];
@@ -200,6 +205,17 @@ int main(int argc, char **argv) {
       lut_lds = true;
     } else if (std::strcmp(argv[i], "--lut-lds-unroll") == 0 && i + 1 < argc) {
       list(lut_lds_unroll);  // aceita "1,2,4" (o atoi direto leria so o 1)
+    } else if (std::strcmp(argv[i], "--batch") == 0 && i + 1 < argc) {
+      // --batch a,b,c: sweep the number of tokens that share one weight pass
+      // (prefill / MTP). N=1 in the list times the GEMV path as the reference.
+      list(batch_list);
+    } else if (std::strcmp(argv[i], "--batch-unroll") == 0 && i + 1 < argc) {
+      // UNROLL forcado no lote (bit-exato), so' nos tipos com kMtIlp == 1.
+      list(unroll_list);
+    } else if (std::strcmp(argv[i], "--batch-cap") == 0) {
+      // Sondagem de capacidade: a mesma passagem em duas streams (sobreposicao
+      // possivel = latencia; 2x = throughput saturado).
+      cap_probe = true;
     } else if (std::strcmp(argv[i], "--no-ab") == 0) {
       do_ab = false;
     } else {
@@ -414,6 +430,180 @@ int main(int argc, char **argv) {
       }
       (void)hipStreamDestroy(cs);
     }
+  }
+
+  // ---------------------------------------------------------------------
+  // BATCH (prefill / MTP): N tokens share ONE read of the weights. The question
+  // this section answers is *which* side runs out first.
+  //   - weight side: the CTA pass over a row-block is amortized over N, so a
+  //     pass whose cost is flat in N is weight-bound (per-token ms falls ~1/N);
+  //   - token side: activation blocks + dp4a scale with N, and so does the
+  //     activation working set per CTA (N * ncols bytes; 5 KB per token at
+  //     ncols=5120, i.e. 82 KB at N=16) -- far past L1. If ms/token grows with
+  //     N, the token side binds, and the growth rate sizes the activation
+  //     re-read traffic (the hypothesis the previous session left open,
+  //     journal-kernels §10: "a hipotese a medir e' o trafego de re-leitura da
+  //     ativacao por linha").
+  // The N=1 row is the GEMV pass again -- the same kernel the decode path uses --
+  // so the rows of this table are directly comparable to each other.
+  // ---------------------------------------------------------------------
+  if (!batch_list.empty()) {
+    std::int64_t max_rows_b = 0, max_bpr = 0;
+    for (const Tensor &t : sel) {
+      max_rows_b = std::max(max_rows_b, t.nrows);
+      max_bpr = std::max(max_bpr, t.bpr);
+    }
+    const int n_max = *std::max_element(batch_list.begin(), batch_list.end());
+    block_q8_1 *d_ab = nullptr;
+    float *d_yb = nullptr;
+    if (hipMalloc(&d_ab, (std::size_t)n_max * max_bpr * sizeof(block_q8_1)) != hipSuccess ||
+        hipMalloc(&d_yb, (std::size_t)n_max * max_rows_b * sizeof(float)) != hipSuccess) {
+      std::printf("batch: staging alloc failed\n");
+      return 1;
+    }
+    // One quantized activation row per token slot, back to back: exactly the
+    // layout the graph uses (act_stride = ncols/32).
+    {
+      std::vector<float> x;
+      fill_x(x, max_bpr * QK8_1, 4242u);
+      for (int n = 0; n < n_max; ++n) {
+        float *d_x = nullptr;
+        (void)hipMalloc(&d_x, x.size() * sizeof(float));
+        (void)hipMemcpy(d_x, x.data(), x.size() * sizeof(float), hipMemcpyHostToDevice);
+        rdna4::quantize_q8_1_kernel<<<(unsigned)((max_bpr + 3) / 4), 128>>>(
+            d_x, d_ab + (std::size_t)n * max_bpr, max_bpr);
+        hipDeviceSynchronize();
+        (void)hipFree(d_x);
+      }
+    }
+
+    std::printf("\n=== BATCH === staged %.3f GiB, %zu tensors, launch cap %d\n",
+                used / (1024.0 * 1024 * 1024), sel.size(), rdna4::matvec_batch_cap());
+    std::printf("%5s %12s %12s %12s %14s %10s %12s %10s", "N", "pass_ms", "ms/token",
+                "GB/s(pass)", "GB/s/token-eq", "vs GEMV", "reuse_ms", "reuse%");
+    for (int U : unroll_list) std::printf(" %13s", U == 1 ? "unr1_ms" : (U == 2 ? "unr2_ms" : "unr4_ms"));
+    std::printf("\n");
+    double gemv_ms = 1e9, unroll_ref = 1e9;
+    // `reuse` = act_stride 0: every token reads the SAME activation row. Same
+    // kernel, same instruction count, same dp4a count, same weight traffic --
+    // only the activation working set changes (5 KB instead of N * 5 KB), so
+    // the difference against the dense pass is the cost of the activation
+    // re-read traffic and nothing else. It is the control that separates
+    // "issue-bound" from "cache/latency-bound" (journal-kernels §10).
+    auto pass = [&](int N, bool reuse) {
+      return ev([&] {
+        for (const Tensor &t2 : sel) {
+          if (N < 2) {
+            (void)rdna4::matvec_launch(t2.dt, t2.d_w, act_for(t2.ncols), d_yb, t2.nrows, t2.ncols,
+                                       nullptr);
+          } else {
+            (void)rdna4::matvec_launch_batch(t2.dt, t2.d_w, d_ab, d_yb, t2.nrows, t2.ncols,
+                                             reuse ? 0 : t2.bpr, N, nullptr);
+          }
+        }
+      });
+    };
+    // Hybrid pass: the affected types (kMtIlp == 1) use the forced UNROLL, every
+    // other type uses the shipping launch. Numbers stay bit-exact either way.
+    auto pass_unr = [&](int N, int U) {
+      return ev([&] {
+        for (const Tensor &t2 : sel) {
+          if (!rdna4::matvec_launch_batch_unroll(t2.dt, t2.d_w, d_ab, d_yb, t2.nrows, t2.ncols,
+                                                 t2.bpr, N, U, nullptr)) {
+            (void)rdna4::matvec_launch_batch(t2.dt, t2.d_w, d_ab, d_yb, t2.nrows, t2.ncols, t2.bpr,
+                                             N, nullptr);
+          }
+        }
+      });
+    };
+    for (int N : batch_list) {
+      // Two rounds: the first timed cell of the section is the one that pays the
+      // clock ramp (the DPM gap this bench exists because of), so warm up first.
+      (void)pass(N, false);
+      double ms = 1e9, ms_reuse = 1e9;
+      for (int r = 0; r < reps; ++r) ms = std::min(ms, pass(N, false));
+      if (N >= 2) {
+        (void)pass(N, true);
+        for (int r = 0; r < reps; ++r) ms_reuse = std::min(ms_reuse, pass(N, true));
+      }
+      const int nn = N < 1 ? 1 : N;
+      if (N < 2) gemv_ms = ms;
+      const double gbs = used / (ms * 1e-3) / 1e9;
+      std::printf("%5d %12.3f %12.3f %12.1f %14.1f %9.2fx %12.3f %10.1f", N, ms, ms / nn, gbs,
+                  gbs * nn, gemv_ms / ms * nn, ms_reuse, 100.0 * ms_reuse / ms);
+      for (int U : unroll_list) {
+        if (N < 8) {
+          std::printf(" %14s", "n/a");
+          continue;
+        }
+        (void)pass_unr(N, U);
+        double mu = 1e9;
+        for (int r = 0; r < reps; ++r) mu = std::min(mu, pass_unr(N, U));
+        std::printf(" %13.3f", mu);
+        if (U == unroll_list.front()) unroll_ref = mu;
+      }
+      if (cap_probe) {
+        // Capacidade livre: a MESMA passagem em DUAS streams. Se a maquina tem
+        // folga (limitada por latencia), as duas se sobrepoem e o par custa bem
+        // menos que 2x; se ja' esta' saturada (limitada por throughput), o par
+        // custa 2x. Nao ha hazard: as duas escrevem no mesmo d_yb de proposito --
+        // o que se mede aqui e' tempo, nao resultado.
+        hipStream_t s1 = nullptr, s2 = nullptr;
+        (void)hipStreamCreate(&s1);
+        (void)hipStreamCreate(&s2);
+        auto one = [&](hipStream_t st) {
+          for (const Tensor &t2 : sel) {
+            if (N < 2) {
+              (void)rdna4::matvec_launch(t2.dt, t2.d_w, act_for(t2.ncols), d_yb, t2.nrows,
+                                         t2.ncols, st);
+            } else {
+              (void)rdna4::matvec_launch_batch(t2.dt, t2.d_w, d_ab, d_yb, t2.nrows, t2.ncols,
+                                               t2.bpr, N, st);
+            }
+          }
+        };
+        (void)ev([&] { one(s1); });
+        double two = 1e9;
+        for (int r = 0; r < reps; ++r) {
+          two = std::min(two, ev([&] {
+                           one(s1);
+                           one(s2);
+                         }));
+        }
+        std::printf(" %14.3f (%.2fx de 2 passagens)", two, two / ms);
+        (void)hipStreamDestroy(s1);
+        (void)hipStreamDestroy(s2);
+      }
+      std::printf("\n");
+    }
+
+    // Register/local/shared usage per (type, N): the cheap way to rule out "the
+    // batched kernel spills to scratch" before blaming traffic.
+    std::printf("\nbatch kernel resources (hipFuncGetAttributes): type  N  regs  local  smem  threads\n");
+    for (int dt = 1; dt <= 14; ++dt) {
+      bool any = false;
+      for (const Tensor &t : sel)
+        if (t.dt == dt) any = true;
+      if (!any) continue;
+      for (int N : batch_list) {
+        if (N < 2) continue;
+        hipFuncAttributes a{};
+        bool ok = false;
+        switch (N) {
+          case 2: ok = rdna4::matvec_batch_kernel_attrs<2>(dt, a); break;
+          case 3: ok = rdna4::matvec_batch_kernel_attrs<3>(dt, a); break;
+          case 4: ok = rdna4::matvec_batch_kernel_attrs<4>(dt, a); break;
+          case 8: ok = rdna4::matvec_batch_kernel_attrs<8>(dt, a); break;
+          case 16: ok = rdna4::matvec_batch_kernel_attrs<16>(dt, a); break;
+          default: break;
+        }
+        if (!ok) continue;
+        std::printf("  %-10s %3d %5d %6zu %5zu %8d\n", dt_name(dt), N, a.numRegs, a.localSizeBytes,
+                    a.sharedSizeBytes, a.maxThreadsPerBlock);
+      }
+    }
+    std::printf("\n");
+    return 0;
   }
 
   // ---------------------------------------------------------------------

@@ -444,7 +444,7 @@ matvec_kernel_gen(const void *__restrict__ vx, const block_q8_1 *__restrict__ vy
 //   vy         : N activation rows of q8_1 blocks, row stride `act_stride` blocks
 //   dst        : N rows of `nrows` floats, row stride `nrows` (token-major)
 // ---------------------------------------------------------------------------
-template <class T, int ROWS, int WPR, int ILP = 1, int N = 1>
+template <class T, int ROWS, int WPR, int ILP = 1, int N = 1, int UNROLL = 1>
 __global__ void
 #if defined(__HIP_DEVICE_COMPILE__)
 __launch_bounds__(ROWS * WPR * 32, 1)
@@ -452,6 +452,18 @@ __launch_bounds__(ROWS * WPR * 32, 1)
 matvec_kernel_batch(const void *__restrict__ vx, const block_q8_1 *__restrict__ vy,
                     float *__restrict__ dst, int64_t nrows, int64_t blocks_per_row,
                     int64_t act_stride) {
+  static_assert(ILP >= 1, "ILP must be >= 1");
+  // UNROLL e' o MESMO knob de MLP bit-exato do matvec_kernel_gen: processa UNROLL
+  // blocos por iteracao no MESMO acumulador e na MESMA ordem do caminho por token
+  // (as somas de um elemento de saida acontecem exatamente na sequencia em que
+  // aconteceriam sem o unroll; so' ha mais cargas em voo). O caminho por token ja
+  // o usa onde kMtIlp == 1 (kMtUnroll=2 para iq3_s, iq3_xxs, iq2_s, iq4_nl -- 59 %
+  // dos bytes deste modelo) e o lote nao o tinha: era a diferenca estrutural entre
+  // os dois caminhos, e e' o que a medicao de N=1..16 (pass ~ 13,9 + 6,04N) manda
+  // atacar, porque o custo por token NAO e' trafego (o controle de reuso da
+  // ativacao mostra 6 % de ganho) e sim latencia/issue.
+  static_assert(UNROLL >= 1, "UNROLL must be >= 1");
+  static_assert(ILP == 1 || UNROLL == 1, "ILP and UNROLL are mutually exclusive");
   constexpr int vdr = T::vdr;
   constexpr int qi = T::qi;
   constexpr int qk = T::qk;
@@ -488,17 +500,34 @@ matvec_kernel_batch(const void *__restrict__ vx, const block_q8_1 *__restrict__ 
   // `dot` de antes, entao a sequencia de operacoes e' IDENTICA e o resultado segue
   // bit-exato (gate: check-matmul-gpu e check-batch-gpu, os dois memcmp/rel-L2 0).
   int64_t kb = slot;
-  for (; kb + (ILP - 1) * blocks_per_iter < blocks_per_row; kb += ILP * blocks_per_iter) {
+  if (UNROLL == 1) {
+    for (; kb + (ILP - 1) * blocks_per_iter < blocks_per_row; kb += ILP * blocks_per_iter) {
 #pragma unroll
-    for (int u = 0; u < ILP; ++u) {
-      const int64_t k = kb + u * blocks_per_iter;
-      const block_q8_1 *abase = vy + k * (qk / QK8_1);
-      const typename T::prep_t pre =
-          T::prep((const void *)rowp, (const int)k, kqs, (const void *)T::lut_source());
+      for (int u = 0; u < ILP; ++u) {
+        const int64_t k = kb + u * blocks_per_iter;
+        const block_q8_1 *abase = vy + k * (qk / QK8_1);
+        const typename T::prep_t pre =
+            T::prep((const void *)rowp, (const int)k, kqs, (const void *)T::lut_source());
 #pragma unroll
-      for (int n = 0; n < N; ++n) {
-        acc[n][u] += T::dot_prep(pre, (const void *)rowp, abase + (int64_t)n * act_stride,
-                                 (const int)k, kqs, (const void *)T::lut_source());
+        for (int n = 0; n < N; ++n) {
+          acc[n][u] += T::dot_prep(pre, (const void *)rowp, abase + (int64_t)n * act_stride,
+                                   (const int)k, kqs, (const void *)T::lut_source());
+        }
+      }
+    }
+  } else {
+    for (; kb + (UNROLL - 1) * blocks_per_iter < blocks_per_row; kb += UNROLL * blocks_per_iter) {
+#pragma unroll
+      for (int u = 0; u < UNROLL; ++u) {
+        const int64_t k = kb + u * blocks_per_iter;
+        const block_q8_1 *abase = vy + k * (qk / QK8_1);
+        const typename T::prep_t pre =
+            T::prep((const void *)rowp, (const int)k, kqs, (const void *)T::lut_source());
+#pragma unroll
+        for (int n = 0; n < N; ++n) {
+          acc[n][0] += T::dot_prep(pre, (const void *)rowp, abase + (int64_t)n * act_stride,
+                                   (const int)k, kqs, (const void *)T::lut_source());
+        }
       }
     }
   }
@@ -871,7 +900,12 @@ inline bool matvec_launch_batch_n(int dt, const void *d_w, const block_q8_1 *d_a
   case Dt: {                                                                                  \
     const int grid = (int)((nrows + MtShape<Dt>::rows - 1) / MtShape<Dt>::rows);              \
     const int threads = MtShape<Dt>::rows * MtShape<Dt>::wpr * 32;                            \
-    matvec_kernel_batch<Traits, MtShape<Dt>::rows, MtShape<Dt>::wpr, MtIlp<Dt>::value, N>     \
+    /* kMtUnroll NAO entra aqui: medido e neutro no lote (-1 % a +5 %, dentro do piso  */    \
+    /* de ruido; unr2 e' 5 % PIOR em N=16). O knob fica no template + no lancador      */   \
+    /* bench-only abaixo como registro da hipotese refutada -- ver docs/journal-lote.md. */   \
+    constexpr int kIlp = MtIlp<Dt>::value;                                                    \
+    constexpr int kUnr = 1;                                                                   \
+    matvec_kernel_batch<Traits, MtShape<Dt>::rows, MtShape<Dt>::wpr, kIlp, N, kUnr>           \
         <<<grid, threads, 0, stream>>>(d_w, d_a, d_o, nrows, ncols / QK, act_stride);         \
     return hipGetLastError() == hipSuccess;                                                   \
   }
@@ -894,6 +928,57 @@ inline bool matvec_launch_batch_n(int dt, const void *d_w, const block_q8_1 *d_a
       return false;  // no kernel: caller must fail loudly (SPEC 1.3)
   }
 #undef RD_BATCH
+}
+
+// ---------------------------------------------------------------------------
+// Bench-only: o UNROLL do lote, forcado. Existe para MEDIR o knob de MLP
+// bit-exato no caminho em lote nos tipos em que kMtIlp == 1 (os 59 % de bytes
+// deste modelo: iq3_s, iq3_xxs, iq2_s). Instanciado so' para esses tipos e para
+// N em {8,16} -- o lote de prefill -- para manter o numero de instanciacoes
+// limitado. Nao e' caminho de producao: quem embarca e' matvec_launch_batch,
+// que ja' usa kMtUnroll onde kMtIlp == 1.
+// ---------------------------------------------------------------------------
+template <int N, int UNROLL>
+inline bool matvec_launch_batch_unroll_n(int dt, const void *d_w, const block_q8_1 *d_a,
+                                         float *d_o, int64_t nrows, int64_t ncols,
+                                         int64_t act_stride, hipStream_t stream) {
+#define RD_BU(Traits, Dt, QK)                                                                 \
+  case Dt: {                                                                                  \
+    const int grid = (int)((nrows + MtShape<Dt>::rows - 1) / MtShape<Dt>::rows);              \
+    const int threads = MtShape<Dt>::rows * MtShape<Dt>::wpr * 32;                            \
+    matvec_kernel_batch<Traits, MtShape<Dt>::rows, MtShape<Dt>::wpr, 1, N, UNROLL>            \
+        <<<grid, threads, 0, stream>>>(d_w, d_a, d_o, nrows, ncols / QK, act_stride);         \
+    return hipGetLastError() == hipSuccess;                                                   \
+  }
+  switch (dt) {
+    RD_BU(TIQ3XXS_S, 9, 256)
+    RD_BU(TIQ3S_S, 12, 256)
+    RD_BU(TIQ2S_S, 13, 256)
+    default: return false;
+  }
+#undef RD_BU
+}
+
+template <int N>
+inline bool matvec_launch_batch_unroll_n2(int dt, const void *d_w, const block_q8_1 *d_a,
+                                          float *d_o, int64_t nrows, int64_t ncols,
+                                          int64_t act_stride, int unroll, hipStream_t stream) {
+  switch (unroll) {
+    case 1: return matvec_launch_batch_unroll_n<N, 1>(dt, d_w, d_a, d_o, nrows, ncols, act_stride, stream);
+    case 2: return matvec_launch_batch_unroll_n<N, 2>(dt, d_w, d_a, d_o, nrows, ncols, act_stride, stream);
+    case 4: return matvec_launch_batch_unroll_n<N, 4>(dt, d_w, d_a, d_o, nrows, ncols, act_stride, stream);
+    default: return false;
+  }
+}
+
+inline bool matvec_launch_batch_unroll(int dt, const void *d_w, const block_q8_1 *d_a, float *d_o,
+                                      int64_t nrows, int64_t ncols, int64_t act_stride,
+                                      int n_tokens, int unroll, hipStream_t stream) {
+  switch (n_tokens) {
+    case 8: return matvec_launch_batch_unroll_n2<8>(dt, d_w, d_a, d_o, nrows, ncols, act_stride, unroll, stream);
+    case 16: return matvec_launch_batch_unroll_n2<16>(dt, d_w, d_a, d_o, nrows, ncols, act_stride, unroll, stream);
+    default: return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -925,6 +1010,32 @@ inline bool matvec_launch_batch(int dt, const void *d_w, const block_q8_1 *d_a, 
     case 16: return matvec_launch_batch_n<16>(dt, d_w, d_a, d_o, nrows, ncols, act_stride, stream);
     default: return false;  // N is a compile-time instantiation, not a runtime knob
   }
+}
+
+// Occupancy diagnostic for the BATCHED kernel: register/local/shared usage of
+// one (type, N) instantiation. Same purpose as matvec_kernel_attrs above; it is
+// what turns "o lote e' lento" into "o lote gasta N registradores por token e
+// transborda para memoria local", which is the first thing to rule out
+// (docs/journal-noite.md, matvec em lote).
+template <int N>
+inline bool matvec_batch_kernel_attrs(int dt, hipFuncAttributes &attr) {
+#define RD_BATCH_ATTR(Traits, Dt)                                                              \
+  case Dt: {                                                                                   \
+    constexpr int kIlp = MtIlp<Dt>::value;                                                     \
+    constexpr int kUnr = kIlp == 1 ? MtUnroll<Dt>::value : 1;                                  \
+    auto *fn = &matvec_kernel_batch<Traits, MtShape<Dt>::rows, MtShape<Dt>::wpr, kIlp, N,      \
+                                    kUnr>;                                                     \
+    return hipFuncGetAttributes(&attr, (const void *)fn) == hipSuccess;                         \
+  }
+  switch (dt) {
+    RD_BATCH_ATTR(TQ8_0, 1) RD_BATCH_ATTR(TQ2K, 2) RD_BATCH_ATTR(TQ3K, 3) RD_BATCH_ATTR(TQ4K, 4)
+    RD_BATCH_ATTR(TQ5K, 5) RD_BATCH_ATTR(TQ6K, 6) RD_BATCH_ATTR(TIQ2XXS_S, 7)
+    RD_BATCH_ATTR(TIQ2XS_S, 8) RD_BATCH_ATTR(TIQ3XXS_S, 9) RD_BATCH_ATTR(TIQ1S, 10)
+    RD_BATCH_ATTR(TIQ4NL, 11) RD_BATCH_ATTR(TIQ3S_S, 12) RD_BATCH_ATTR(TIQ2S_S, 13)
+    RD_BATCH_ATTR(TIQ4XS, 14)
+    default: return false;
+  }
+#undef RD_BATCH_ATTR
 }
 
 // ---------------------------------------------------------------------------
