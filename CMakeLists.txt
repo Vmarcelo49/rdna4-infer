@@ -284,3 +284,34 @@ if(EXISTS "/opt/rocm/include")
   target_include_directories(check-batch-gpu PRIVATE /opt/rocm/include)
 endif()
 target_link_libraries(check-batch-gpu PRIVATE ${AMDHIP64})
+
+# ---------------------------------------------------------------------------
+# task 6 (autotuning gfx1201) — gate da tabela de tuning.
+#
+# CPU puro: nao inclui HIP, nao abre modelo, nao toca a GPU (microssegundos), e
+# por isso pode rodar em qualquer gate. Ele imprime a configuracao embarcada
+# (include/rdna4/tuning.h, a unica fonte dos numeros que matvec.cuh/attn.cuh/
+# graph.cuh usam) e compara com a referencia commitada tests/golden/ml_tuning.txt
+# -- um refactor que troque um parametro medido quebra aqui, em vez de mudar o
+# desempenho em silencio. Ver docs/autotuning-gfx1201.md.
+add_executable(check-tuning tests/check_tuning.cpp)
+target_include_directories(check-tuning PRIVATE include)
+
+# ---------------------------------------------------------------------------
+# task 7 (suite de regressao numerica) — gate de pre-merge.
+#
+# Roda um conjunto FIXO de prompts pelo caminho real do motor em greedy puro e
+# compara os ids gerados (bit-exatos) e os logits do ultimo passo (rel-L2 <= 1e-5)
+# contra tests/golden/regression_greedy_f16.txt. Script: scripts/check_regression.sh
+# (passa pelo scripts/gpu-lock.sh). Ver docs/autotuning-gfx1201.md §gate.
+add_executable(check-regression-gpu tests/check_regression_gpu.hip
+               src/backend/gguf.cpp src/backend/loader.cpp src/backend/model.cpp
+               src/backend/unicode.cpp src/backend/unicode_data.cpp
+               src/backend/tokenizer.cpp src/backend/sampler.cpp src/backend/chat.cpp)
+target_compile_options(check-regression-gpu PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_link_options(check-regression-gpu PRIVATE --offload-arch=gfx1201)
+target_include_directories(check-regression-gpu PRIVATE include)
+if(EXISTS "/opt/rocm/include")
+  target_include_directories(check-regression-gpu PRIVATE /opt/rocm/include)
+endif()
+target_link_libraries(check-regression-gpu PRIVATE ${AMDHIP64})

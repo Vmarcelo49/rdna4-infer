@@ -14,6 +14,7 @@
 #pragma once
 #include <hip/hip_runtime.h>
 
+#include "rdna4/tuning.h"
 #include "rdna4/quants.h"
 #include "rdna4/fp16.h"
 #include "rdna4/vecdotq.cuh"
@@ -441,40 +442,65 @@ inline bool launch_gen(const void *d_weights, const block_q8_1 *d_act, float *d_
 }
 
 
+// The per-type numbers live in exactly one place: include/rdna4/tuning.h
+// (namespace rdna4::tuned), which check-tuning compares against
+// tests/golden/ml_tuning.txt. These tables only give them type-level names so the
+// dispatch below can use them as template arguments.
 template <int Dt> struct MtShape;             // { rows, wpr } per dtype ordinal
-template <> struct MtShape<1>  { static constexpr int rows = 2, wpr = 1; };  // q8_0
-template <> struct MtShape<2>  { static constexpr int rows = 2, wpr = 1; };  // q2_K
-template <> struct MtShape<3>  { static constexpr int rows = 1, wpr = 8; };  // q3_K
-template <> struct MtShape<4>  { static constexpr int rows = 8, wpr = 1; };  // q4_K
-template <> struct MtShape<5>  { static constexpr int rows = 4, wpr = 1; };  // q5_K
-template <> struct MtShape<6>  { static constexpr int rows = 1, wpr = 4; };  // q6_K
-template <> struct MtShape<7>  { static constexpr int rows = 4, wpr = 1; };  // iq2_xxs
-template <> struct MtShape<8>  { static constexpr int rows = 2, wpr = 2; };  // iq2_xs
-template <> struct MtShape<9>  { static constexpr int rows = 2, wpr = 1; };  // iq3_xxs
-template <> struct MtShape<10> { static constexpr int rows = 1, wpr = 4; };  // iq1_s
-template <> struct MtShape<11> { static constexpr int rows = 8, wpr = 1; };  // iq4_nl
-template <> struct MtShape<12> { static constexpr int rows = 8, wpr = 1; };  // iq3_s
-template <> struct MtShape<13> { static constexpr int rows = 2, wpr = 1; };  // iq2_s
-template <> struct MtShape<14> { static constexpr int rows = 8, wpr = 1; };  // iq4_xs
+template <> struct MtShape<1>  { static constexpr int rows = tuned::kMtRows[0], wpr = tuned::kMtWpr[0]; };   // q8_0
+template <> struct MtShape<2>  { static constexpr int rows = tuned::kMtRows[1], wpr = tuned::kMtWpr[1]; };   // q2_K
+template <> struct MtShape<3>  { static constexpr int rows = tuned::kMtRows[2], wpr = tuned::kMtWpr[2]; };   // q3_K
+template <> struct MtShape<4>  { static constexpr int rows = tuned::kMtRows[3], wpr = tuned::kMtWpr[3]; };   // q4_K
+template <> struct MtShape<5>  { static constexpr int rows = tuned::kMtRows[4], wpr = tuned::kMtWpr[4]; };   // q5_K
+template <> struct MtShape<6>  { static constexpr int rows = tuned::kMtRows[5], wpr = tuned::kMtWpr[5]; };   // q6_K
+template <> struct MtShape<7>  { static constexpr int rows = tuned::kMtRows[6], wpr = tuned::kMtWpr[6]; };   // iq2_xxs
+template <> struct MtShape<8>  { static constexpr int rows = tuned::kMtRows[7], wpr = tuned::kMtWpr[7]; };   // iq2_xs
+template <> struct MtShape<9>  { static constexpr int rows = tuned::kMtRows[8], wpr = tuned::kMtWpr[8]; };   // iq3_xxs
+template <> struct MtShape<10> { static constexpr int rows = tuned::kMtRows[9], wpr = tuned::kMtWpr[9]; };   // iq1_s
+template <> struct MtShape<11> { static constexpr int rows = tuned::kMtRows[10], wpr = tuned::kMtWpr[10]; }; // iq4_nl
+template <> struct MtShape<12> { static constexpr int rows = tuned::kMtRows[11], wpr = tuned::kMtWpr[11]; }; // iq3_s
+template <> struct MtShape<13> { static constexpr int rows = tuned::kMtRows[12], wpr = tuned::kMtWpr[12]; }; // iq2_s
+template <> struct MtShape<14> { static constexpr int rows = tuned::kMtRows[13], wpr = tuned::kMtWpr[13]; }; // iq4_xs
 
 // ILP (independent accumulators) per type, measured with --bench-tune.
 // Helps the latency-bound types a lot (q4_K 610->739 GB/s), does nothing or
 // slightly regresses the ALU-bound IQ types, so those stay at 1.
 template <int Dt> struct MtIlp { static constexpr int value = 1; };
-template <> struct MtIlp<1>  { static constexpr int value = 4; };  // q8_0
-template <> struct MtIlp<2>  { static constexpr int value = 2; };  // q2_K
-template <> struct MtIlp<3>  { static constexpr int value = 2; };  // q3_K
-template <> struct MtIlp<4>  { static constexpr int value = 2; };  // q4_K
-template <> struct MtIlp<5>  { static constexpr int value = 2; };  // q5_K
-template <> struct MtIlp<6>  { static constexpr int value = 2; };  // q6_K
-template <> struct MtIlp<7>  { static constexpr int value = 2; };  // iq2_xxs
-template <> struct MtIlp<8>  { static constexpr int value = 4; };  // iq2_xs
-template <> struct MtIlp<9>  { static constexpr int value = 1; };  // iq3_xxs
-template <> struct MtIlp<10> { static constexpr int value = 1; };  // iq1_s
-template <> struct MtIlp<11> { static constexpr int value = 1; };  // iq4_nl
-template <> struct MtIlp<12> { static constexpr int value = 1; };  // iq3_s
-template <> struct MtIlp<13> { static constexpr int value = 1; };  // iq2_s
-template <> struct MtIlp<14> { static constexpr int value = 2; };  // iq4_xs
+template <> struct MtIlp<1>  { static constexpr int value = tuned::kMtIlp[0]; };   // q8_0
+template <> struct MtIlp<2>  { static constexpr int value = tuned::kMtIlp[1]; };   // q2_K
+template <> struct MtIlp<3>  { static constexpr int value = tuned::kMtIlp[2]; };   // q3_K
+template <> struct MtIlp<4>  { static constexpr int value = tuned::kMtIlp[3]; };   // q4_K
+template <> struct MtIlp<5>  { static constexpr int value = tuned::kMtIlp[4]; };   // q5_K
+template <> struct MtIlp<6>  { static constexpr int value = tuned::kMtIlp[5]; };   // q6_K
+template <> struct MtIlp<7>  { static constexpr int value = tuned::kMtIlp[6]; };   // iq2_xxs
+template <> struct MtIlp<8>  { static constexpr int value = tuned::kMtIlp[7]; };   // iq2_xs
+template <> struct MtIlp<9>  { static constexpr int value = tuned::kMtIlp[8]; };   // iq3_xxs
+template <> struct MtIlp<10> { static constexpr int value = tuned::kMtIlp[9]; };   // iq1_s
+template <> struct MtIlp<11> { static constexpr int value = tuned::kMtIlp[10]; };  // iq4_nl
+template <> struct MtIlp<12> { static constexpr int value = tuned::kMtIlp[11]; };  // iq3_s
+template <> struct MtIlp<13> { static constexpr int value = tuned::kMtIlp[12]; };  // iq2_s
+template <> struct MtIlp<14> { static constexpr int value = tuned::kMtIlp[13]; };  // iq4_xs
+
+// UNROLL (blocks per iteration into the SAME accumulator) per type: the
+// bit-exact MLP lever (same ops, same order, more loads in flight). Only used
+// where ILP is 1 -- the kernel static_asserts that the two are exclusive, and
+// that is why iq3_s/iq3_xxs/iq2_s/iq4_nl bought their +3..8% by moving from
+// ILP to UNROLL.
+template <int Dt> struct MtUnroll { static constexpr int value = 1; };
+template <> struct MtUnroll<1>  { static constexpr int value = tuned::kMtUnroll[0]; };   // q8_0
+template <> struct MtUnroll<2>  { static constexpr int value = tuned::kMtUnroll[1]; };   // q2_K
+template <> struct MtUnroll<3>  { static constexpr int value = tuned::kMtUnroll[2]; };   // q3_K
+template <> struct MtUnroll<4>  { static constexpr int value = tuned::kMtUnroll[3]; };   // q4_K
+template <> struct MtUnroll<5>  { static constexpr int value = tuned::kMtUnroll[4]; };   // q5_K
+template <> struct MtUnroll<6>  { static constexpr int value = tuned::kMtUnroll[5]; };   // q6_K
+template <> struct MtUnroll<7>  { static constexpr int value = tuned::kMtUnroll[6]; };   // iq2_xxs
+template <> struct MtUnroll<8>  { static constexpr int value = tuned::kMtUnroll[7]; };   // iq2_xs
+template <> struct MtUnroll<9>  { static constexpr int value = tuned::kMtUnroll[8]; };   // iq3_xxs
+template <> struct MtUnroll<10> { static constexpr int value = tuned::kMtUnroll[9]; };   // iq1_s
+template <> struct MtUnroll<11> { static constexpr int value = tuned::kMtUnroll[10]; };  // iq4_nl
+template <> struct MtUnroll<12> { static constexpr int value = tuned::kMtUnroll[11]; };  // iq3_s
+template <> struct MtUnroll<13> { static constexpr int value = tuned::kMtUnroll[12]; };  // iq2_s
+template <> struct MtUnroll<14> { static constexpr int value = tuned::kMtUnroll[13]; };  // iq4_xs
 
 inline MatvecConfig matvec_default_config(int dt) {
   // Derived from the compile-time tables so the reported/shipping shape and the
@@ -498,6 +524,20 @@ inline MatvecConfig matvec_default_config(int dt) {
   }
 }
 
+// UNROLL the shipping path uses for this type (see MtUnroll / tuning.h).
+inline int matvec_default_unroll(int dt) {
+  switch (dt) {
+    case 1:  return MtUnroll<1>::value;   case 2:  return MtUnroll<2>::value;
+    case 3:  return MtUnroll<3>::value;   case 4:  return MtUnroll<4>::value;
+    case 5:  return MtUnroll<5>::value;   case 6:  return MtUnroll<6>::value;
+    case 7:  return MtUnroll<7>::value;   case 8:  return MtUnroll<8>::value;
+    case 9:  return MtUnroll<9>::value;   case 10: return MtUnroll<10>::value;
+    case 11: return MtUnroll<11>::value;  case 12: return MtUnroll<12>::value;
+    case 13: return MtUnroll<13>::value;  case 14: return MtUnroll<14>::value;
+    default: return 1;
+  }
+}
+
 inline int matvec_default_ilp(int dt) {
   switch (dt) {
     case 1:  return MtIlp<1>::value;   case 2:  return MtIlp<2>::value;
@@ -517,8 +557,8 @@ inline bool matvec_launch(int dt, const void *d_w, const block_q8_1 *d_a, float 
                           int64_t nrows, int64_t ncols, hipStream_t stream) {
 #define RD_SHIP(Traits, Dt, QK)                                                            \
   case Dt:                                                                                 \
-    return launch_gen<Traits, MtShape<Dt>::rows, MtShape<Dt>::wpr, MtIlp<Dt>::value, false>(\
-        d_w, d_a, d_o, nrows, ncols / QK, stream);
+    return launch_gen<Traits, MtShape<Dt>::rows, MtShape<Dt>::wpr, MtIlp<Dt>::value, false, \
+                      0, MtUnroll<Dt>::value>(d_w, d_a, d_o, nrows, ncols / QK, stream);
   switch (dt) {
     RD_SHIP(TQ8_0, 1, 32)
     RD_SHIP(TQ2K, 2, 256)
@@ -545,7 +585,10 @@ inline bool matvec_launch(int dt, const void *d_w, const block_q8_1 *d_a, float 
 // Batched shipping path. N is a compile-time constant (2/4/8/16) and the shape
 // per type is the *same* one the GEMV path uses, which is what makes the results
 // bit-identical; n_tokens is capped at the largest instantiation and the caller
-// loops over sub-batches.
+// loops over sub-batches. The batched kernel has no UNROLL knob (its `N` already
+// provides the memory-level parallelism), and since UNROLL does not change the
+// summation order the batched result stays bit-identical to the GEMV path for
+// every type that ships with unroll>1 -- tests/check_batch_gpu.hip asserts it.
 inline int matvec_batch_cap() { return 16; }
 
 template <int N>

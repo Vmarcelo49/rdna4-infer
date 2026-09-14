@@ -14,7 +14,17 @@
 //      the row through L1 instead of streaming it 6 times, and the FMAs are free
 //      (the kernel uses ~1% of the fp32 throughput).
 //
-// usage: bench-attn-gpu [kvtype] [t...]      (kvtype: f16 | q4_0 | q8_0 | f32)
+// usage: bench-attn-gpu [kvtype] [t...] [--smax N] [--splits a,b,c] [--wpb a,b,c]
+//        (kvtype: f16 | q4_0 | q8_0 | f32)
+//
+// AUTOTUNING (task 6, docs/autotuning-gfx1201.md): the split-count x warps-per-CTA
+// table is the search space of the attention kernel, and the engine's policy is
+// `attn_splits_for(keys)` (graph.cuh: keys/kAttnSplitMin, capped at kAttnMaxSplits)
+// plus `attn_split_wpb(splits)` (attn.cuh: 16 warps up to kAttnSplitWpbLimit
+// splits, 8 above). --smax raises the split cap so the sweep can ask whether the
+// shipped kAttnMaxSplits=16 is still the optimum at long context, and every `t`
+// row prints the best cell, the cell the shipping policy would pick, and the
+// same-kernel-twice noise floor that makes the comparison meaningful.
 #include <hip/hip_runtime.h>
 
 #include <chrono>
@@ -34,6 +44,10 @@ constexpr int kHeadDim = 256;
 constexpr int kHeads = 24;
 constexpr int kHeadsKv = 4;
 constexpr float kScale = 1.0f / 16.0f;
+// Attention layers of the shipped model (qwen35 dense, block_count 65 with the
+// MTP block: 16 layers carry a KV cache). Used only to turn a per-layer kernel
+// number into the ms/token at stake.
+constexpr int kLayers = 16;
 
 void fill_random(std::vector<float> &v, std::size_t n, unsigned seed) {
   v.resize(n);
@@ -44,6 +58,31 @@ void fill_random(std::vector<float> &v, std::size_t n, unsigned seed) {
     v[i] = ((float)(h >> 8) / 8388608.0f) - 1.0f;
   }
 }
+
+// Event-pair timer: one pair around `reps` launches, no per-launch sync (the
+// pattern the matvec bench uses). A per-cell warm-up is NOT usable here -- the
+// per-t benchmark showed the first cell measured after the cache fill running
+// 15% slower than the same kernel measured later.
+struct EvPair {
+  hipEvent_t e0 = nullptr, e1 = nullptr;
+  EvPair() {
+    (void)hipEventCreate(&e0);
+    (void)hipEventCreate(&e1);
+  }
+  ~EvPair() {
+    if (e0) (void)hipEventDestroy(e0);
+    if (e1) (void)hipEventDestroy(e1);
+  }
+  double operator()(const std::function<void()> &fn) {
+    hipEventRecord(e0, nullptr);
+    fn();
+    hipEventRecord(e1, nullptr);
+    hipEventSynchronize(e1);
+    float ms = 0;
+    hipEventElapsedTime(&ms, e0, e1);
+    return ms;
+  }
+};
 
 double time_ms(const std::function<void()> &fn, int reps, double warm_ms) {
   const auto w0 = std::chrono::steady_clock::now();
@@ -167,8 +206,53 @@ bool launch_gqa(const float *q, const void *k, const void *v, float *out, int t,
 int main(int argc, char **argv) {
   const char *tname = argc > 1 ? argv[1] : "f16";
   std::vector<int> ts;
-  for (int i = 2; i < argc; ++i) ts.push_back(std::atoi(argv[i]));
+  std::vector<int> split_list{2, 4, 8, 16};
+  std::vector<int> wpb_list{8, 16, 32};
+  int smax = 16;
+  bool have_ab = false;
+  bool no_sweep = false;
+  int ab_sp = 0, ab_wpb = 0, ab_rounds = 15, ab_reps = 3;
+  std::vector<std::pair<int, int>> cands;  // (splits, warps/CTA)
+  auto cell_spec = [](const char *v, int *sp, int *wpb) {
+    *sp = std::atoi(v);
+    while (*v && *v != ':') ++v;
+    *wpb = (*v == ':') ? std::atoi(v + 1) : 0;
+  };
+  for (int i = 2; i < argc; ++i) {
+    auto list = [&](std::vector<int> &out) {
+      const char *v = argv[++i];
+      while (*v) {
+        out.push_back(std::atoi(v));
+        while (*v && *v != ',') ++v;
+        if (*v == ',') ++v;
+      }
+    };
+    if (std::strcmp(argv[i], "--smax") == 0 && i + 1 < argc) {
+      smax = std::atoi(argv[++i]);
+    } else if (std::strcmp(argv[i], "--splits") == 0 && i + 1 < argc) {
+      split_list.clear();
+      list(split_list);
+    } else if (std::strcmp(argv[i], "--wpb") == 0 && i + 1 < argc) {
+      wpb_list.clear();
+      list(wpb_list);
+    } else if (std::strcmp(argv[i], "--ab") == 0 && i + 1 < argc) {
+      cell_spec(argv[++i], &ab_sp, &ab_wpb);
+      have_ab = true;
+    } else if (std::strcmp(argv[i], "--cand") == 0 && i + 1 < argc) {
+      int sp = 0, wpb = 0;
+      cell_spec(argv[++i], &sp, &wpb);
+      cands.push_back({sp, wpb});
+    } else if (std::strcmp(argv[i], "--no-sweep") == 0) {
+      no_sweep = true;
+    } else if (std::strcmp(argv[i], "--ab-rounds") == 0 && i + 1 < argc) {
+      ab_rounds = std::atoi(argv[++i]);
+    } else {
+      ts.push_back(std::atoi(argv[i]));
+    }
+  }
   if (ts.empty()) ts = {4096, 16384, 65536};
+  if (smax < 1) smax = 1;
+  for (int sp : split_list) smax = std::max(smax, sp);
 
   rdna4::KvType kt = rdna4::KvType::F16;
   if (std::strcmp(tname, "q4_0") == 0) kt = rdna4::KvType::Q4_0;
@@ -209,116 +293,258 @@ int main(int argc, char **argv) {
     const std::uint64_t rowb = rdna4::kv_row_bytes(kt, kHeadDim);
     const std::size_t bytes = (std::size_t)(t + 1) * kHeadsKv * rowb;
     const std::int64_t rows = (std::int64_t)(t + 1) * kHeadsKv;
+    (void)hipGetLastError();  // a stale error from an earlier phase must not be
+                              // misattributed to the fill (it was, in run 3)
     if (!rdna4::kv_fill_launch(kt, d_k, rows, kHeadDim, 11u) ||
         !rdna4::kv_fill_launch(kt, d_v, rows, kHeadDim, 22u)) {
-      std::fprintf(stderr, "kv_fill_launch failed\n");
+      std::fprintf(stderr, "kv_fill_launch failed at t=%d: %s\n", t,
+                   hipGetErrorString(hipGetLastError()));
       return 1;
     }
-
-    const double ms_ship =
-        time_ms([&] { rdna4::attn_launch(d_q, d_k, d_v, d_out, t, kHeads, kHeadsKv, kHeadDim,
-                                         kScale, kt, kt, nullptr); },
-                5, 300.0);
-    // UNSPLIT kernel with a different warps-per-CTA (the "32 warps" of M7: the
-    // commit message claims kAttnWarpsPerBlock 8 -> 32, but the header still
-    // says 8, so the shipping unsplit kernel is 8 warps; this is what the
-    // measured 8/16/32 curve looks like now).
-    {
-      std::printf("  unsplit WPB sweep: ");
-      std::vector<float> ref0((std::size_t)kHeads * kHeadDim);
-      hipMemcpy(ref0.data(), d_out, ref0.size() * sizeof(float), hipMemcpyDeviceToHost);
-      for (int wpb : {8, 16, 32}) {
-        const double ms =
-            time_ms([&] {
-              (void)rdna4::attn_launch_wpb(d_q, d_k, d_v, d_out2, t, kHeads, kHeadsKv, kHeadDim,
-                                           kScale, kt, kt, wpb, nullptr);
-            }, 5, 300.0);
-        std::vector<float> got((std::size_t)kHeads * kHeadDim);
-        hipMemcpy(got.data(), d_out2, got.size() * sizeof(float), hipMemcpyDeviceToHost);
-        double num = 0, den = 0;
-        for (std::size_t i = 0; i < got.size(); ++i) {
-          const double d = (double)ref0[i] - (double)got[i];
-          num += d * d;
-          den += (double)ref0[i] * ref0[i] + (double)got[i] * got[i];
-        }
-        std::printf("wpb=%d: %.4f ms (%.2fx) rel-L2 %.1e | ", wpb, ms, ms_ship / ms,
-                    std::sqrt(num / den));
-      }
-      std::printf("\n");
-    }
-    // split-KV path (M7 step 2): same inputs, so the only difference is the
-    // summation order across key splits
+    // ------------------------------------------------------------------
+    // The search space of the attention kernel: split count x warps per CTA,
+    // measured the way this repo measures everything (PLAN.md M2 "Passo 5b"):
+    // ONE warm-up until ~300 ms of GPU time, then every cell timed by an event
+    // pair around `reps` launches, in ROTATED order over `rounds` rounds, keeping
+    // the MINIMUM per cell. The first cell measured after the cache fill is
+    // systematically slower (measured 0.85x on the same unsplit kernel when it
+    // was timed first and last), so a sequential sweep with a per-cell warm-up is
+    // not trustworthy at the few-percent level this table is used at.
+    //
+    // `ship` is the same unsplit kernel as `ship2` and `ship3` measured again as
+    // their own cells: their spread IS this bench's noise floor.
+    //
+    // WPB is a template knob (attn.cuh); changing it changes how many partial
+    // slices are merged per CTA (rel-L2 column), i.e. it is a numeric-equivalence
+    // change, not a bit-exact one. The shipping policy picks the warps
+    // (attn_split_wpb: 16 warps for n_splits <= kAttnSplitWpbLimit, 8 above).
+    // ------------------------------------------------------------------
+    constexpr int kPolicySplitMin = 512;
+    constexpr int kPolicyMaxSplits = 16;
+    constexpr int kReps = 5;
+    constexpr int kRounds = 3;
     float *d_partial = nullptr;
-    const int n_splits = (t / 2048) < 1 ? 1 : ((t / 2048) > 16 ? 16 : (t / 2048));
-    hipMalloc(&d_partial, rdna4::attn_partial_bytes(kHeads, kHeadDim, n_splits));
-    std::vector<float> sp((std::size_t)kHeads * kHeadDim);
-    double ms_split = -1.0, split_rel = -1.0, split_maxd = -1.0;
-    if (n_splits > 1) {
-      const bool ok_s = rdna4::attn_launch_split(d_q, d_k, d_v, d_out2, d_partial, t, kHeads,
-                                                 kHeadsKv, kHeadDim, kScale, kt, kt, n_splits);
-      hipDeviceSynchronize();
-      if (ok_s) {
-        hipMemcpy(sp.data(), d_out2, sp.size() * sizeof(float), hipMemcpyDeviceToHost);
-        std::vector<float> a2((std::size_t)kHeads * kHeadDim);
-        hipMemcpy(a2.data(), d_out, a2.size() * sizeof(float), hipMemcpyDeviceToHost);
-        double num = 0, den = 0, md = 0;
-        for (std::size_t i = 0; i < a2.size(); ++i) {
-          const double d = (double)a2[i] - (double)sp[i];
-          num += d * d;
-          den += (double)a2[i] * a2[i] + (double)sp[i] * sp[i];
-          md = std::max(md, std::fabs(d));
-        }
-        split_rel = std::sqrt(num / den);
-        split_maxd = md;
-        ms_split = time_ms(
-            [&] {
-              (void)rdna4::attn_launch_split(d_q, d_k, d_v, d_out2, d_partial, t, kHeads, kHeadsKv,
-                                             kHeadDim, kScale, kt, kt, n_splits);
-            },
-            5, 300.0);
-      }
+    if (hipMalloc(&d_partial, rdna4::attn_partial_bytes(kHeads, kHeadDim, smax)) != hipSuccess) {
+      std::fprintf(stderr, "hipMalloc partial failed\n");
+      return 1;
     }
-    hipFree(d_partial);
+    const int keys = t + 1;
+    int n_splits = keys / kPolicySplitMin;
+    if (n_splits < 1) n_splits = 1;
+    if (n_splits > kPolicyMaxSplits) n_splits = kPolicyMaxSplits;
+
+    if (no_sweep) {
+      // duel only: the sweep (and the GQA prototype) is skipped so a run measures
+      // exactly the two configurations being decided, nothing else
+      struct DCell { int sp, wpb; double ms; };
+      std::vector<DCell> duel;
+      duel.push_back({ab_sp, ab_wpb, -1.0});
+      for (auto &c : cands) duel.push_back({c.first, c.second, -1.0});
+      auto run_d = [&](const DCell &c) {
+        if (c.sp == 0)
+          (void)rdna4::attn_launch(d_q, d_k, d_v, d_out2, t, kHeads, kHeadsKv, kHeadDim, kScale, kt,
+                                   kt, nullptr);
+        else
+          (void)rdna4::attn_launch_split_wpb(d_q, d_k, d_v, d_out2, d_partial, t, kHeads, kHeadsKv,
+                                             kHeadDim, kScale, kt, kt, c.sp, c.wpb, nullptr);
+      };
+      {
+        const auto w0 = std::chrono::steady_clock::now();
+        do {
+          for (const DCell &c : duel) run_d(c);
+          hipDeviceSynchronize();
+        } while (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0)
+                     .count() < 300.0);
+      }
+      std::vector<int> wins(duel.size(), 0);
+      EvPair ev2;
+      for (int r = 0; r < ab_rounds; ++r) {
+        const bool fwd = (r % 2) == 0;
+        std::vector<double> got(duel.size(), -1.0);
+        for (std::size_t k = 0; k < duel.size(); ++k) {
+          const std::size_t idx = fwd ? k : duel.size() - 1 - k;
+          const double ms = ev2([&] {
+            for (int j = 0; j < ab_reps; ++j) run_d(duel[idx]);
+          }) / ab_reps;
+          got[idx] = ms;
+          if (duel[idx].ms < 0 || ms < duel[idx].ms) duel[idx].ms = ms;
+        }
+        for (std::size_t k = 1; k < duel.size(); ++k)
+          if (got[k] > 0 && got[0] > 0 && got[k] < got[0]) wins[k]++;
+      }
+      std::printf("t=%d (%d keys) INTERLEAVED A/B (%d rounds, %d launches each, order swapped)\n",
+                  t, t + 1, ab_rounds, ab_reps);
+      std::printf("  %-8s %-8s %10s %8s %10s  %s\n", "splits", "warps", "min ms", "vs ref",
+                  "wins", "note");
+      for (std::size_t k = 0; k < duel.size(); ++k)
+        std::printf("  %-8d %-8d %10.4f %7.3fx %5d/%-4d  %s\n", duel[k].sp, duel[k].wpb,
+                    duel[k].ms, duel[0].ms / duel[k].ms, wins[k], ab_rounds,
+                    k == 0 ? "reference" : "candidate");
+      std::printf("  (%d layers x 24 heads: the difference is worth %.3f ms/token)\n\n",
+                  kLayers, (duel[0].ms - duel[1].ms) * kLayers);
+      hipFree(d_partial);
+      continue;
+    }
+
+    struct Cell {
+      int sp;    // 0 = the shipping unsplit kernel, -1 = unsplit with forced wpb
+      int wpb;
+      double ms;
+      double rel;
+      double maxd;
+    };
+    std::vector<Cell> cells;
+    cells.push_back({0, 0, -1.0, 0.0, 0.0});   // ship (attn_launch, unsplit)
+    cells.push_back({0, 0, -1.0, 0.0, 0.0});   // ship2: identical -> noise floor
+    cells.push_back({0, 0, -1.0, 0.0, 0.0});   // ship3: identical -> noise floor
+    for (int wpb : wpb_list) cells.push_back({-1, wpb, -1.0, 0.0, 0.0});  // unsplit, forced warps
+    for (int sp : split_list)
+      for (int wpb : wpb_list) cells.push_back({sp, wpb, -1.0, 0.0, 0.0});
+
+    auto run_cell = [&](const Cell &c) {
+      if (c.sp == 0) {
+        (void)rdna4::attn_launch(d_q, d_k, d_v, d_out2, t, kHeads, kHeadsKv, kHeadDim, kScale, kt,
+                                 kt, nullptr);
+      } else if (c.sp < 0) {
+        (void)rdna4::attn_launch_wpb(d_q, d_k, d_v, d_out2, t, kHeads, kHeadsKv, kHeadDim, kScale,
+                                     kt, kt, c.wpb, nullptr);
+      } else {
+        (void)rdna4::attn_launch_split_wpb(d_q, d_k, d_v, d_out2, d_partial, t, kHeads, kHeadsKv,
+                                           kHeadDim, kScale, kt, kt, c.sp, c.wpb, nullptr);
+      }
+    };
+    // one global warm-up: the DPM state is what it is, and every cell below is
+    // measured in the same (hot) state
+    {
+      const auto w0 = std::chrono::steady_clock::now();
+      do {
+        run_cell(cells[0]);
+        run_cell(cells[cells.size() - 1]);
+        hipDeviceSynchronize();
+      } while (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0)
+                   .count() < 300.0);
+    }
+    EvPair ev;
 
     // ------------------------------------------------------------------
-    // Split-count x warps-per-CTA sweep. The engine's auto policy is
-    // `keys / 2048` capped at 16, so at 4K keys it runs the UNSplit kernel with
-    // 24 CTAs on 64 CUs; the question this table answers is what that costs.
-    // WPB is a template knob (attn.cuh) and changing it changes the number of
-    // partial slices merged per CTA, i.e. it is a numeric-equivalence change.
+    // Interleaved A/B ("duel"): the sweep above can place two cells several
+    // seconds apart, and on this card the SAME kernel measured as three
+    // independent cells spread by up to 20% (see the noise-floor line). For a
+    // decision that ships, the two configurations are measured ALTERNATELY,
+    // `ab_rounds` times each way, and the table reports the min, the ratio and
+    // how many rounds the candidate won -- a difference that does not win most
+    // rounds is not a win, whatever the min says.
     // ------------------------------------------------------------------
-    {
-      std::vector<float> ref((std::size_t)kHeads * kHeadDim);
-      hipMemcpy(ref.data(), d_out, ref.size() * sizeof(float), hipMemcpyDeviceToHost);
-      float *dp = nullptr;
-      if (hipMalloc(&dp, rdna4::attn_partial_bytes(kHeads, kHeadDim, 16)) != hipSuccess) {
-        std::fprintf(stderr, "hipMalloc partial failed\n");
-        return 1;
-      }
-      std::printf("  %-10s %-10s %10s %8s %12s %10s\n", "splits", "warps/CTA", "ms", "vs unsplit",
-                  "rel-L2", "grid CTAs");
-      for (int sp : {2, 4, 8, 16}) {
-        for (int wpb : {8, 16, 32}) {
-          const double ms = time_ms(
-              [&] {
-                (void)rdna4::attn_launch_split_wpb(d_q, d_k, d_v, d_out2, dp, t, kHeads, kHeadsKv,
-                                                   kHeadDim, kScale, kt, kt, sp, wpb, nullptr);
-              },
-              5, 300.0);
-          std::vector<float> got((std::size_t)kHeads * kHeadDim);
-          hipMemcpy(got.data(), d_out2, got.size() * sizeof(float), hipMemcpyDeviceToHost);
-          double num = 0, den = 0;
-          for (std::size_t i = 0; i < got.size(); ++i) {
-            const double d = (double)ref[i] - (double)got[i];
-            num += d * d;
-            den += (double)ref[i] * ref[i] + (double)got[i] * got[i];
-          }
-          std::printf("  %-10d %-10d %10.4f %7.2fx %12.2e %10d\n", sp, wpb, ms, ms_ship / ms,
-                      std::sqrt(num / den), kHeads * sp);
+    if (have_ab || !cands.empty()) {
+      std::vector<Cell> duel;
+      duel.push_back({ab_sp, ab_wpb, -1.0, 0.0, 0.0});
+      for (auto &c : cands) duel.push_back({c.first, c.second, -1.0, 0.0, 0.0});
+      std::vector<int> wins(duel.size(), 0);
+      for (int r = 0; r < ab_rounds; ++r) {
+        const bool fwd = (r % 2) == 0;
+        std::vector<double> got(duel.size(), -1.0);
+        for (std::size_t k = 0; k < duel.size(); ++k) {
+          const std::size_t idx = fwd ? k : duel.size() - 1 - k;
+          const double ms = ev([&] {
+            for (int j = 0; j < ab_reps; ++j) run_cell(duel[idx]);
+          }) / ab_reps;
+          got[idx] = ms;
+          if (duel[idx].ms < 0 || ms < duel[idx].ms) duel[idx].ms = ms;
         }
+        for (std::size_t k = 1; k < duel.size(); ++k)
+          if (got[k] > 0 && got[0] > 0 && got[k] < got[0]) wins[k]++;
       }
-      hipFree(dp);
+      std::printf("  INTERLEAVED A/B (%d rounds, %d launches per measurement, order swapped each "
+                  "round)\n", ab_rounds, ab_reps);
+      std::printf("  %-10s %-10s %10s %8s %10s  %s\n", "splits", "warps/CTA", "min ms", "vs A",
+                  "wins", "note");
+      for (std::size_t k = 0; k < duel.size(); ++k) {
+        std::printf("  %-10d %-10d %10.4f %7.3fx %5d/%-4d  %s\n", duel[k].sp, duel[k].wpb,
+                    duel[k].ms, duel[0].ms / duel[k].ms, wins[k], ab_rounds,
+                    k == 0 ? "reference" : "candidate");
+      }
+      std::printf("  A/B noise floor is the reference row against itself: run --cand %d:%d to "
+                  "measure it.\n", ab_sp, ab_wpb);
     }
+
+    for (int r = 0; r < kRounds; ++r) {
+      for (std::size_t i = 0; i < cells.size(); ++i) {
+        Cell &c = cells[(i + (std::size_t)r * 7) % cells.size()];
+        const double ms = ev([&] {
+          for (int k = 0; k < kReps; ++k) run_cell(c);
+        }) / kReps;
+        if (c.ms < 0 || ms < c.ms) c.ms = ms;
+      }
+    }
+    // numerics per cell, against the unsplit reference output
+    std::vector<float> ref((std::size_t)kHeads * kHeadDim);
+    run_cell(cells[1]);
+    hipDeviceSynchronize();
+    hipMemcpy(ref.data(), d_out2, ref.size() * sizeof(float), hipMemcpyDeviceToHost);
+    for (Cell &c : cells) {
+      run_cell(c);
+      hipDeviceSynchronize();
+      std::vector<float> got((std::size_t)kHeads * kHeadDim);
+      hipMemcpy(got.data(), d_out2, got.size() * sizeof(float), hipMemcpyDeviceToHost);
+      double num = 0, den = 0, md = 0;
+      for (std::size_t i = 0; i < got.size(); ++i) {
+        const double d = (double)ref[i] - (double)got[i];
+        num += d * d;
+        den += (double)ref[i] * ref[i] + (double)got[i] * got[i];
+        md = std::max(md, std::fabs(d));
+      }
+      c.rel = std::sqrt(num / den);
+      c.maxd = md;
+    }
+    const double ms_ship = cells[0].ms;
+    const double ms_ship2 = std::min(cells[1].ms, cells[2].ms);
+    std::printf("  noise floor (same unsplit kernel as 3 independent cells, min of %d rounds): "
+                "%.4f vs %.4f ms = %.3fx\n",
+                kRounds, ms_ship, ms_ship2, ms_ship2 / ms_ship);
+    std::printf("  unsplit kernel with forced warps/CTA:");
+    for (const Cell &c : cells)
+      if (c.sp < 0) std::printf("  wpb=%d: %.4f ms (%.2fx)", c.wpb, c.ms, ms_ship / c.ms);
+    std::printf("\n");
+
+    std::printf("  %-10s %-10s %10s %8s %12s %10s\n", "splits", "warps/CTA", "ms", "vs unsplit",
+                "rel-L2", "grid CTAs");
+    double best_ms = ms_ship, policy_ms = -1.0;
+    int best_sp = 0, best_wpb = 0, policy_sp = 1, policy_wpb = 0;
+    for (const Cell &c : cells) {
+      if (c.sp <= 0) continue;
+      const bool is_policy = (c.sp == n_splits) &&
+                             (c.wpb == (c.sp <= rdna4::kAttnSplitWpbLimit
+                                            ? 16
+                                            : rdna4::kAttnWarpsPerBlock));
+      if (is_policy) {
+        policy_ms = c.ms;
+        policy_sp = c.sp;
+        policy_wpb = c.wpb;
+      }
+      if (c.ms < best_ms) {
+        best_ms = c.ms;
+        best_sp = c.sp;
+        best_wpb = c.wpb;
+      }
+      std::printf("  %-10d %-10d %10.4f %7.2fx %12.2e %10d%s\n", c.sp, c.wpb, c.ms,
+                  ms_ship / c.ms, c.rel, kHeads * c.sp, is_policy ? "  <- ship policy" : "");
+    }
+    std::printf("  best cell: %d splits x %d warps = %.4f ms (%.3fx unsplit); "
+                "ship policy at %d keys = %d splits x %d warps = %.4f ms (%.3fx unsplit)\n",
+                best_sp, best_wpb, best_ms, ms_ship / best_ms, keys, policy_sp, policy_wpb,
+                policy_ms, policy_ms > 0 ? ms_ship / policy_ms : 0.0);
+    std::printf("  best cell vs ship policy: %.3fx (%.4f vs %.4f ms) over %d heads x %d layers "
+                "= %.3f ms/token at stake; noise floor %.3fx\n",
+                policy_ms / best_ms, best_ms, policy_ms, kHeads, kLayers,
+                (policy_ms - best_ms) * kLayers, ms_ship2 / ms_ship);
+    const double ms_split = policy_ms > 0 ? policy_ms : -1.0;
+    double split_rel = 0.0, split_maxd = 0.0;
+    for (const Cell &c : cells)
+      if (c.sp == policy_sp && c.wpb == policy_wpb) {
+        split_rel = c.rel;
+        split_maxd = c.maxd;
+      }
+    hipFree(d_partial);
 
     bool gqa_ok = true;
     const double ms_gqa = time_ms(
@@ -365,6 +591,7 @@ int main(int argc, char **argv) {
                 "prototype vs ship: rel-L2 %.1e\n",
                 split_rel, split_maxd, n_splits, rel);
     (void)grow;
+    hipFree(d_partial);
   }
   return 0;
 }

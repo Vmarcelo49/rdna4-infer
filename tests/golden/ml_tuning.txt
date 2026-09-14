@@ -1,0 +1,27 @@
+# ml_tuning — configuracao MEDIDA e EMBARCADA deste motor em gfx1201
+# (AMD RX 9070 XT, ROCm 7.2). Gerado por `check-tuning --record tests/golden/ml_tuning.txt`.
+# Comparado por `check-tuning` (gate de pre-merge); numeros medidos,
+# candidatos rejeitados e piso de ruido: docs/autotuning-gfx1201.md.
+# Fonte dos valores: include/rdna4/tuning.h (unica).
+matvec.types = 14
+matvec.q8_0 = rows 2 wpr 1 ilp 4 unroll 1
+matvec.q2_K = rows 2 wpr 1 ilp 2 unroll 1
+matvec.q3_K = rows 1 wpr 8 ilp 2 unroll 1
+matvec.q4_K = rows 8 wpr 1 ilp 2 unroll 1
+matvec.q5_K = rows 4 wpr 1 ilp 2 unroll 1
+matvec.q6_K = rows 1 wpr 4 ilp 2 unroll 1
+matvec.iq2_xxs = rows 1 wpr 1 ilp 2 unroll 1
+matvec.iq2_xs = rows 1 wpr 2 ilp 4 unroll 1
+matvec.iq3_xxs = rows 2 wpr 1 ilp 1 unroll 2
+matvec.iq1_s = rows 1 wpr 4 ilp 1 unroll 1
+matvec.iq4_nl = rows 8 wpr 1 ilp 1 unroll 2
+matvec.iq3_s = rows 8 wpr 1 ilp 1 unroll 2
+matvec.iq2_s = rows 2 wpr 1 ilp 1 unroll 2
+matvec.iq4_xs = rows 8 wpr 1 ilp 2 unroll 1
+attn.warps_per_block = 8
+attn.split_wpb_limit = 4
+attn.split_wpb_wide = 16
+attn.split_min = 512
+attn.max_splits = 16
+batch.ns = 2,3,4,8,16
+batch.cap = 16
