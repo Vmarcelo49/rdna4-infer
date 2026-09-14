@@ -222,3 +222,30 @@ Estado de partida (medido neste worktree, `build/` próprio, IQ3_S, f16 KV):
 - **16K, aceitação 54,9 %**: com o pré-preenchimento por token o número foi
   re-medido (§7); a hipótese era que o mesmo bug também estivesse degradando o
   estado do bloco de rascunho em contexto longo.
+
+## 7. Atribuição do bug e re-medição com a `main` consertada
+
+- **Referência**: mensagem do coordenador (revisão adversarial 2): **R9** — o
+  `forward_batch` não honrava `want_argmax_`, então o braço *ganancioso* gerava o
+  token 0 (`!`) como primeiro token quando o último chunk do prefill era um lote
+  (justamente o caso a 4K). Ou seja: na §6 quem estava errado era o **baseline**,
+  não o `--mtp` (que amostra no host a partir de `logits`). Conserto na `main`
+  (`7ecb400`, helper `Graph::finish_argmax()` + gate diferencial no
+  `check_golden_run.sh`).
+  **R1** — `attn_split_batch_kernel` lia o `q` da primeira linha do grupo para
+  todas as linhas, o que corrompia a **atenção dividida em lote** — em contexto
+  longo, splits > 1, exatamente o que a verificação do MTP usa. Conserto na `main`
+  (`30e9668`), coberto pelo gate novo do `check-batch-gpu` (posição 1088, splits 2).
+  **R11** — o despacho em lote da atenção dividida não conhecia `q5_0`/`q4_1`.
+- **Hipótese**: com R1 e R9 consertados, (a) a saída do `--mtp` volta a ser
+  byte-idêntica ao ganancioso a 4K, (b) o ganho a 4K se confirma, (c) a aceitação
+  a 16K melhora (o estado do bloco de rascunho estava sendo construído a partir de
+  uma atenção errada).
+- **Comando**: `git merge main` (duas vezes: R9 às 05:17, R1/R11 às 05:40),
+  rebuild, e `/tmp/mtp-now.sh` sob uma tomada de lock:
+  `RD_MTP_XALL_POS=4096 ./build/check-mtp-gpu <IQ3_S> 32 3` (gate do
+  `forward_batch_all` contra o caminho por token numa posição de contexto longo,
+  linha a linha, N=2/4/16), depois
+  `/tmp/mtp-matrix.sh 4096 64 1 plain: b2:… b3:… s3:…` e
+  `/tmp/mtp-matrix.sh 16384 64 1 plain: b3:… b2:…`.
+- **Resultado**: §8.

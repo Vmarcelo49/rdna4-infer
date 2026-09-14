@@ -1,5 +1,20 @@
 # rdna4-infer — MTP (NextN): o bloco 64 como cabeça de rascunho
 
+> **Atualização (rodada noturna de 2026-09-14, frente MTP).** O verify batelado
+> que este documento pedia em §7 **existe agora** e o MTP **paga**: em IQ3_S, f16
+> KV, greedy, prompt de wiki enchendo o contexto,
+> ganancioso **29,33 tok/s** contra **51,47 tok/s** com `--mtp --draft 3`
+> (**1,75×** a 4K; 1,71× com `--draft 2`), com a saída **byte-idêntica** ao
+> ganancioso (`md5` do stdout igual) e os gates numéricos verdes. O que mudou:
+> `Graph::forward_batch_all` (hidden **e** logits de todas as linhas),
+> `Graph::state_snapshot/state_restore` (rollback do estado recorrente GDN, 149,6
+> MiB, 0,54 ms por par) e a rodada especulativa de `mtp_gen.h` — ver
+> `docs/journal-mtp.md`. Limite medido: `matvec_launch_batch` só tem instanciações
+> 2/3/4/8/16, então o verify de `k` rascunhos usa `k+1` linhas e o caminho batelado
+> para em **k = 3** (`--draft 4` exigiria `N = 5` em `matvec.cuh`). A 16K o ganho
+> medido foi menor e a taxa de aceitação caiu (§4.3 do diário); o texto abaixo é o
+> estudo original, mantido como registro.
+
 O GGUF tem 65 blocos: 64 camadas de trunk mais o bloco 64, que é o cabeça
 **MTP / NextN** (`qwen35.nextn_predict_layers = 1`). O trunk nunca o executava
 (`Graph::n_layer()` = `block_count - nextn_predict_layers` = 64). Este trabalho
@@ -277,8 +292,12 @@ scripts/gpu-lock.sh ./build/check-mtp-gpu $IQ4_XS 64 3
 
 ## 7. O que ficou de fora
 
-- **Verify batelado** (o que daria o ganho): precisa de atenção multi-query com
-  máscara causal e do forward batelado do trunk, que toca `attn.cuh`/`gdn.cuh`.
+- ~~**Verify batelado** (o que daria o ganho)~~ **feito na rodada noturna de
+  2026-09-14**: `forward_batch_all` + `state_snapshot/state_restore` +
+  `mtp_gen.h`, medido em 1,71-1,75× a 4K (ver o topo deste arquivo e
+  `docs/journal-mtp.md`). A atenção multi-query com máscara causal acabou vindo da
+  frente de prefill (`feat/noite-prefill`, o andaime em lote dentro do
+  `forward_batch`), e o verify a herda sem mudança nenhuma.
 - **Amostragem especulativa correta** (rejection sampling) para `temp > 0`.
 - **MTP em contexto longo**: medido só a 4K; a cache KV do bloco é f16 e são
   **duas** caches (K e V, `d_ck_`/`d_cv_` em `MtpHead::alloc_kv`): 16 MiB a 4K
