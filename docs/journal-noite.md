@@ -207,19 +207,27 @@ diferença vinha de um chute de 1 GiB de overhead e de contar o bloco MTP que n�
 ### C11. MTP: o ganho existe e é 1,75× (medido pela frente, 05:35)
 - **Referência**: `docs/mtp.md` §7 ("verify batelado" como a peça que falta), `docs/medicoes-m8.md`
   (projeção de 1,3-1,5× com o `cf(N)` antigo).
-- **Resultado medido** (IQ3_S, `bench`-equivalente da própria frente, 2 repetições intercaladas,
-  mesmo md5 entre repetições): a 4K, **ganancioso 29,33 tok/s · `--mtp --draft 2` 50,15 (1,71×) ·
-  `--draft 3` 51,47 (1,75×) · `--draft 3 --mtp-serial` 25,99 (0,89×)**. O contraste com o
-  caminho serial (que era o único existente até hoje e é 9-11 % **mais lento** que o ganancioso)
-  é a prova de que o ganho vem da verificação em lote, não do rascunho.
+- **Resultado medido, COM O BASELINE CERTO** (a primeira medição da frente deu 1,71-1,75× e
+  estava errada: comparava contra o baseline quebrado pelo R9, e o texto degenerado que ele
+  produzia — "actor actor actor…" — *inflava a aceitação* de 67,9 % para 88,9 %): a 4K,
+  **ganancioso 29,37 tok/s · `--draft 2` 34,56 (1,18×) · `--draft 3` 30,11 (1,03×) ·
+  `--draft 3 --mtp-serial` 25,85 (0,88×)**; a 16K, ganancioso 26,81 · **`--draft 3` 30,53
+  (1,14×)**. Exatidão conferida por **md5 do stdout** (`--mtp` == ganancioso nas duas pontas,
+  todas as variantes). O contraste que sobrevive é o que prova a tese: **0,88× (serial) →
+  1,18× (batelado)** na mesma janela e com a mesma saída.
+- **Duas lições de método que vão para o relatório**: (a) um ganho só vale o que vale o
+  baseline contra o qual foi medido — o número inflado ficou ~40 min no README antes de ser
+  corrigido; (b) taxa de aceitação é um proxy de qualidade que um motor quebrado consegue
+  *melhorar*.
 - **Peças que sustentam o número**: *snapshot/restore* do estado GDN bit-exato (max|d| = 0,
   argmax igual) a 0,53 ms por par; `forward_batch_all` bit-exato em posição 4084 (linha a linha,
   h e logits); linha extra na verificação a 7,0-7,2 ms contra 32,7 ms de um passo por token.
 - **Ressalva de escopo**: os números de **16K** da frente (0,86× e aceitação 54,9 %) estão
   contaminados pelo achado **R1** (a atenção dividida em lote lia o `q` da primeira linha), que
   foi consertado depois; a re-medição decide se o MTP paga também em contexto longo.
-- **Veredito**: MANTIDO. É a entrega da tarefa 2: o MTP saiu de "9-11 % mais lento" para
-  **1,71-1,75× mais rápido** com a saída idêntica ao ganancioso.
+- **Veredito**: MANTIDO. É a entrega da tarefa 2: o MTP saiu de **0,88-0,91× (serial)** para
+  **1,18× a 4K e 1,14× a 16K**, com a saída byte-idêntica ao ganancioso (md5) e a aceitação
+  subindo de 54,9 % para 67,7 % quando o R1 foi consertado.
 
 ## Estado do alvo (atualizado pelo coordenador)
 

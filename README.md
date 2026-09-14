@@ -447,29 +447,34 @@ Ordered by how much they cost the user, with the number that justifies each. Not
    anyone not spending that headroom on MTP. Note that **perplexity does not order these
    formats**: `q5_0`/`q4_0` beats `q5_0`/`q4_1` on PPL (5.932 vs 5.958) while having 23 % more
    KL and nearly double the greedy divergence — PPL is blind to this, KL is not.
-3. **MTP (block 64) now pays: 1.71-1.75× at 4K, with the output still byte-identical to
-   greedy.** The NextN head drafts at 86.7 % acceptance (llama.cpp's own driver: 87.5 %); the
-   missing piece was **batched verification**, and it is what the night built: draft `k`
-   tokens, verify all `k+1` rows in **one** `forward_batch_all` (the weight pass is shared),
-   accept the longest prefix, and roll the recurrent state back with a device-to-device
-   snapshot when a draft is rejected.
-   Measured at 4K (IQ3_S, two interleaved repetitions, identical md5 between them):
+3. **MTP (block 64) now pays, modestly and honestly: 1.18× at 4K, 1.14× at 16K, with the
+   output byte-identical to greedy.** The NextN head drafts at 67.9 % acceptance; the missing
+   piece was **batched verification**, and it is what the night built: draft `k` tokens, verify
+   all `k+1` rows in **one** `forward_batch_all` (the weight pass is shared), accept the longest
+   prefix, and roll the recurrent state back with a device-to-device snapshot when a draft is
+   rejected.
 
-   | mode | tok/s | vs greedy |
-   |---|---|---|
-   | plain greedy | 29.33 | 1.00× |
-   | `--mtp --draft 2` | **50.15** | **1.71×** |
-   | `--mtp --draft 3` | **51.47** | **1.75×** |
-   | `--mtp --draft 3 --mtp-serial` (the old path) | 25.99 | 0.89× |
+   | context | mode | tok/s | vs greedy | acceptance | rows/round |
+   |---|---|---|---|---|---|
+   | 4K | plain greedy | 29.37 | 1.00× | — | — |
+   | 4K | `--mtp --draft 2` (batched) | **34.56** | **1.18×** | 67.9 % | 2.96 |
+   | 4K | `--mtp --draft 3` (batched) | 30.11 | 1.03× | 52.1 % | 3.92 |
+   | 4K | `--mtp --draft 3 --mtp-serial` | 25.85 | 0.88× | 58.2 % | — |
+   | 16K | `--mtp --draft 3` (batched) | **30.53** | **1.14×** | 67.7 % | 3.95 |
 
-   The pieces that make it work are measured too: the state snapshot/restore is bit-exact
-   (`max|d| = 0`, same argmax) and costs 0.53 ms per pair; `forward_batch_all` is bit-exact
-   against the per-token path at position 4084 (row by row, `h` and logits); an extra verified
-   row costs 7.0-7.2 ms against 32.7 ms for a whole per-token step. The contrast with the
-   serial path (0.89×) is the evidence that the win comes from batching the verification and
-   not from the draft. **At 16K the number is still open** — the first measurement (0.86×) ran
-   against the split-attention kernel *before* review finding R1 was fixed, so it is being
-   re-measured. `docs/mtp.md`, `docs/medicoes-m8.md`.
+   Exactness is checked by `md5` of stdout, not by eye: `--mtp` and plain greedy produce the
+   same bytes at 4K and at 16K, in every variant. The pieces are measured too: the state
+   snapshot/restore is bit-exact (`max|d| = 0`, same argmax) at 0.53 ms per pair, an extra
+   verified row costs 7.0-7.2 ms against 32.7 ms for a whole per-token step, and the contrast
+   `0.88×` (serial, the only path that existed before tonight) → `1.18×` (batched) is the
+   evidence that the win comes from batching the verification, not from the draft.
+
+   **A warning about this number, because it was wrong once tonight.** An earlier measurement
+   in the same session reported 1.71-1.75×: it compared against a baseline broken by the bug
+   below, and the degenerate text that baseline produced ("actor actor actor…") *inflated the
+   acceptance rate* from 67.9 % to 88.9 %. Two lessons are now in the repo: a speedup is only
+   as good as the baseline it was measured against, and the acceptance rate is a quality proxy
+   that a broken engine can game. `docs/mtp.md`, `docs/medicoes-m8.md`.
 4. **Long context works but the GQA re-read is still per query head**: with a 6:1 ratio each
    K/V row is read **6 times** per token (25.77 GB of logical KV traffic at 64K against
    4.295 GB of unique bytes). The attention kernel saturates ~1.35 TB/s of L2, so the L2 hides
