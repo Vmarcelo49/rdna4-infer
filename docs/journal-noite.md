@@ -15,6 +15,7 @@ máximo de desempenho que couber na noite.
 | Kernels gfx1201 | `feat/noite-kernels` | `../rdna4-wt-noite-kernels` | `docs/journal-kernels.md` | a começar |
 | Contexto longo / RoPE / qualidade | `feat/noite-longctx` | `../rdna4-wt-noite-longctx` | `docs/journal-longctx.md` | a começar |
 | Levantamento de referências | `feat/noite-refs` | `../rdna4-wt-noite-refs` | `docs/journal-refs.md` | **mergeada** (1014 linhas; cf(N) medido, Hadamard, veredito K/V) |
+| **Estudo do prefill (14/09, dia)** | `main` | — | **`docs/estudo-prefill.md`** + `docs/plano-prefill.md` | **o gap é 8,54× em três fatores medidos: 1,38× estrutura × 2,50× micro-lote × 2,47× unidades de matriz** (frentes A/B/C/D/F; ver §0 do estudo para uma correção de integridade) |
 | **Matvec em lote (pós-fechamento)** | `main` | — | **`docs/journal-lote.md`** | **medido**: o peso amortiza (13,9 ms), o token não (6,04 ms/token); ativação e MLP refutados |
 
 Este arquivo é atualizado pelo coordenador conforme os merges entram: no fim da noite ele tem

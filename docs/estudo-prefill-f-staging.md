@@ -89,7 +89,7 @@ Leituras (todas com o comando da tabela acima, `--reps 5`, mínimo de 5):
    pack → store`, com poucas cadeias independentes por thread (uma, no tile BM=128: 256 threads para
    256 sub-blocos por iteração de K ⇒ exatamente 1 sub-bloco por thread por iteração). Com 1 CTA por
    CU em BM=128 (LDS 33,8 KB de 65,5 KB) não há outro CTA para preencher os buracos: por iteração de K
-   são ~21 000 ciclos para 440 instruções de warp.
+   são ~21 000 ciclos para 440 instruções de warp no CTA (**48 ciclos por instrução de warp**).
 3. **A alavanca medida é a ocupação, não a largura de carga**: com BM=64 (LDS 25,3 KB ⇒ 2 CTAs/CU e
    272 CTAs em vez de 136) o staging passa de 173,5 para **404,6 G pesos/s**; com BK=32 em BM=128
    (LDS 17,4 KB ⇒ 3 CTAs/CU) passa de 173,5 para 240,2 G pesos/s. Em todos os casos o byte por peso

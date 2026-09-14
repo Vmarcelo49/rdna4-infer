@@ -228,9 +228,12 @@ is comparable (64 tokens).
 Two notes that keep the table honest. **The window matters**: these numbers are 8-9 % *better*
 than the M7/M8 records at the same positions (4K: 26.8 → 29.3), while the controlled A/B of the
 tuning changes that landed since measured +1.2 % there — the rest is machine state, because the
-earlier records were taken while other jobs shared the GPU. **The prefill row deserves a second
-look**: the gap is real (73 vs 440-1143) and it *widens* with prompt length, since a long prompt
-amortizes per-call overhead while our per-token scaffolding does not. Sources: `docs/medicoes-m5.md` (both files, KV types,
+earlier records were taken while other jobs shared the GPU. **The prefill row was re-measured on
+14/09 and the gap is 8.54× against a pristine llama.cpp build, decomposed by measurement into
+three factors** — `docs/estudo-prefill.md` (the study: `docs/estudo-prefill-{a-vulkan,b-mmq,c-nosso,d-wmma,f-staging}.md`)
+and `docs/plano-prefill.md` (the resulting plan). Note that the local llama.cpp checkout carries a
+one-line local edit that makes it ~11 % faster, which is why earlier records say 1143 and the clean
+build says 1054 — the study's §0 has the correction. Sources: `docs/medicoes-m5.md` (both files, KV types,
 contexts, perplexity), `medicoes-m7.md` (long context), `medicoes-m8.md` (batched prefill,
 MTP projection), `medicoes-banda-e-gargalos.md` (per-phase time and the traffic budget).
 

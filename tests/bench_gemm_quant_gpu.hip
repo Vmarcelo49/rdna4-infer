@@ -29,8 +29,11 @@
 //      veredito f16 x int8-dp4a.
 //
 // Uso:
-//   bench-gemm-quant-gpu <model.gguf> [--m 16,64,128] [--bk 64] [--reps 5]
-//                        [--tensor NOME] [--n N] [--k K] [--list] [--no-verify]
+//   bench-gemm-quant-gpu <model.gguf> [--m 16,64,128] [--bk 64] [--bm 0|16|32|64|128]
+//                        [--reps 5] [--dbuf] [--tensor NOME] [--n N] [--k K] [--list]
+//                        [--no-verify]
+//     --bm    forca o tile de M (varre ocupacao de LDS x paralelismo)
+//     --dbuf  duplo buffer no laco de K (off por padrao; medido: nao paga)
 //
 // Regra de ouro desta casa (docs/estudo-prefill.md §3b): a primeira versao da
 // bancada anterior reportou 1198 T MACs/s porque o lancamento tinha o numero de
@@ -272,6 +275,312 @@ __global__ void __launch_bounds__((BM / RM) * (BN / RN)) gemm_iq3s_f16_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// 3b. FRENTE G -- variantes de staging, medidas na MESMA janela
+// ---------------------------------------------------------------------------
+// O diagnostico da frente F (docs/estudo-prefill-f-staging.md §1): o staging
+// custa 42 % do kernel, ocupa ~2 % dos slots de issue e roda a 12-28 % da banda
+// -- e' LATENCIA. Por sub-bloco de 32 pesos e por thread a cadeia e'
+//
+//   LDG qs/qh/signs -> indice -> LDG da LUT (L1) -> cvt/mul -> pack -> STS
+//
+// com UMA cadeia por thread (BM=128/BK=64: 256 threads para 256 sub-blocos por
+// iteracao de K) e um `__syncthreads` entre staging e conta -- o mesmo warp faz
+// as duas coisas e elas se serializam (medido: t_stage + t_conta = t_GEMM). A
+// ISA confirma: 5 cargas de campo por thread (`global_load_u16` do `d`,
+// `global_load_b64` do `qs`, `global_load_u8` do `qh`, `global_load_b32` dos
+// `signs`, `global_load_u8` da escala), depois 8 `global_load_b32` da LUT num
+// `s_clause 0x7` + `s_wait_loadcnt 0x8` (espera pelas OITO), e so' entao
+// 16 `v_fma_mixlo_f16` + 8 `ds_store_2addr_b32`.
+//
+// As variantes atacam a cadeia uma de cada vez, como BITS do template (STG),
+// para que o A/B seja entre kernels que so' diferem no que o bit muda:
+//
+//   bit 0 (1)  AVEC : a copia da ativacao usa `int4` (16 B) em vez de `half2`
+//                     (4 B): 4x menos instrucoes e 4x menos pedidos (o loop cai
+//                     de 16 para 4 iteracoes). Exige stride de linha 16-B
+//                     alinhado, entao AS vai de BK+2 para BK+8 halves. O pad par
+//                     NAO cria conflito no A: dentro de uma warp so' existem 2
+//                     enderecos de A (tr e tr+1), cada um broadcast para 16
+//                     lanes; quem precisa de stride impar e' o W (W2 = BK/2+1),
+//                     e esse nao mudou.
+//   bit 1 (2)  WPF  : prefetch dos CAMPOS do peso de k+BK para REGISTRADORES,
+//                     emitido depois do `__syncthreads` e ANTES da conta de k. O
+//                     compilador nao pode afundar a carga atraves da barreira,
+//                     entao a janela de voo e' a conta inteira; a latencia do
+//                     LDG sai da cadeia do staging. Nao custa LDS.
+//   bit 2 (4)  WDB  : duplo buffer SO' do W (o A fica com um buffer), o que
+//                     deixa a dequantizacao+STS de k+BK rodar DURANTE a conta de
+//                     k. O duplo buffer completo da frente F nao caberia em
+//                     BM=128 (67,6 KB); este cabe porque o A nao e' duplicado.
+//   bit 3 (8)  AG   : a ativacao NAO vai para a LDS -- o laco interno le direto
+//                     da global (broadcast de 2 enderecos por warp). Mata a
+//                     copia da ativacao (frente F: 0,178-0,190 ms = 35 % do
+//                     staging, 178 MB por passada em BM=128) e libera 18 KB de
+//                     LDS por CTA.
+//
+// MODE: 0 = GEMM, 1 = staging (A+W) com consumo minimo, 3 = staging do W para
+// int8 na LDS -- a alternativa da regra 5 do pedido, na convencao do
+// `vec_dot_iq3_s_q8_1`: magnitude 1..15 com o sinal aplicado por
+// `__vcmpne4`/`__vsub4` e o `1+2*sc` FORA do byte (ele e' multiplicacao inteira
+// no int32 do bloco, `vecdotq.cuh:725`, e trocar a ordem muda o arredondamento).
+//
+// Toda variante tem de dar C BIT A BIT igual ao kernel da frente F: elas so'
+// mudam POR ONDE o operando anda, nunca a algebra. A bancada verifica isso e
+// imprime `bitid`.
+struct WFields {
+  unsigned long long qs;  // 8 B de blk->qs + 8s
+  unsigned int signs;     // 4 B de blk->signs + 4s
+  unsigned short d;       // blk->d (fp16)
+  unsigned char qh;       // blk->qh[s]
+  unsigned char sc;       // blk->scales[s/2]
+};
+
+// `__builtin_memcpy` em vez de cast com alinhamento assumido: o `qs` mora no
+// offset 2 de um bloco de 110 B, ou seja 2 mod 8 -- a carga de 8 B deste campo e'
+// DESALINHADA por construcao. O kernel da frente F ja' faz isso (a ISA dele
+// mostra `global_load_b64 ..., off offset:2`, vindo do `get_int_b2` de dois u16)
+// e passa bit a bit contra o oraculo: o gfx1201 aceita a carga desalinhada.
+__device__ __forceinline__ WFields wf_load(const block_iq3_s *__restrict__ blk, const int s) {
+  WFields f;
+  __builtin_memcpy(&f.qs, blk->qs + 8 * s, 8);
+  __builtin_memcpy(&f.signs, blk->signs + 4 * s, 4);
+  f.d = blk->d;
+  f.qh = blk->qh[s];
+  f.sc = blk->scales[s / 2];
+  return f;
+}
+
+// Mesma algebra de `stage_iq3s_32`, em cima dos campos ja' em registrador.
+__device__ __forceinline__ void wf_dequant(const WFields &f, const int s, __half2 *__restrict__ dst) {
+  const unsigned char *qs = (const unsigned char *)&f.qs;
+  const unsigned char *sg = (const unsigned char *)&f.signs;
+  const int qh = f.qh;
+  const float d = rdna4::fp16_to_float(f.d) * (float)(1 + 2 * ((f.sc >> (4 * (s % 2))) & 0x0F));
+#pragma unroll
+  for (int il = 0; il < 4; ++il) {
+    const int g1 = rdna4::iq3s_grid[qs[2 * il + 0] | ((qh << (8 - 2 * il)) & 0x100)];
+    const int g2 = rdna4::iq3s_grid[qs[2 * il + 1] | ((qh << (7 - 2 * il)) & 0x100)];
+    const int m0 = rdna4::__vcmpne4(((sg[il] & 0x03) << 7) | ((sg[il] & 0x0C) << 21), 0);
+    const int m1 = rdna4::__vcmpne4(((sg[il] & 0x30) << 3) | ((sg[il] & 0xC0) << 17), 0);
+    iq3s_store4(dst + 4 * il + 0, rdna4::__vsub4(g1 ^ m0, m0), d);
+    iq3s_store4(dst + 4 * il + 2, rdna4::__vsub4(g2 ^ m1, m1), d);
+  }
+}
+
+// O MESMO sub-bloco de 32 pesos para int8 na LDS: 32 B por sub-bloco em vez de
+// 64 B de f16, sem `cvt`/`mul`/`pack` (a magnitude 1..15 ja' sai do grid com o
+// sinal por `__vsub4`) e com dois `ds_store_b128` no lugar de oito stores.
+__device__ __forceinline__ void stage_iq3s_i8_32(const block_iq3_s *__restrict__ blk, const int s,
+                                                 signed char *__restrict__ dst) {
+  const unsigned char *qs = blk->qs + 8 * s;
+  const unsigned char *sg = blk->signs + 4 * s;
+  const int qh = blk->qh[s];
+  int out[8];
+#pragma unroll
+  for (int il = 0; il < 4; ++il) {
+    const int g1 = rdna4::iq3s_grid[qs[2 * il + 0] | ((qh << (8 - 2 * il)) & 0x100)];
+    const int g2 = rdna4::iq3s_grid[qs[2 * il + 1] | ((qh << (7 - 2 * il)) & 0x100)];
+    const int m0 = rdna4::__vcmpne4(((sg[il] & 0x03) << 7) | ((sg[il] & 0x0C) << 21), 0);
+    const int m1 = rdna4::__vcmpne4(((sg[il] & 0x30) << 3) | ((sg[il] & 0xC0) << 17), 0);
+    out[2 * il + 0] = rdna4::__vsub4(g1 ^ m0, m0);
+    out[2 * il + 1] = rdna4::__vsub4(g2 ^ m1, m1);
+  }
+  *(int4 *)&dst[0] = *(const int4 *)&out[0];
+  *(int4 *)&dst[16] = *(const int4 *)&out[4];
+}
+
+// O kernel das variantes: mesma grade, mesmos threads, mesmo tile e mesmo laco
+// interno do kernel da frente F -- so' o caminho do dado muda.
+template <int BM, int BN, int BK, int RM, int RN, int STG, int MODE>
+__global__ void __launch_bounds__((BM / RM) * (BN / RN)) gemm_v2_kernel(
+    const __half *__restrict__ A, const block_iq3_s *__restrict__ W, float *__restrict__ C,
+    const int N, const int K) {
+  constexpr int TM = BM / RM;
+  constexpr int TN = BN / RN;
+  constexpr int NT = TM * TN;
+  constexpr int NIQS = BK / 32;
+  constexpr bool AVEC = (STG & 1) != 0;
+  constexpr bool WPF = (STG & 2) != 0;
+  constexpr bool WDB = (STG & 4) != 0;
+  constexpr bool AG = (STG & 8) != 0;
+  constexpr bool I8 = (MODE == 3);
+  constexpr bool DO_GEMM = (MODE == 0);
+  constexpr int AS = AVEC ? (BK + 8) : (BK + 2);  // halves por linha do tile A
+  constexpr int WS = BK + 2;
+  constexpr int A2 = AS / 2, W2 = WS / 2;
+  constexpr int NBA = BM * AS, NBW = BN * WS;
+  constexpr int WI8S = BK + 16;  // stride em BYTES do tile W em int8 (16-B alinhado)
+  static_assert(BK % 32 == 0 && BM % RM == 0 && BN % RN == 0, "");
+  // O prefetch exige que cada thread tenha EXATAMENTE uma task de W, fixa em
+  // todas as iteracoes de K: e' ela que define o que vai para o registrador.
+  static_assert(!(WPF || WDB || I8) || BN * NIQS == NT, "prefetch exige 1 task de W por thread");
+
+  __shared__ __align__(16) __half s_a[(AG || I8) ? 1 : NBA];
+  __shared__ __align__(16) __half s_w[WDB ? 2 * NBW : NBW];
+  __shared__ __align__(16) signed char s_wi[I8 ? BN * WI8S : 1];
+
+  const int tid = threadIdx.x;
+  const int tr = tid / TN;
+  const int tc = tid % TN;
+  const int m0 = blockIdx.y * BM;
+  const int n0 = blockIdx.x * BN;
+  const int bpr = K / kQK;
+
+  float acc[RM][RN];
+#pragma unroll
+  for (int r = 0; r < RM; ++r)
+#pragma unroll
+    for (int c = 0; c < RN; ++c) acc[r][c] = 0.f;
+
+  float sink = 0.f;
+
+  // task de W fixa (1 por thread) + endereco da linha calculado UMA vez
+  const int wrow = tid / NIQS;
+  const int wti = tid % NIQS;
+  const block_iq3_s *const wrowp = W + (std::int64_t)(n0 + wrow) * bpr;
+  const int wdst = wrow * WS + wti * 32;  // em halves
+  const int i8dst = wrow * WI8S + wti * 32;
+
+  // ---- (a) ativacao -> LDS ------------------------------------------------
+  auto a_copy = [&](__half *ta, const int k0) {
+    if constexpr (AVEC) {
+      constexpr int NI4 = BK / 8;  // `int4` = 8 halves
+      for (int i = tid; i < BM * NI4; i += NT) {
+        const int row = i / NI4;
+        const int c8 = i % NI4;
+        *(int4 *)&ta[row * AS + 8 * c8] =
+            *(const int4 *)&A[(std::int64_t)(m0 + row) * K + k0 + 8 * c8];
+      }
+    } else {
+      for (int i = tid; i < BM * (BK / 2); i += NT) {
+        const int row = i / (BK / 2);
+        const int c2 = i % (BK / 2);
+        *(__half2 *)&ta[row * AS + 2 * c2] =
+            *(const __half2 *)&A[(std::int64_t)(m0 + row) * K + k0 + 2 * c2];
+      }
+    }
+  };
+  // ---- (b) peso iq3_s -> f16 na LDS ---------------------------------------
+  auto w_stage = [&](__half *tw, const int k0) {
+    stage_iq3s_32(wrowp + (k0 >> 8), ((k0 & 255) >> 5) + wti, (__half2 *)&tw[wdst]);
+  };
+  auto wf_at = [&](const int k0) { return wf_load(wrowp + (k0 >> 8), ((k0 & 255) >> 5) + wti); };
+  auto wf_to = [&](__half *tw, const WFields &f, const int k0) {
+    wf_dequant(f, ((k0 & 255) >> 5) + wti, (__half2 *)&tw[wdst]);
+  };
+  auto w_stage_i8 = [&](const int k0) {
+    stage_iq3s_i8_32(wrowp + (k0 >> 8), ((k0 & 255) >> 5) + wti, &s_wi[i8dst]);
+  };
+  // ---- (c) o laco interno -------------------------------------------------
+  auto compute = [&](const __half *ta, const __half *tw, const int k0) {
+    const __half2 *a2 = (const __half2 *)ta;
+    const __half2 *w2 = (const __half2 *)tw;
+    const __half2 *ag = (const __half2 *)(A + (std::int64_t)(m0 + tr) * K + k0);
+#pragma unroll
+    for (int k2 = 0; k2 < BK / 2; ++k2) {
+      __half2 a[RM], w[RN];
+#pragma unroll
+      for (int r = 0; r < RM; ++r) {
+        if constexpr (AG) {
+          a[r] = ag[(r * TM) * (K / 2) + k2];
+        } else {
+          a[r] = a2[(tr + r * TM) * A2 + k2];
+        }
+      }
+#pragma unroll
+      for (int c = 0; c < RN; ++c) w[c] = w2[(tc + c * TN) * W2 + k2];
+#pragma unroll
+      for (int r = 0; r < RM; ++r)
+#pragma unroll
+        for (int c = 0; c < RN; ++c) acc[r][c] = fdot2(a[r], w[c], acc[r][c]);
+    }
+  };
+  // ---- consumo minimo dos modos de staging --------------------------------
+  auto sink_read = [&]() {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int rw = (tid * 7 + i * 29) % BN;
+      const int kw = (tid * 11 + i * 5) % BK;
+      sink += __half2float(s_w[rw * WS + kw]);
+      if constexpr (!AG) {
+        const int ra = (tid * 5 + i * 17) % BM;
+        const int ka = (tid * 13 + i * 3) % BK;
+        sink += __half2float(s_a[ra * AS + ka]);
+      }
+    }
+  };
+
+  if constexpr (MODE == 3) {
+    for (int k0 = 0; k0 < K; k0 += BK) {
+      w_stage_i8(k0);
+      __syncthreads();
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int rw = (tid * 7 + i * 29) % BN;
+        const int kw = (tid * 11 + i * 5) % BK;
+        sink += (float)s_wi[rw * WI8S + kw];
+      }
+      __syncthreads();
+    }
+  } else if constexpr (WPF && DO_GEMM) {
+    if constexpr (!AG) a_copy(s_a, 0);
+    WFields wf = wf_at(0);
+    if constexpr (WDB) {
+      wf_to(s_w, wf, 0);
+      if (K > BK) wf = wf_at(BK);
+      __syncthreads();
+      for (int k0 = 0, buf = 0; k0 < K; k0 += BK, buf ^= 1) {
+        if (k0 + BK < K) {
+          wf_to(s_w + (buf ^ 1) * NBW, wf, k0 + BK);
+          if (k0 + 2 * BK < K) wf = wf_at(k0 + 2 * BK);
+        }
+        compute(s_a, s_w + buf * NBW, k0);
+        __syncthreads();
+        if constexpr (!AG) {
+          if (k0 + BK < K) a_copy(s_a, k0 + BK);
+        }
+        __syncthreads();
+      }
+    } else {
+      wf_to(s_w, wf, 0);
+      __syncthreads();
+      for (int k0 = 0; k0 < K; k0 += BK) {
+        if (k0 + BK < K) wf = wf_at(k0 + BK);  // em voo durante a conta
+        compute(s_a, s_w, k0);
+        __syncthreads();
+        if (k0 + BK < K) {
+          wf_to(s_w, wf, k0 + BK);
+          if constexpr (!AG) a_copy(s_a, k0 + BK);
+        }
+        __syncthreads();
+      }
+    }
+  } else {
+    for (int k0 = 0; k0 < K; k0 += BK) {
+      if constexpr (!AG) a_copy(s_a, k0);
+      w_stage(s_w, k0);
+      __syncthreads();
+      if constexpr (DO_GEMM) {
+        compute(s_a, s_w, k0);
+      } else {
+        sink_read();
+      }
+      __syncthreads();
+    }
+  }
+
+  if constexpr (DO_GEMM) {
+#pragma unroll
+    for (int r = 0; r < RM; ++r)
+#pragma unroll
+      for (int c = 0; c < RN; ++c)
+        C[(std::int64_t)(m0 + tr + r * TM) * N + n0 + tc + c * TN] = acc[r][c];
+  } else {
+    if (__float_as_uint(sink) == 0x7F800001u) C[0] = sink;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 4. O oraculo de GPU: um warp por elemento de saida
 // ---------------------------------------------------------------------------
 // Reusa `dequantize_iq3_s` do MOTOR, sem reescrita: as 32 lanes cobrem os 256
@@ -449,6 +758,65 @@ void launch_cfg_dbuf(const dim3 grid, const int th, const __half *dA, const bloc
   gemm_iq3s_f16_kernel<BM, BN, BK, RM, RN, 0, true><<<grid, th>>>(dA, dW, dC, N, K);
 }
 
+// ---------------------------------------------------------------------------
+// Despacho das variantes da frente G (template <..., STG, MODE>)
+// ---------------------------------------------------------------------------
+// Devolve os atributos da funcao (regs/LDS) do ultimo lancamento, que e' o que
+// diz se a ocupacao estimada bate com a medida: `ctas/CU` sai de
+// min(LDS do cartao / LDS por CTA, 16 - regs*threads/(256*4)) -- a segunda
+// parcela e' o limite de VGPRs (256 KB por SIMD, 4 SIMD por CU), que e' o que a
+// frente D viu limitar o WMMA a 2 warps por SIMD.
+template <int BM, int BN, int BK, int RM, int RN, int STG, int MODE>
+void launch_v2_one(const dim3 grid, const int th, const __half *dA, const block_iq3_s *dW, float *dC,
+                   const int N, const int K, int *regs_out, std::size_t *lds_out, int *occ_out) {
+  gemm_v2_kernel<BM, BN, BK, RM, RN, STG, MODE><<<grid, th>>>(dA, dW, dC, N, K);
+  if (regs_out) {
+    hipFuncAttributes a{};
+    if (hipFuncGetAttributes(&a, (const void *)gemm_v2_kernel<BM, BN, BK, RM, RN, STG, MODE>) ==
+        hipSuccess) {
+      *regs_out = a.numRegs;
+      *lds_out = a.sharedSizeBytes;
+    }
+  }
+  if (occ_out) {
+    *occ_out = 0;
+    int nb = 0;
+    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
+            &nb, gemm_v2_kernel<BM, BN, BK, RM, RN, STG, MODE>, th, 0) == hipSuccess) {
+      *occ_out = nb;
+    }
+  }
+}
+
+#define RD_V2_STG_CASE(STG_)                                                                  \
+  case STG_:                                                                                  \
+    if (mode == 0)                                                                            \
+      launch_v2_one<BM, 128, 64, RM, 8, STG_, 0>(grid0, th, dA, dW, dC, N, K, regs, lds, occ); \
+    else if (mode == 1)                                                                       \
+      launch_v2_one<BM, 128, 64, RM, 8, STG_, 1>(grid0, th, dA, dW, dC, N, K, nullptr, nullptr, \
+                                                 nullptr);                                    \
+    else if (mode == 3)                                                                       \
+      launch_v2_one<BM, 128, 64, RM, 8, STG_, 3>(grid0, th, dA, dW, dC, N, K, nullptr, nullptr, \
+                                                 nullptr);                                    \
+    break;
+
+template <int BM, int RM>
+void launch_v2(const int stg, const int mode, const dim3 grid, const int th, const __half *dA,
+               const block_iq3_s *dW, float *dC, const int N, const int K, int *regs,
+               std::size_t *lds, int *occ) {
+  const dim3 grid0 = grid;
+  switch (stg) {
+    RD_V2_STG_CASE(0)
+    RD_V2_STG_CASE(1)
+    RD_V2_STG_CASE(3)
+    RD_V2_STG_CASE(7)
+    RD_V2_STG_CASE(9)
+    RD_V2_STG_CASE(11)
+    RD_V2_STG_CASE(15)
+  }
+}
+#undef RD_V2_STG_CASE
+
 bool launch(const Cfg &c, const int mode, const int M, const std::int64_t N, const std::int64_t K,
             const __half *dA, const block_iq3_s *dW, float *dC, const bool dbuf = false) {
   const dim3 grid((unsigned)(N / c.BN), (unsigned)((M + c.BM - 1) / c.BM), 1u);
@@ -485,7 +853,7 @@ bool launch(const Cfg &c, const int mode, const int M, const std::int64_t N, con
 int main(int argc, char **argv) {
   std::vector<int> ms_list{16, 64, 128};
   int BK_sel = 64, reps = 5, BM_ovr = 0;
-  bool DBUF = false;
+  bool DBUF = false, AB = false;
   std::int64_t n_ovr = -1, k_ovr = -1;
   std::string tensor_name;
   bool list_only = false, verify = true;
@@ -505,6 +873,8 @@ int main(int argc, char **argv) {
       BM_ovr = std::atoi(argv[++i]);
     } else if (std::strcmp(argv[i], "--dbuf") == 0) {
       DBUF = true;
+    } else if (std::strcmp(argv[i], "--ab") == 0) {
+      AB = true;  // frente G: tabela A/B das variantes de staging
     } else if (std::strcmp(argv[i], "--reps") == 0 && i + 1 < argc) {
       reps = std::atoi(argv[++i]);
     } else if (std::strcmp(argv[i], "--n") == 0 && i + 1 < argc) {
@@ -522,8 +892,9 @@ int main(int argc, char **argv) {
     }
   }
   if (!model) {
-    std::printf("uso: bench-gemm-quant-gpu <model.gguf> [--m 16,64,128] [--bk 64] [--reps 5]\n"
-                "                          [--tensor NOME] [--n N] [--k K] [--list] [--no-verify]\n");
+    std::printf("uso: bench-gemm-quant-gpu <model.gguf> [--m 16,64,128] [--bk 64] [--bm 0|16|32|64|128]\n"
+                "                          [--reps 5] [--dbuf] [--tensor NOME] [--n N] [--k K]\n"
+                "                          [--list] [--no-verify]\n");
     return 1;
   }
 
@@ -663,8 +1034,6 @@ int main(int argc, char **argv) {
       std::printf("  dRef: %d valores nao-finitos; primeiro i=%zu (m=%zu n=%zu) = %g\n", n_nonfinite,
                   first_bad, first_bad / (std::size_t)N, first_bad % (std::size_t)N, bad_val);
     }
-    const unsigned char *w0 = w_raw.data();
-    (void)w0;
     for (int m = 0; m < Mc; ++m) {
       for (int n = 0; n < Nc; ++n) {
         const unsigned char *b = w_raw.data() + ((std::size_t)n * (std::size_t)bpr) * kBlockBytes;
@@ -761,7 +1130,122 @@ int main(int argc, char **argv) {
     for (int it = 0; it < 4000 && warm < 600.0; ++it) warm += ev(fn);
     std::printf("(aquecimento global: %.0f ms de GPU em %s)\n", warm, cw.tag);
   }
-  std::printf("\n== 2/4. GEMM com peso real, staging f16, dot2 (acumulador f32) ==\n");
+  // ---- 5. FRENTE G: A/B das variantes de staging --------------------------
+  // Tudo na MESMA janela e no MESMO processo: cada variante e' um kernel que so'
+  // difere no caminho do dado, entao a razao entre duas linhas e' o efeito da
+  // mudanca (a placa e' compartilhada e o absoluto varia entre janelas em 1,5 %).
+  if (AB) {
+    struct V {
+      const char *tag;
+      int BM, RM, STG;
+      bool i8;
+    };
+    static const V vs[] = {
+        {"V0  base", 128, 8, 0, false},
+        {"V1  avec", 128, 8, 1, false},
+        {"V2  avec+pf", 128, 8, 3, false},
+        {"V3  avec+pf+dbuf", 128, 8, 7, false},
+        {"V4  avec+ag", 128, 8, 9, false},
+        {"V5  avec+pf+ag", 128, 8, 11, false},
+        {"V6  avec+pf+db+ag", 128, 8, 15, false},
+        {"I8  int8 x f16 (so' W)", 128, 8, 9, true},
+        {"V0  base     BM64", 64, 4, 0, false},
+        {"V2  avec+pf  BM64", 64, 4, 3, false},
+        {"V5  avec+pf+ag BM64", 64, 4, 11, false},
+        {"V6  pf+db+ag BM64", 64, 4, 15, false},
+        {"V0  base (repete)", 128, 8, 0, false},
+    };
+    std::printf("\n== 5. FRENTE G: A/B do staging (mesma janela, mesmo processo) ==\n");
+    std::printf(
+        "  t_stg = modo 1 (staging com consumo minimo, sem a conta). Nas linhas com '+ag' a\n"
+        "  ativacao nao passa pela LDS, entao o modo 1 so' mede o staging do PESO: a fracao\n"
+        "  de staging dessas linhas e' um PISO. `bitid` = max|C - C(V0)| (0 = bit a bit igual).\n"
+        "  Na linha I8 as duas colunas de tempo sao o A/B do staging DO PESO na mesma grade:\n"
+        "  `t_GEMM` = iq3_s -> f16 na LDS (com ag, ou seja sem a ativacao) e `t_stg` = o MESMO\n"
+        "  sub-bloco -> int8 na LDS (32 B em vez de 64 B, sem cvt/mul/pack).\n");
+    std::printf("%5s %-19s %4s %5s %9s %4s %10s %9s %9s %6s %9s %7s %8s\n", "M", "variante", "th",
+                "regs", "LDS KB", "CTA/CU", "t_GEMM ms", "T MAC/s", "t_stg ms", "stg %",
+                "G peso/s", "bitid", "rel-L2");
+
+    for (const int M : ms_list) {
+      const std::size_t n_el = (std::size_t)M * (std::size_t)N;
+      (void)hipMemset(dRef, 0, n_el * sizeof(float));
+      launch_ref(dA, Wblk, dRef, M, N, (int)K);
+      if (!launch_ok("ref_kernel (A/B)")) break;
+      (void)hipDeviceSynchronize();
+      std::vector<float> ref(n_el), got(n_el), base(n_el, 0.f);
+      (void)hipMemcpy(ref.data(), dRef, n_el * sizeof(float), hipMemcpyDeviceToHost);
+      int g_regs = 0, g_occ = 0;
+      std::size_t g_lds = 0;
+
+      auto run_v2 = [&](const V &v, const int mode) -> bool {
+        const int th = (v.BM / v.RM) * 16;  // TN = 128/8 = 16
+        const dim3 g((unsigned)(N / 128), (unsigned)((M + v.BM - 1) / v.BM), 1u);
+        int regs = 0, occ = 0;
+        std::size_t lds = 0;
+        if (v.BM == 128) {
+          launch_v2<128, 8>(v.STG, mode, g, th, dA, Wblk, dC, (int)N, (int)K, &regs, &lds, &occ);
+        } else if (v.BM == 64) {
+          launch_v2<64, 4>(v.STG, mode, g, th, dA, Wblk, dC, (int)N, (int)K, &regs, &lds, &occ);
+        } else {
+          return false;
+        }
+        if (mode == 0) {
+          g_regs = regs;
+          g_lds = lds;
+          g_occ = occ;
+        }
+        return launch_ok("gemm_v2");
+      };
+      auto timeit = [&](const V &v, const int mode) {
+        auto fn = [&] { (void)run_v2(v, mode); };
+        fn();
+        (void)hipDeviceSynchronize();
+        double warm = 0;
+        for (int it = 0; it < 4000 && warm < 250.0; ++it) warm += ev(fn);
+        double best = 1e9;
+        for (int r = 0; r < reps; ++r) best = std::min(best, ev(fn));
+        return best;
+      };
+
+      bool first = true;
+      for (const V &v : vs) {
+        if (v.BM > M) continue;
+        const int mode_g = v.i8 ? 1 : 0;  // o int8 e' um modo de STAGING
+        if (!run_v2(v, mode_g)) break;
+        (void)hipDeviceSynchronize();
+        int regs = g_regs, occ = g_occ;
+        const std::size_t lds = g_lds;
+        (void)hipMemcpy(got.data(), dC, n_el * sizeof(float), hipMemcpyDeviceToHost);
+        double sum_d = 0, sum_r = 0, mx = 0;
+        for (std::size_t i = 0; i < n_el; ++i) {
+          const double d = (double)got[i] - (double)ref[i];
+          sum_d += d * d;
+          sum_r += (double)ref[i] * (double)ref[i];
+          mx = std::max(mx, std::fabs((double)got[i] - (double)base[i]));
+        }
+        if (first) {
+          base = got;
+          mx = 0;  // a primeira linha e' a referencia (V0) do `bitid`
+          first = false;
+        }
+        const double rel_l2 = std::sqrt(sum_d / sum_r);
+        const double t0 = timeit(v, mode_g);
+        const double t1 = timeit(v, v.i8 ? 3 : 1);
+        const double macs = (double)M * (double)N * (double)K;
+        const double tmacs = (v.i8 ? 0.0 : macs / (t0 * 1e-3) / 1e12);
+        const int m_tiles = (M + v.BM - 1) / v.BM;
+        const double wts = (double)N * (double)K * (double)m_tiles;
+        std::printf("%5d %-19s %4d %5d %9.1f %4d %10.3f %9s %9.3f %6.1f %9.1f %7.0f %8.2e\n", M,
+                    v.tag, (v.BM / v.RM) * 16, regs, (double)lds / 1024.0, occ, t0,
+                    v.i8 ? "   (n/a)" : std::to_string(tmacs).c_str(), t1, 100.0 * t1 / t0,
+                    wts / (t1 * 1e-3) / 1e9, mx, rel_l2);
+        std::fflush(stdout);
+      }
+    }
+  }
+
+
   std::printf("%5s %-22s %11s %11s %11s %11s %11s %11s\n", "M", "cfg", "t_GEMM ms", "T MAC/s",
               "TOPS", "t_stage ms", "t_A ms", "t_W ms");
   for (const int M : ms_list) {
