@@ -233,7 +233,14 @@ inline int prefill_chunk_cap() {
     //      `RD_PREFILL_CHUNK=16` volta ao comportamento anterior.
     // A medicao de ponta a ponta (512/2048 tokens, decode a 4K, 131K com
     // q5_0/q4_1) e os gates estao no relatorio da frente.
-    int n = e ? std::atoi(e) : 128;
+    // 16 POR ENQUANTO. O chunk 128 esta' medido (104,86 -> 231,83 tok/s a 512 tokens) e
+    // o GEMM que ele usa esta' certo, mas o fallback de sub-lote que cobre os tipos que o
+    // GEMM nao cobre esta' ERRADO: `check-batch-gpu` falha com erro L2 rel. de 8,7e-03
+    // (chunk de 32) e 6,1e-02 (n=128) contra uma tolerancia declarada de 1e-06, enquanto
+    // n<=16 continua bit-exato. Nada disso aparecia com os k-quants ligados no GEMM,
+    // porque ai o fallback nao era exercitado -- foi desliga-los que expôs o bug.
+    // Volta a 128 quando o fallback estiver corrigido: docs/plano-ninfer-pendente.md §1.
+    int n = e ? std::atoi(e) : 16;
     if (n < 16) n = 16;
     if (n > 512) n = 512;  // == Graph::kMaxChunkHost
     return n;
