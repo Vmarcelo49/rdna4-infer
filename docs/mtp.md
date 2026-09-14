@@ -117,10 +117,19 @@ mede 6,2 % de desvio em `result_norm`, então essa é a ordem de grandeza espera
 Os dois nós que saem **bit-iguais** (`mtp_tok_embd`, `mtp_enorm`) e o
 `result_output` a 0,2 % delimitam esse ruído.
 
-O argmax do rascunho diverge do oráculo neste passo (nosso 198, dele 271) porque
-no dump os dois melhores logits estão a **5,2e-4** (15,427459 vs 15,426939) —
-empate que qualquer ruído de 1e-3 vira. Para a taxa de aceitação o que importa é
-a concordância com o trunk **no mesmo motor** (§4).
+**O token rascunhado bate com o do oráculo**: os dois melhores logits daquele
+passo estão a **5,2e-4** (271 em 15,427459 vs 198 em 15,426939), e o nosso argmax
+é 271 — o mesmo empate resolvido do mesmo lado. Vale registrar que a primeira
+versão do teste dava 198, e a causa não era o empate: era o *teste* alimentando
+`h_7` no passo da posição 7 em vez de `h_6` (o motor sempre esteve certo). Esse
+erro deslocava `mtp_hnorm` em 69 % e `mtp_attn_pregate` em 319 % — ou seja, a
+comparação nó a nó pegou um erro de pareamento de uma linha, que é exatamente
+para isso que ela serve.
+
+O dump é de um arquivo de pesos específico e o `oracle-mtp` grava o tamanho do
+modelo nele: rodar o `check-mtp-gpu` no IQ4_XS **pula** a comparação (dizendo o
+motivo) em vez de acusar 34 % de desvio que seria só a quantização diferente.
+Para comparar o IQ4_XS, capture um dump dele com o mesmo comando.
 
 ## 4. Medições
 
@@ -136,6 +145,7 @@ Prompt de wiki = um parágrafo de `reference/data/wikitext-2-raw/wiki.test.raw`
 | wiki.test.raw, 128 tokens | 128 | 111 | **86,7 %** |
 | "França" (continuação em ciclo), 128 tokens | 128 | 122 | 95,3 % |
 | prompt do `check-mtp-gpu`, 64 tokens | 64 | 61 | 95,3 % |
+| wiki.test.raw, 128 tokens, **IQ4_XS** | 87 | 74 | 85,1 % |
 | o próprio drive MTP do llama.cpp, prompt de 8 tokens | 24 | 21 | 87,5 % |
 
 A última linha é do `tests/oracle_mtp.cpp` rodando o grafo MTP do llama.cpp: é o
@@ -154,7 +164,9 @@ sobe para ~95 %.
 | `--mtp --draft 3` | 76/109 (69,7 %) | 128 | 5,07 s | 25,27 (−9,1 %) |
 | `--mtp --draft 4` | 79/125 (63,2 %) | 128 | 5,14 s | 24,88 (−10,5 %) |
 
-`D=3` commita 3,46 tokens por rodada e `D=4` 4,00 (32 rodadas). A queda da taxa
+`D=3` commita 3,46 tokens por rodada e `D=4` 4,00 (32 rodadas). No IQ4_XS o
+`check-mtp-gpu` mede, no mesmo A/B em processo: ganancioso 28,06 tok/s,
+`--mtp-score` −8,8 %, `--mtp --draft 3` −11,0 % (mesma conclusão, mesmo efeito). A queda da taxa
 por rascunho com D é esperada: o primeiro rascunho usa o `h` do trunk, os
 seguintes são encadeados pelo `h` do próprio bloco.
 
@@ -233,6 +245,16 @@ scripts/gpu-lock.sh ./build/rdna4-infer run -m $MOD -p "..." -n 128 --greedy --m
 scripts/gpu-lock.sh ./build/rdna4-infer run -m $MOD -p "..." -n 128 --greedy --mtp --draft 3
 # gate completo (estrutura, oráculo, aceitação, equivalência, custo)
 scripts/gpu-lock.sh ./build/check-mtp-gpu $MOD 64 3
+```
+
+No IQ4_XS o gate roda igual (estrutura, aceitação, equivalência, custo) e só a
+comparação com o oráculo é pulada, porque o dump é do IQ3_S:
+
+```
+scripts/gpu-lock.sh ./build/check-mtp-gpu $IQ4_XS 64 3
+   == oracle: ... was captured from a 12040883104-byte model, this one is
+      14252845984 bytes (different quantization): comparison skipped ==
+   ... PASS (0 failures)      # spec D=3: 41/50 (82,0%), plain 26,30 tok/s, +10,9%
 ```
 
 `RD_MTP_CONCAT=he` inverte a ordem do concat (só para medir; ver §1),
