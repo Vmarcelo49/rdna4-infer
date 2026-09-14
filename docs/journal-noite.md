@@ -164,6 +164,27 @@ pior. Repassado à frente KV.
   kernels pequenos (o `emit()` do grafo faz `hipMemcpy` bloqueante, então fundir 4 ops em 1 faz o
   oráculo por nó ler um buffer já sobrescrito — a variante que preserva o dump vale 0,26 ms).
 
+## Resultado da noite (TL;DR)
+
+**Objetivo**: 131K de contexto · KV `q5_0` (K) / `q4_1` (V) · MTP entregando ganho · e o máximo de
+desempenho que coubesse na noite. Sete frentes, um coordenador, uma GPU.
+
+| entregável | estado | número |
+|---|---|---|
+| **Revisão adversarial + backlog** | ✅ duas revisões, 26 achados, 233 itens de backlog priorizado | 15 achados da árvore (F1-F15) + 11 do código escrito hoje (R1-R11); 4 consertados por mim |
+| **KV `q5_0`/`q4_1`** | ✅ implementados e validados **byte a byte** contra os quantizadores do llama.cpp | erro `max|gpu−cpu| = 0`; K `q8_0` 16 % melhor que `q5_0`; V `q4_1` 19 % melhor que `q4_0` (KL) |
+| **131K de contexto** | ✅ medido (custo) com o KV do alvo | **14,83 tok/s**, 14,26 GiB em uso, 1,66 GiB livres, zero GTT |
+| **MTP** | ✅ mecanismo correto e exato; ganho **medido nos dois regimes** | 1,22× (pré-kernels) / **0,96× na árvore final**; **2,03× em texto de código** (95 % de aceitação) |
+| **Prefill** | ✅ **+69 %** (bit-exato) | 73,05 → **123,68 tok/s** (512 tokens); 117,47 a 4096 |
+| **Decode** | ✅ **+17,4 %** (bit-exato) | 28,97 → **34,00 tok/s** a 4K (A/B intercalado, 3 rodadas) |
+| **Qualidade em contexto longo** | ✅ sem P0: RoPE correto, top-5 idêntico à referência | 17 639 tokens reais: mesmos ids, mesma ordem, argmax igual |
+| **Gates** | ✅ verdes (com uma ressalva de recurso) | 10 CPU + 14 GPU + `check-mtp` PASS + `check_server` PASS (118 checagens) |
+
+**Estado do alvo**: 131K **cabe** com `q5_0`/`q4_1` (o orçamento honesto aprova: 14,09 GiB de
+necessidade) e roda a ~14,8 tok/s; a qualidade do KV foi medida por KL (não por PPL, que
+ordena ao contrário); o MTP está correto, bit-exato e com o teto medido — **o que falta para
+ele pagar em prosa é o matvec em lote**, que é também 83,7 % do prefill.
+
 ## Relatório da manhã — como ler
 
 1. **O que foi pedido e o que foi entregue**: a tabela de frentes no topo diz o estado de
