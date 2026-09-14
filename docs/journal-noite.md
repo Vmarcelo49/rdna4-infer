@@ -305,6 +305,61 @@ diferença vinha de um chute de 1 GiB de overhead e de contar o bloco MTP que n�
   dois regimes; o ganho em prosa depende do item acima, e isso está escrito no README com as
   duas medições lado a lado, em vez de escolher a mais conveniente.
 
+## Fechamento: o que fica medido, o que fica aberto, o que fica sem explicação
+
+### Medido e sustentado por gate ou por A/B intercalado
+- **Prefill**: 73,05 → 123,68 tok/s (512), 117,47 (4096) — `check-batch-gpu` bit-exato, curva em
+  `docs/journal-prefill.md` §1; orçamento por fase com o matvec em 83,7 %.
+- **Decode**: 28,97 → 34,00 tok/s (4K real) — atribuição fechada: `delta_rule` −3,58 ms +
+  LUT dos IQ em LDS −1,20 + `rms_norm` −0,26 = −5,04 ms contra −5,14 medidos.
+- **KV**: formatos novos com bytes idênticos aos do llama.cpp; KL ordenando os formatos
+  (0,000492 a 0,003208); needle 8/8 a 8K em todos; 131K com `q5_0/q4_1` a 14,83 tok/s.
+- **Contexto longo**: RoPE contra o `ggml_rope_multi` real até 262 143; top-5 idêntico à
+  referência a 17 639 tokens reais; PPL que **não** cresce com o contexto.
+- **MTP**: exato (md5 do stdout igual ao ganancioso em todas as variantes e prompts), rollback
+  bit-exato (0,54 ms por par), 2,03× em texto de código; em prosa, 0,96× na árvore final.
+
+### Aberto, com o número que o torna prioritário
+1. **`matvec_kernel_batch` a 109 GB/s contra 446 GB/s do caminho por token** (12 GB por chunk de
+   16 em 110 ms). É 83,7 % do prefill **e** o que decide se o MTP paga em prosa. Duas hipóteses
+   concorrentes já medidas: a dequantização **não** é reexecutada (provado por ISA pela frente de
+   kernels), e o que resta é o trabalho por token que o lote não amortiza (16 `dp4a` + 3 cargas
+   de ativação por bloco por token) mais a re-leitura da ativação por linha de peso
+   (≈5,6 GB por tensor por chunk) — banda amortizada × issue/ocupação, **não decidido**.
+2. **Atenção dividida em lote com o KV do alvo**: o despacho foi completado e o `switch` avisa,
+   mas o par `q5_0`/`q4_1` a ≥1024 chaves ainda não tem medição própria de ponta a ponta (o gate
+   cobre o caso de 1104 chaves com `f16`).
+3. **`q8_0` como padrão acima de 56K**: mudou de justificativa (ver C12) — vale pelo dobro da
+   precisão, não por evitar um penhasco que não se reproduziu na árvore final.
+4. **GQA compartilhado** só para KV quantizado em contexto longo: +9,0-11,8 % a 64K/131K, e
+   **perde** 1,1-1,8× com `f16` a 4K-16K (medido).
+5. **`UNROLL=4` com a LUT em LDS** (sem medida), **hoist em lote** (pronto, desligado, teto ~0
+   por ISA), **fusão dos kernels pequenos** (bloqueada pelo `emit()` bloqueante do oráculo).
+
+### Sem explicação (e dito assim, não maquiado)
+- **Um `Memory access fault`** da ferramenta `check-kvquality-gpu` a 4096 e 16387 tokens, que
+  **não** se reproduz a 64 nem a 1024 tokens e não afeta nenhum gate de aceitação (todos criam um
+  `Graph` por processo). Hipótese registrada: janela suja (1,46 GiB e 12,6 GiB de resíduo do dono
+  anterior nas duas corridas); não fechado.
+- **O `balloc` que não zerava** foi consertado (18 buffers de lote por `Graph` nasciam com
+  conteúdo reciclado), mas a frente foi honesta: **não** era a causa do NaN da ferramenta.
+- **64K com `f16`**: a frente de medições viu transbordo para GTT e 2-8 tok/s; eu e a frente de
+  contexto longo medimos 22,42 tok/s com 15,63 GiB em uso e GTT em 113 MiB. A minha medida (a
+  terceira) está na bateria final e é a que vale, mas a divergência fica registrada.
+
+### O que a noite ensinou sobre o processo (para o próximo lote)
+1. **Um gate vermelho por contenção é pior que um gate não rodado** — aconteceu 4 vezes; o
+   conserto estrutural foi fazer o `gpu-lock.sh` esperar a VRAM do dono anterior drenar e marcar
+   os filhos com `GPU_LOCK_HELD` (ninho de lock custou ~2 h de GPU).
+2. **A revisão adversarial valeu a noite inteira**: dos 11 achados no código escrito hoje, dois
+   eram críticos (uma atenção que lia a linha errada a ≥1040 tokens e o `run --greedy` que
+   gerava o token 0), e nenhum dos dois era coberto por gate.
+3. **Um ganho vale o que vale o baseline contra o qual foi medido** — o número do MTP ficou 40 min
+   inflado no README por causa de um baseline quebrado, e o texto degenerado do baseline
+   *melhorava* a taxa de aceitação.
+4. **Duas estimativas independentes se contradizendo é um bom sinal**: 2-2,5× × ~10 % × ~0 para o
+   mesmo hoist levou a medir por ISA, e a medida matou a hipótese errada.
+
 ## Estado do alvo (atualizado pelo coordenador)
 
 - **131K**: ainda não medido nesta rodada. No baseline, 131K com KV `q4_0` roda a 14,0 tok/s
