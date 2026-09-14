@@ -225,6 +225,8 @@ inline bool split_batch_enabled() {
   // V only differs from K's size when the two cache types do; both accessors are
   // needed to report the cache footprint honestly (docs/journal-kv.md §VRAM).
   std::size_t kv_layer_bytes_v() const { return kv_bytes_v_; }
+  // Teto do chunk do prefill em lote (RD_PREFILL_CHUNK; default kMaxBatch).
+  int batch_cap() const { return batch_max_; }
   int n_full_attn() const { return n_layer() - count_recr(); }
   int max_ctx() const { return max_ctx_; }
 
@@ -382,6 +384,9 @@ inline bool split_batch_enabled() {
   void *d_k_ = nullptr, *d_v_ = nullptr;
   std::size_t kv_bytes_ = 0;
   std::size_t kv_bytes_v_ = 0;  // per-layer V bytes; == kv_bytes_ when kt row == vt row
+  // Teto RUNTIME do chunk do prefill em lote (RD_PREFILL_CHUNK, default kMaxBatch).
+  // Os buffers de lote sao dimensionados por ele; com o default (16) nada muda.
+  int batch_max_ = kMaxBatch;
   int count_recr() const {
     int n = 0;
     for (int i = 0; i < n_layer(); ++i) n += is_recr(i) ? 1 : 0;
@@ -640,8 +645,9 @@ inline bool Graph::init(int max_ctx, KvType kv_k, KvType kv_v, std::string &err)
     // builds several Graphs in one process: with the un-zeroed version the SECOND
     // graph produced NaN logits at a 64-token context in a window where the first
     // one was fine (docs/journal-kv.md §8.2).
+    batch_max_ = prefill_chunk_cap();
     const auto balloc = [&](float *&p, std::size_t n) {
-      const std::size_t bytes = (std::size_t)kMaxBatch * n * sizeof(float);
+      const std::size_t bytes = (std::size_t)batch_max_ * n * sizeof(float);
       if (hipMalloc(&p, bytes) != hipSuccess) return false;
       return hipMemset(p, 0, bytes) == hipSuccess;
     };
@@ -655,12 +661,12 @@ inline bool Graph::init(int max_ctx, KvType kv_k, KvType kv_v, std::string &err)
       err = "hipMalloc failed for the batch buffers";
       return false;
     }
-    if (hipMalloc(&d_aqb_, (std::size_t)kMaxBatch * aq_per_row * sizeof(block_q8_1)) !=
+    if (hipMalloc(&d_aqb_, (std::size_t)batch_max_ * aq_per_row * sizeof(block_q8_1)) !=
         hipSuccess) {
       err = "hipMalloc failed for the batch activation blocks";
       return false;
     }
-    if (hipMalloc(&d_posb_, (std::size_t)kMaxBatch * sizeof(int)) != hipSuccess) {
+    if (hipMalloc(&d_posb_, (std::size_t)batch_max_ * sizeof(int)) != hipSuccess) {
       err = "hipMalloc failed for the batch positions";
       return false;
     }
@@ -669,7 +675,7 @@ inline bool Graph::init(int max_ctx, KvType kv_k, KvType kv_v, std::string &err)
   // Sized for the whole batch: the batched split attention keeps one partial per
   // (token, head, split) instead of reusing one token's buffer (feat/noite-prefill).
   const std::size_t part_bytes =
-      (std::size_t)kMaxBatch * attn_partial_bytes(NH, HD, kAttnMaxSplits);
+      (std::size_t)batch_max_ * attn_partial_bytes(NH, HD, kAttnMaxSplits);
   if (hipMalloc(&d_attn_partial_, part_bytes) != hipSuccess) {
     err = "hipMalloc attn partial failed";
     return false;
@@ -1021,7 +1027,7 @@ inline bool Graph::proj_batch(const GpuTensor &w, const float *d_x, float *d_y, 
     err = "batch weight shape mismatch";
     return false;
   }
-  if (n < 2 || n > kMaxBatch || !batch_supported(n)) {
+  if (n < 2 || n > batch_max_ || !batch_supported(n)) {
     err = "unsupported batch size " + std::to_string(n);
     return false;
   }
@@ -1356,8 +1362,8 @@ inline bool Graph::forward_batch(const std::vector<std::int32_t> &tokens, int st
                                  std::string &err) {
   const int E = n_embd();
   const int n = (int)tokens.size();
-  if (n < 2 || n > kMaxBatch) {
-    err = "forward_batch needs 2.." + std::to_string(kMaxBatch) + " tokens";
+  if (n < 2 || n > batch_max_) {
+    err = "forward_batch needs 2.." + std::to_string(batch_max_) + " tokens";
     return false;
   }
   if (!batch_supported(n)) {

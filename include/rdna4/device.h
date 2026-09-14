@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -127,7 +128,13 @@ inline std::uint64_t graph_buffer_bytes(const GraphBufferShape &s) {
   const std::uint64_t aq_blocks = (F + 31) / 32;  // block_q8_1 (36 B) per 32 elems
   const std::uint64_t single = single_floats * 4;
   const std::uint64_t batch = s.max_batch * (per_token_floats * 4 + aq_blocks * 36 + 4);
-  const std::uint64_t partial = s.n_head * s.max_splits * (2 + s.head_dim) * 4;
+  // Atencao: o alocador dimensiona as parciais por (token, cabeca, split)
+  // -- `batch_max_ * attn_partial_bytes(NH, HD, kAttnMaxSplits)` em graph.cuh --
+  // e este espelho esquecia o fator `max_batch`. Medido: 396 288 B/token, ou seja
+  // o espelho sub-contava 5 944 320 B no default de 16 tokens (e 45,7 MB num chunk
+  // de 128). O erro estava escondido dentro da margem de 384 MiB (kAllocatorMarginBytes),
+  // que foi calibrada contra este numero -- ver o comentario dela.
+  const std::uint64_t partial = s.max_batch * s.n_head * s.max_splits * (2 + s.head_dim) * 4;
   const std::uint64_t state = s.n_recr_layers * s.ssm_tsr * s.ssm_state * s.ssm_state * 4;
   const std::uint64_t convst = s.n_recr_layers * (s.conv_k - 1) * chan * 4;
   const std::uint64_t q8 = ((F / 32) + 8) * 36;
@@ -187,6 +194,26 @@ inline std::uint64_t required_bytes(std::uint64_t weights_bytes, std::uint64_t c
   return weights_bytes + buffers_bytes + kv_cache_bytes(ctx_size, kv_k, kv_v) + kOverheadBytes;
 }
 
+// Teto RUNTIME do chunk do prefill em lote. O default (16) e' o `Graph::kMaxBatch`,
+// que e' o que o GEMV em lote tem instanciado; `RD_PREFILL_CHUNK` sobe esse teto
+// para o GEMM tilejado (docs/plano-prefill.md, degrau D2). Esta funcao e' a fonte
+// unica: o alocador (graph.cuh) e o orcamento de VRAM (graph_buffer_bytes) leem
+// daqui, para nao poderem divergir.
+//
+// Custo medido dos buffers de lote: 0,46 MB por token (18 buffers) + 19,6 KB/token
+// de blocos q8_1 + 396 KB/token de parciais de atencao = ~0,87 MB/token, ou seja
+// ~109 MiB num chunk de 128 (7,2 MiB no default de 16).
+inline int prefill_chunk_cap() {
+  static const int v = [] {
+    const char *e = std::getenv("RD_PREFILL_CHUNK");
+    int n = e ? std::atoi(e) : 16;
+    if (n < 16) n = 16;
+    if (n > 512) n = 512;
+    return n;
+  }();
+  return v;
+}
+
 // Fills GraphBufferShape from a parsed qwen35 config. Duck-typed on the config
 // (`block_count`, `full_attention_interval`, ...) so this header still needs no
 // model.h. `vocab` comes from the caller because the config carries no vocab —
@@ -207,6 +234,7 @@ inline GraphBufferShape graph_buffer_shape(const Cfg &cfg, std::uint64_t vocab) 
   s.ssm_tsr = cfg.ssm_time_step_rank;
   s.conv_k = cfg.ssm_conv_kernel;
   s.vocab = vocab;
+  s.max_batch = (std::uint64_t)prefill_chunk_cap();
   return s;
 }
 

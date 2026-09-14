@@ -194,8 +194,11 @@ int main() {
     const std::uint64_t got = rdna4::graph_buffer_bytes(s);
     std::printf("   graph buffers for the IQ3_S shape: %llu B = %.2f MiB\n",
                 (unsigned long long)got, (double)got / (1024.0 * 1024.0));
-    ok(got == 166314020ull, "graph_buffer_bytes == 166 314 020 B (158.60 MiB), the sum of "
-                            "graph.cuh:518-590 added up by hand");
+    // 172 258 340 = 166 314 020 + 5 944 320: o espelho passou a contar as parciais de
+    // atencao por TOKEN (16 x 24 x 16 x 258 x 4 B), como o alocador sempre fez.
+    ok(got == 172258340ull, "graph_buffer_bytes == 172 258 340 B (164.27 MiB), the sum of "
+                            "graph.cuh:518-590 added up by hand, com as parciais de atencao "
+                            "multiplicadas pelo max_batch (16)");
     // ... and the budget must not count the whole file: 10.877 GiB of trunk
     // weights, not 11.214 GiB.
     const std::uint64_t need = rdna4::required_bytes(11678877696ull, 131072,
