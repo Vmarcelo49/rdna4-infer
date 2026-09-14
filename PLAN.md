@@ -637,8 +637,12 @@ limpa, `bench --prefill 512 --prefill-reps 3`, melhor de 3, piso de ruído 1,2 %
 | | prefill 512 tokens |
 |---|---|
 | baseline da noite | 73,05 tok/s |
-| + andaime em lote | 104,5 tok/s (+40,6 %) |
-| + `delta_rule` com `float4` | **123,9 tok/s (+69,7 %)** |
+| + andaime em lote | 104,5 tok/s (**+43 %**, A/B intercalado) |
+| + `delta_rule` com `float4` | **123,9 tok/s (+18,6 % sobre o anterior; +69,7 % no total)** |
+
+A atribuição acima é a do diário da frente (`journal-prefill.md` §4.1, A/B intercalado em
+janela limpa): o README e este PLAN chegaram a atribuir os mesmos +69,7 % a mudanças
+diferentes — quem herdasse a alavanca pelo PLAN superestimaria o `float4` em 3,7×.
 
 `check-batch-gpu` continua **BIT-EXACT** em N=2/3/4/8/16 e no prompt completo, e o
 `check-graph-gpu` passa. O que sobrou: o matvec em lote lê 12,0 GB por chunk de 16 em 110 ms
