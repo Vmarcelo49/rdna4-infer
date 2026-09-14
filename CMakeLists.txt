@@ -218,3 +218,13 @@ if(EXISTS "/opt/rocm/include")
   target_include_directories(check-mtp-gpu PRIVATE /opt/rocm/include)
 endif()
 target_link_libraries(check-mtp-gpu PRIVATE ${AMDHIP64})
+
+# feat/mtp — the llama.cpp oracle for the draft block: runs llama.cpp's own
+# LLM_GRAPH_TYPE_DECODER_MTP graph (qwen35.cpp graph_mtp) on the CPU and dumps
+# every node of one draft step, in the same format tests/check_graph_gpu.hip
+# parses. Captured output goes to reference/oracle_mtp_prompt6_cpu.txt (see
+# docs/mtp.md); check-mtp-gpu compares its own nodes against it.
+add_executable(oracle-mtp tests/oracle_mtp.cpp)
+target_include_directories(oracle-mtp PRIVATE ${LLAMA_CPP_SRC}/include ${LLAMA_CPP_SRC}/ggml/include)
+target_link_libraries(oracle-mtp PRIVATE ${LLAMA_CPP_BUILD}/bin/libllama.so ${LLAMA_CPP_BUILD}/bin/libggml.so ${LLAMA_CPP_BUILD}/bin/libggml-base.so ${AMDHIP64})
+set_target_properties(oracle-mtp PROPERTIES BUILD_RPATH "${LLAMA_CPP_BUILD}")

@@ -1270,10 +1270,10 @@ int cmd_run(int argc, char **argv) {
       }
       std::fprintf(stderr,
                    "rdna4-infer: MTP %s: %lld/%lld drafts matched the trunk (%.1f%%), "
-                   "%d trunk steps, %d draft steps, draft %.2f ms/step\n",
+                   "%d trunk steps, %d draft steps, %d rounds (%.2f tokens/round)\n",
                    mtp_score ? "score" : "spec", gs.accepted, gs.drafted,
-                   gs.acceptance() * 100.0, gs.trunk_steps, gs.draft_steps,
-                   gs.draft_steps > 0 ? gs.draft_ms / gs.draft_steps : 0.0);
+                   gs.acceptance() * 100.0, gs.trunk_steps, gs.draft_steps, gs.rounds,
+                   gs.rounds > 0 ? (double)gs.ids.size() / (double)gs.rounds : 0.0);
       std::fprintf(stderr, "rdna4-infer: generated %zu tokens in %.2f s (%.2f tok/s)%s\n",
                    gs.ids.size(), gen, gen > 0 ? (double)gs.ids.size() / gen : 0.0,
                    gs.hit_eos ? " [eos]" : "");
