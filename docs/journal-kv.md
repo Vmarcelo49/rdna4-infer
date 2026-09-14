@@ -735,3 +735,48 @@ se perder: **a 131K a qualidade não foi medida com texto real** (§7.3). A 131K
 custo medido (tok/s, VRAM, GTT) sobre cache **sintético**; a qualidade tem medida a
 4096 tokens (KL) e 8192 tokens (needle). Reportar os dois como se fossem a mesma
 coisa seria o erro que este diário existe para não cometer.
+
+### 8.1 O que o merge final exige (achado que o gate não pegou)
+
+`Graph::release()` está completo — auditei membro a membro: todos os `d_*_`
+declarados são liberados e anulados, incluindo os dois que a frente de prefill
+acrescentou (`d_qkb_`, `d_vcb_`, `graph.cuh:1601/1607`), e os dois de alocação
+preguiçosa (`d_logits_`, `d_argmax_val_`) também.
+
+**Mas `graph_buffer_bytes()` (o espelho do `device.h`) ficou 640 KiB curto**, porque
+a frente de prefill acrescentou `d_qkb_` (`kMaxBatch × 2*key_dim`) e `d_vcb_`
+(`kMaxBatch × d_inner`) em `graph.cuh:590` e o espelho não os conhecia:
+16 × (4096 + 6144) × 4 B = 640 KiB. O total pinado no `check-kvtype` era o do
+pré-merge e **continuava passando**, então **o gate não pegou — a releitura do merge
+pegou**. Corrigido: 166 314 020 B = 158,60 MiB.
+
+**Lição, escrita aqui para o coordenador**: o gate pina um *número*, então ele não
+detecta sozinho a deriva do alocador; ele só acusa depois que alguém atualiza o
+espelho. Todo merge que encoste em `Graph::init`/`release` exige reconferir
+`graph_buffer_bytes` contra `graph.cuh` à mão. Blindar isso de verdade é gerar o
+total a partir do alocador (ou instrumentar `hipMalloc`), o que é mudança de desenho.
+
+### 8.2 `Memory access fault` no SEGUNDO `Graph` do mesmo processo (pós-merge) — ABERTO
+
+Medido duas vezes na tomada de 05:31-05:37, e o mesmo padrão passava **pré-merge**:
+
+- `[I]` KL a 4096: a referência `f16/f16` (Graph nº 1) roda inteira e imprime; o fault
+  vem na config seguinte (`q8_0:q4_1`, Graph nº 2).
+- `[J]` needle a 16384: idem — `f16/f16` faz 8/8 e imprime; o fault vem no
+  `q5_0:q4_1` (Graph nº 2).
+- **Pré-merge**, `[F]` fez **7 Graphs em sequência** no mesmo processo sem fault.
+- Não é o par K/V (`[J]` usa `q5_0:q4_1` como segunda config, que pré-merge era a
+  segunda e funcionava) nem o tamanho (4104 e 16 387 tokens). O endereço do fault
+  (`0x7f...`) é típico de ponteiro de device não mapeado.
+- **Não separado ainda**: (a) regressão do merge no caminho "segundo Graph no mesmo
+  processo" em `graph.cuh`/`gdn.cuh`/`nn.cuh`; (b) janela suja — `[I]` começou com
+  **1,46 GiB** de resíduo do dono anterior, `[J]` com **12,6 GiB** (o processo que
+  acabara de faultar). Reprodução mínima na fila (`/tmp/kv-repro.sh`: 2 configs com
+  contexto 64, que separa bug de código de pressão de VRAM).
+- **Consequência**: até isso ser explicado, **nada que crie mais de um `Graph` no
+  mesmo processo serve como gate**. Os gates que passaram no §8 são todos de um Graph
+  por vez e continuam válidos; as medições de 131K (`bench`) também (um Graph por
+  processo).
+- **O que se perdeu**: os eixos completos da KL e a needle a 16K (§9). A tabela de
+  131K, a KL de 256 probes, a needle a 8K e o orçamento foram medidos **pré-merge**,
+  em janelas limpas, e o merge não toca essas contas.
