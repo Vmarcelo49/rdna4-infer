@@ -468,7 +468,7 @@ que vale 1 instrução por 4 MACs por lane.
 | **int8 dp4a, num tile bom** (4×4 de registrador, LDS) | 128 | ~2,5-3,0 | ~45-50 | INFERIDO da estrutura de `mul_mmq_funcs.glsl:33-41` + `l_warptile_mmq_int` (`ggml-vulkan.cpp:4495`, TM=TN=4) |
 | **int8 WMMA (MMQ-RDNA4)** | 4 096 | **0,0103** (16 WMMA + 25 cargas LDS + 128 FMA de epílogo por 65 536 MACs) | **~300-350** | INFERIDO, §6.5 |
 | **f16 `v_dot2_f32_f16`, tile do `mul_mm.comp`** | 64 | **~2,56** (por lane por passo `BK_STEP`: 36 cargas LDS + 128 `dot_product` para 256 MACs; `mul_mm.comp:395-424`) | ~50 | INFERIDO, contado no shader |
-| **f16 sem DOT2** (2 `v_fma_f32` por `dot_product`) | 32 | ~4,75 | ~27 | idem, ramo `#else` de `dot_product_funcs.glsl:18-25` |
+| **f16 sem DOT2** (2 fma + 2 conversões por `dot_product`) | 32 | ~4,8-6,0 | ~22-27 | idem, ramo `#else` de `dot_product_funcs.glsl:18-25` |
 | **f16 coopmat / WMMA f16** | 4 096 | ~0,01 | ~300+ | idem |
 
 Peak de cada família, para referência: int8 dp4a **78,6 TOPS** (100 % dos slots, zero outra instrução);

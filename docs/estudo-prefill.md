@@ -198,6 +198,48 @@ Depende do P0: sem o tile e a LDS, a instrução nova não tem de onde ler.
 
 **P4 — f16 no caminho vetorial** (normas, elementwise, atenção): 1,5× no FMA deste cartão.
 
+## 5b. Até onde vai o caminho vetorial (o muro de issue) — e por que a saída é a unidade de matriz
+
+A frente B fechou a conta que o protótipo sugeria: os 12,74 T MAC/s do `bench-gemm-gpu` são
+**9,95e10 dp4a de warp/s**, e com as 2,5-3,0 instruções por dp4a que um tile bom gasta, isso é
+**65-78 % dos 3,80e11 slots de issue do cartão a 2,97 GHz**. Ou seja: **o protótipo já está a
+dois terços do muro da família dp4a, e o muro não é banda nem LDS — é emissão de instrução.**
+
+| caminho | instruções por 4 MAC | MAC por instrução de warp | teto prático |
+|---|---|---|---|
+| dp4a no nosso kernel (medido) | **3,31** (33 % esperas) | 44,7 | ~27 TOPS |
+| dp4a num tile bom (4×4, LDS) | ~2,5-3,0 | 128 | **~12-13 T MAC/s** (o protótipo chegou lá) |
+| f16 `v_dot2_f32_f16` empacotado | ~2,56 | 64 | 39-49 TOPS, **saturado de issue** (o fallback do Vulkan roda a ~94 % dos slots) |
+| **WMMA/coopmat (matriz)** | **~0,0103** | **4096** | o único caminho acima disso |
+
+Consequência direta para o plano: **trocar dp4a por f16 vetorial não resolve** (mesmo muro, e o
+fallback do Vulkan a 478 tok/s está saturado de issue). Passar de ~478 tok/s para ~1200 exige a
+**unidade de matriz** — não há terceira via, e as duas famílias de matriz (WMMA int8 do
+ggml-cuda, coopmat f16 do Vulkan) são as duas opções.
+
+### Qual família de matriz, e com que acumulador (frente B §7)
+
+Fato de código que eu não sabia e que corrige a leitura das minhas 4 medições: **o Vulkan não
+tem pipeline int8 para os tipos IQ** — a lista fechada de pipelines `q8_1`/dp4a cobre
+Q2_0/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/MXFP4/Q2_K..Q6_K e **nenhum IQ1/IQ2/IQ3/IQ4**
+(`ggml-vulkan.cpp:5235-5246`, seleção em `:9490-9501`). Logo os **59 % de bytes IQ deste modelo
+rodam sempre em f16**, e o meu `DISABLE_INTEGER_DOT = −1,4 %` estava medindo só a fatia
+k-quant/q8_0. O 2,50× do coopmat é, para eles, **matriz f16 × vetor f16**.
+
+Veredito da frente B, que eu adoto: **para IQ3_S/iq3_xxs/iq4_xs a aposta é o pipe de matriz com
+f16 e acumulador f32**, por três razões medidas/verificáveis: (1) precisão — arredondar um peso
+de 3-4 bits para f16 erra 4,9e-4, 20-100× menos que o erro da própria quantização, enquanto o
+int8 introduz uma quantização nova de 8 bits na ativação; (2) código — f16 dispensa o
+quantizador no layout MMQ, os termos de correção e o staging int8 com sinal; (3) existe
+implementação **medida** neste cartão (1196 tok/s = ~32,7 T MAC/s com coopmat f16), enquanto
+int8 WMMA não tem medição nenhuma no gfx1201. **Ressalva obrigatória: acumulador f32** — nunca
+`v_pk_fma_f16`, que acumula em f16. O dp4a continua sendo a escolha certa no **decode** (M=1):
+4 MAC/lane contra 2.
+
+De quebra, a rota f16 mata dois custos que a frente C mediu no nosso prefill: a quantização de
+ativação (`act_quant`, **0,227 ms/token**) deixa de existir como bloco de 32 com escala e soma —
+vira uma conversão para f16.
+
 ## 6. Status das frentes
 
 | frente | arquivo | estado |

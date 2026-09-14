@@ -685,32 +685,40 @@ void decode_ref_i8(const std::vector<int> &A, const std::vector<int> &Bn, std::v
 }
 
 // fp32 -> fp16 -> fp32 (round-to-nearest-even), so' para a referencia f16.
+// Conferido contra numpy.float16 nos 19 casos de teste (inclusive subnormais e
+// o limite 65504); a versao anterior esquecia o rebias do expoente (15 -> 127).
 float f16_round(float x) {
   uint32_t u;
   std::memcpy(&u, &x, 4);
   const uint32_t sign = u & 0x80000000u;
   const int32_t exp = (int32_t)((u >> 23) & 0xff) - 127;
-  uint32_t mant = u & 0x7fffffu;
-  if (exp > 15) return x;  // fora do range f16 (nao acontece neste bench)
-  if (exp < -25) return sign ? -0.0f : 0.0f;
-  uint32_t h;  // bits de f16 (sem sinal)
+  const uint32_t mant = u & 0x7fffffu;
+  if (exp > 15) return x;                     // fora do range f16 (nao ocorre aqui)
+  if (exp < -25) return sign ? -0.0f : 0.0f;  // arredonda para zero
   if (exp < -14) {
-    const int shift = -14 - exp;
+    // subnormal de f16: campo = round(valor * 2^24) = round((1.mant) >> (-exp-1))
     const uint32_t m = mant | 0x800000u;
-    uint32_t q = m >> shift;
-    const uint32_t rem = m & ((1u << shift) - 1u);
-    const uint32_t half = 1u << (shift - 1);
+    const int rs = -exp - 1;  // 14..24
+    uint32_t q = m >> rs;
+    const uint32_t rem = m & ((1u << rs) - 1u);
+    const uint32_t half = 1u << (rs - 1);
     if (rem > half || (rem == half && (q & 1u))) q++;
-    h = q;
-  } else {
-    const uint32_t hm = mant >> 13;
-    const uint32_t rem = mant & 0x1fffu;
-    h = ((uint32_t)(exp + 15) << 10) | hm;
-    if (rem > 0x1000u || (rem == 0x1000u && (hm & 1u))) h++;
+    const float v = (float)q * 5.9604644775390625e-08f;  // 2^-24, exato
+    return sign ? -v : v;
   }
-  const uint32_t out = sign | (h << 13);
+  uint32_t hm = mant >> 13;
+  const uint32_t rem = mant & 0x1fffu;
+  uint32_t e16 = (uint32_t)(exp + 15);
+  if (rem > 0x1000u || (rem == 0x1000u && (hm & 1u))) {
+    hm++;
+    if (hm == 0x400u) {
+      hm = 0;
+      e16++;
+    }
+  }
+  const uint32_t bits = sign | ((e16 + 112u) << 23) | (hm << 13);  // 127 - 15 = 112
   float f;
-  std::memcpy(&f, &out, 4);
+  std::memcpy(&f, &bits, 4);
   return f;
 }
 
