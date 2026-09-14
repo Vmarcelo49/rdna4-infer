@@ -238,7 +238,7 @@ class Graph {
   // Splits are chosen by context length: below kAttnSplitMin keys one CTA already
   // covers the range, and keeping the unsplit path there keeps the short-context
   // gates bit-identical to the pre-M7 numbers (the golden run, the oracle dumps).
-  static constexpr int kAttnSplitMin = 2048;
+  static constexpr int kAttnSplitMin = 512;  // M8: 2048 -> 512 (medido +14,7% a 4K, docs/rocm-estudo.md)
   int attn_splits_for(int keys) const {
     // RD_ATTN_SPLITS forces a split count (diagnostics/tests: 1 = the pre-M7 path,
     // which is what makes the split path checkable against it at any context).
