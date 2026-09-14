@@ -213,6 +213,22 @@ Duas leituras que dirigem o plano:
    Quem transforma chunk grande em velocidade é o GEMM tilejado — e é por isso que as duas
    metades do P0 são inseparáveis (o protótipo mediu 3,46 T MACs/s em M=16 e 10,34 T em M=128).
 
+## 3g. Utilização do cartão (aritmética sobre as medições, para fechar esta ponta)
+
+| recurso | nós (prefill 512) | llama.cpp (mesmo prompt) | pico medido | quem usa mais |
+|---|---|---|---|---|
+| **DRAM (pesos)** | 355,9 GB em 4,140 s = **86,0 GB/s = 13,6 %** do roofline | 11,1 GB em 0,486 s = **22,9 GB/s = 3,6 %** | 633 GB/s | **nós movemos 32× mais byte de peso por token** (695 MB contra 21,7 MB) |
+| **MACs** | 24,35e9 MACs/token a **3,01 T-MAC/s = 6,8 %** do pico de dp4a | **25,67 T-MAC/s** no chunk inteiro (= 58,3 % do pico de dp4a; **32,7 T-MAC/s** durante a fase de MUL_MAT, = 74 %) | dp4a 44 / f16-WMMA 89,6 / int8-WMMA 182-198 T-MAC/s | eles, por 8,5× |
+| **slots de issue** | V0 do GEMM tilejado: 68 %; V6 (f16): **95 %** | não medido aqui | 3,80e11 instr-warp/s | os dois estão no muro, nós com 10× menos trabalho útil por instrução |
+| **LDS** | ~2 % da banda derivada | 24 KB de 64 KB de ocupação no tile deles | (derivado, não medido) | ninguém |
+
+**A leitura que interessa**: nós **não** somos limitados por banda (13,6 % do roofline, 32× mais
+tráfego por token e ainda assim longe do teto) e **não** somos limitados por LDS. Somos limitados
+por **instruções por MAC** numa forma de kernel que gasta 3,31 instruções por `dp4a` (que faz 4
+MACs) e que, com o chunk de 16, não consegue amortizar nem o peso nem a ativação. O llama.cpp move
+**32× menos** peso por token e transforma isso em 8,5× mais velocidade: o número que separa os dois
+não é banda, é *forma*.
+
 ## 4. O que nós não temos, em uma tabela (e é isto que foi "pulado")
 
 ### O limiar que nós não temos: 8 colunas

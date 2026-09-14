@@ -38,8 +38,9 @@ próprio motor** (`rdna4::quantize_q8_1_batch_launch`, `matvec.cuh:78`).
    633 GB/s de roofline do cartão — o diagnóstico da frente F (§1/§4) se
    reproduz sem mudança. O miolo, quando roda sozinho, faz 37 T-MAC/s (19 % do
    pico) e 84 T-MAC/s sem a correção (42 %).
-5. **Duplo buffer piora 32 %** (14,46 contra 21,37 T-MAC/s em M=512): o mesmo
-   resultado negativo da frente F, agora medido no kernel do WMMA.
+5. **Duplo buffer piora 35-43 %** (mesma janela, mesmo binário: 14,16 contra
+   21,68 T-MAC/s em M=512/BM128 BN64): o mesmo resultado negativo da frente F,
+   agora medido no kernel do WMMA.
 
 ---
 
@@ -119,9 +120,10 @@ WMMA 198,04 T-MAC/s, dp4a 48,12, razão 4,12×). Saída literal, por shape:
 ```
 
 `max ulp 0` e `rel-L2 0` são o que distingue "bit-exato" de "perto": não há
-1 ulp de diferença em nenhum elemento. Na janela A são 16 células verificadas
-(4 geometrias × 4 valores de M), 278 528 a 8 912 896 elementos cada, ~50 milhões
-de elementos no total; nas janelas B/C/D/G mais 13 células.
+1 ulp de diferença em nenhum elemento. A janela A tem 16 células verificadas
+(4 geometrias × 4 valores de M), de 278 528 a 8 912 896 elementos cada (~50
+milhões no total); somando as outras janelas desta frente (B, C, D, G e os dois
+A/B de duplo buffer) são 55 células — **todas com 0 elementos diferentes**.
 
 **A prova de que isso é a aritmética do motor, e não uma convenção desta
 bancada.** Compilando o arquivo para ISA e olhando o laço interno do
@@ -198,7 +200,8 @@ Três leituras:
 
 1. **Em M=16 o WMMA ganha de verdade**: 7,63 contra 2,69 T-MAC/s do dp4a
    (**2,8×**), porque o tile estreito (BM=16, 4 warps de 1 tile de 16 em N) não
-   desperdiça linhas e o staging é o único custo — 82 % do tempo, a 586 G pesos/s.
+   desperdiça linhas e o staging é o único custo — 80-82 % do tempo, a 586 G
+   pesos/s de fonte (252 GB/s).
    É a forma que o motor usa hoje (M=16 por sub-lote): **2,4× o prefill atual**
    sem sair de M=16.
 2. **O tile de M tem de acompanhar o M do lote**: BM=16 em M=64/128/512 reestagia
