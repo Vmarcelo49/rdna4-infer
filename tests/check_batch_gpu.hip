@@ -88,13 +88,19 @@ int main(int argc, char **argv) {
   while ((int)ids.size() < need + 4) ids.push_back(ids[ids.size() % 17]);
 
   const int ctx = (int)ids.size() + 8;
+  // The long-context case below runs a chunk at position 1088, which needs a cache
+  // that holds it. Allocating it up front costs ~39 MB of KV and changes nothing
+  // for the short cases (positions below kAttnSplitMin take the unsplit path there
+  // either way), so there is exactly one Graph -- and therefore one copy of the
+  // weights -- in this process.
+  const int ctx_used = ctx > 1216 ? ctx : 1216;
   rdna4::Graph g(loader, cfg);
-  if (!g.init(ctx, rdna4::KvType::F16, rdna4::KvType::F16, err)) {
+  if (!g.init(ctx_used, rdna4::KvType::F16, rdna4::KvType::F16, err)) {
     std::fprintf(stderr, "graph init failed: %s\n", err.c_str());
     return 1;
   }
   g.set_want_hidden(false);
-  std::printf("prompt: %zu tokens, ctx %d\n\n", ids.size(), ctx);
+  std::printf("prompt: %zu tokens, ctx %d\n\n", ids.size(), ctx_used);
 
   int failures = 0;
   std::printf("%5s %12s %12s %12s %10s %10s\n", "N", "per-token ms", "batched ms", "speedup",
@@ -173,6 +179,113 @@ int main(int argc, char **argv) {
     std::printf("\nfull prompt (%d tokens, mixed 16+tail chunks): rel-L2 %.3e max|d| %.3e  %s\n", n,
                 rel, maxd, exact ? "BIT-EXACT" : "DIFFERS");
     if (!exact) ++failures;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Long-context case: from kAttnSplitMin = 512 keys on, the attention splits the
+  // key range across CTAs and the split COUNT depends on the position. A short
+  // prompt never reaches that branch -- and that is exactly how a wrong query
+  // pointer in the batched split kernel survived the earlier version of this test
+  // (ctx 60 => splits == 1, and only the LAST token's logits were compared, so a
+  // wrong row in the middle of a chunk would have passed even at a long context).
+  // Two things are therefore asserted here:
+  //   (a) the context: a seeded cache at position 1088 makes the chunk's split
+  //       count 2 in every full-attention layer;
+  //   (b) the granularity: EVERY row of the chunk, layer by layer, through the
+  //       `l_out` node callback -- not just the last one.
+  // ---------------------------------------------------------------------------
+  {
+    const int n = 16;
+    const int pos0 = 1088;
+    std::vector<std::int32_t> chunk(ids.begin(), ids.begin() + n);
+    const int E = g.n_embd();
+    const int L = g.n_layer();
+    std::vector<std::vector<float>> ref((std::size_t)L), bat((std::size_t)L);
+    auto capture = [&](std::vector<std::vector<float>> &dst) {
+      g.set_node_cb([&dst, E](const char *name, int il, int t, const float *d, std::int64_t nn) {
+        (void)t;
+        if (std::strcmp(name, "l_out") != 0 || il < 0 || nn <= 0) return;
+        std::vector<float> tmp((std::size_t)nn);
+        if (hipMemcpy(tmp.data(), d, (std::size_t)nn * sizeof(float), hipMemcpyDeviceToHost) !=
+            hipSuccess) {
+          return;
+        }
+        // per token: one call of E floats per layer; batched: one call of n*E
+        std::vector<float> &v = dst[(std::size_t)il];
+        v.insert(v.end(), tmp.begin(), tmp.end());
+      });
+    };
+
+    std::vector<float> h1, l1, h2, l2;
+    // reference: one token at a time, from the same seeded state
+    if (!g.debug_fill_caches(4321u, err)) return 1;
+    capture(ref);
+    for (int t = 0; t < n; ++t) {
+      if (!g.forward_tokens({chunk[(std::size_t)t]}, pos0 + t, h1, l1, err)) {
+        std::fprintf(stderr, "long-ctx forward_tokens failed: %s\n", err.c_str());
+        return 1;
+      }
+    }
+    g.set_node_cb(nullptr);
+    // batched
+    if (!g.debug_fill_caches(4321u, err)) return 1;
+    capture(bat);
+    if (!g.forward_batch(chunk, pos0, h2, l2, err)) {
+      std::fprintf(stderr, "long-ctx forward_batch failed: %s\n", err.c_str());
+      return 1;
+    }
+    g.set_node_cb(nullptr);
+
+    // every row of every layer
+    double num = 0, den = 0, mx = 0;
+    bool exact = true;
+    int bad_rows = 0, rows = 0;
+    for (int il = 0; il < L; ++il) {
+      const std::vector<float> &a = ref[(std::size_t)il];
+      const std::vector<float> &b = bat[(std::size_t)il];
+      const std::size_t want = (std::size_t)n * (std::size_t)E;
+      if (a.size() != want || b.size() != want) {
+        std::fprintf(stderr, "long-ctx: layer %d captured %zu/%zu floats (want %zu)\n", il,
+                     a.size(), b.size(), want);
+        ++failures;
+        exact = false;
+        continue;
+      }
+      for (int t = 0; t < n; ++t) {
+        bool row_ok = true;
+        for (int i = 0; i < E; ++i) {
+          const double x = (double)a[(std::size_t)t * E + i];
+          const double y = (double)b[(std::size_t)t * E + i];
+          const double d = x - y;
+          num += d * d;
+          den += x * x + y * y;
+          if (d != 0.0) {
+            row_ok = false;
+            if (std::fabs(d) > mx) mx = std::fabs(d);
+          }
+        }
+        ++rows;
+        if (!row_ok) {
+          ++bad_rows;
+          exact = false;
+        }
+      }
+    }
+    const double rel = den > 0 ? std::sqrt(num / den) : 0.0;
+    double lrel = 0, lmax = 0;
+    const bool lexact = compare(l1, l2, &lrel, &lmax);
+    std::printf("\nlong context (pos %d..%d, keys %d, splits %d): %d camadas, %d linhas\n", pos0,
+                pos0 + n - 1, pos0 + n, g.debug_attn_splits(), L, rows);
+    std::printf("  todas as linhas (l_out por camada): rel-L2 %.3e max|d| %.3e  %d/%d linhas iguais"
+                "  %s\n",
+                rel, mx, rows - bad_rows, rows, exact ? "BIT-EXACT" : "DIFEREM");
+    std::printf("  logits do ultimo token:             rel-L2 %.3e max|d| %.3e  %s\n", lrel, lmax,
+                lexact ? "BIT-EXACT" : "DIFEREM");
+    if (!exact || !lexact) {
+      std::fprintf(stderr, "FAIL: caso de contexto longo (%d chaves, splits %d) nao e bit-exato\n",
+                   pos0 + n, g.debug_attn_splits());
+      ++failures;
+    }
   }
 
   if (failures == 0) {

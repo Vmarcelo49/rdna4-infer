@@ -606,7 +606,10 @@ inline bool Graph::init(int max_ctx, KvType kv_k, KvType kv_v, std::string &err)
     }
   }
 
-  const std::size_t part_bytes = attn_partial_bytes(NH, HD, kAttnMaxSplits);
+  // Sized for the whole batch: the batched split attention keeps one partial per
+  // (token, head, split) instead of reusing one token's buffer (feat/noite-prefill).
+  const std::size_t part_bytes =
+      (std::size_t)kMaxBatch * attn_partial_bytes(NH, HD, kAttnMaxSplits);
   if (hipMalloc(&d_attn_partial_, part_bytes) != hipSuccess) {
     err = "hipMalloc attn partial failed";
     return false;
@@ -1024,22 +1027,35 @@ inline bool Graph::forward_batch_layer(int il, int n, int pos0, std::string &err
       attn_splits_last_ = splits;
       const float scale = 1.0f / std::sqrt((float)HD);
       if (splits > 1) {
-        // long context: the per-token split kernel has to stay per token (its
-        // partial-sum order is part of the recorded numbers)
-        for (int t = 0; t < n; ++t) {
-          float *an = d_attnb_ + (std::size_t)t * NH * HD;
-          const int pos = pos0 + t;
-          const int sp = attn_splits_for(pos + 1);
+        // Long context: the key range is split across CTAs and the split COUNT
+        // depends on the token's position. splits is non-decreasing in pos, so the
+        // chunk is a sequence of contiguous runs of equal split count; inside a run
+        // every token's key assignment and merge order is exactly what the
+        // per-token split kernel does (same WPB, same j = w + WPB*s + k*WPB*sp,
+        // same merge), so the batched launch is bit-identical and only removes
+        // N-1 (kernel, merge) pairs per layer.
+        int t0 = 0;
+        while (t0 < n) {
+          const int sp = attn_splits_for(pos0 + t0 + 1);
+          int t1 = t0 + 1;
+          while (t1 < n && attn_splits_for(pos0 + t1 + 1) == sp) ++t1;
+          const int cnt = t1 - t0;
+          float *an0 = d_attnb_ + (std::size_t)t0 * NH * HD;
           if (sp > 1) {
-            if (!attn_launch_split(an, kc, vc, an, d_attn_partial_, pos, NH, NKV, HD, scale, kv_k_,
-                                   kv_v_, sp)) {
+            float *part0 = d_attn_partial_ +
+                           (std::size_t)t0 * attn_partial_bytes(NH, HD, kAttnMaxSplits) /
+                               sizeof(float);
+            if (!attn_split_batch_launch(an0, kc, vc, an0, part0, d_posb_ + t0, cnt, NH, NKV, HD,
+                                         scale, kv_k_, kv_v_, sp)) {
               err = "batch attn split launch failed";
               return false;
             }
-          } else if (!attn_launch(an, kc, vc, an, pos, NH, NKV, HD, scale, kv_k_, kv_v_)) {
+          } else if (!attn_batch_launch(an0, kc, vc, an0, d_posb_ + t0, cnt, NH, NKV, HD, scale,
+                                        kv_k_, kv_v_)) {
             err = "batch attn launch failed";
             return false;
           }
+          t0 = t1;
         }
       } else if (!attn_batch_launch(d_attnb_, kc, vc, d_attnb_, d_posb_, n, NH, NKV, HD, scale,
                                     kv_k_, kv_v_)) {
