@@ -1375,21 +1375,20 @@ int cmd_run(int argc, char **argv) {
     std::vector<float> hidden, logits;
     std::vector<float> h_prev((std::size_t)graph.n_embd(), 0.0f);  // h at position -1
     const double t_pre0 = now_s();
-    // feat/noite-mtp: RD_MTP_PREFILL=batched runs the prompt through the trunk in
-    // batched chunks (forward_batch_all) with the draft block stepped once per
-    // token, which is much faster on a long prompt.
-    // DEFAULT IS THE PER-TOKEN LOOP (the path the gates have validated since
-    // feat/mtp). The batched variant (RD_MTP_PREFILL=batched) is still here, but it
-    // is NOT bit-identical to the plain path at a long context: measured at 4K
-    // (3996-token prompt) the CLI with `--mtp` emitted a different first token
-    // than plain greedy, while the in-process gate at ~20 positions is bit-exact.
-    // Until that is root-caused, the shipping default is the per-token loop — the
-    // prefill costs ~5 s more at 4K and buys the exactness property that makes
-    // --mtp safe. See docs/journal-mtp.md §6.
+    // feat/noite-mtp: the prompt runs through the trunk in batched chunks
+    // (forward_batch_all) with the draft block stepped once per token. Measured
+    // 39,6 s at 4K and ~3 min at 16K against 143,8 s / 621,7 s for the per-token
+    // loop, and byte-identical to it: the CLI's stdout md5 with `--mtp` equals
+    // plain greedy's at 4K and at 16K, and RD_MTP_XALL_POS=4096 in
+    // tests/check_mtp_gpu.hip asserts row-for-row bit-exactness of
+    // forward_batch_all against the per-token path at a long context. (An earlier
+    // divergence at 4K was R9 in the trunk's own fast argmax, not this loop —
+    // docs/journal-mtp.md §7.) RD_MTP_PREFILL=serial keeps the per-token loop as
+    // the fallback and for the A/B.
     const char *mtp_prefill_env = std::getenv("RD_MTP_PREFILL");
-    const bool mtp_prefill_batched_env =
-        mtp_prefill_env != nullptr && std::strcmp(mtp_prefill_env, "batched") == 0;
-    if (mtp_prefill_batched_env) {
+    const bool mtp_prefill_serial =
+        mtp_prefill_env != nullptr && std::strcmp(mtp_prefill_env, "serial") == 0;
+    if (!mtp_prefill_serial) {
       if (!rdna4::mtp_prefill_batched(graph, mtp, prompt_ids, hidden, logits, mtop_err)) {
         std::fprintf(stderr, "rdna4-infer: MTP batched prefill failed: %s\n", mtop_err.c_str());
         return 1;

@@ -305,3 +305,42 @@ Estado de partida (medido neste worktree, `build/` próprio, IQ3_S, f16 KV):
   de outra frente); com o ganho de D=3 já abaixo do de D=2 (a aceitação marginal
   cai e o replay sobe), o custo não se justifica — o coordenador confirmou a
   decisão de não gastar a janela nisso.
+
+## 9. Fecho: corpus de regressão, custos de fase a 4K e o pré-preenchimento batelado de volta
+
+- **Referência**: prioridades do coordenador (19h de fila de GPU): (1) exatidão no
+  corpus de regressão com `--mtp` ligado, (2) custos de fase, (3) re-checar o
+  `mtp_prefill_batched` — o motivo para o ter desligado era o R9, não ele.
+- **Comandos**: `/tmp/mtp-regr.sh` e `/tmp/mtp-verify-last.sh`, ambos sob uma
+  tomada de lock (janela limpa).
+- **Resultado — corpus fixo de `tests/check_regression_gpu.hip`, ctx 4096, md5 do
+  stdout (ganancioso puro vs `--mtp --draft 2` vs `--draft 3`)**:
+
+  | prompt | ganancioso | D=2 | D=3 | md5 |
+  |---|---|---|---|---|
+  | `short` "The capital of France is" (32 tok) | 30,34 tok/s | 45,54 (**1,50×**) | 45,45 | `d226177116a9ef05` nos três |
+  | `kCode` (32 tok) | 30,11 | 61,15 (**2,03×**) | 61,72 | `7be88d0948fb9978` nos três |
+  | `kCjk` (24 tok) | 30,18 | 35,10 (1,16×) | 35,30 | `957d436bc6522a46` nos três |
+  | `kProse` (24 tok) | 24,86 | 27,66 (1,11×) | 21,34 (0,86×) | `0cd652754e181e32` nos três |
+
+  Ou seja: **byte-idêntico nos quatro**, e o ganho acompanha a aceitação do
+  rascunho — que vai de 55 % (prosa longa) a 95 % (código, texto repetitivo).
+  Em `kCode`, com 95,2 % de aceitação, o ganho é 1,9-2,0×.
+- **Custos de fase a 4K (posição 4084, kernels em lote da `main`)**:
+  passo de trunk por token **34,4 ms**; `forward_batch_all` 2/3/4 linhas
+  **34,6 / 39,7 / 47,7 ms** ⇒ linha marginal **8,0 ms** (contra 34,4 ms de um
+  token); passo do bloco MTP **2,21 ms com a LM head, 0,83 ms sem**;
+  snapshot+restore do estado **0,54 ms por par** (149,6 MiB).
+  É por isso que o ganho é 1,2× e não maior: numa rodada de D=2 a 4K o verify de 3
+  linhas custa ~40 ms contra os 34,4 ms de um token, o *replay* das rodadas
+  rejeitadas (48 % delas) custa ~8-35 ms, e o rascunho+rebuild somam ~5,5 ms — o
+  teto é a aceitação de 68 %.
+- **Pré-preenchimento batelado do MTP: MANTIDO como default.** Re-medido com o R9
+  consertado: a 4K o md5 com `RD_MTP_PREFILL=batched` é igual ao do ganancioso e ao
+  do laço por token (`84099989b3dca42c`), e o prefill cai de **143,8 s para
+  39,6 s** a 4K (e de 621,7 s para ~3 min a 16K, medido na §8). O motivo que eu
+  tinha registrado para o desligar (§6) era o R9 — a atribuição importa, e está
+  corrigida no código e aqui.
+- **Confirmação final com o default batelado** (mesma janela): 4K ganancioso 29,25
+  tok/s, `--mtp --draft 2` **35,69 tok/s (1,22×)**, aceitação 67,9 %, md5 idêntico;
+  `short` 1,50×; `kCode` 1,91-2,03×.
