@@ -356,29 +356,56 @@ those are queued with the attention changes rather than silenced with a flag.
 
 ## Known limitations (v1)
 
-- **Prefill is batched up to N=16** (bit-identical to the per-token path): ~70 tok/s against
-  llama.cpp's batched numbers. The ceiling is not batching — it is the `vec_dot` inner loop
-  (issue-bound per weight byte, measured in M6): even with an infinitely fast matvec the
-  per-token scaffolding caps prefill near 145 tok/s. Reaching llama.cpp's range needs a tiled
-  MMQ-style kernel with weights staged in LDS and wide int8 dots, i.e. giving up
-  bit-exactness for a numerically-gated kernel. Milestone-sized, not done.
-- **Long context**: decode used to be attention-bound (4.2 tok/s at 64K with `q4_0` KV); see
-  `docs/medicoes-m7.md` for the fix (vectorized cache loads, more warps per CTA, split-KV)
-  and the numbers. The GQA re-read is still per-query-head, which is the next known win.
-- KV type by context, measured: `f16` up to 48K (fits with 1.30 GiB free), **`q8_0` above
-  ~56K** (18.28 tok/s at 64K, 2.18 GiB free, and *faster* than `q4_0`), `q4_0` only when
-  128K must fit. `f16` at 64K overflows into GTT and collapses to 2-8 tok/s.
-- **MTP (block 64) works but does not pay**: `--mtp` drafts with the NextN head at 86.7 %
-  acceptance and reproduces plain greedy output exactly, but every mode still runs one trunk
-  forward per committed token, so it is 9-10 % *slower* than plain greedy. With batched
-  verification the measured projection is only 1.3-1.5×, so it was deliberately not built.
-  `docs/mtp.md`, `docs/medicoes-m8.md`.
-- The CLI is single-turn (`--chat` renders one system+user turn); multi-turn rendering exists
-  and is tested (`chat_render`) but there is no conversation-file flag yet.
-- `output.weight` is required (no tied-embedding fallback) and only `gfx1201` builds/runs.
-- The server is single-request, with no keep-alive and no prefix-cache reuse; it validates
-  request parameters but does not implement `logprobs`, `n>1`, tools or vision. Full list in
-  `docs/servidor-openai.md`.
+Ordered by how much they cost the user, with the number that justifies each. Nothing here is
+"should be fine" — each line is a measurement or a code fact with a pointer.
+
+1. **Prefill is the weak number: 72.9 tok/s at 512 tokens against llama.cpp's 1143 (a 15×
+   gap)**, so a 4K prompt costs ~56 s before the first token. The matvec is *not* the whole
+   story: inside `forward_batch` the weight pass is shared across the 16-token chunk, but the
+   attention, the GDN recurrence, the norms and the elementwise chains still run **per token**
+   (~11 ms/token of scaffolding, measured in `docs/medicoes-banda-e-gargalos.md` §1), which is
+   ~80 % of prefill time. Even with an infinitely fast matvec that scaffolding caps prefill
+   near 145 tok/s. Two honest routes: batch the scaffolding (the prefill front's work) or
+   replace the `vec_dot` with a tiled MMQ-style int8 kernel (weights in LDS, WMMA int8 —
+   possible on this card, but it gives up bit-exactness and needs numeric gating).
+2. **The KV cache has a cliff, not a curve.** IQ3_S + `f16` KV fits to 48K; at 64K it spills
+   ~2.1 GB into GTT and decode collapses from ~18 to **2.16-7.97 tok/s** with no error
+   message. Above ~56K the supported configuration is `q8_0` (or `q5_0`/`q4_1` once the KV
+   front lands); `q4_0` is only for when 128K must fit. `f16` at 128K needs 8 GiB of KV and
+   cannot fit at all.
+3. **MTP (block 64) is implemented and exact but does not pay yet.** The NextN head drafts at
+   86.7 % acceptance (llama.cpp's own driver: 87.5 %) and `--mtp` output is byte-identical to
+   plain greedy — but every mode still runs one trunk forward per committed token, so it
+   measures 9-10 % *slower* than plain greedy (2.24 ms draft + a full 35 ms trunk step per
+   token). The missing piece is batched verification: one `forward_batch` over
+   `[current, d1..dk]` shares the weight pass, which is where the multiplier lives. Nightly
+   front in progress; `docs/mtp.md`, `docs/medicoes-m8.md`.
+4. **Long context works but the GQA re-read is still per query head**: with a 6:1 ratio each
+   K/V row is read **6 times** per token (25.77 GB of logical KV traffic at 64K against
+   4.295 GB of unique bytes). The attention kernel saturates ~1.35 TB/s of L2, so the L2 hides
+   most of it — but a Vulkan-style grouped attention (one row loaded once for the 6 query
+   heads) is a known, unclaimed win. Decode was attention-bound before M7 (4.2 tok/s at 64K);
+   `docs/medicoes-m7.md` has the fix and the curve.
+5. **Quality at long context is the model's, not ours — but we have not proven it beyond
+   wikitext-2.** Per-chunk perplexity deltas against llama.cpp are ≤ 0.25 % at 512-token
+   windows; longer windows and the RoPE-scaling question are being measured (long-context
+   front). Do not read "131K runs" as "131K is good": the RoPE/quality check is what makes
+   that claim, and it has to be done in the reference too.
+6. **The attention kernel's *unsplit* variant ignores its `WPB` template parameter**
+   (`include/rdna4/attn.cuh`), so any warp-per-CTA sweep done through it measured redundant
+   warps. It affects diagnostics, not the shipped split path (which uses the parameter), and
+   the shipped constant is 8.
+7. **`--mtp` and `--chat` are CLI-only**: the OpenAI-compatible server does not expose
+   speculative decoding, and it is single-request with no keep-alive and no prefix-cache
+   reuse. It validates request parameters (including non-finite ones) but does not implement
+   `logprobs`, `n>1`, tools or vision — full list in `docs/servidor-openai.md`.
+8. **Smaller, documented, deliberately not fixed**: the CLI is single-turn (`--chat` renders
+   one system+user turn; multi-turn rendering exists and is tested in `chat_render`);
+   `output.weight` is required (no tied-embedding fallback); only `gfx1201` builds and runs;
+   `--ctx-size` is capped at 2^24 (the graph takes an `int`); 47 buffer sizes are computed in
+   `int` and widened afterwards (safe for this model, latent for another — audit finding M10);
+   and the test binaries still ignore 422 `[[nodiscard]]` HIP returns (test noise, not engine
+   risk — the engine's own 19 `hipMalloc` sites and 41 kernel launches are all checked).
 
 ## Docs
 
