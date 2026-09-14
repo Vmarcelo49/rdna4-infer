@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "rdna4/chat.h"
+#include "rdna4/cli_commands.h"
 #include "rdna4/device.h"
 #include "rdna4/graph.cuh"
 #include "rdna4/loader.h"
@@ -1241,5 +1242,6 @@ int main(int argc, char **argv) {
   if (argc > 1 && std::strcmp(argv[1], "info") == 0) {
     return cmd_info(argc - 1, argv + 1);
   }
+  if (argc > 1 && std::strcmp(argv[1], "serve") == 0) return cmd_serve(argc - 1, argv + 1);
   return cmd_info(argc, argv);
 }

@@ -201,3 +201,34 @@ if(EXISTS "/opt/rocm/include")
   target_include_directories(bench-attn-gpu PRIVATE /opt/rocm/include)
 endif()
 target_link_libraries(bench-attn-gpu PRIVATE ${AMDHIP64})
+
+# CPU-only checks for the HTTP/JSON half: no model, no GPU, no ROCm.
+add_executable(check-server-http tests/check_server_http.cpp src/server/http.cpp
+                                 src/server/json.cpp)
+target_include_directories(check-server-http PRIVATE include)
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible server (branch feat/openai-server, docs/servidor-openai.md).
+#
+# Appended by the server workstream: no line above this one was modified
+# (docs/agentes-paralelos.md rule 2, "CMakeLists.txt: só append").
+#
+# Layout: src/server/serve.hip is the HIP translation unit (it owns the model,
+# Graph, tokenizer and the generation loop and declares cmd_serve, dispatched
+# from src/main.hip); src/server/http.cpp + src/server/json.cpp are plain C++
+# (sockets, router, JSON) and carry no HIP at all, which is what lets
+# check-server-http exercise the request routing and the JSON codec on CPU.
+# ---------------------------------------------------------------------------
+# A shared library, not a second object in the executable: graph.cuh (and the
+# kernel headers it pulls in) defines its __global__ functions without
+# `static`/`inline`, so a second translation unit that includes it collides with
+# main.hip's copy at link time ("duplicate symbol: rdna4::mul_kernel"). Linking
+# the server as a shared object keeps serve.hip a normal translation unit - the
+# alternative, marking 21 kernels across six headers internal, would edit files
+# owned by the ROCm workstream.
+add_library(rdna4_serve SHARED src/server/serve.hip src/server/http.cpp src/server/json.cpp)
+target_include_directories(rdna4_serve PRIVATE include)
+target_compile_options(rdna4_serve PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_link_options(rdna4_serve PRIVATE --offload-arch=gfx1201)
+target_link_libraries(rdna4_serve PRIVATE ${AMDHIP64})
+target_link_libraries(rdna4-infer PRIVATE rdna4_serve)
