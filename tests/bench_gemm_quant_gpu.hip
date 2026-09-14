@@ -135,13 +135,16 @@ __device__ __forceinline__ void stage_iq3s_32(const block_iq3_s *__restrict__ bl
 // MODE 0 = GEMM completo (staging + conta)
 // MODE 1 = so' staging (ativacao f16 + peso real -> LDS): e' o item 1
 // MODE 2 = so' a copia da ativacao f16 (isola a outra metade do staging)
+// DBUF   = duplo buffer no laco de K (software pipelining: o staging da
+//          iteracao k+1 e' emitido ANTES da conta da iteracao k, entao as
+//          latencias de L1/global do staging ficam em voo durante a conta)
 //
 // Mapeamento de threads: tr = tid / TN (linhas de A) e tc = tid % TN (linhas de
 // W). Dentro de uma wave32 os 16 valores de `tc` sao distintos, entao as 16
 // linhas do tile ficam a `stride` palavras de distancia; com o pad de 1 half2
 // por linha (stride = BK/2+1 half2 = impar) os 16 acessos caem em 16 bancos
 // distintos -- sem conflito de LDS nem no A nem no W.
-template <int BM, int BN, int BK, int RM, int RN, int MODE>
+template <int BM, int BN, int BK, int RM, int RN, int MODE, bool DBUF>
 __global__ void __launch_bounds__((BM / RM) * (BN / RN)) gemm_iq3s_f16_kernel(
     const __half *__restrict__ A, const block_iq3_s *__restrict__ W, float *__restrict__ C,
     const int N, const int K) {
@@ -152,13 +155,15 @@ __global__ void __launch_bounds__((BM / RM) * (BN / RN)) gemm_iq3s_f16_kernel(
   constexpr int AS = BK + 2;               // halves por linha do tile A (+1 half2 de pad)
   constexpr int WS = BK + 2;
   constexpr int A2 = AS / 2, W2 = WS / 2;  // os mesmos strides em half2
+  constexpr int NBA = BM * AS, NBW = BN * WS;
   constexpr bool DO_W = (MODE != 2);
   constexpr bool DO_GEMM = (MODE == 0);
+  constexpr bool PIPE = (DBUF && DO_GEMM);  // duplo buffer so' faz sentido no GEMM
   static_assert(BK % 32 == 0, "BK tem de ser multiplo de 32 (o sub-bloco da escala)");
   static_assert(BN % RN == 0 && BM % RM == 0, "");
 
-  __shared__ __align__(16) __half s_a[BM * AS];
-  __shared__ __align__(16) __half s_w[BN * WS];
+  __shared__ __align__(16) __half s_a[PIPE ? 2 * NBA : NBA];
+  __shared__ __align__(16) __half s_w[PIPE ? 2 * NBW : NBW];
 
   const int tid = threadIdx.x;
   const int tr = tid / TN;
@@ -175,13 +180,14 @@ __global__ void __launch_bounds__((BM / RM) * (BN / RN)) gemm_iq3s_f16_kernel(
 
   float sink = 0.f;  // modos de staging: impede o compilador de apagar a LDS
 
-  for (int k0 = 0; k0 < K; k0 += BK) {
+  // ---- staging de uma iteracao de K ---------------------------------------
+  auto stage_tile = [&](__half *ta, __half *tw, const int k0) {
     // (a) ativacao: no caminho novo ela JA' e' f16 (o `act_quant` de 0,227
     // ms/token deixa de existir), entao aqui e' copia direta, sem dequant.
     for (int i = tid; i < BM * (BK / 2); i += NT) {
       const int row = i / (BK / 2);
       const int c2 = i % (BK / 2);
-      *(__half2 *)&s_a[row * AS + 2 * c2] =
+      *(__half2 *)&ta[row * AS + 2 * c2] =
           *(const __half2 *)&A[(std::int64_t)(m0 + row) * K + k0 + 2 * c2];
     }
     // (b) peso real: iq3_s da global -> f16 na LDS (o staging que decide)
@@ -192,41 +198,64 @@ __global__ void __launch_bounds__((BM / RM) * (BN / RN)) gemm_iq3s_f16_kernel(
         const int row = task / NIQS;
         const int ti = task % NIQS;
         stage_iq3s_32(W + (std::int64_t)(n0 + row) * bpr + ib, s0 + ti,
-                      (__half2 *)&s_w[row * WS + ti * 32]);
+                      (__half2 *)&tw[row * WS + ti * 32]);
       }
     }
-    __syncthreads();
+  };
+  // ---- conta de uma iteracao de K -----------------------------------------
+  auto compute_tile = [&](const __half *ta, const __half *tw) {
+    const __half2 *a2 = (const __half2 *)ta;
+    const __half2 *w2 = (const __half2 *)tw;
+#pragma unroll
+    for (int k2 = 0; k2 < BK / 2; ++k2) {
+      __half2 a[RM], w[RN];
+#pragma unroll
+      for (int r = 0; r < RM; ++r) a[r] = a2[(tr + r * TM) * A2 + k2];
+#pragma unroll
+      for (int c = 0; c < RN; ++c) w[c] = w2[(tc + c * TN) * W2 + k2];
+#pragma unroll
+      for (int r = 0; r < RM; ++r)
+#pragma unroll
+        for (int c = 0; c < RN; ++c) acc[r][c] = fdot2(a[r], w[c], acc[r][c]);
+    }
+  };
 
-    if constexpr (DO_GEMM) {
-      const __half2 *a2 = (const __half2 *)s_a;
-      const __half2 *w2 = (const __half2 *)s_w;
-#pragma unroll
-      for (int k2 = 0; k2 < BK / 2; ++k2) {
-        __half2 a[RM], w[RN];
-#pragma unroll
-        for (int r = 0; r < RM; ++r) a[r] = a2[(tr + r * TM) * A2 + k2];
-#pragma unroll
-        for (int c = 0; c < RN; ++c) w[c] = w2[(tc + c * TN) * W2 + k2];
-#pragma unroll
-        for (int r = 0; r < RM; ++r)
-#pragma unroll
-          for (int c = 0; c < RN; ++c) acc[r][c] = fdot2(a[r], w[c], acc[r][c]);
-      }
-    } else {
-      // Consumo minimo. Os indices dependem de `tid`, entao o compilador nao
-      // prova que a LDS inteira nao e' necessaria e o staging tem de ser
-      // materializado de verdade (o risco desta medicao virar ficcao).
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        const int rw = (tid * 7 + i * 29) % BN;
-        const int kw = (tid * 11 + i * 5) % BK;
-        sink += __half2float(s_w[rw * WS + kw]);
-        const int ra = (tid * 5 + i * 17) % BM;
-        const int ka = (tid * 13 + i * 3) % BK;
-        sink += __half2float(s_a[ra * AS + ka]);
-      }
-    }
+  if constexpr (PIPE) {
+    // Software pipelining: o staging de k+BK e' emitido ANTES da conta de k e
+    // as duas barreiras por iteracao viram uma. E' a resposta medida ao achado
+    // de que, com buffer unico, staging e conta se SERIALIZAM (a soma dos dois
+    // tempos medidos e' o tempo total).
+    stage_tile(s_a, s_w, 0);
     __syncthreads();
+    for (int k0 = 0, buf = 0; k0 < K; k0 += BK, buf ^= 1) {
+      __half *na = s_a + (buf ^ 1) * NBA;
+      __half *nw = s_w + (buf ^ 1) * NBW;
+      if (k0 + BK < K) stage_tile(na, nw, k0 + BK);
+      compute_tile(s_a + buf * NBA, s_w + buf * NBW);
+      __syncthreads();
+    }
+  } else {
+    for (int k0 = 0; k0 < K; k0 += BK) {
+      stage_tile(s_a, s_w, k0);
+      __syncthreads();
+      if constexpr (DO_GEMM) {
+        compute_tile(s_a, s_w);
+      } else {
+        // Consumo minimo. Os indices dependem de `tid`, entao o compilador nao
+        // prova que a LDS inteira nao e' necessaria e o staging tem de ser
+        // materializado de verdade (o risco desta medicao virar ficcao).
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const int rw = (tid * 7 + i * 29) % BN;
+          const int kw = (tid * 11 + i * 5) % BK;
+          sink += __half2float(s_w[rw * WS + kw]);
+          const int ra = (tid * 5 + i * 17) % BM;
+          const int ka = (tid * 13 + i * 3) % BK;
+          sink += __half2float(s_a[ra * AS + ka]);
+        }
+      }
+      __syncthreads();
+    }
   }
 
   if constexpr (DO_GEMM) {
@@ -396,9 +425,9 @@ void launch_ref(const __half *dA, const block_iq3_s *dW, float *dC, const int M,
 namespace {
 
 // Despacho em tempo de compilacao (o Cfg e' runtime, o template nao).
-#define RD_MODE_CASE(MODE)                                                              \
-  case MODE:                                                                            \
-    gemm_iq3s_f16_kernel<BM, BN, BK, RM, RN, MODE><<<grid, th>>>(dA, dW, dC, N, K);      \
+#define RD_MODE_CASE(MODE)                                                                   \
+  case MODE:                                                                                 \
+    gemm_iq3s_f16_kernel<BM, BN, BK, RM, RN, MODE, false><<<grid, th>>>(dA, dW, dC, N, K);   \
     break;
 
 template <int BM, int BN, int BK, int RM, int RN>
@@ -412,23 +441,42 @@ void launch_cfg(const int mode, const dim3 grid, const int th, const __half *dA,
 }
 #undef RD_MODE_CASE
 
+// Variante com duplo buffer (so' MODE 0). Nao existe para (BM=128, BK=64):
+// 2*(128*66 + 128*66)*2 B = 67 584 B passa dos 65 536 B de LDS do cartao.
+template <int BM, int BN, int BK, int RM, int RN>
+void launch_cfg_dbuf(const dim3 grid, const int th, const __half *dA, const block_iq3_s *dW,
+                     float *dC, const int N, const int K) {
+  gemm_iq3s_f16_kernel<BM, BN, BK, RM, RN, 0, true><<<grid, th>>>(dA, dW, dC, N, K);
+}
+
 bool launch(const Cfg &c, const int mode, const int M, const std::int64_t N, const std::int64_t K,
-            const __half *dA, const block_iq3_s *dW, float *dC) {
+            const __half *dA, const block_iq3_s *dW, float *dC, const bool dbuf = false) {
   const dim3 grid((unsigned)(N / c.BN), (unsigned)((M + c.BM - 1) / c.BM), 1u);
   const int th = c.threads();
+  const bool pipe = dbuf && mode == 0;
+#define RD_DISPATCH(BM_, BK_, RM_)                                                            \
+  do {                                                                                        \
+    if (pipe) launch_cfg_dbuf<BM_, 128, BK_, RM_, 8>(grid, th, dA, dW, dC, (int)N, (int)K);    \
+    else launch_cfg<BM_, 128, BK_, RM_, 8>(mode, grid, th, dA, dW, dC, (int)N, (int)K);        \
+  } while (0)
   if (c.BM == 128) {
-    if (c.BK == 32) launch_cfg<128, 128, 32, 8, 8>(mode, grid, th, dA, dW, dC, (int)N, (int)K);
-    else launch_cfg<128, 128, 64, 8, 8>(mode, grid, th, dA, dW, dC, (int)N, (int)K);
+    if (c.BK == 32) {
+      RD_DISPATCH(128, 32, 8);
+    } else {
+      if (pipe) std::printf("  (duplo buffer indisponivel em BM=128 BK=64: 67,6 KB de LDS)\n");
+      launch_cfg<128, 128, 64, 8, 8>(mode, grid, th, dA, dW, dC, (int)N, (int)K);
+    }
   } else if (c.BM == 64) {
-    if (c.BK == 32) launch_cfg<64, 128, 32, 4, 8>(mode, grid, th, dA, dW, dC, (int)N, (int)K);
-    else launch_cfg<64, 128, 64, 4, 8>(mode, grid, th, dA, dW, dC, (int)N, (int)K);
+    if (c.BK == 32) RD_DISPATCH(64, 32, 4);
+    else RD_DISPATCH(64, 64, 4);
   } else if (c.BM == 32) {
-    if (c.BK == 32) launch_cfg<32, 128, 32, 2, 8>(mode, grid, th, dA, dW, dC, (int)N, (int)K);
-    else launch_cfg<32, 128, 64, 2, 8>(mode, grid, th, dA, dW, dC, (int)N, (int)K);
+    if (c.BK == 32) RD_DISPATCH(32, 32, 2);
+    else RD_DISPATCH(32, 64, 2);
   } else {
-    if (c.BK == 32) launch_cfg<16, 128, 32, 2, 8>(mode, grid, th, dA, dW, dC, (int)N, (int)K);
-    else launch_cfg<16, 128, 64, 2, 8>(mode, grid, th, dA, dW, dC, (int)N, (int)K);
+    if (c.BK == 32) RD_DISPATCH(16, 32, 2);
+    else RD_DISPATCH(16, 64, 2);
   }
+#undef RD_DISPATCH
   return launch_ok("gemm_iq3s_f16");
 }
 
@@ -437,6 +485,7 @@ bool launch(const Cfg &c, const int mode, const int M, const std::int64_t N, con
 int main(int argc, char **argv) {
   std::vector<int> ms_list{16, 64, 128};
   int BK_sel = 64, reps = 5, BM_ovr = 0;
+  bool DBUF = false;
   std::int64_t n_ovr = -1, k_ovr = -1;
   std::string tensor_name;
   bool list_only = false, verify = true;
@@ -454,6 +503,8 @@ int main(int argc, char **argv) {
       BK_sel = std::atoi(argv[++i]);
     } else if (std::strcmp(argv[i], "--bm") == 0 && i + 1 < argc) {
       BM_ovr = std::atoi(argv[++i]);
+    } else if (std::strcmp(argv[i], "--dbuf") == 0) {
+      DBUF = true;
     } else if (std::strcmp(argv[i], "--reps") == 0 && i + 1 < argc) {
       reps = std::atoi(argv[++i]);
     } else if (std::strcmp(argv[i], "--n") == 0 && i + 1 < argc) {
@@ -696,6 +747,20 @@ int main(int argc, char **argv) {
   };
 
   EvPair ev;
+  // AQUECIMENTO GLOBAL -- e ele que faz a medicao valer. Medido nesta bancada:
+  // a PRIMEIRA configuracao de um processo sai ~47 % mais lenta que as
+  // seguintes (1,757 contra 1,195 ms na MESMA config, `--m 128,128,128`), e a
+  // partir da segunda a repeticao concorda em 0,1 %. Ou seja: o aquecimento tem
+  // de vir ANTES do laco de medicao; o warm-up por modo (abaixo) nao basta.
+  {
+    const Cfg cw = cfg_for(MMAX);
+    auto fn = [&] { (void)launch(cw, 0, MMAX, N, K, dA, Wblk, dC, DBUF); };
+    fn();
+    (void)hipDeviceSynchronize();
+    double warm = 0;
+    for (int it = 0; it < 4000 && warm < 600.0; ++it) warm += ev(fn);
+    std::printf("(aquecimento global: %.0f ms de GPU em %s)\n", warm, cw.tag);
+  }
   std::printf("\n== 2/4. GEMM com peso real, staging f16, dot2 (acumulador f32) ==\n");
   std::printf("%5s %-22s %11s %11s %11s %11s %11s %11s\n", "M", "cfg", "t_GEMM ms", "T MAC/s",
               "TOPS", "t_stage ms", "t_A ms", "t_W ms");
@@ -720,30 +785,36 @@ int main(int argc, char **argv) {
         sum_d += d * d;
         sum_r += (double)ref[i] * (double)ref[i];
         mx_ref = std::max(mx_ref, std::fabs((double)ref[i]));
-        if (std::fabs((double)ref[i]) > 1e-3 * 1.0) {
-          mx_rel = std::max(mx_rel, std::fabs(d) / std::fabs((double)ref[i]));
-        }
         if (got[i] != 0.f) allzero = false;
+      }
+      // Erro relativo so' onde ele significa algo: |ref| > 5 % do maior |ref|
+      // (com |ref| ~ 1e-3 o relativo mede cancelamento, nao precisao).
+      for (std::size_t i = 0; i < n_el; ++i) {
+        const double r = std::fabs((double)ref[i]);
+        if (r > 0.05 * mx_ref) {
+          mx_rel = std::max(mx_rel, std::fabs((double)got[i] - (double)ref[i]) / r);
+        }
       }
       std::printf(
           "  check M=%-4d %s (%d threads, grade %u x %u): rel-L2=%.3g  max|d|=%.3g  "
-          "max|ref|=%.3g\n            max rel (|ref|>1e-3)=%.3g%s\n",
+          "max|ref|=%.3g  max rel (|ref|>5%% do max)=%.3g%s\n",
           M, c.tag, c.threads(), (unsigned)(N / c.BN), (unsigned)((M + c.BM - 1) / c.BM),
           std::sqrt(sum_d / sum_r), mx, mx_ref, mx_rel, allzero ? "   TODA ZERO!" : "");
       if (allzero) break;
     }
     double t[3] = {1e9, 1e9, 1e9};
     for (int mode = 0; mode < 3; ++mode) {
-      auto fn = [&] { (void)launch(c, mode, M, N, K, dA, Wblk, dC); };
+      auto fn = [&] { (void)launch(c, mode, M, N, K, dA, Wblk, dC, DBUF); };
       fn();
       (void)hipDeviceSynchronize();
       double warm = 0;  // DPM: a placa cai para ~10 MHz ociosa
-      for (int it = 0; it < 400 && warm < 150.0; ++it) warm += ev(fn);
+      for (int it = 0; it < 4000 && warm < 250.0; ++it) warm += ev(fn);
       for (int r = 0; r < reps; ++r) t[mode] = std::min(t[mode], ev(fn));
     }
     const double macs = (double)M * (double)N * (double)K;
     const double tmacs = macs / (t[0] * 1e-3) / 1e12;
-    std::printf("%5d %-22s %11.3f %11.2f %11.1f %11.3f %11.3f %11.3f\n", M, c.tag, t[0], tmacs,
+    std::printf("%5d %-22s%11.3f %11.2f %11.1f %11.3f %11.3f %11.3f\n", M,
+                DBUF ? (std::string(c.tag) + " +dbuf").c_str() : c.tag, t[0], tmacs,
                 2 * tmacs, t[1], t[2], t[1] - t[2]);
     // item 1: staging isolado. Com BM < M o peso e' estagiado DE NOVO por
     // fatia de M (a grade tem M/BM blocos em y), entao o total de pesos
