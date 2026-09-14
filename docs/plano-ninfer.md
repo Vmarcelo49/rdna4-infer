@@ -17,10 +17,10 @@ gate antes de cronometrar, e número medido no lugar de adjetivo.
 | **3. `ColsPerTile ≤ 8` com `static_assert`, paralelismo em warps** | **VIVO e alinhado** | é exatamente a regra que faltou ao nosso D1: subir N levou de 62 para 133 VGPR e custou +71 % (`docs/plano-prefill.md` §0.1). O limiar deles (`T ≤ 16 → SIMT, T > 16 → tensor core`, `q4_dispatch.cpp:14-17`) é o mesmo do nosso despacho. |
 | **4. GDN em blocos de 64 com três estágios** | **VIVO, e é o segundo maior** | ataca 0,852 ms/token de recorrência (`docs/estudo-prefill-c-nosso.md` §5) — o maior custo de andaime que sobra depois do matvec. A matemática (block-WY) **não foi validada termo a termo** pela frente do ninfer → vira pesquisa antes de virar código (§1 N2). |
 | **5. Launcher por T exato com K dividido entre warps** | **VIVO, e é o item do MTP** | ataca o coeficiente `6,04 ms/token` de `pass_ms ≈ 13,9 + 6,04·N` e o custo marginal da verificação. |
-| **honra: ReplaySSM** (registrar entradas e reexecutar em vez de snapshot+restore) | **VIVO, barato de medir** | contra os nossos **0,54 ms** por par snapshot+restore; a razão de tráfego de estado deles é 86,1×. |
+| **honra: ReplaySSM** (registrar entradas e reexecutar em vez de snapshot+restore) | **REBAIXADO por medição (N4)** | a razão de 86× existe em BYTES (o nosso 87,75× em m=1), mas a cópia já é **~1 % do round**: o teto do ganho é **≤0,6-1,2 ms/round = 0,95 % do wall**. Não é alavanca. |
 | **honra: PDL** (28 sítios) | **FECHADO: não portável** | sonda de compilação: as três peças não existem no ROCm 7.2.4 e a ISA do gfx1201 rejeita as instruções; e o custo que ele ataca (rampa de GPU) não é o nosso (enfileiramento de CPU). `docs/estudo-pdl-hip.md` |
 | **honra: política de split em degraus, teto 85** | **VIVO, mas subordinado** | a nossa atenção a 64K custa 19,0 ms/token e o teto é 16 splits; a frente J mediu que a atenção é ≤2 % do prefill, então isto é **contexto longo**, não prefill. |
-| **§3.13 drafter em bloco (DFlash2)** | **enquadramento, não port** | bloqueio de **artefato** (pesos que o GGUF não tem). O que passa a valer é a medição F0: *ms por draft proposto hoje* contra `1/K` de um forward. |
+| **§3.13 drafter em bloco (DFlash2)** | **FECHADO pelos nossos números (N4)** | o nosso draft custa **1/12 a 1/14 de um forward** (2,45 ms contra 30,4 ms; 2,70 contra 37,6), ou seja **1,8× mais barato que `(1/K)·forward` para K=7** — já estamos no regime barato. Se custasse um forward, o round D=3 iria a 0,66×; um drafter em bloco hipotético economizaria **5,4 %** de um round de 84,6 ms. |
 
 **O que o ninfer sugere e nós já refutamos por medição** (não repetir): fusão de kernels em massa
 para o prefill (1,1 %), duplo buffer de ativação (−17 %), aumentar o tile em M para matar a cauda
@@ -72,6 +72,16 @@ Duas medições baratas que decidem dois itens grandes:
 2. **tráfego do snapshot+restore** por par (0,54 ms) contra o que um "registrar entradas e
    reexecutar" moveria (a razão do ninfer é 86,1×) — dimensiona o ReplaySSM antes de escrevê-lo.
 Entregável: números para mim; o doc sou eu que escrevo.
+
+### N4b — Implementação (nova, e agora a de MAIOR valor): argmax no device no laço do MTP
+Medido por N4: o round do MTP tem um **resíduo não atribuído de 7-17 ms (12-20 %)**, e a causa
+provável é o **sampler no host** — o laço chama `Sampler::sample` **2D+1 vezes por round**, e cada
+chamada monta um vetor `Candidate` de **248 320** entradas (~6 MB) e faz uma varredura completa
+mesmo no caminho ganancioso (`src/backend/sampler.cpp:56-95`); a diferença
+`run` (35,25 ms/token) − `bench` (31,56, com argmax no device) é **3,7 ms por chamada**. O motor
+**já tem** o `argmax_kernel`/`last_argmax` (C1/R9 da noite) — é trocar o caminho ganancioso do laço
+pelo device, mantendo o host para `temp > 0`. Alvo: **2-5 ms/token** e o break-even de aceitação
+caindo ~5-10 pontos; o gate é o md5 do `--mtp` igual ao ganancioso, que a noite já estabeleceu.
 
 ### N5 — Implementação: launcher small-T com K dividido entre warps (depois de N4)
 Padrão do ninfer `q4_small_t_mma`: `kKWarps=8`, `kTileKPerWarp=64`, `kRowsPerCta=16`, redução na
@@ -140,3 +150,20 @@ GPU pelo lock (serializam, cada um com `timeout` dentro).
    **0,81 ms/token** (`README.md`). Quem for decidir com base nele deve usar um desses dois.
 3. **O item nº 1 do ninfer (GQA fundido) já estava refutado aqui** — foi o filtro do §0 que pegou,
    e é a razão de o plano começar por pesquisa (N1) em vez de implementação.
+
+## 5. Correções de números que o N4 mediu (valem para o README e para o modelo do MTP)
+
+1. **`pass_ms ≈ 13,9 + 6,04·N` subestima a parte FIXA.** Medido no `forward_batch_all`:
+   **22,4 + 5,65·N ms** (pos 20) e **27,2 + 6,65·N** (pos 2036). O marginal (5,9-7,1 ms/linha)
+   confere com os 6,04; o fixo é 22-27 ms, não 13,9.
+2. **Os "0,54 ms por par" de snapshot+restore são por CÓPIA, não por par.** O teste roda 16 cópias
+   e divide por 8·2 (`tests/check_mtp_gpu.hip:863-868`); o par real é **~1,18 ms** (pos 20) /
+   **1,30** (pos 2036), e 149,625 MiB por cópia a 633,8 GB/s (pico medido) dão piso de 0,495 ms —
+   coerente com 0,59 medido (84 % do pico).
+3. **O break-even de 56 % do README está certo para as parcelas que ele conta** e é o extremo
+   OTIMISTA: com a posição realista (pos 2036) e o overhead do laço medido, ele sobe para
+   **64-70 % em D=2** e **67-71 % em D=3**. Prosa a 68 % cai exatamente na linha — é a explicação
+   aritmética dos 0,96×/0,80× da árvore final.
+4. **O pedido do ninfer de "GQA fundido" continua sem veredito final**: N1 mostrou que a nossa
+   refutação cobre a forma do protótipo C, não a dele, e que o confundidor é a **grade** (192 CTAs
+   contra 32) — o experimento E0 (uma célula, binário que já existe) está rodando.
