@@ -890,7 +890,7 @@ inline bool matvec_launch_lut_lds_unroll(int dt, const void *d_w, const block_q8
 // provides the memory-level parallelism), and since UNROLL does not change the
 // summation order the batched result stays bit-identical to the GEMV path for
 // every type that ships with unroll>1 -- tests/check_batch_gpu.hip asserts it.
-inline int matvec_batch_cap() { return 16; }
+inline int matvec_batch_cap() { return 64; }
 
 template <int N>
 inline bool matvec_launch_batch_n(int dt, const void *d_w, const block_q8_1 *d_a, float *d_o,
@@ -1008,6 +1008,11 @@ inline bool matvec_launch_batch(int dt, const void *d_w, const block_q8_1 *d_a, 
     case 4:  return matvec_launch_batch_n<4>(dt, d_w, d_a, d_o, nrows, ncols, act_stride, stream);
     case 8:  return matvec_launch_batch_n<8>(dt, d_w, d_a, d_o, nrows, ncols, act_stride, stream);
     case 16: return matvec_launch_batch_n<16>(dt, d_w, d_a, d_o, nrows, ncols, act_stride, stream);
+    // N=32/64 existem para MEDIR o degrau D1 do plano (chunk maior com o kernel de hoje).
+    // A previsao do modelo de custo (13,9 ms + 6,04 ms/token) e' de apenas +10 % em N=64 --
+    // previsao falsificavel, e e' isto que a mede. Custo: acc[N] floats = N registradores.
+    case 32: return matvec_launch_batch_n<32>(dt, d_w, d_a, d_o, nrows, ncols, act_stride, stream);
+    case 64: return matvec_launch_batch_n<64>(dt, d_w, d_a, d_o, nrows, ncols, act_stride, stream);
     default: return false;  // N is a compile-time instantiation, not a runtime knob
   }
 }

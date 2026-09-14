@@ -438,13 +438,15 @@ contagens dão o mesmo teto de MAC — muda o percentual, não a conclusão.)
 
 ### 3.5 Por que a nossa conta não fecha com "issue saturado"
 
-No lote, `docs/journal-lote.md` mede `675e6` instruções de warp por token em 6,04 ms de custo
-marginal ⇒ `112e9` instruções/s contra 640e9 slots = **17,5 % de ocupação de issue**. O dp4a
-sozinho: `24,35e9/4 = 6,09e9` dp4a por lane por token = `95,1e6` dp4a de warp (wave64) por token
-= **14 % das 675e6 instruções** e, pelos slots, `6,09e9/64 = 95,1e6` × 2 slots = 3,0 % de 640e9
-por token. Não é saturação de issue, não é DRAM (o lado do peso roda a 100 GB/s de 633), não é
-registrador (`localSizeBytes = 0` em 14 tipos × 4 N) e não é o UNROLL (medido, refutado). O que
-sobra é latência não coberta — e uma conta de tráfego que a referência simplesmente não tem.
+No lote, `docs/journal-lote.md` mede o custo marginal de 6,04 ms/token e
+`docs/journal-kernels.md` §10 conta `25,3e6` iterações de warp × ~428 instruções = `10,8e9`
+instruções de warp por chunk de 16 tokens (por token: `675e6`). Isso dá `98-112e9` instruções/s
+(15 % se contadas contra a passagem inteira de 110,7 ms, 17,5 % contra o custo marginal de
+6,04 ms/token) contra 640e9 slots. O dp4a sozinho: `24,35e9/4 = 6,09e9` dp4a por lane por token
+= `95,1e6` dp4a de warp (wave64) por token = **14 % das 675e6 instruções**. Não é saturação de
+issue, não é DRAM (o lado do peso roda a 100 GB/s de 633), não é registrador
+(`localSizeBytes = 0` em 14 tipos × 4 N) e não é o UNROLL (medido, refutado). O que sobra é
+latência não coberta — e uma conta de tráfego que a referência simplesmente não tem.
 
 ### 3.6 A conta que separa os dois: bytes de ativação por MAC
 

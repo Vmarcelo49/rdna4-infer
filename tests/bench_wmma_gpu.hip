@@ -463,11 +463,15 @@ __global__ void exact_block_kernel(const int8_t *__restrict__ A, const int8_t *_
 // Variante f16: o staging converte int8*d para f16 (a escala fica embutida no
 // valor, como o llama.cpp faz com k-quant -> f16 no shared) e o acumulador
 // fp32 segue por todo o K sem correcao por bloco.
-template <int BM, int WARPS, bool F16>
+// MODE: 0 = GEMM completo; 1 = so' o staging + as leituras de fragmento na LDS
+// (sem WMMA e sem correcao); 2 = so' o staging (global -> LDS). Os modos 1/2
+// existem para separar, com o MESMO codigo e a MESMA grade, o custo de alimentar
+// a LDS do custo do matrix core -- e' o que responde "onde trava".
+template <int BM, int BN, int WARPS, bool F16, int MODE = 0>
 __global__ void gemm_kernel(const int8_t *__restrict__ A, const float *__restrict__ da,
                             const int8_t *__restrict__ W, const float *__restrict__ dw,
                             float *__restrict__ C, int M, int N, int K) {
-  constexpr int BN = 64, BK = 64;          // BK = 64 = 2 blocos de quant por estagio
+  constexpr int BK = 64;                   // BK = 64 = 2 blocos de quant por estagio
   constexpr int STRIDE = F16 ? (BK + 8) : (BK + 8);  // halves p/ f16, bytes p/ int8
   constexpr int nMT = BM / 16, nNT = BN / 16;
   constexpr int warps_per_mt = WARPS / nMT;
@@ -482,8 +486,8 @@ __global__ void gemm_kernel(const int8_t *__restrict__ A, const float *__restric
   // buffer que vamos reescrever ja' foi consumido por todos os warps.
   __shared__ __align__(16) ST sA[2][BM * STRIDE];
   __shared__ __align__(16) ST sW[2][BN * STRIDE];
-  __shared__ float sda[2][BM];
-  __shared__ float sdw[2][BN];
+  __shared__ float sda[2][2][BM];  // [buffer][bloco de 32][m]
+  __shared__ float sdw[2][2][BN];  // [buffer][bloco de 32][n]
 
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
@@ -502,16 +506,18 @@ __global__ void gemm_kernel(const int8_t *__restrict__ A, const float *__restric
   for (int t = 0; t < nnt; ++t)
 #pragma unroll
     for (int j = 0; j < 8; ++j) facc[t][j] = 0.0f;
+  int sink = 0;  // usado por MODE 1/2 para nada ser eliminado por DCE
 
+  // kb0 = indice do PRIMEIRO bloco de quant de 32 do estagio (nao do k de 64)
   auto stage = [&](int buf, int kb0) {
     // A: BM linhas x 64 B; W: 64 linhas x 64 B; 8 B por chunk
     for (int idx = tid; idx < BM * 8; idx += WARPS * 32) {
       const int m = idx >> 3, g = idx & 7;
       const bool ok = (m0 + m) < M;
       const int koff = g * 8;
-      const uint2 u = ok ? *(const uint2 *)(A + (size_t)(m0 + m) * K + kb0 * BK + koff)
+      const uint2 u = ok ? *(const uint2 *)(A + (size_t)(m0 + m) * K + kb0 * 32 + koff)
                          : make_uint2(0u, 0u);
-      const float s = ok ? da[(size_t)(m0 + m) * nKD + kb0 * 2 + (koff >> 5)] : 0.0f;
+      const float s = ok ? da[(size_t)(m0 + m) * nKD + kb0 + (koff >> 5)] : 0.0f;
       if constexpr (F16) {
         _Float16 *dst = sA[buf] + m * STRIDE + koff;
         const int8_t *q = (const int8_t *)&u;
@@ -525,9 +531,9 @@ __global__ void gemm_kernel(const int8_t *__restrict__ A, const float *__restric
       const int n = idx >> 3, g = idx & 7;
       const bool ok = (n0 + n) < N;
       const int koff = g * 8;
-      const uint2 u = ok ? *(const uint2 *)(W + (size_t)(n0 + n) * K + kb0 * BK + koff)
+      const uint2 u = ok ? *(const uint2 *)(W + (size_t)(n0 + n) * K + kb0 * 32 + koff)
                          : make_uint2(0u, 0u);
-      const float s = ok ? dw[(size_t)(n0 + n) * nKD + kb0 * 2 + (koff >> 5)] : 0.0f;
+      const float s = ok ? dw[(size_t)(n0 + n) * nKD + kb0 + (koff >> 5)] : 0.0f;
       if constexpr (F16) {
         _Float16 *dst = sW[buf] + n * STRIDE + koff;
         const int8_t *q = (const int8_t *)&u;
@@ -539,11 +545,11 @@ __global__ void gemm_kernel(const int8_t *__restrict__ A, const float *__restric
     }
     for (int i = tid; i < 2 * BM; i += WARPS * 32) {
       const int b = i / BM, m = i % BM;
-      sda[buf][m] = (m0 + m < M) ? da[(size_t)(m0 + m) * nKD + kb0 * 2 + b] : 0.0f;
+      sda[buf][b][m] = (m0 + m < M) ? da[(size_t)(m0 + m) * nKD + kb0 + b] : 0.0f;
     }
     for (int i = tid; i < 2 * BN; i += WARPS * 32) {
       const int b = i / BN, n = i % BN;
-      sdw[buf][n + b * BN] = (n0 + n < N) ? dw[(size_t)(n0 + n) * nKD + kb0 * 2 + b] : 0.0f;
+      sdw[buf][b][n] = (n0 + n < N) ? dw[(size_t)(n0 + n) * nKD + kb0 + b] : 0.0f;
     }
   };
 
@@ -553,73 +559,106 @@ __global__ void gemm_kernel(const int8_t *__restrict__ A, const float *__restric
     __syncthreads();
     if (st + 1 < nStage) stage(cur ^ 1, (st + 1) * 2);
 #pragma unroll
-    for (int q = 0; q < 4; ++q) {  // 4 k16 por estagio; a correcao cai em q=1 e q=3
-      const int kb = (q >> 1);     // bloco de 32 dentro do estagio
-      const int k0 = (q & 1) * 16;
-      i32x2_t af;
-      f16x8_t aff;
-      if constexpr (F16) {
-        aff = *reinterpret_cast<const f16x8_t *>(sA[cur] + (mt * 16 + lo) * STRIDE + kb * 32 + k0 + 8 * hi);
-      } else {
-        const int8_t *ap = sA[cur] + (mt * 16 + lo) * STRIDE + kb * 32 + k0 + 8 * hi;
-        af = pack_i32x2(i32_at(ap), i32_at(ap + 4));
+    for (int kb = 0; kb < 2; ++kb) {  // os 2 blocos de quant de 32 do estagio
+      if constexpr (MODE == 2) continue;  // so' staging: nada e' lido da LDS
+      // fragmentos de A dos dois k16 do bloco (reusados pelos nnt tiles)
+      i32x2_t af[2];
+      f16x8_t aff[2];
+      if constexpr (MODE != 2) {
+        if constexpr (F16) {
+#pragma unroll
+          for (int h = 0; h < 2; ++h)
+            aff[h] = *reinterpret_cast<const f16x8_t *>(sA[cur] + (mt * 16 + lo) * STRIDE +
+                                                        kb * 32 + h * 16 + 8 * hi);
+        } else {
+#pragma unroll
+          for (int h = 0; h < 2; ++h) {
+            const int8_t *ap = sA[cur] + (mt * 16 + lo) * STRIDE + kb * 32 + h * 16 + 8 * hi;
+            af[h] = pack_i32x2(i32_at(ap), i32_at(ap + 4));
+          }
+        }
       }
       int32_t iacc[nnt][8];
 #pragma unroll
       for (int t = 0; t < nnt; ++t)
 #pragma unroll
         for (int j = 0; j < 8; ++j) iacc[t][j] = 0;
+      if constexpr (MODE == 0) {
 #pragma unroll
-      for (int t = 0; t < nnt; ++t) {
-        const int nt = nt0 + t;
-        if constexpr (F16) {
-          const f16x8_t bf = *reinterpret_cast<const f16x8_t *>(
-              sW[cur] + (nt * 16 + lo) * STRIDE + kb * 32 + k0 + 8 * hi);
-          f32x8_t acc;
+      for (int h = 0; h < 2; ++h) {
 #pragma unroll
-          for (int j = 0; j < 8; ++j) acc[j] = facc[t][j];
-          acc = WMMA_F16(aff, bf, acc);
+        for (int t = 0; t < nnt; ++t) {
+          const int nt = nt0 + t;
+          if constexpr (F16) {
+            const f16x8_t bf = *reinterpret_cast<const f16x8_t *>(
+                sW[cur] + (nt * 16 + lo) * STRIDE + kb * 32 + h * 16 + 8 * hi);
+            f32x8_t acc;
 #pragma unroll
-          for (int j = 0; j < 8; ++j) facc[t][j] = acc[j];
-        } else {
-          // dois WMMAs por bloco de 32: o segundo acumula no int32 do primeiro
-          i32x8_t c = zero_i32x8();
-          const int8_t *bp = sW[cur] + (nt * 16 + lo) * STRIDE + kb * 32 + k0 + 8 * hi;
-          c = WMMA_I8(af, pack_i32x2(i32_at(bp), i32_at(bp + 4)), c);
-          if (q == 1 || q == 3) {
-            // segunda metade do bloco de 32
-            const int8_t *bp2 = bp + 16;
-            c = WMMA_I8(af2_for(q, sA[cur], mt, STRIDE, lo, hi, kb, k0), 
-                        pack_i32x2(i32_at(bp2), i32_at(bp2 + 4)), c);
+            for (int j = 0; j < 8; ++j) acc[j] = facc[t][j];
+            acc = WMMA_F16(aff[h], bf, acc);
 #pragma unroll
-            for (int j = 0; j < 8; ++j) iacc[t][j] = c[j];
+            for (int j = 0; j < 8; ++j) facc[t][j] = acc[j];
           } else {
-            // primeira metade: guarda no iacc para o segundo k16 completar
+            const int8_t *bp = sW[cur] + (nt * 16 + lo) * STRIDE + kb * 32 + h * 16 + 8 * hi;
+            i32x8_t c;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) c[j] = iacc[t][j];
+            c = WMMA_I8(af[h], pack_i32x2(i32_at(bp), i32_at(bp + 4)), c);
 #pragma unroll
             for (int j = 0; j < 8; ++j) iacc[t][j] = c[j];
           }
         }
       }
-      if constexpr (!F16) {
-        if (q == 1 || q == 3) {
-          const int b = (q >> 1);
-          float da8[8];
+      if constexpr (MODE == 1) {
+        // le os MESMOS fragmentos que o WMMA leria, sem WMMA: isola o caminho
+        // de dados (LDS) da unidade de matriz.
 #pragma unroll
-          for (int j = 0; j < 8; ++j) da8[j] = sda[cur][b * BM + mt * 16 + 8 * hi + j];
+        for (int t = 0; t < nnt; ++t) {
+          const int nt = nt0 + t;
 #pragma unroll
-          for (int t = 0; t < nnt; ++t) {
-            const float wsc = sdw[cur][(nt0 + t) * 16 + lo];
+          for (int h = 0; h < 2; ++h) {
+            if constexpr (F16) {
+              const f16x8_t bf = *reinterpret_cast<const f16x8_t *>(
+                  sW[cur] + (nt * 16 + lo) * STRIDE + kb * 32 + h * 16 + 8 * hi);
 #pragma unroll
-            for (int j = 0; j < 8; ++j)
-              facc[t][j] = fmaf((float)iacc[t][j], wsc * da8[j], facc[t][j]);
+              for (int j = 0; j < 8; ++j) sink += (int)f16_as_u16(bf[j]);
+            } else {
+              const int8_t *bp = sW[cur] + (nt * 16 + lo) * STRIDE + kb * 32 + h * 16 + 8 * hi;
+              sink += i32_at(bp) + i32_at(bp + 4);
+            }
+          }
+        }
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          if constexpr (F16) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) sink += (int)f16_as_u16(aff[h][j]);
+          } else {
+            sink += af[h][0] + af[h][1];
           }
         }
       }
+      if constexpr (MODE == 0 && !F16) {
+        // correcao de escala do bloco de 32, em fp32, exatamente como o motor
+        float da8[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) da8[j] = sda[cur][kb][mt * 16 + 8 * hi + j];
+#pragma unroll
+        for (int t = 0; t < nnt; ++t) {
+          const float wsc = sdw[cur][kb][(nt0 + t) * 16 + lo];
+#pragma unroll
+          for (int j = 0; j < 8; ++j)
+            facc[t][j] = fmaf((float)iacc[t][j], wsc * da8[j], facc[t][j]);
+        }
+      }
+      }  // if constexpr (MODE == 0)
     }
     cur ^= 1;
   }
+  if constexpr (MODE != 0) C[(size_t)(blockIdx.y * gridDim.x + blockIdx.x) * 32 + lane] = (float)sink;
 
   // escrita: slot j do lane L -> C[m = m0 + mt*16 + 8*hi + j][n = n0 + nt*16 + lo]
+  if constexpr (MODE == 0) {
   const int cm0 = m0 + mt * 16 + 8 * hi;
 #pragma unroll
   for (int t = 0; t < nnt; ++t) {
@@ -631,6 +670,7 @@ __global__ void gemm_kernel(const int8_t *__restrict__ A, const float *__restric
       if (cm < M) C[(size_t)cm * N + cn] = facc[t][j];
     }
   }
+  }  // if constexpr (MODE == 0)
 }
 
 __global__ void empty_kernel() {}
@@ -1453,6 +1493,19 @@ int main(int argc, char **argv) {
     std::printf("  referencia (mesmo cartao/modelo, docs/journal-lote.md): llama.cpp Vulkan pp512 "
                 "= %.1f T-MACs/s (67 TOPS-equiv);\n  este motor = %.2f T-MACs/s (7,5 TOPS int8). "
                 "TOPS = 2 x MACs.\n", llama_macs / 1e12, 15.5e12 / 4.13 / 1e12);
+    {
+      hipFuncAttributes a{}, b{}, c{}, d{};
+      const char *names[4] = {"gemm<16,4,i8>", "gemm<64,4,i8>", "gemm<16,4,f16>", "gemm<64,4,f16>"};
+      hipFuncAttributes *at[4] = {&a, &b, &c, &d};
+      (void)hipFuncGetAttributes(&a, (const void *)gemm_kernel<16, 64, 4, false>);
+      (void)hipFuncGetAttributes(&b, (const void *)gemm_kernel<64, 64, 4, false>);
+      (void)hipFuncGetAttributes(&c, (const void *)gemm_kernel<16, 64, 4, true>);
+      (void)hipFuncGetAttributes(&d, (const void *)gemm_kernel<64, 64, 4, true>);
+      std::printf("  recursos: ");
+      for (int i = 0; i < 4; ++i)
+        std::printf("%s regs=%d LDS=%zu B spill=%zu B%s", names[i], at[i]->numRegs,
+                    at[i]->sharedSizeBytes, at[i]->localSizeBytes, i == 3 ? "\n" : "; ");
+    }
     std::printf("  %5s %6s %7s | %-13s %9s %7s %7s %7s | %-13s %9s %7s %7s %7s\n", "M", "N", "K",
                 "int8 ms", "T-MACs/s", "TOPS", "%llama", "LDS/W", "f16 ms", "T-MACs/s", "TOPS",
                 "%llama", "LDS/W");
@@ -1483,24 +1536,33 @@ int main(int argc, char **argv) {
           std::function<void()> li8, lf16;
           switch (Mi) {
             case 16:
-              li8 = [&] { gemm_kernel<16, 4, false><<<dim3((Ni + 63) / 64), dim3(128)>>>(d_A, d_da, d_W, d_dw, d_C, Mi, Ni, K); };
-              lf16 = [&] { gemm_kernel<16, 4, true><<<dim3((Ni + 63) / 64), dim3(128)>>>(d_A, d_da, d_W, d_dw, d_C, Mi, Ni, K); };
+              li8 = [&] { gemm_kernel<16, 64, 4, false><<<dim3((Ni + 63) / 64), dim3(128)>>>(d_A, d_da, d_W, d_dw, d_C, Mi, Ni, K); };
+              lf16 = [&] { gemm_kernel<16, 64, 4, true><<<dim3((Ni + 63) / 64), dim3(128)>>>(d_A, d_da, d_W, d_dw, d_C, Mi, Ni, K); };
               break;
             case 32:
-              li8 = [&] { gemm_kernel<32, 4, false><<<dim3((Ni + 63) / 64), dim3(128)>>>(d_A, d_da, d_W, d_dw, d_C, Mi, Ni, K); };
-              lf16 = [&] { gemm_kernel<32, 4, true><<<dim3((Ni + 63) / 64), dim3(128)>>>(d_A, d_da, d_W, d_dw, d_C, Mi, Ni, K); };
+              li8 = [&] { gemm_kernel<32, 64, 4, false><<<dim3((Ni + 63) / 64), dim3(128)>>>(d_A, d_da, d_W, d_dw, d_C, Mi, Ni, K); };
+              lf16 = [&] { gemm_kernel<32, 64, 4, true><<<dim3((Ni + 63) / 64), dim3(128)>>>(d_A, d_da, d_W, d_dw, d_C, Mi, Ni, K); };
               break;
             case 64:
-              li8 = [&] { gemm_kernel<64, 4, false><<<dim3((Ni + 63) / 64, (Mi + 63) / 64), dim3(128)>>>(d_A, d_da, d_W, d_dw, d_C, Mi, Ni, K); };
-              lf16 = [&] { gemm_kernel<64, 4, true><<<dim3((Ni + 63) / 64, (Mi + 63) / 64), dim3(128)>>>(d_A, d_da, d_W, d_dw, d_C, Mi, Ni, K); };
+              li8 = [&] { gemm_kernel<64, 64, 4, false><<<dim3((Ni + 63) / 64, (Mi + 63) / 64), dim3(128)>>>(d_A, d_da, d_W, d_dw, d_C, Mi, Ni, K); };
+              lf16 = [&] { gemm_kernel<64, 64, 4, true><<<dim3((Ni + 63) / 64, (Mi + 63) / 64), dim3(128)>>>(d_A, d_da, d_W, d_dw, d_C, Mi, Ni, K); };
               break;
             default:
-              li8 = [&] { gemm_kernel<128, 8, false><<<dim3((Ni + 63) / 64, (Mi + 127) / 128), dim3(256)>>>(d_A, d_da, d_W, d_dw, d_C, Mi, Ni, K); };
-              lf16 = [&] { gemm_kernel<128, 8, true><<<dim3((Ni + 63) / 64, (Mi + 127) / 128), dim3(256)>>>(d_A, d_da, d_W, d_dw, d_C, Mi, Ni, K); };
+              li8 = [&] { gemm_kernel<128, 64, 8, false><<<dim3((Ni + 63) / 64, (Mi + 127) / 128), dim3(256)>>>(d_A, d_da, d_W, d_dw, d_C, Mi, Ni, K); };
+              lf16 = [&] { gemm_kernel<128, 64, 8, true><<<dim3((Ni + 63) / 64, (Mi + 127) / 128), dim3(256)>>>(d_A, d_da, d_W, d_dw, d_C, Mi, Ni, K); };
               break;
           }
           const double ms_i8 = best_ms(li8, reps, rounds);
           const double ms_f16 = best_ms(lf16, reps, rounds);
+          // diagnostico: a MESMA grade e o MESMO staging, sem WMMA
+          auto lstage = [&](int mode) {
+            if (mode == 2)
+              gemm_kernel<16, 64, 4, false, 2><<<dim3((Ni + 63) / 64), dim3(128)>>>(d_A, d_da, d_W, d_dw, d_C, Mi, Ni, K);
+            else
+              gemm_kernel<16, 64, 4, false, 1><<<dim3((Ni + 63) / 64), dim3(128)>>>(d_A, d_da, d_W, d_dw, d_C, Mi, Ni, K);
+          };
+          const double ms_st = best_ms([&] { lstage(2); }, reps, rounds);
+          const double ms_stf = best_ms([&] { lstage(1); }, reps, rounds);
           // LDS por WMMA (ver docs): A 8 B por lane + os fragmentos de escala
           const double lds_per_wmma = 3712.0 / 8.0;
           std::printf("  %5d %6d %7d | %-13.4f %9.2f %7.1f %6.1f%% %7.0f | %-13.4f %9.2f %7.1f "
@@ -1509,12 +1571,73 @@ int main(int argc, char **argv) {
                       lds_per_wmma, ms_f16, macs / (ms_f16 * 1e-3) / 1e12,
                       2 * macs / (ms_f16 * 1e-3) / 1e12, 100.0 * (macs / (ms_f16 * 1e-3)) / llama_macs,
                       lds_per_wmma);
+          std::printf("           diagnostico (M=16, mesma grade/staging, sem WMMA): staging puro "
+                      "%.4f ms (%.0f%% do GEMM int8); staging + leituras de fragmento na LDS "
+                      "%.4f ms (%.0f%%); o WMMA custa %.4f ms (%.0f%%)\n",
+                      ms_st, 100.0 * ms_st / ms_i8, ms_stf, 100.0 * ms_stf / ms_i8,
+                      ms_i8 - ms_stf, 100.0 * (ms_i8 - ms_stf) / ms_i8);
           hipFree(d_A);
           hipFree(d_W);
           hipFree(d_da);
           hipFree(d_dw);
           hipFree(d_C);
         }
+      }
+    }
+
+    // --- varredura de geometria: quantos warps por CU, e quanto custa o A
+    // duplicado por CTA. A grade de um GEMM com M=16 e' (N/BN) x 1: com BN=64
+    // sao 64 CTAs de 4 warps para N=4096 = 1 warp por SIMD, e nada esconde a
+    // latencia do staging. BN menor = mais CTAs = mais warps por CU.
+    {
+      const int K = 5120, nKD = K / 32;
+      struct Geo { int bm, bn, warps; const char *name; };
+      const Geo geos[6] = {{16, 16, 1, "BM16 BN16 W1"}, {16, 32, 2, "BM16 BN32 W2"},
+                           {16, 64, 4, "BM16 BN64 W4"}, {64, 16, 4, "BM64 BN16 W4"},
+                           {64, 32, 4, "BM64 BN32 W4"}, {64, 64, 4, "BM64 BN64 W4"}};
+      const int Ms[2] = {16, 64};
+      std::printf("  varredura de geometria (K=%d, N=4096, int8) -- T-MACs/s:\n", K);
+      for (int mi = 0; mi < 2; ++mi) {
+        const int M = Ms[mi], N = 4096;
+        std::vector<int8_t> A, W;
+        std::vector<float> da((size_t)M * nKD), dw((size_t)N * nKD);
+        fill_i8(A, (size_t)M * K, -100, 100);
+        fill_i8(W, (size_t)N * K, -100, 100);
+        for (size_t i = 0; i < da.size(); ++i) da[i] = 0.0009f + 0.0001f * (float)(i % 7);
+        for (size_t i = 0; i < dw.size(); ++i) dw[i] = 0.0007f + 0.0001f * (float)(i % 5);
+        int8_t *d_A = nullptr, *d_W = nullptr;
+        float *d_da = nullptr, *d_dw = nullptr, *d_C = nullptr;
+        HIPCHECK(hipMalloc(&d_A, A.size()));
+        HIPCHECK(hipMalloc(&d_W, W.size()));
+        HIPCHECK(hipMalloc(&d_da, da.size() * sizeof(float)));
+        HIPCHECK(hipMalloc(&d_dw, dw.size() * sizeof(float)));
+        HIPCHECK(hipMalloc(&d_C, (size_t)M * N * sizeof(float)));
+        HIPCHECK(hipMemcpy(d_A, A.data(), A.size(), hipMemcpyHostToDevice));
+        HIPCHECK(hipMemcpy(d_W, W.data(), W.size(), hipMemcpyHostToDevice));
+        HIPCHECK(hipMemcpy(d_da, da.data(), da.size() * sizeof(float), hipMemcpyHostToDevice));
+        HIPCHECK(hipMemcpy(d_dw, dw.data(), dw.size() * sizeof(float), hipMemcpyHostToDevice));
+        for (int g = 0; g < 6; ++g) {
+          if (geos[g].bm != M) continue;
+          auto launch = [&, g] {
+            const int bn = geos[g].bn, w = geos[g].warps;
+            const dim3 gr((unsigned)((N + bn - 1) / bn), (unsigned)((M + geos[g].bm - 1) / geos[g].bm));
+            const dim3 bl((unsigned)(w * 32));
+            if (g == 0) gemm_kernel<16, 16, 1, false><<<gr, bl>>>(d_A, d_da, d_W, d_dw, d_C, M, N, K);
+            else if (g == 1) gemm_kernel<16, 32, 2, false><<<gr, bl>>>(d_A, d_da, d_W, d_dw, d_C, M, N, K);
+            else if (g == 2) gemm_kernel<16, 64, 4, false><<<gr, bl>>>(d_A, d_da, d_W, d_dw, d_C, M, N, K);
+            else if (g == 3) gemm_kernel<64, 16, 4, false><<<gr, bl>>>(d_A, d_da, d_W, d_dw, d_C, M, N, K);
+            else if (g == 4) gemm_kernel<64, 32, 4, false><<<gr, bl>>>(d_A, d_da, d_W, d_dw, d_C, M, N, K);
+            else gemm_kernel<64, 64, 4, false><<<gr, bl>>>(d_A, d_da, d_W, d_dw, d_C, M, N, K);
+          };
+          const double ms = best_ms(launch, reps, rounds);
+          const double macs = (double)M * N * K;
+          std::printf("    M=%-3d %-14s CTAs=%-4d warps/CTA=%d -> %.4f ms = %.2f T-MACs/s (%0.0f%% do "
+                      "llama.cpp, %.1f%% do pico WMMA)\n", M, geos[g].name,
+                      (N + geos[g].bn - 1) / geos[g].bn, geos[g].warps, ms,
+                      macs / (ms * 1e-3) / 1e12, 100.0 * (macs / (ms * 1e-3)) / llama_macs,
+                      100.0 * (macs / (ms * 1e-3)) / 182e12);
+        }
+        hipFree(d_A); hipFree(d_W); hipFree(d_da); hipFree(d_dw); hipFree(d_C);
       }
     }
 
@@ -1540,7 +1663,7 @@ int main(int argc, char **argv) {
       HIPCHECK(hipMemcpy(d_dw, dw.data(), dw.size() * sizeof(float), hipMemcpyHostToDevice));
       std::vector<float> ref, got((size_t)M * N, 0.0f);
       gemm_ref_i8(A, da, W, dw, M, N, K, ref);
-      gemm_kernel<16, 4, false><<<dim3((N + 63) / 64), dim3(128)>>>(d_A, d_da, d_W, d_dw, d_C, M, N, K);
+      gemm_kernel<16, 64, 4, false><<<dim3((N + 63) / 64), dim3(128)>>>(d_A, d_da, d_W, d_dw, d_C, M, N, K);
       HIPCHECK(hipDeviceSynchronize());
       HIPCHECK(hipMemcpy(got.data(), d_C, got.size() * sizeof(float), hipMemcpyDeviceToHost));
       size_t bits = 0, far = 0;
@@ -1553,7 +1676,7 @@ int main(int argc, char **argv) {
                   rel_l2(ref, got));
       std::vector<float> ref16;
       gemm_ref_f16(A, da, W, dw, M, N, K, ref16);
-      gemm_kernel<16, 4, true><<<dim3((N + 63) / 64), dim3(128)>>>(d_A, d_da, d_W, d_dw, d_C, M, N, K);
+      gemm_kernel<16, 64, 4, true><<<dim3((N + 63) / 64), dim3(128)>>>(d_A, d_da, d_W, d_dw, d_C, M, N, K);
       HIPCHECK(hipDeviceSynchronize());
       HIPCHECK(hipMemcpy(got.data(), d_C, got.size() * sizeof(float), hipMemcpyDeviceToHost));
       double mxd = 0;

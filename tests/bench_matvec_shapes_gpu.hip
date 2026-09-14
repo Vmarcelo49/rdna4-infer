@@ -643,6 +643,8 @@ int main(int argc, char **argv) {
           case 4: ok = rdna4::matvec_batch_kernel_attrs<4>(dt, a); break;
           case 8: ok = rdna4::matvec_batch_kernel_attrs<8>(dt, a); break;
           case 16: ok = rdna4::matvec_batch_kernel_attrs<16>(dt, a); break;
+          case 32: ok = rdna4::matvec_batch_kernel_attrs<32>(dt, a); break;
+          case 64: ok = rdna4::matvec_batch_kernel_attrs<64>(dt, a); break;
           default: break;
         }
         if (!ok) continue;

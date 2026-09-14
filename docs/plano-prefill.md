@@ -10,7 +10,7 @@ que o sustenta; nenhuma escolha é por preferência. O que **não** está medido
 | degrau | o que muda | ganho medido/derivado | prefill esperado |
 |---|---|---|---|
 | **hoje** | chunk 16 + GEMV em lote (dp4a, 1 saída/thread, sem LDS) | — | **123,4 tok/s** (`--prefill 512`, melhor de 3) |
-| **D1** | chunk 128 (mesmo kernel) | +10 % (`13,9 + 6,04·N`: 6,92 → 6,26 ms/token) | ~136 tok/s |
+| **D1** | chunk maior com o MESMO kernel | **MEDIDO: −18 % em N=32, −71 % em N=64** (ver §0.1) | ~100 / 58 tok/s — **não fazer** |
 | **D2** | D1 + GEMM tilejado com staging na LDS, caminho vetorial (`dot2`/dp4a) | protótipo: 10,34 T MAC/s em M=128 vs 3,18 T do motor = **3,24×** | **~400-480 tok/s** |
 | **D3** | D2 + laço interno na **unidade de matriz** (coopmat/WMMA f16→f32) | 1196/478 = **2,50×** (medido no llama.cpp, mesma máquina) | **~1000-1200 tok/s** |
 | referência | llama.cpp Vulkan, `-ub 512` | — | 1170-1196 tok/s |
@@ -18,6 +18,34 @@ que o sustenta; nenhuma escolha é por preferência. O que **não** está medido
 Os degraus não são independentes: **D2 não rende nada sem D1** (medido: o mesmo GEMM tilejado em
 M=16 dá 3,46 T MAC/s = 1,08× o kernel de hoje; em M=128 dá 10,34 T = 3,24×). E **D3 não existe
 sem o staging de D2** — a unidade de matriz precisa ler os operandos da LDS.
+
+
+### 0.1 O degrau D1 foi medido e REPROVOU (14/09)
+
+A previsão do modelo de custo era +10 % em N=64 (só a parcela fixa de 13,9 ms amortiza). Medido
+com `bench-matvec-shapes-gpu --batch 8,16,32,64` (inventário real, min de 3):
+
+| N | ms/token | vs N=16 | registradores (`iq3_s`) | scratch |
+|---|---|---|---|---|
+| 8 | 8,074 | +16 % | — | 0 |
+| **16** | **6,964** | — | **62** | 0 |
+| 32 | 8,242 | **+18 %** | 78 | 0 |
+| 64 | 11,916 | **+71 %** | **133** | **0 (sem spill)** |
+
+**Mecanismo**: `acc[N][ILP]` custa N registradores por thread; em N=64 o `iq3_s` vai de 62 para
+133 registradores, o que **derruba a ocupação pela metade** (133 × 256 threads = 34 k registradores
+por CTA) — e como este kernel é limitado por latência, perder ocupação custa mais do que o peso
+amortizado ganha. **Não há spill** (`localSizeBytes = 0` em todos), então não é transbordo: é
+ocupação.
+
+Consequências para o plano:
+1. **O degrau D1 não existe como degrau.** Subir o chunk sem trocar o kernel é **regressão**.
+2. Isso *reforça* a dependência do D2: quem dá reuse em M grande é o **staging na LDS** (o peso
+   entra uma vez por tile e serve os 128 tokens), não mais acumuladores por thread. O tilejado
+   usa 8×8 = 64 acumuladores *fixos* (independentes de M), com o M grande multiplicando o
+   trabalho por CTA e não os registradores.
+3. O `kMaxBatch = 16` do motor não é um número mal escolhido para o kernel que existe — é o ótimo
+   dele (medido). Só faz sentido mudar junto com o kernel novo.
 
 ## 1. Por que a unidade de matriz é obrigatória (e não uma otimização)
 
