@@ -205,7 +205,7 @@ is comparable (64 tokens).
 | decode, 64K `f16` | **does not fit**: 2.1 GB spill to GTT, 2.16-7.97 tok/s | — |
 | decode, 64K `q8_0` | **19.3 tok/s** (13.75 GiB in use; the measurement front's window saw 18.28 on the same configuration) | — |
 | decode, 128K `q4_0` | **14.0 tok/s** (13.88 GiB in use) | — |
-| prefill, batched (N≤16) | **123.9 tok/s** on a 512-token prompt (73.05 at the start of the night; +69.7 % = ~+43 % from batching the per-token scaffolding and +18.6 % from the `float4` state load in `delta_rule`, both bit-exact) | 575 ± 65 tok/s (pp64, re-measured; 440 ± 77 recorded in M5 — pp64 is noisy), 1143 ± 30 (pp512) |
+| prefill, batched (N≤16) | **123.9 tok/s** on a 512-token prompt (73.05 at the start of the night; +69.7 % = ~+43 % from batching the per-token scaffolding and +18.6 % from the `float4` state load in `delta_rule`, both bit-exact) | **1054.3 ± 11.9 tok/s** (pp512, micro-batch 512 — see the caveat below) |
 | weight bandwidth, end to end | **325 GB/s at 4K = 51 %** of the measured 633 GB/s DRAM roofline | ≥442 GB/s (derived) |
 | weight bandwidth, matvec alone | **436 GB/s = 69 %**; the LM head reaches 620 GB/s = 98 % | — |
 | IQ4_XS decode, 4K `f16` | 27.0 tok/s | — |
@@ -392,8 +392,8 @@ noise, not engine risk.
 Ordered by how much they cost the user, with the number that justifies each. Nothing here is
 "should be fine" — each line is a measurement or a code fact with a pointer.
 
-1. **Prefill is still the weak number: 123.9 tok/s at 512 tokens against llama.cpp's 1143 (a
-   9× gap)**, so a 4K prompt costs ~33 s before the first token (was 56 s at the start of the
+1. **Prefill is still the weak number: 123.9 tok/s at 512 tokens against llama.cpp's 1054.3 (a
+   8.5× gap, and it is THREE factors, not one)**, so a 4K prompt costs ~33 s before the first token (was 56 s at the start of the
    night). That +69.7 % decomposes as ~+43 % from batching the per-token scaffolding and
    +18.6 % from the `delta_rule` state load — the review caught the two docs attributing the
    whole of it to different changes, which would have made whoever inherited the lever
@@ -401,6 +401,14 @@ Ordered by how much they cost the user, with the number that justifies each. Not
    story: inside `forward_batch` the weight pass is shared across the 16-token chunk, but the
    attention, the GDN recurrence, the norms and the elementwise chains still run **per token**
    (~11 ms/token of scaffolding, measured in `docs/medicoes-banda-e-gargalos.md` §1).
+   **The comparison had a trap, found and fixed on 14/09**: `llama-bench` feeds the whole
+   512-token prompt in ONE micro-batch (`n_ubatch 512`), while this engine cuts it into 32 chunks
+   of 16 (`kMaxBatch`, `graph.cuh:189`). With llama.cpp forced to our micro-batch (`-b 16 -ub 16`)
+   it does **170.4 tok/s** against our **123.4** — **1.38×**, not 8.5×. The full decomposition,
+   measured on a pristine llama.cpp build (`df03399b8`; the local checkout had a one-line local
+   edit, `rm_kq = 2 → 1`, which made it ~11 % faster — see `docs/estudo-prefill.md` §0):
+   **1.38× kernel/data-path structure at equal micro-batch × 2.50× micro-batch size × 2.47×
+   cooperative-matrix units = 8.52×**.
    **Where prefill time actually goes was measured on the real inventory of 497 tensors**
    (`docs/journal-lote.md`, `bench-matvec-shapes-gpu --batch`): the batched pass costs
    **`13.9 ms + 6.04 ms per token`**. The weight side is already near the roofline (11.1 GB per
