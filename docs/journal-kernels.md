@@ -369,3 +369,32 @@ máscara de sinal e o `V_PERM` aparecem **uma vez por bloco** no kernel em lote 
    17408 × 16 × 20 KB ≈ 5,6 GB por tensor por chunk, saindo de L2/Infinity Cache), e as
    duas alavancas candidatas são mais blocos independentes por thread (mais cargas em voo)
    e staging de ativação por CTA em LDS.
+
+## 11. Bateria de gates COMPLETA no binário com as três mudanças (04:31-04:40)
+
+Rodou (dentro de um `gpu-lock`, janela verificada: VRAM 978 MB antes, 2,17 GB logo depois,
+nenhum processo vivo meu): `--check-lds` **OK — 5 tipos BIT-IDENTICO** (e a regra de
+produção escolhendo LDS em `iq3_s` e não em `iq2_s`, como projetado); `check-matvec-gpu`
+**OK — 14 tipos**; `check-batch-gpu` **OK — bit-idêntico, rel-L2 0,00e+00**;
+`check-nn-gpu` **OK**; `GRAPH_LAST_TOKEN=1 check-graph-gpu` **PASS**;
+`check_regression.sh` **OK — 7 casos, 7 ids bit-exatos** (parede 48 s); `check_golden_run.sh`
+**OK**. Isso fecha a ressalva do §6: a mudança de `nn.cuh` (§4) também passou pelo grafo e
+pelo oráculo por nó, não só pelo memcmp do harness isolado.
+
+Na mesma sessão, `check-matmul-gpu` rodado nos dois binários (pristino vs novo) deu
+**resultados idênticos dentro do ruído** (ex.: `q2_k` N=16 lote 1,382 vs 1,385 ms; `iq4_nl`
+N=16 0,035 vs 0,035 ms; `q8_0` N=16 0,830 vs 0,827 ms) — confirmação *medida* de que as
+minhas mudanças não tocam o caminho em lote, coerente com a leitura de ISA do §10.
+
+**Prefill, mesma janela, intercalado (512 tokens):** base pristino **72,73 / 73,72 / 73,77**
+tok/s contra o pós-merge (novo) **123,14 / 122,88 / 122,91** = **1,67x**. **Atribuição
+honesta: esse ganho é da frente de prefill** (o "novo" já é pós-merge e o número bate com
+os 123,9 tok/s que aquela frente mediu antes do merge); a parte que a aritmética atribuiria
+à minha `delta_rule` (512 × 48 × 63 µs ≈ 1,55 s) **não aparece** porque o prefill já usa o
+kernel em lote daquela frente (`delta_rule_batch_rows_kernel`) — ou seja, no prefill a
+minha mudança é redundante por construção. Não reivindico esse número.
+
+**A/B de decode**: a extração da saída do `bench` no meu lote usou um padrão de `grep`
+errado (`"tok/s, mean"`, quando a linha é `... (28,66 tok/s), mean ...`) e as seis linhas
+saíram vazias — **erro meu, o mesmo tipo de erro de duas horas antes**, registrado aqui.
+Script corrigido (`/tmp/kab2.sh`) e enfileirado; o coordenador também assumiu a corrida.
