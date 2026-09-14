@@ -582,8 +582,21 @@ inline bool Graph::init(int max_ctx, KvType kv_k, KvType kv_v, std::string &err)
   aq_blocks_per_row_ = aq_per_row;
   {
     const int NH_ = NH, HD_ = HD, NKV_ = NKV;
+    // Zeroed on purpose, like alloc() below/above. hipMalloc returns whatever was
+    // in those pages: for the FIRST Graph of a process that is fresh (zeroed) VRAM,
+    // but a second Graph in the same process gets pages recycled from the first one
+    // and its batch buffers start with the previous graph's activations. 18 x
+    // kMaxBatch buffers, ~7.6 MiB of memset per init -- measured irrelevant next to
+    // the 10.9 GiB weight upload, and it removes the only place where the engine's
+    // behaviour depended on the process's allocation history.
+    // Found by the KV front's check-kvquality-gpu, which is the only tool that
+    // builds several Graphs in one process: with the un-zeroed version the SECOND
+    // graph produced NaN logits at a 64-token context in a window where the first
+    // one was fine (docs/journal-kv.md §8.2).
     const auto balloc = [&](float *&p, std::size_t n) {
-      return hipMalloc(&p, (std::size_t)kMaxBatch * n * sizeof(float)) == hipSuccess;
+      const std::size_t bytes = (std::size_t)kMaxBatch * n * sizeof(float);
+      if (hipMalloc(&p, bytes) != hipSuccess) return false;
+      return hipMemset(p, 0, bytes) == hipSuccess;
     };
     if (!balloc(d_xb_, E) || !balloc(d_xnb_, E) || !balloc(d_projb_, E) ||
         !balloc(d_qb_, (std::size_t)NH_ * 2 * HD_) || !balloc(d_kb_, (std::size_t)NKV_ * HD_) ||

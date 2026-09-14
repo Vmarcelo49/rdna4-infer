@@ -116,8 +116,14 @@ inline std::uint64_t graph_buffer_bytes(const GraphBufferShape &s) {
                                       3 * s.ssm_tsr + 2 * F + 2 * kv_elems;
   // batch block per token, in FLOATS (graph.cuh:544-553): the same set minus
   // d_proj_ (the batch path writes E-wide into d_projb_) and plus d_qkvb_.
+  // + d_qkb_ (2*key_dim) and d_vcb_ (d_inner): the batched GDN staging the prefill
+  // front added in graph.cuh:590. Missing them under-counted the budget by 640 KiB
+  // (16 x (4096+6144) x 4 B) after the preventive merge -- see the note in
+  // docs/journal-kv.md §8: a merge that touches graph.cuh invalidates this mirror,
+  // and the pinned total in tests/check_kvtype.hip is what forces the update.
   const std::uint64_t per_token_floats = 3 * E + q_gate_floats + 2 * kv_elems + 2 * q_dim +
-                                         2 * F + 2 * chan + d_inner + 3 * s.ssm_tsr;
+                                         2 * F + 2 * chan + d_inner + 3 * s.ssm_tsr +
+                                         2 * (s.ssm_group * s.ssm_state) + d_inner;
   const std::uint64_t aq_blocks = (F + 31) / 32;  // block_q8_1 (36 B) per 32 elems
   const std::uint64_t single = single_floats * 4;
   const std::uint64_t batch = s.max_batch * (per_token_floats * 4 + aq_blocks * 36 + 4);

@@ -735,3 +735,76 @@ se perder: **a 131K a qualidade não foi medida com texto real** (§7.3). A 131K
 custo medido (tok/s, VRAM, GTT) sobre cache **sintético**; a qualidade tem medida a
 4096 tokens (KL) e 8192 tokens (needle). Reportar os dois como se fossem a mesma
 coisa seria o erro que este diário existe para não cometer.
+
+### 8.1 O que o merge final exige (achado que o gate não pegou)
+
+`Graph::release()` está completo — auditei membro a membro: todos os `d_*_`
+declarados são liberados e anulados, incluindo os dois que a frente de prefill
+acrescentou (`d_qkb_`, `d_vcb_`, `graph.cuh:1601/1607`), e os dois de alocação
+preguiçosa (`d_logits_`, `d_argmax_val_`) também.
+
+**Mas `graph_buffer_bytes()` (o espelho do `device.h`) ficou 640 KiB curto**, porque
+a frente de prefill acrescentou `d_qkb_` (`kMaxBatch × 2*key_dim`) e `d_vcb_`
+(`kMaxBatch × d_inner`) em `graph.cuh:590` e o espelho não os conhecia:
+16 × (4096 + 6144) × 4 B = 640 KiB. O total pinado no `check-kvtype` era o do
+pré-merge e **continuava passando**, então **o gate não pegou — a releitura do merge
+pegou**. Corrigido: 166 314 020 B = 158,60 MiB.
+
+**Lição, escrita aqui para o coordenador**: o gate pina um *número*, então ele não
+detecta sozinho a deriva do alocador; ele só acusa depois que alguém atualiza o
+espelho. Todo merge que encoste em `Graph::init`/`release` exige reconferir
+`graph_buffer_bytes` contra `graph.cuh` à mão. Blindar isso de verdade é gerar o
+total a partir do alocador (ou instrumentar `hipMalloc`), o que é mudança de desenho.
+
+### 8.2 `Memory access fault` no SEGUNDO `Graph` do mesmo processo (pós-merge) — RESOLVIDO
+
+**Reprodução mínima `[K1]` (2 configs, contexto 64, janela com 2,0 GiB de resíduo do
+processo que acabara de faultar): NÃO faultou.** Ou seja **não é uma regressão P0 do
+merge no sentido "segundo Graph quebra"** — a hipótese mais grave caiu.
+
+**Mas produziu NaN**, e isso é um achado de verdade:
+```
+q5_0:q4_1          -nan         -nan     0.000148          nan      3/4
+```
+`mean KL`, `PPL` e `mean|dNLL|` = NaN com `KL max` finito (0,000148): pelo menos uma
+das 4 probes teve logits NaN, e `std::max(kl_max, NaN)` devolve `kl_max`, então o NaN
+fica escondido na coluna do máximo. A segunda config no mesmo processo **não se
+comporta como a primeira**.
+
+**Causa encontrada por leitura, e é uma assimetria concreta do motor:**
+`Graph::alloc()` faz `hipMemset(p, 0, ...)` (`graph.cuh:439-448`) — por isso
+`d_state_`/`d_convst_` (o estado GDN) nascem zerados e o teste de continuação do
+`check_kvctx_gpu` passa — mas **`balloc()`, o alocador do bloco em lote, NÃO zerava**
+(`graph.cuh:585-587`: só `hipMalloc`). São 18 buffers × `kMaxBatch`.
+Para o **primeiro** Graph de um processo isso não aparece: `hipMalloc` devolve páginas
+frescas, que o driver entrega zeradas. Para o **segundo**, as páginas são recicladas
+do primeiro Graph, que acabou de rodar um prompt inteiro — os buffers de batch
+começam com as ativações do grafo anterior. É a única parte do motor cujo
+comportamento dependia do histórico de alocação do processo, e é exatamente o que um
+teste com vários Graphs por processo expõe.
+
+**Conserto** (`graph.cuh`): `balloc` passou a zerar, como `alloc`. ~7,6 MiB de memset
+por `init()`, irrelevante ao lado dos 10,9 GiB de upload de pesos, e **semanticamente
+no-op para o primeiro Graph de um processo** (as páginas já vinham zeradas) — por isso
+os gates bit-exatos (`check_regression`, `check_golden_run`) não podem mudar.
+Verificação na fila (`/tmp/kv-final.sh`): `[L1]` o mesmo caso que dava NaN, e `[L2]`
+3 configs a 1024 tokens exigindo números finitos e coerentes.
+
+**O que isso NÃO explica**: o `Memory access fault` de `[I]`/`[J]`, que aconteceu a
+4096/16 387 tokens e **não** se reproduziu a 64. Um fault precisa de ponteiro ruim, e
+lixo em buffer de dados não produz ponteiro ruim — então o fault continua sem
+explicação, e a hipótese que sobrou para ele é a janela suja (1,46 GiB em `[I]`,
+12,6 GiB em `[J]`, este último resíduo do processo que acabara de faultar). **Não
+afirmo que está explicado.** O que afirmo é o que medi: a 64 tokens não faulta, e o
+NaN tem causa nomeada e conserto no `balloc`.
+
+**Cuidado que fica registrado sobre os meus próprios números**: `[E]`, `[F]` e `[I]`
+são as únicas corridas que criam vários Graphs num processo. `[E]`/`[F]` (pré-merge)
+deram resultados internamente coerentes — duas sessões independentes concordam na
+ordem (q4_0/q4_0 pior, q8_0/q8_0 melhor), a linha `f16:f16` sai exatamente 0 e a
+needle deu 8/8 nos quatro formatos — mas com esta assimetria no `balloc` elas **não
+estão limpas por construção**. A tabela de 131K (§6) e o orçamento (§4/§5) não são
+afetados: `bench` e `info` criam **um** Graph por processo.
+
+
+
