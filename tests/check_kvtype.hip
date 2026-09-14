@@ -194,8 +194,8 @@ int main() {
     const std::uint64_t got = rdna4::graph_buffer_bytes(s);
     std::printf("   graph buffers for the IQ3_S shape: %llu B = %.2f MiB\n",
                 (unsigned long long)got, (double)got / (1024.0 * 1024.0));
-    ok(got == 165658660ull, "graph_buffer_bytes == 165 658 660 B (157.98 MiB), the sum of "
-                            "graph.cuh:518-585 added up by hand");
+    ok(got == 166314020ull, "graph_buffer_bytes == 166 314 020 B (158.60 MiB), the sum of "
+                            "graph.cuh:518-590 added up by hand");
     // ... and the budget must not count the whole file: 10.877 GiB of trunk
     // weights, not 11.214 GiB.
     const std::uint64_t need = rdna4::required_bytes(11678877696ull, 131072,
