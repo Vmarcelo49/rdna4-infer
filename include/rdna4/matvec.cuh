@@ -897,16 +897,19 @@ inline bool matvec_launch_batch_n(int dt, const void *d_w, const block_q8_1 *d_a
 }
 
 // ---------------------------------------------------------------------------
-// NAO LIGADO (medida pendente): o caminho em lote tem uma versao com a
-// dequantizacao hoistada (`TIQ3S_PREP`/`TIQ3XXS_PREP` acima, com
-// `vec_prep_iq3_*` em vecdotq.cuh) que faz o gather da LUT / mascara de sinal /
-// V_PERM UMA vez por bloco e so' o dp4a por token. Ela e' bit-exata por
-// construcao (mesmas operacoes, mesma ordem) e o fallback `NoPrep` dos outros 12
-// tipos e' identico ao codigo anterior, mas **nao foi medida**: a fila da GPU
-// passou a noite inteira ocupada por outras frentes (ver docs/journal-kernels.md
-// §8, que traz o comando de medida base-vs-novo e a estimativa honesta de teto).
-// Para ligar: trocar as duas linhas `RD_BATCH(TIQ3*_S, ...)` de volta para
-// `TIQ3S_PREP`/`TIQ3XXS_PREP` e rodar `check-matmul-gpu` + `check-batch-gpu`.
+// NAO LIGADO -- e a leitura de ISA mostra que NAO DEVE ser ligado: o compilador
+// JA FAZ esse hoist. Medido com `--save-temps` no kernel em lote com N=16
+// (docs/journal-kernels.md §10): por bloco, `v_perm_b32` aparece 8x (nao 8x16) e
+// as cargas da LUT 8x (nao 8x16), enquanto `v_dot4_i32_iu8` e as cargas de
+// ativacao escalam exatamente 16x. Ou seja: o lado do peso (gather da LUT,
+// mascara de sinal, V_PERM) ja esta fora do laco por token, e o teto desta
+// mudanca e' ~0 -- nao os ~10 % da contagem de instrucoes do §8.
+//
+// O par `T::prep`/`T::dot_prep` fica no arquivo como registro do beco sem saida
+// (e como ponto de partida se um dia o `T::dot` deixar de ser CSE-ado pelo
+// compilador), com o fallback `NoPrep` identico ao codigo anterior nos outros 12
+// tipos. O que limita o lote e' o que NAO pode ser amortizado (dp4a + cargas de
+// ativacao por token) e a latencia dessas cargas: IPC implicito ~0,15 do pico.
 // ---------------------------------------------------------------------------
 
 // `n_tokens` must be <= matvec_batch_cap(); d_a holds `n_tokens` activation rows
