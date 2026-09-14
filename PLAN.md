@@ -580,9 +580,10 @@ entre CTAs com merge de softmax online). Resultado final (decode, IQ3_S):
 |---|---|---|---|
 | 4 096 f16 | 22,13 | **26,82** | 1,21× |
 | 16 384 f16 | 13,72 | **24,29** | 1,77× |
-| 65 536 f16 | — | **18,91** | — |
+| 65 536 f16 | — | **não cabe** (transborda 2,1 GB para GTT: 2,16-7,97 tok/s; ver §2.4 do doc das tarefas 2/5) | — |
 | 65 536 q4_0 | 4,18 | **17,88** | 4,3× |
 | 131 072 q4_0 | 2,27 | **12,99** | 5,7× |
+| 65 536 **q8_0** | — | **18,28** (atenção 19,87 ms) | — |
 
 Split-KV **não** é bit-exato (a soma das chaves muda de ordem) e por isso tem gate próprio:
 `scripts/check_attn_split.sh` compara em texto real (PPL 5,1989 contra 5,1917, 0,14 %) e o
