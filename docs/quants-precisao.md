@@ -42,7 +42,8 @@ cruzada entre os dois arquivos** (§4), que é o proxy disponível.
 
 Ativação usada: gaussiana com RMS 1 (é o que sai de um RMS-norm e entra nas
 projeções), semente fixa `777 + tipo`; 2048 linhas de um tensor **real** de cada
-tipo (o primeiro do arquivo que cabe no limite). O `q8_1` é produzido pelo próprio
+tipo (o maior do arquivo que cabe no limite de elementos, para ter a melhor
+estatística possível com o mesmo custo). O `q8_1` é produzido pelo próprio
 kernel do motor (`quantize_q8_1_kernel`) e lido de volta, para que os dois lados
 vejam exatamente os mesmos bytes.
 
@@ -212,9 +213,11 @@ Todos os 14 tipos têm kernel nativo (nenhum cai em caminho genérico); a varian
 que **envia** está escolhida em `include/rdna4/matvec.cuh` (`case 12:` → `TIQ3S_PERM`
 para `iq3_s`, `case 9:` → `TIQ3XXS_PERM2` para `iq3_xxs`, `113-116` + `868-895`).
 
-¹ q8_0, q6_k e iq4_nl são tensores *muito pequenos* no inventário (`ssm_beta`/
-`ssm_alpha` do GDN, 48×160) — 24-199 GB/s é **latência**, não banda: são 6-30 MB/s
-de trabalho real em 1,0 ms/token somados.
+¹ q8_0, q6_k e iq4_nl são tensores *muito pequenos* no inventário (as
+`ssm_beta`/`ssm_alpha` do GDN, 48×160) — 24-199 GB/s é **latência de kernel
+pequeno**, não banda: os três juntos somam 0,032 GB/token em 1,11 ms (29 GB/s
+agregados) e o que domina ali é o piso de despacho de 2,2 µs por lançamento
+(§3 de `docs/medicoes-banda-e-gargalos.md`).
 ² `q3_k` é o único k-quant em emulação de bytes 16-bit (`v_sub_nc_u16`/`v_and_b32`,
 208 instruções por chamada). O estudo ROCm mediu 307 GB/s nele; eu meço **271 GB/s**
 numa sessão em que `q5_k` deu exatamente os 582 GB/s do estudo — a discordância é
