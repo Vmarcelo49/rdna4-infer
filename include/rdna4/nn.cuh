@@ -114,6 +114,24 @@ __global__ void scale_kernel(const float *__restrict__ x, float *__restrict__ y,
 }
 
 // ---------------------------------------------------------------------------
+// Broadcast elementwise, for the BATCHED prefill path (feat/noite-prefill).
+// y[i] = a[i] (+|*) b[i % nb]: the per-token path applies a length-`nb` array
+// (ssm_dt, ssm_a) to one token at a time, so folding the token index into the
+// thread index reproduces each token's arithmetic exactly -- same operand values,
+// same single rounding, one launch for the whole batch instead of one per token.
+__global__ void add_bcast_kernel(const float *__restrict__ a, const float *__restrict__ b,
+                                 float *__restrict__ y, std::int64_t n, int nb) {
+  const std::int64_t i = (std::int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = a[i] + b[i % nb];
+}
+
+__global__ void mul_bcast_kernel(const float *__restrict__ a, const float *__restrict__ b,
+                                 float *__restrict__ y, std::int64_t n, int nb) {
+  const std::int64_t i = (std::int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = a[i] * b[i % nb];
+}
+
+// ---------------------------------------------------------------------------
 // Host launchers. All return false on a failed launch (never a silent fallback).
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -215,6 +233,23 @@ inline bool scale_launch(const float *d_x, float *d_y, std::int64_t n, float s,
                          hipStream_t stream = nullptr) {
   const int threads = 256;
   scale_kernel<<<(unsigned)((n + threads - 1) / threads), threads, 0, stream>>>(d_x, d_y, n, s);
+  return hipGetLastError() == hipSuccess;
+}
+
+// nb = length of the broadcast operand (elements per token in the batch).
+inline bool add_bcast_launch(const float *d_a, const float *d_b, float *d_y, std::int64_t n, int nb,
+                             hipStream_t stream = nullptr) {
+  const int threads = 256;
+  add_bcast_kernel<<<(unsigned)((n + threads - 1) / threads), threads, 0, stream>>>(d_a, d_b, d_y,
+                                                                                    n, nb);
+  return hipGetLastError() == hipSuccess;
+}
+
+inline bool mul_bcast_launch(const float *d_a, const float *d_b, float *d_y, std::int64_t n, int nb,
+                             hipStream_t stream = nullptr) {
+  const int threads = 256;
+  mul_bcast_kernel<<<(unsigned)((n + threads - 1) / threads), threads, 0, stream>>>(d_a, d_b, d_y,
+                                                                                    n, nb);
   return hipGetLastError() == hipSuccess;
 }
 

@@ -208,6 +208,7 @@ int cmd_bench(int argc, char **argv) {
   long long warmup = 8;
   long long reps = 3;
   long long prefill = 0;  // 0 => prompt length
+  long long prefill_reps = 1;  // timed prefill passes (best-of-N) — front prefill
   std::uint64_t ctx_size = 4096;
   rdna4::KvType kv_k = rdna4::KvType::F16, kv_v = rdna4::KvType::F16;
   bool fill_cache = false;
@@ -252,6 +253,11 @@ int cmd_bench(int argc, char **argv) {
       if (!v || !parse_i64(v, &prefill) || prefill < 0) {
         return 1;
       }
+    } else if (std::strcmp(a, "--prefill-reps") == 0) {
+      const char *v = need("--prefill-reps");
+      if (!v || !parse_i64(v, &prefill_reps) || prefill_reps < 1) {
+        return 1;
+      }
     } else if (std::strcmp(a, "--ctx-size") == 0) {
       const char *v = need("--ctx-size");
       if (!v || !parse_u64(v, &ctx_size) || ctx_size == 0 ||
@@ -277,8 +283,8 @@ int cmd_bench(int argc, char **argv) {
       if (!v || !parse_u64(v, &seed)) return 1;
     } else if (std::strcmp(a, "-h") == 0 || std::strcmp(a, "--help") == 0) {
       std::printf("usage: rdna4-infer bench -m model.gguf [-p TEXT] [-n DECODE] [--warmup N] "
-                  "[--reps N] [--prefill N] [--start-pos N] [--ctx-size N] [--cache-type-k T] "
-                  "[--cache-type-v T] [--fill-cache] [--seed N] [--layers N]\n");
+                  "[--reps N] [--prefill N] [--prefill-reps N] [--start-pos N] [--ctx-size N] "
+                  "[--cache-type-k T] [--cache-type-v T] [--fill-cache] [--seed N] [--layers N]\n");
       return 0;
     } else {
       std::fprintf(stderr, "rdna4-infer bench: unknown argument '%s'\n", a);
@@ -370,12 +376,24 @@ int cmd_bench(int argc, char **argv) {
     std::fprintf(stderr, "rdna4-infer: fill cache failed: %s\n", err.c_str());
     return 1;
   }
-  const double tp0 = now_s();
-  if (!prefill_ids(graph, ids, hidden, logits, err)) {
-    std::fprintf(stderr, "rdna4-infer: prefill failed: %s\n", err.c_str());
-    return 1;
+  // The prefill is timed `prefill_reps` times (best-of-N, like the decode loop):
+  // one pass is a single sample of a metric that moves with the DPM state and with
+  // whatever else shares the card, so this front reports the BEST pass of two or
+  // three, not a single draw. Default 1 keeps every existing command identical.
+  double t_prefill = 0.0;
+  for (long long r = 0; r < prefill_reps; ++r) {
+    const double tp0 = now_s();
+    if (!prefill_ids(graph, ids, hidden, logits, err)) {
+      std::fprintf(stderr, "rdna4-infer: prefill failed: %s\n", err.c_str());
+      return 1;
+    }
+    const double t = now_s() - tp0;
+    if (t_prefill == 0.0 || t < t_prefill) t_prefill = t;
+    if (prefill_reps > 1) {
+      std::fprintf(stderr, "rdna4-infer bench: prefill pass %lld/%lld: %.3f s (%.2f tok/s)\n",
+                   r + 1, prefill_reps, t, (double)ids.size() / t);
+    }
   }
-  const double t_prefill = now_s() - tp0;
 
   // Per-token weight traffic = what decode actually reads: the whole file minus
   // the embedding matrix (one row is read, not the matrix), minus the MTP block

@@ -176,6 +176,20 @@ class Graph {
     return n == 2 || n == 3 || n == 4 || n == 8 || n == 16;
   }
 
+  // feat/noite-prefill: `RD_PREFILL_BATCH=0` runs forward_batch with the
+  // per-token scaffolding the M8 path shipped (the attention and the GDN
+  // recurrence launched once per token) instead of the batched kernels. It is the
+  // in-binary A/B switch for the measurement — same window, same DPM state, same
+  // weights — and the fallback if a gate ever disagrees with the batched path.
+  bool batch_ops() const {
+    if (!batch_env_read_) {
+      batch_env_read_ = true;
+      const char *e = getenv("RD_PREFILL_BATCH");
+      batch_env_ = !(e != nullptr && e[0] == '0');
+    }
+    return batch_env_;
+  }
+
   // M5: brings the graph back to the state it has after init(), for evaluating a
   // second independent sequence (perplexity chunks, chat turns). The recurrent
   // (GDN) state is zeroed — llama.cpp also starts every sequence from zeros — and
@@ -256,6 +270,14 @@ class Graph {
                   bool act_ready, std::string &err);
   bool quantize_batch(const float *d_x, int ncols, int n, std::string &err);
   bool forward_batch_layer(int il, int n, int pos0, std::string &err);
+  // One launch for the whole chunk's K and V rows (feat/noite-prefill). The rows
+  // of a chunk are contiguous BOTH in the cache ((t*NKV + h) * row_bytes) and in
+  // the staging buffers (t*NKV*head_dim + h*head_dim), so a single call of the
+  // per-row kernel with `n_tok*NKV*head_dim` as its width reproduces the per-row
+  // calls element for element: F32/F16 are elementwise, and Q8_0/Q4_0 walk
+  // blocks of 32 in the same packed order.
+  bool kv_write_batch(int il, int pos0, const float *d_ksrc, const float *d_vsrc, int n_tok,
+                      std::string &err);
   bool proj(const GpuTensor &w, const float *d_x, float *d_y, int nrows, int ncols,
             std::string &err);
   // Same as proj() but reuses the activation already quantized into the q8
@@ -322,6 +344,12 @@ class Graph {
   float *d_xb_ = nullptr, *d_xnb_ = nullptr, *d_qb_ = nullptr, *d_kb_ = nullptr, *d_vb_ = nullptr;
   float *d_attnb_ = nullptr, *d_gateb_ = nullptr, *d_ffnab_ = nullptr, *d_ffnbb_ = nullptr;
   float *d_projb_ = nullptr, *d_qkvb_ = nullptr, *d_zb_ = nullptr, *d_convb_ = nullptr;
+  // feat/noite-prefill: the batched GDN recurrence's staging — `d_qkb_` is
+  // [n][q(nkh*S) | k(nkh*S)] so both l2_norm and the delta rule see plain rows,
+  // `d_vcb_` is [n][d_inner] in place of the per-token conv slice.
+  float *d_qkb_ = nullptr, *d_vcb_ = nullptr;
+  mutable bool batch_env_read_ = false;
+  mutable bool batch_env_ = true;
   float *d_alphab_ = nullptr, *d_betab_ = nullptr, *d_gate2b_ = nullptr;
   block_q8_1 *d_aqb_ = nullptr;
   std::size_t aq_blocks_per_row_ = 0;
@@ -547,7 +575,7 @@ inline bool Graph::init(int max_ctx, KvType kv_k, KvType kv_v, std::string &err)
         !balloc(d_gateb_, (std::size_t)NH_ * HD_) || !balloc(d_ffnab_, F) ||
         !balloc(d_ffnbb_, F) || !balloc(d_qkvb_, chan) || !balloc(d_zb_, d_inner) ||
         !balloc(d_convb_, chan) || !balloc(d_alphab_, nvh) || !balloc(d_betab_, nvh) ||
-        !balloc(d_gate2b_, nvh)) {
+        !balloc(d_gate2b_, nvh) || !balloc(d_qkb_, 2 * key_dim) || !balloc(d_vcb_, d_inner)) {
       err = "hipMalloc failed for the batch buffers";
       return false;
     }
@@ -752,6 +780,25 @@ inline bool Graph::kv_write(int il, int t, const float *d_ksrc, const float *d_v
   return true;
 }
 
+// Same rows, one launch for the whole chunk (see the declaration).
+inline bool Graph::kv_write_batch(int il, int pos0, const float *d_ksrc, const float *d_vsrc,
+                                  int n_tok, std::string &err) {
+  const int HD = head_dim(), NKV = n_head_kv();
+  const std::size_t krow_bytes = kv_row_bytes(kv_k_, HD);
+  const std::size_t vrow_bytes = kv_row_bytes(kv_v_, HD);
+  char *krow = (char *)d_k_ + (std::size_t)attn_slot(il) * kv_bytes_ +
+               (std::size_t)pos0 * NKV * krow_bytes;
+  char *vrow = (char *)d_v_ + (std::size_t)attn_slot(il) * kv_bytes_ +
+               (std::size_t)pos0 * NKV * vrow_bytes;
+  const int width = n_tok * NKV * HD;
+  if (!kv_store_row_launch(kv_k_, d_ksrc, krow, width) ||
+      !kv_store_row_launch(kv_v_, d_vsrc, vrow, width)) {
+    err = "batched kv_store_row launch failed";
+    return false;
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 inline bool Graph::gdn_layer(int il, int t, std::string &err) {
   const int E = n_embd();
@@ -872,6 +919,7 @@ inline bool Graph::quantize_batch(const float *d_x, int ncols, int n, std::strin
     err = "batch q8 scratch too small";
     return false;
   }
+  RD_PHASE(pfine(), "act_quant");  // RD_PHASE_PROF (frente prefill: caminho em lote)
   if (!quantize_q8_1_batch_launch(d_x, d_aqb_, nb, n, ncols)) {
     err = "batch quantize launch failed";
     return false;
@@ -892,6 +940,7 @@ inline bool Graph::proj_batch(const GpuTensor &w, const float *d_x, float *d_y, 
   }
   if (!act_ready && !quantize_batch(d_x, ncols, n, err)) return false;
   const std::int64_t act_stride = ncols / QK8_1;
+  RD_PHASE(pfine(), "matvec");  // RD_PHASE_PROF (frente prefill: caminho em lote)
   if (!matvec_launch_batch((int)w.dt, w.ptr, d_aqb_, d_y, nrows, ncols, act_stride, n, nullptr)) {
     err = "matvec_launch_batch failed";
     return false;
@@ -914,6 +963,10 @@ inline bool Graph::forward_batch_layer(int il, int n, int pos0, std::string &err
     return false;
   }
   emit("attn_norm", il, d_xnb_, (std::int64_t)n * E);
+  // RD_PHASE_PROF: os mesmos nomes de bucket do caminho por token, para as duas
+  // tabelas (decode e prefill em lote) serem comparáveis fase a fase. Marcas
+  // inertes sem profiler armado (include/rdna4/phase_prof.cuh).
+  RD_PHASE(prof_, L.recr ? "gdn_proj" : "qkv_proj");
 
   if (!L.recr) {
     if (!proj_batch(L.attn_q, d_xnb_, d_qb_, NH * 2 * HD, E, n, false, err)) return false;
@@ -921,6 +974,71 @@ inline bool Graph::forward_batch_layer(int il, int n, int pos0, std::string &err
     if (!quantize_batch(d_xnb_, E, n, err)) return false;
     if (!proj_batch(L.attn_k, d_xnb_, d_kb_, NKV * HD, E, n, true, err)) return false;
     if (!proj_batch(L.attn_v, d_xnb_, d_vb_, NKV * HD, E, n, true, err)) return false;
+    if (batch_ops()) {
+      // ---- BATCHED (feat/noite-prefill): one launch per stage for the chunk ---
+      // Every one of these is element- or row-local, so folding the N tokens into
+      // one launch reproduces the per-token arithmetic exactly; only the ATTENTION
+      // is per token when its key range would be split across CTAs (different
+      // summation order -- see attn.cuh).
+      RD_PHASE(prof_, "qk_norm_rope_kv");  // RD_PHASE_PROF
+      if (!deinterleave_q_gate_batch_launch(d_qb_, d_attnb_, d_gateb_, NH, HD, n)) {
+        err = "batch deinterleave launch failed";
+        return false;
+      }
+      if (!rms_norm_launch(d_attnb_, (const float *)L.attn_q_norm.ptr, d_attnb_,
+                           (std::int64_t)n * NH, HD, eps) ||
+          !rms_norm_launch(d_kb_, (const float *)L.attn_k_norm.ptr, d_kb_,
+                           (std::int64_t)n * NKV, HD, eps)) {
+        err = "batch qk norm launch failed";
+        return false;
+      }
+      // rope_kernel is already multi-token: pos[] holds this chunk's positions
+      if (!rope_launch(d_attnb_, n, NH, HD, n_rot(), base, d_posb_) ||
+          !rope_launch(d_kb_, n, NKV, HD, n_rot(), base, d_posb_)) {
+        err = "batch rope launch failed";
+        return false;
+      }
+      if (!kv_write_batch(il, pos0, d_kb_, d_vb_, n, err)) return false;
+      RD_PHASE(prof_, "attention");  // RD_PHASE_PROF
+      const char *kc = (const char *)d_k_ + (std::size_t)attn_slot(il) * kv_bytes_;
+      const char *vc = (const char *)d_v_ + (std::size_t)attn_slot(il) * kv_bytes_;
+      // splits is non-decreasing in pos, so the last token's key count decides
+      // whether the whole chunk can use the batched (unsplit) kernel.
+      const int splits = attn_splits_for(pos0 + n);
+      attn_splits_last_ = splits;
+      const float scale = 1.0f / std::sqrt((float)HD);
+      if (splits > 1) {
+        // long context: the per-token split kernel has to stay per token (its
+        // partial-sum order is part of the recorded numbers)
+        for (int t = 0; t < n; ++t) {
+          float *an = d_attnb_ + (std::size_t)t * NH * HD;
+          const int pos = pos0 + t;
+          const int sp = attn_splits_for(pos + 1);
+          if (sp > 1) {
+            if (!attn_launch_split(an, kc, vc, an, d_attn_partial_, pos, NH, NKV, HD, scale, kv_k_,
+                                   kv_v_, sp)) {
+              err = "batch attn split launch failed";
+              return false;
+            }
+          } else if (!attn_launch(an, kc, vc, an, pos, NH, NKV, HD, scale, kv_k_, kv_v_)) {
+            err = "batch attn launch failed";
+            return false;
+          }
+        }
+      } else if (!attn_batch_launch(d_attnb_, kc, vc, d_attnb_, d_posb_, n, NH, NKV, HD, scale,
+                                    kv_k_, kv_v_)) {
+        err = "batch attn (batched) launch failed";
+        return false;
+      }
+      RD_PHASE(prof_, "attn_gate_out");  // RD_PHASE_PROF
+      if (!unary_launch(d_gateb_, d_gateb_, (std::int64_t)n * NH * HD, UnOp::Sigmoid) ||
+          !mul_launch(d_attnb_, d_gateb_, d_attnb_, (std::int64_t)n * NH * HD)) {
+        err = "batch attn gate launch failed";
+        return false;
+      }
+      RD_PHASE(prof_, "attn_out_proj");  // RD_PHASE_PROF
+      if (!proj_batch(L.attn_output, d_attnb_, d_projb_, E, NH * HD, n, false, err)) return false;
+    } else {
     // per token: split q/gate, QK-norm, RoPE, cache write, attention
     for (int t = 0; t < n; ++t) {
       float *q = d_qb_ + (std::size_t)t * NH * 2 * HD;
@@ -967,6 +1085,7 @@ inline bool Graph::forward_batch_layer(int il, int n, int pos0, std::string &err
       }
     }
     if (!proj_batch(L.attn_output, d_attnb_, d_projb_, E, NH * HD, n, false, err)) return false;
+    }
   } else {
     const int S = (int)cfg_.ssm_state_size;
     const int nkh = (int)cfg_.ssm_group_count;
@@ -985,6 +1104,60 @@ inline bool Graph::forward_batch_layer(int il, int n, int pos0, std::string &err
     if (!proj_batch(L.attn_gate, d_xnb_, d_zb_, d_inner, E, n, true, err)) return false;
     if (!proj_batch(L.ssm_beta, d_xnb_, d_betab_, nvh, E, n, true, err)) return false;
     if (!proj_batch(L.ssm_alpha, d_xnb_, d_alphab_, nvh, E, n, true, err)) return false;
+    if (batch_ops()) {
+      // ---- BATCHED (feat/noite-prefill) ------------------------------------
+      // The recurrence stays SEQUENTIAL -- the state of token t+1 is built from
+      // the state of token t -- but the whole chunk now runs inside one launch per
+      // stage, walking the tokens in order internally. Same operations, same
+      // order, same rounding: bit-identical (tests/check_batch_gpu.hip). What
+      // changes is that the state of the layer is read once per CHUNK instead of
+      // once per token (measured 152 GB/s and 69.6 us per delta_rule launch
+      // against a 20 us memory floor, docs/medicoes-banda-e-gargalos.md 4.2).
+      const std::int64_t nvh_tot = (std::int64_t)n * nvh;
+      RD_PHASE(prof_, "gdn_scalars");  // RD_PHASE_PROF
+      if (!unary_launch(d_betab_, d_betab_, nvh_tot, UnOp::Sigmoid)) return false;
+      if (!add_bcast_launch(d_alphab_, (const float *)L.ssm_dt.ptr, d_alphab_, nvh_tot, nvh)) {
+        return false;
+      }
+      if (!unary_launch(d_alphab_, d_gate2b_, nvh_tot, UnOp::Softplus)) return false;
+      if (!mul_bcast_launch(d_gate2b_, (const float *)L.ssm_a.ptr, d_gate2b_, nvh_tot, nvh)) {
+        return false;
+      }
+      // conv1d: q|k go to d_qkb_ as contiguous rows (so l2_norm and the delta
+      // rule see plain row arrays), v goes to d_vcb_ as n rows of d_inner
+      RD_PHASE(prof_, "gdn_conv");  // RD_PHASE_PROF
+      if (!conv1d_state_batch_launch(d_qkvb_, (const float *)L.ssm_conv1d.ptr, d_qkb_, d_vcb_,
+                                     convst, chan, K, key_dim, d_inner, n)) {
+        err = "batch conv1d launch failed";
+        return false;
+      }
+      RD_PHASE(prof_, "gdn_l2norm");  // RD_PHASE_PROF
+      if (!l2_norm_launch(d_qkb_, d_qkb_, (std::int64_t)n * 2 * nkh, S, eps)) {
+        err = "batch l2 norm launch failed";
+        return false;
+      }
+      RD_PHASE(prof_, "gdn_delta");  // RD_PHASE_PROF
+      if (!delta_rule_batch_launch(d_qkb_, d_vcb_, d_gate2b_, d_betab_, state, d_vcb_, nvh, nkh, S,
+                                   nvh, key_dim, d_inner, n)) {
+        err = "batch delta rule launch failed";
+        return false;
+      }
+      RD_PHASE(prof_, "gdn_norm_silu");  // RD_PHASE_PROF
+      if (!rms_norm_launch(d_vcb_, (const float *)L.ssm_norm.ptr, d_vcb_,
+                           (std::int64_t)n * nvh, S, eps)) {
+        err = "batch ssm_norm launch failed";
+        return false;
+      }
+      if (!unary_launch(d_zb_, d_zb_, (std::int64_t)n * d_inner, UnOp::Silu) ||
+          !mul_launch(d_vcb_, d_zb_, d_vcb_, (std::int64_t)n * d_inner)) {
+        err = "batch gdn output launch failed";
+        return false;
+      }
+      // no copy: the delta rule wrote into d_vcb_ in place, which is exactly the
+      // buffer the batched ssm_out projection reads
+      RD_PHASE(prof_, "gdn_out_proj");  // RD_PHASE_PROF
+      if (!proj_batch(L.ssm_out, d_vcb_, d_projb_, E, d_inner, n, false, err)) return false;
+    } else {
     // The recurrence itself is sequential: token order, same kernels as the
     // per-token path, one token's slices at a time.
     for (int t = 0; t < n; ++t) {
@@ -1032,9 +1205,11 @@ inline bool Graph::forward_batch_layer(int il, int n, int pos0, std::string &err
       }
     }
     if (!proj_batch(L.ssm_out, d_zb_, d_projb_, E, d_inner, n, false, err)) return false;
+    }
   }
 
   // residual + post-attention norm
+  RD_PHASE(prof_, "post_norm");  // RD_PHASE_PROF
   if (!add_launch(d_projb_, d_xb_, d_xb_, (std::int64_t)n * E)) {
     err = "batch residual launch failed";
     return false;
@@ -1045,11 +1220,14 @@ inline bool Graph::forward_batch_layer(int il, int n, int pos0, std::string &err
   }
 
   // FFN (gate and up share the activation)
+  RD_PHASE(prof_, "ffn_gate_up");  // RD_PHASE_PROF
   if (!proj_batch(L.ffn_gate, d_xnb_, d_ffnab_, F, E, n, false, err)) return false;
   if (!proj_batch(L.ffn_up, d_xnb_, d_ffnbb_, F, E, n, true, err)) return false;
   if (!unary_launch(d_ffnab_, d_ffnab_, (std::int64_t)n * F, UnOp::Silu)) return false;
   if (!mul_launch(d_ffnab_, d_ffnbb_, d_ffnab_, (std::int64_t)n * F)) return false;
+  RD_PHASE(prof_, "ffn_down");  // RD_PHASE_PROF
   if (!proj_batch(L.ffn_down, d_ffnab_, d_projb_, E, F, n, false, err)) return false;
+  RD_PHASE(prof_, "ffn_residual");  // RD_PHASE_PROF
   if (!add_launch(d_projb_, d_xb_, d_xb_, (std::int64_t)n * E)) {
     err = "batch ffn residual launch failed";
     return false;
@@ -1408,13 +1586,13 @@ inline void Graph::release() {
   d_v_ = nullptr;
   float *batch_ptrs[] = {d_xb_,   d_xnb_,  d_qb_,    d_kb_,    d_vb_,     d_attnb_,
                          d_gateb_, d_ffnab_, d_ffnbb_, d_projb_, d_qkvb_,   d_zb_,
-                         d_convb_, d_alphab_, d_betab_, d_gate2b_};
+                         d_convb_, d_alphab_, d_betab_, d_gate2b_, d_qkb_,   d_vcb_};
   for (float *p : batch_ptrs) {
     if (p) (void)hipFree(p);
   }
   d_xb_ = d_xnb_ = d_qb_ = d_kb_ = d_vb_ = d_attnb_ = d_gateb_ = nullptr;
   d_ffnab_ = d_ffnbb_ = d_projb_ = d_qkvb_ = d_zb_ = d_convb_ = nullptr;
-  d_alphab_ = d_betab_ = d_gate2b_ = nullptr;
+  d_alphab_ = d_betab_ = d_gate2b_ = d_qkb_ = d_vcb_ = nullptr;
   if (d_aqb_) (void)hipFree(d_aqb_);
   if (d_posb_) (void)hipFree(d_posb_);
   d_aqb_ = nullptr;
