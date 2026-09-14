@@ -39,6 +39,40 @@
 //   * **2 CTAs/CU nao paga**: a config de 105 VGPRs com 12 KB de LDS (cfg 7)
 //     faz 13,86 T contra 15,50 do 1 CTA/CU -- o mesmo que a frente G mediu com
 //     o V4 (mais CTAs por CU, sozinho, nao e' alavanca).
+//   * **O STAGING CRU COM A DECODIFICACAO NO CONSUMO PERDE 1,7-4,8x** (medido
+//     nesta frente com `--cfg 9,10`, mesma janela da producao, min de 5 reps,
+//     piso de ruido 1,000x). E' a receita do NInfer
+//     (`q4_rowsplit_gemm_simt.cuh:77-110` deposita bytes crus com copia
+//     vetorial e decodifica dentro do consumo) transplantada para ca: o
+//     staging grava 1 int4 de campos crus por sub-bloco e o consumo refaz LUT,
+//     sinal, `d_w` e `1+2*sc`. T-MAC/s (M=64/128/512), producao -> cru:
+//       iq3_s  blk.3.ffn_up  (5120x17408): 13,41/15,06/16,48 -> 6,23/7,28/7,99
+//       iq3_xxs blk.5.ffn_up (5120x17408): 11,11/12,46/13,49 -> 5,59/6,59/7,28
+//       iq4_xs blk.2.attn_qkv(5120x10240): 13,33/16,15/17,18 -> 7,60/9,39/10,31
+//     A bit-exatidao contra o `vec_dot_*` FICA (0 de 4096, max ulp 0, nos tres
+//     tipos): o caminho cru desembrulha o record e chama o MESMO `store()`.
+//     A causa esta' medida, nao suposta:
+//       (a) o deposito JA' E' VETORIAL. Na ISA da producao, a janela inteira
+//           (2 blocos de 32) usa 16 `ds_load_b128` + 8 `ds_load_2addr_b64` no
+//           consumo e 2 `ds_store_b128` + 1 `ds_store_b64` no staging. Nao ha'
+//           round-trip escalar para remover;
+//       (b) a decodificacao no staging NAO custa tempo: o modo "so' staging"
+//           (cfg 11 -- mesma grade, mesmos threads, mesmo prologo, conta
+//           trocada por 4 leituras da LDS) da' 17,5-18,3 % do kernel em M>=64,
+//           e esse tempo e' o trafego COMPULSORIO do peso (281,5 KB por CTA;
+//           76,6 MB em 0,134 ms em M=128 = 572 GB/s, ~90 % dos ~633 GB/s do
+//           cartao). O staging cru (cfg 12) tem 2,25x MENOS instrucoes (198
+//           contra 446 na ISA) e NAO e' mais rapido: 0,058 contra 0,076 ms em
+//           M=64, 0,144 contra 0,134 em M=128, 1,179 contra 0,512 em M=512;
+//       (c) o preco esta' no consumo: a LUT passa a ser consultada por TM =
+//           BM/RM = 16 threads em vez de uma, entao as consultas saem de 8 por
+//           janela (staging) para 136 (consumo, 17x) e as instrucoes vivas por
+//           janela vao de 1126 para 3114 (+177 %, contadas na ISA), com os
+//           MESMOS 512 dp4a e o MESMO bloco `ww[RN][8]` de registradores: LDS
+//           de 40 para 16 acessos, ALU de ~500 para ~2200.
+//     A fracao de staging cai de 17,5 % para 9,2 % em M=128 -- NAO porque o
+//     staging ficou mais barato (0,134 -> 0,144 ms), e sim porque o consumo
+//     ficou 2,3x mais lento. Fracao de staging sozinha nao e' criterio.
 //
 // Orcamento de LDS (BM=64, BN=128, BK=64, duplo buffer do W + os campos d_w/sc):
 //   s_w   2 * 128 * (64+16) B  = 20 480 B
@@ -143,6 +177,33 @@ struct SolverIq3S {
   static __device__ __forceinline__ float corr(const int sumi, const int scf) {
     return (float)(sumi * scf);
   }
+
+  // ---- caminho "raw" (cfg 9/10 da bancada): o staging guarda os CAMPOS CRUS e
+  // a decodificacao acima acontece no laco de consumo ------------------------
+  // O record de 16 B cabe em int4 (1 ds_load_b128 por coluna). O `dsc` (d nos
+  // bits 0-15, byte de scales nos 16-23) desliza 8 bits para a esquerda: o byte
+  // de `qh` entra nos bits 0-7, `d` fica em 8-23 e o byte de scales em 24-31.
+  // O custo e' 1 shift + 1 or no staging e 1 shift no consumo.
+  static constexpr int raw_words = 4;
+  static __device__ __forceinline__ void raw_pack(const Pf &p, int *rec) {
+    rec[0] = p.qs0;
+    rec[1] = p.qs1;
+    rec[2] = (int)p.sg;
+    rec[3] = (int)((p.qh & 0xFFu) | (p.dsc << 8));
+  }
+  // Desembrulha o record e chama o MESMO `store()` -- a aritmetica do caminho
+  // raw e' a do caminho de producao por CONSTRUCAO, nao por coincidencia.
+  static __device__ __forceinline__ void decode_raw(const int *rec, const int sub, int *dst,
+                                                    float *dw, int *scf) {
+    Pf p;
+    const unsigned w3 = (unsigned)rec[3];
+    p.qs0 = rec[0];
+    p.qs1 = rec[1];
+    p.sg = (unsigned)rec[2];
+    p.qh = w3 & 0xFFu;
+    p.dsc = w3 >> 8;
+    store(p, sub, dst, dw, scf);
+  }
 };
 
 // ---- iq3_xxs (2,75 bpw, 17,8 % dos bytes do inventario). Mesma forma de cadeia
@@ -189,6 +250,24 @@ struct SolverIq3XXS {
   }
   static __device__ __forceinline__ float corr(const int sumi, const int scf) {
     return (float)((scf * sumi + sumi / 2) / 2);
+  }
+
+  // ---- caminho "raw" (cfg 9/10): `Pf` JA' tem 4 palavras (16 B) -----------
+  static constexpr int raw_words = 4;
+  static __device__ __forceinline__ void raw_pack(const Pf &p, int *rec) {
+    rec[0] = p.qs0;
+    rec[1] = p.qs1;
+    rec[2] = (int)p.aux;
+    rec[3] = (int)p.d;
+  }
+  static __device__ __forceinline__ void decode_raw(const int *rec, const int /*sub*/, int *dst,
+                                                    float *dw, int *scf) {
+    Pf p;
+    p.qs0 = rec[0];
+    p.qs1 = rec[1];
+    p.aux = (unsigned)rec[2];
+    p.d = (unsigned)rec[3];
+    store(p, 0, dst, dw, scf);
   }
 };
 
@@ -255,6 +334,29 @@ struct SolverIq4XS {
   static __device__ __forceinline__ float corr(const int sumi, const int scf) {
     return (float)(sumi * scf);
   }
+
+  // ---- caminho "raw" (cfg 9/10): 4 palavras de nibbles + dsl/sh = 6 --------
+  // (nao cabe em 16 B: o record e' 1 int4 + 1 int2, com o slot alinhado a 16 B)
+  static constexpr int raw_words = 6;
+  static __device__ __forceinline__ void raw_pack(const Pf &p, int *rec) {
+    rec[0] = p.q0;
+    rec[1] = p.q1;
+    rec[2] = p.q2;
+    rec[3] = p.q3;
+    rec[4] = (int)p.dsl;
+    rec[5] = (int)p.sh;
+  }
+  static __device__ __forceinline__ void decode_raw(const int *rec, const int sub, int *dst,
+                                                    float *dw, int *scf) {
+    Pf p;
+    p.q0 = rec[0];
+    p.q1 = rec[1];
+    p.q2 = rec[2];
+    p.q3 = rec[3];
+    p.dsl = (unsigned)rec[4];
+    p.sh = (unsigned)rec[5];
+    store(p, sub, dst, dw, scf);
+  }
 };
 
 // ===========================================================================
@@ -272,7 +374,8 @@ struct SolverIq4XS {
 // ou seja: uma barreira por janela de K e a dequantizacao da janela seguinte
 // rodando junto com a conta da atual (o `db` do V6), com as cargas globais
 // emitidas ANTES da conta para esconder a latencia (o `pf` do V6).
-template <class TR, int BM, int BN, int BK, int RM, int RN, bool DBUF, bool WHOLD, int MINB>
+template <class TR, int BM, int BN, int BK, int RM, int RN, bool DBUF, bool WHOLD, int MINB,
+          bool RAW = false, bool STAGE_ONLY = false>
 __global__ void __launch_bounds__((BM / RM) * (BN / RN), MINB) gemm_i8_kernel(
     const char *__restrict__ W, const block_q8_1 *__restrict__ A, float *__restrict__ C,
     const int M, const int N, const int K, const int act_stride) {
@@ -285,14 +388,24 @@ __global__ void __launch_bounds__((BM / RM) * (BN / RN), MINB) gemm_i8_kernel(
   constexpr int NKB = BK / 32;  // blocos de 32 (da escala) por janela de k
   constexpr int WSB = BK + 16;  // stride de linha da LDS do W (multiplo de 16)
   constexpr int NTASK = (BN * NKB + NTH - 1) / NTH;
+  // Caminho RAW: 1 record de campos crus por (linha, bloco de 32). O slot e' o
+  // record arredondado para cima em palavras de 16 B, entao todo offset de
+  // record e' 16 B alinhado e a leitura cabe em ds_load_b128.
+  constexpr int RWW = TR::raw_words;
+  constexpr int RSLOT = (RWW + 3) & ~3;
+  constexpr int RSTR = NKB * RSLOT;  // palavras por linha do tile do W
+  constexpr int NBUF = DBUF ? 2 : 1;
   static_assert(BK % 32 == 0, "BK tem de ser multiplo de 32 (o bloco da escala)");
   static_assert(WSB % 16 == 0, "a linha do W na LDS tem de ser 16 B alinhada");
   static_assert(QK % 32 == 0, "");
   static_assert(BM % RM == 0 && BN % RN == 0, "");
   static_assert(NKB <= 8, "");
+  static_assert(!RAW || (RWW >= 4 && RWW <= 6), "o record raw tem de ser 1 int4 (+1 int2)");
+  static_assert(!RAW || WHOLD, "o caminho raw decodifica para o bloco de registradores (WHOLD)");
 
-  __shared__ __align__(16) unsigned char s_w[DBUF ? 2 : 1][BN * WSB];
-  __shared__ __align__(16) int2 s_dwsc[DBUF ? 2 : 1][NKB * BN];
+  __shared__ __align__(16) unsigned char s_w[RAW ? 16 : NBUF * BN * WSB];
+  __shared__ __align__(16) int2 s_dwsc[RAW ? 1 : NBUF * NKB * BN];
+  __shared__ __align__(16) int s_wr[RAW ? NBUF * BN * RSTR : 4];
 
   const int tid = threadIdx.x;
   const int tr = tid / TN;
@@ -323,11 +436,23 @@ __global__ void __launch_bounds__((BM / RM) * (BN / RN), MINB) gemm_i8_kernel(
       const int task = tid + i * NTH;
       const int row = task / NKB;
       const int kb = task - row * NKB;
-      float dw;
-      int scf;
       const int kk = k0 + 32 * kb;
-      TR::store(pf[i], (kk >> 5) & 7, (int *)(void *)(s_w[buf] + row * WSB + kb * 32), &dw, &scf);
-      s_dwsc[buf][kb * BN + row] = make_int2(__float_as_int(dw), scf);
+      if constexpr (RAW) {
+        // Staging CRU: 1 int4 (16 B) por sub-bloco, sem LUT, sem mascara de
+        // sinal e sem `s_dwsc` -- e' o minimo que o consumidor consegue
+        // decodificar, e sai da frente do `__syncthreads` inteiro.
+        int rec[RWW];
+        TR::raw_pack(pf[i], rec);
+        int *dst = s_wr + buf * (BN * RSTR) + row * RSTR + kb * RSLOT;
+        *(int4 *)(void *)dst = make_int4(rec[0], rec[1], rec[2], rec[3]);
+        if constexpr (RWW > 4) *(int2 *)(void *)(dst + 4) = make_int2(rec[4], rec[5]);
+      } else {
+        float dw;
+        int scf;
+        TR::store(pf[i], (kk >> 5) & 7,
+                  (int *)(void *)(s_w + buf * (BN * WSB) + row * WSB + kb * 32), &dw, &scf);
+        s_dwsc[buf * (NKB * BN) + kb * BN + row] = make_int2(__float_as_int(dw), scf);
+      }
     }
   };
 
@@ -350,6 +475,13 @@ __global__ void __launch_bounds__((BM / RM) * (BN / RN), MINB) gemm_i8_kernel(
   for (int r = 0; r < RM; ++r)
 #pragma unroll
     for (int c = 0; c < RN; ++c) F[r][c] = 0.0f;
+
+  // Sonda do modo STAGE_ONLY (a fracao de staging medida pela frente G/H): le'
+  // 4 palavras espalhadas do tile depositado na LDS para o compilador nao
+  // eliminar o deposito e no fim so' escreve em C se `sink` for um NaN que
+  // nunca aparece -- assim o modo mede staging e nao aritmetica.
+  float sink = 0.0f;
+  (void)sink;
 
   // ---- prologo -----------------------------------------------------------
   if (DBUF) {
@@ -389,11 +521,78 @@ __global__ void __launch_bounds__((BM / RM) * (BN / RN), MINB) gemm_i8_kernel(
 #pragma unroll
         for (int c = 0; c < RN; ++c) I[r][c] = 0;
 
-      if (WHOLD) {
+      if constexpr (STAGE_ONLY) {
+        // "modo 1" da frente G: mesmo prologo, mesmo staging, mesma grade e
+        // mesmos threads, com a conta trocada por 4 leituras da LDS.
+        constexpr int NW = RAW ? BN * RSTR : (BN * WSB) / 4;
+        const int *base = RAW ? (s_wr + cb * (BN * RSTR))
+                              : (const int *)(const void *)(s_w + cb * (BN * WSB));
+#pragma unroll
+        for (int i = 0; i < 4; ++i) sink += (float)base[(tid * 7 + i * 29) % NW];
+      } else if constexpr (RAW) {
+        // ---- decodificacao DENTRO do laco de consumo -----------------------
+        // 1 ds_load_b128 por coluna traz os campos crus; a LUT, a mascara de
+        // sinal, `d_w` e `1+2*sc` sao refeitos AQUI, e `TR::decode_raw` chama o
+        // MESMO `store()` do caminho de producao (a aritmetica e' a mesma por
+        // construcao). O quadrado `ww[RN][8]` de registradores e' identico ao
+        // do caminho WHOLD: o que muda e' de onde ele vem (LDS decodificada vs
+        // LDS crua + decodificacao).
+        int ww[RN][8];
+        float wdw[RN];
+        int wsc[RN];
+#pragma unroll
+        for (int c = 0; c < RN; ++c) {
+          const int *src = s_wr + cb * (BN * RSTR) + (nloc + c * TN) * RSTR + kb * RSLOT;
+          const int4 r0 = *(const int4 *)(const void *)src;
+          int rec[RWW];
+          rec[0] = r0.x;
+          rec[1] = r0.y;
+          rec[2] = r0.z;
+          rec[3] = r0.w;
+          if constexpr (RWW > 4) {
+            const int2 r1 = *(const int2 *)(const void *)(src + 4);
+            rec[4] = r1.x;
+            rec[5] = r1.y;
+          }
+          TR::decode_raw(rec, ka & 7, ww[c], &wdw[c], &wsc[c]);
+        }
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+          int ar[RM];
+#pragma unroll
+          for (int r = 0; r < RM; ++r) {
+            const block_q8_1 *q = A + (std::int64_t)mrow[r] * act_stride + ka;
+            ar[r] = ((const int *)(const void *)q->qs)[g];
+          }
+#pragma unroll
+          for (int r = 0; r < RM; ++r)
+#pragma unroll
+            for (int c = 0; c < RN; ++c) I[r][c] = ggml_cuda_dp4a(ww[c][g], ar[r], I[r][c]);
+        }
+        // mesma sequencia de correcao do caminho de producao, com `dw`/`scf`
+        // vindos do record cru em vez do `s_dwsc`
+        float da[RM];
+#pragma unroll
+        for (int r = 0; r < RM; ++r) {
+          const block_q8_1 *q = A + (std::int64_t)mrow[r] * act_stride + ka;
+          da[r] = fp16_to_float((uint16_t)(q->ds & 0xFFFFu));
+        }
+#pragma unroll
+        for (int c = 0; c < RN; ++c) {
+          const float dw = wdw[c];
+          const int scf = wsc[c];
+#pragma unroll
+          for (int r = 0; r < RM; ++r) {
+            const float d = dw * da[r];
+            F[r][c] = __fmaf_rn(d, TR::corr(I[r][c], scf), F[r][c]);
+          }
+        }
+      } else if (WHOLD) {
         int ww[RN][8];
 #pragma unroll
         for (int c = 0; c < RN; ++c) {
-          const int *wp = (const int *)(const void *)(s_w[cb] + (nloc + c * TN) * WSB + kb * 32);
+          const int *wp =
+              (const int *)(const void *)(s_w + cb * (BN * WSB) + (nloc + c * TN) * WSB + kb * 32);
 #pragma unroll
           for (int g = 0; g < 8; ++g) ww[c][g] = wp[g];
         }
@@ -422,7 +621,8 @@ __global__ void __launch_bounds__((BM / RM) * (BN / RN), MINB) gemm_i8_kernel(
           int wc[RN];
 #pragma unroll
           for (int c = 0; c < RN; ++c) {
-            const int *wp = (const int *)(const void *)(s_w[cb] + (nloc + c * TN) * WSB + kb * 32);
+            const int *wp =
+                (const int *)(const void *)(s_w + cb * (BN * WSB) + (nloc + c * TN) * WSB + kb * 32);
             wc[c] = wp[g];
           }
 #pragma unroll
@@ -433,22 +633,26 @@ __global__ void __launch_bounds__((BM / RM) * (BN / RN), MINB) gemm_i8_kernel(
       }
 
       // ---- correcao (a sequencia do motor: inteiro -> (float) -> fma) ----
-      float da[RM];
-#pragma unroll
-      for (int r = 0; r < RM; ++r) {
-        const block_q8_1 *q = A + (std::int64_t)mrow[r] * act_stride + ka;
-        da[r] = fp16_to_float((uint16_t)(q->ds & 0xFFFFu));
-      }
-      const int2 *wsc = s_dwsc[cb] + kb * BN;
-#pragma unroll
-      for (int c = 0; c < RN; ++c) {
-        const int2 ws = wsc[nloc + c * TN];
-        const float dw = __int_as_float(ws.x);
-        const int scf = ws.y;
+      // (o caminho RAW faz a sua dentro do ramo acima: la' o `dw`/`scf` esta'
+      //  no record cru e nao no `s_dwsc`)
+      if constexpr (!RAW && !STAGE_ONLY) {
+        float da[RM];
 #pragma unroll
         for (int r = 0; r < RM; ++r) {
-          const float d = dw * da[r];
-          F[r][c] = __fmaf_rn(d, TR::corr(I[r][c], scf), F[r][c]);
+          const block_q8_1 *q = A + (std::int64_t)mrow[r] * act_stride + ka;
+          da[r] = fp16_to_float((uint16_t)(q->ds & 0xFFFFu));
+        }
+        const int2 *wsc = s_dwsc + cb * (NKB * BN) + kb * BN;
+#pragma unroll
+        for (int c = 0; c < RN; ++c) {
+          const int2 ws = wsc[nloc + c * TN];
+          const float dw = __int_as_float(ws.x);
+          const int scf = ws.y;
+#pragma unroll
+          for (int r = 0; r < RM; ++r) {
+            const float d = dw * da[r];
+            F[r][c] = __fmaf_rn(d, TR::corr(I[r][c], scf), F[r][c]);
+          }
         }
       }
     }
@@ -462,6 +666,13 @@ __global__ void __launch_bounds__((BM / RM) * (BN / RN), MINB) gemm_i8_kernel(
   }
 
   // ---- epilogo: C[m][n] (token-major, igual ao matvec em lote) ------------
+  if constexpr (STAGE_ONLY) {
+    // o modo de staging nao escreve saida (so' o NaN impossivel, que nunca
+    // acontece -- e' o que impede o compilador de eliminar o deposito)
+    if (__float_as_uint(sink) == 0x7F800001u)
+      C[(std::int64_t)blockIdx.y * gridDim.x + blockIdx.x] = sink;
+    return;
+  }
 #pragma unroll
   for (int r = 0; r < RM; ++r) {
     const int m = m0 + tr + r * TM;
@@ -478,24 +689,32 @@ __global__ void __launch_bounds__((BM / RM) * (BN / RN), MINB) gemm_i8_kernel(
 // ===========================================================================
 // 3. Lancadores
 // ===========================================================================
-template <class TR, int BM, int BN, int BK, int RM, int RN, bool DBUF, bool WHOLD, int MINB>
+template <class TR, int BM, int BN, int BK, int RM, int RN, bool DBUF, bool WHOLD, int MINB,
+          bool RAW = false, bool STAGE_ONLY = false>
 inline bool gemm_launch_t(const void *d_w, const block_q8_1 *d_a, float *d_o, std::int64_t nrows,
                           std::int64_t ncols, std::int64_t act_stride, int n_tokens,
                           hipStream_t stream) {
   const dim3 grid((unsigned)((nrows + BN - 1) / BN), (unsigned)((n_tokens + BM - 1) / BM), 1u);
   const int th = (BM / RM) * (BN / RN);
-  gemm_i8_kernel<TR, BM, BN, BK, RM, RN, DBUF, WHOLD, MINB><<<grid, th, 0, stream>>>(
-      (const char *)d_w, d_a, d_o, n_tokens, (int)nrows, (int)ncols, (int)act_stride);
+  gemm_i8_kernel<TR, BM, BN, BK, RM, RN, DBUF, WHOLD, MINB, RAW, STAGE_ONLY>
+      <<<grid, th, 0, stream>>>((const char *)d_w, d_a, d_o, n_tokens, (int)nrows, (int)ncols,
+                                (int)act_stride);
   return hipGetLastError() == hipSuccess;
 }
 
 // Diagnostico: registradores/LDS da config que `gemm_launch` escolheria.
-template <class TR, int BM, int BN, int BK, int RM, int RN, bool DBUF, bool WHOLD, int MINB>
+template <class TR, int BM, int BN, int BK, int RM, int RN, bool DBUF, bool WHOLD, int MINB,
+          bool RAW = false, bool STAGE_ONLY = false>
 inline bool gemm_attrs_t(hipFuncAttributes &attr, int &lds_bytes) {
   constexpr int NKB = BK / 32;
   constexpr int WSB = BK + 16;
-  lds_bytes = (DBUF ? 2 : 1) * (BN * WSB + NKB * BN * 8);
-  auto *fn = &gemm_i8_kernel<TR, BM, BN, BK, RM, RN, DBUF, WHOLD, MINB>;
+  constexpr int RSTR = NKB * ((TR::raw_words + 3) & ~3);
+  if constexpr (RAW) {
+    lds_bytes = (DBUF ? 2 : 1) * (BN * RSTR * (int)sizeof(int));
+  } else {
+    lds_bytes = (DBUF ? 2 : 1) * (BN * WSB + NKB * BN * 8);
+  }
+  auto *fn = &gemm_i8_kernel<TR, BM, BN, BK, RM, RN, DBUF, WHOLD, MINB, RAW, STAGE_ONLY>;
   return hipFuncGetAttributes(&attr, (const void *)fn) == hipSuccess;
 }
 
@@ -553,8 +772,9 @@ inline bool gemm_attrs(int dt, int n_tokens, hipFuncAttributes &attr, int &lds_b
 }
 
 // ---------------------------------------------------------------------------
-// Bancada: variantes da MESMA geometria para A/B atribuivel (so' iq3_s, para
-// manter o numero de instanciacoes limitado). cfg:
+// Bancada: variantes da MESMA geometria para A/B atribuivel (cfg 1-8 so' para
+// iq3_s, para manter o numero de instanciacoes limitado; cfg 9-12 valem para os
+// tres tipos cobertos, exceto 11-12 que so' existem para iq3_s). cfg:
 //   0 = producao (a escolha de `gemm_launch` para este M)
 //   1 = BM128 BN128 BK64 RM8 RN8, duplo buffer do W, W em registrador (WHOLD)
 //   2 = idem 1 sem o duplo buffer (buffer unico, o caminho da frente F)
@@ -564,11 +784,50 @@ inline bool gemm_attrs(int dt, int n_tokens, hipFuncAttributes &attr, int &lds_b
 //   6 = BM128 BN64 BK64 RM8 RN4, duplo buffer
 //   7 = BM64  BN64 BK64 RM4 RN4, duplo buffer (32 acumuladores/thread)
 //   8 = BM128 BN64 BK64 RM4 RN4, duplo buffer (512 threads)
+//   9 = STAGING CRU + decodificacao no laco de consumo, BM64 (geometria de
+//       producao em M>=64): o staging grava 1 int4 por sub-bloco e o consumo
+//       refaz LUT + sinal + d_w + (1+2*sc). MEDIDO: PERDE 1,7-2,2x (cabecalho)
+//  10 = idem 9 com BM16 (geometria de producao em M<64). MEDIDO: PERDE 3,2-4,8x
+//       -- com RM=1 cada palavra decodificada alimenta UM dp4a so'
+//  11 = STAGE_ONLY (o "modo 1" da frente G) na geometria de producao BM64 e no
+//       caminho de producao: mesma grade/threads/prologo/staging, conta trocada
+//       por 4 leituras da LDS -- mede a fracao de staging
+//  12 = idem 11 no caminho de staging cru (a fracao de staging DEPOIS)
 // ---------------------------------------------------------------------------
 inline bool gemm_launch_cfg(int dt, const void *d_w, const block_q8_1 *d_a, float *d_o,
                             std::int64_t nrows, std::int64_t ncols, std::int64_t act_stride,
                             int n_tokens, int cfg, hipStream_t stream) {
   if (cfg == 0) return gemm_launch(dt, d_w, d_a, d_o, nrows, ncols, act_stride, n_tokens, stream);
+  if (cfg >= 9) {
+    // Variantes do caminho CRU (e o modo de staging): valem para os tres tipos
+    // cobertos, exceto o modo de staging puro, que existe so' para iq3_s.
+    if (cfg >= 11 && dt != 12) return false;
+    if (ncols % 256 != 0 || ncols % 64 != 0) return false;
+#define RD_CFG_RAW(Traits, Dt)                                                                \
+  case Dt: {                                                                                  \
+    if (cfg == 9)                                                                             \
+      return gemm_launch_t<Traits, 64, 128, 64, 4, 8, true, true, 1, true, false>(            \
+          d_w, d_a, d_o, nrows, ncols, act_stride, n_tokens, stream);                         \
+    if (cfg == 10)                                                                            \
+      return gemm_launch_t<Traits, 16, 128, 64, 1, 8, true, true, 1, true, false>(            \
+          d_w, d_a, d_o, nrows, ncols, act_stride, n_tokens, stream);                         \
+    if (cfg == 11)                                                                            \
+      return gemm_launch_t<Traits, 64, 128, 64, 4, 8, true, true, 1, false, true>(            \
+          d_w, d_a, d_o, nrows, ncols, act_stride, n_tokens, stream);                         \
+    if (cfg == 12)                                                                            \
+      return gemm_launch_t<Traits, 64, 128, 64, 4, 8, true, true, 1, true, true>(             \
+          d_w, d_a, d_o, nrows, ncols, act_stride, n_tokens, stream);                         \
+    return false;                                                                             \
+  }
+    switch (dt) {
+      RD_CFG_RAW(SolverIq3S, 12)
+      RD_CFG_RAW(SolverIq3XXS, 9)
+      RD_CFG_RAW(SolverIq4XS, 14)
+      default:
+        return false;
+    }
+#undef RD_CFG_RAW
+  }
   if (dt != 12) return false;  // as variantes de A/B existem so' para iq3_s
   if (ncols % 256 != 0 || ncols % 64 != 0) return false;
   switch (cfg) {

@@ -29,6 +29,13 @@
 //   bench-gemm-engine-gpu <model.gguf> [--m 16,64,128,512] [--reps 5]
 //                        [--tensor NOME] [--list] [--cfg 1,5,6,7]
 //                        [--no-verify] [--quick] [--types]
+// `--cfg` aceita as variantes A/B de `gemm_launch_cfg` (gemm.cuh): 1-8 sao
+// geometrias de iq3_s, 9/10 sao o STAGING CRU (campos crus na LDS, decodificacao
+// dentro do laco de consumo) em BM64/BM16 e 11/12 sao o modo "so' staging"
+// (mesma grade, mesmos threads, conta trocada por 4 leituras da LDS) do caminho
+// de producao e do caminho cru -- 11/12 existem so' para iq3_s. Todo cfg que
+// calcula resultado passa pelo gate de bit-exatidao contra o `vec_dot_*` antes
+// de ser cronometrado; a fracao de staging sai de 11 (ou 12) sobre o GEMM cheio.
 // ===========================================================================
 #include <hip/hip_runtime.h>
 
@@ -294,12 +301,18 @@ const char *type_name(const int dt) {
 // ---------------------------------------------------------------------------
 // 4. Atributos de kernel (registradores / LDS) das configs da bancada
 // ---------------------------------------------------------------------------
-template <class TR, int BM, int BN, int BK, int RM, int RN, bool DBUF, bool WHOLD, int MINB>
+template <class TR, int BM, int BN, int BK, int RM, int RN, bool DBUF, bool WHOLD, int MINB,
+          bool RAW = false, bool STAGE_ONLY = false>
 bool attrs_of(hipFuncAttributes &attr, int &lds) {
   constexpr int NKB = BK / 32;
   constexpr int WSB = BK + 16;
-  lds = (DBUF ? 2 : 1) * (BN * WSB + NKB * BN * 8);
-  auto *fn = &rdna4::gemm_i8_kernel<TR, BM, BN, BK, RM, RN, DBUF, WHOLD, MINB>;
+  constexpr int RSTR = NKB * ((TR::raw_words + 3) & ~3);
+  if (RAW) {
+    lds = (DBUF ? 2 : 1) * (BN * RSTR * (int)sizeof(int));
+  } else {
+    lds = (DBUF ? 2 : 1) * (BN * WSB + NKB * BN * 8);
+  }
+  auto *fn = &rdna4::gemm_i8_kernel<TR, BM, BN, BK, RM, RN, DBUF, WHOLD, MINB, RAW, STAGE_ONLY>;
   return hipFuncGetAttributes(&attr, (const void *)fn) == hipSuccess;
 }
 
@@ -311,6 +324,8 @@ void print_attrs(const char *tag, const int dt, const bool use_cfg, const int cf
     ok = rdna4::gemm_attrs(dt, 128, a, lds);
   } else {
 #define AT(Traits, BM, BN, BK, RM, RN, DB, WH, MB) ok = attrs_of<Traits, BM, BN, BK, RM, RN, DB, WH, MB>(a, lds)
+#define ATR(Traits, BM, BN, BK, RM, RN, DB, WH, MB, RW, SO) \
+  ok = attrs_of<Traits, BM, BN, BK, RM, RN, DB, WH, MB, RW, SO>(a, lds)
     switch (cfg) {
       case 1: AT(rdna4::SolverIq3S, 128, 128, 64, 8, 8, true, true, 1); break;
       case 2: AT(rdna4::SolverIq3S, 128, 128, 64, 8, 8, false, true, 1); break;
@@ -319,16 +334,52 @@ void print_attrs(const char *tag, const int dt, const bool use_cfg, const int cf
       case 6: AT(rdna4::SolverIq3S, 128, 64, 64, 8, 4, true, true, 1); break;
       case 7: AT(rdna4::SolverIq3S, 64, 64, 64, 4, 4, true, true, 1); break;
       case 8: AT(rdna4::SolverIq3S, 128, 64, 64, 4, 4, true, true, 1); break;
+      // 9/10 = staging cru + decodificacao no consumo ; 11/12 = so' staging
+      case 9:
+#define ATC(Traits) ATR(Traits, 64, 128, 64, 4, 8, true, true, 1, true, false)
+        switch (dt) {
+          case kIq3S: ATC(rdna4::SolverIq3S); break;
+          case kIq3XXS: ATC(rdna4::SolverIq3XXS); break;
+          case kIq4XS: ATC(rdna4::SolverIq4XS); break;
+          default: ok = false; break;
+        }
+#undef ATC
+        break;
+      case 10:
+#define ATC10(Traits) ATR(Traits, 16, 128, 64, 1, 8, true, true, 1, true, false)
+        switch (dt) {
+          case kIq3S: ATC10(rdna4::SolverIq3S); break;
+          case kIq3XXS: ATC10(rdna4::SolverIq3XXS); break;
+          case kIq4XS: ATC10(rdna4::SolverIq4XS); break;
+          default: ok = false; break;
+        }
+#undef ATC10
+        break;
+      case 11:
+        if (dt == kIq3S) {
+          ATR(rdna4::SolverIq3S, 64, 128, 64, 4, 8, true, true, 1, false, true);
+        } else {
+          ok = false;
+        }
+        break;
+      case 12:
+        if (dt == kIq3S) {
+          ATR(rdna4::SolverIq3S, 64, 128, 64, 4, 8, true, true, 1, true, true);
+        } else {
+          ok = false;
+        }
+        break;
       default: ok = false; break;
     }
+#undef ATR
 #undef AT
   }
   if (!ok) {
     std::printf("  %-30s attrs indisponiveis\n", tag);
     return;
   }
-  std::printf("  %-30s VGPR=%3d  LDS=%5d B (pedido %5d B)  spill/lane=%d B\n", tag, a.numRegs, lds,
-              lds, (int)a.localSizeBytes);
+  std::printf("  %-30s VGPR=%3d  LDS=%5d B (pedido %5d B, attr %5zu B)  spill/lane=%d B\n", tag,
+              a.numRegs, lds, lds, (size_t)a.sharedSizeBytes, (int)a.localSizeBytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -739,6 +790,8 @@ int main(int argc, char **argv) {
         "razao G1", "razao G2");
     const double macs_per = (double)Nr * (double)Kr;
     double noise_a = 0, noise_b = 0, noise_m = 0;
+    // tempo do GEMM de producao por M (o denominador da fracao de staging)
+    std::vector<double> gemm_ms(ms_list.size(), -1.0);
     for (std::size_t mi = 0; mi < ms_list.size(); ++mi) {
       const int M = ms_list[mi];
       const double macs = macs_per * (double)M;
@@ -751,6 +804,7 @@ int main(int argc, char **argv) {
         }
       };
       const Timing tg = time_it(fn_gemm, reps, quick ? 60.0 : 250.0);
+      gemm_ms[mi] = tg.ms;
       if (!launch_ok("gemm_launch (time)")) continue;
       auto fn64 = [&] { gemv_batch(dt, dW, dAQ, dC2, Nr, Kr, act_full, M, 64, false); };
       auto fn16 = [&] { gemv_batch(dt, dW, dAQ, dC2, Nr, Kr, act_full, M, 16, false); };
@@ -800,25 +854,102 @@ int main(int argc, char **argv) {
         "%.3fx\n",
         noise_m, noise_a, noise_b, noise_b / std::max(noise_a, 1e-9));
 
-    // ---- A/B de configuracao (so' iq3_s, para limitar instanciacoes) ------
-    if (dt == kIq3S && !cfg_list.empty()) {
-      std::printf("\n  -- A/B de configuracao (iq3_s) --\n");
-      for (const int cfg : cfg_list) {
+    // ---- A/B de configuracao ----------------------------------------------
+    // cfg 1-8 existem so' para iq3_s (limite de instanciacoes); cfg 9-12
+    // (staging cru + decodificacao no consumo, e o modo "so' staging") valem
+    // para os tipos cobertos. Todo cfg que CALCULA resultado passa pelo mesmo
+    // gate de BIT-EXATIDAO do caminho de producao (o `vec_dot_*` do motor em
+    // M=16 N=256) antes de ser cronometrado.
+    const bool cfg_ge9 =
+        std::any_of(cfg_list.begin(), cfg_list.end(), [](const int c) { return c >= 9; });
+    if (!cfg_list.empty() && (dt == kIq3S || cfg_ge9)) {
+      std::printf("\n  -- A/B de configuracao (mesma janela da tabela acima) --\n");
+      std::vector<std::vector<double>> cfg_ms(cfg_list.size(),
+                                              std::vector<double>(ms_list.size(), -1.0));
+      for (std::size_t ci = 0; ci < cfg_list.size(); ++ci) {
+        const int cfg = cfg_list[ci];
+        const bool stage_only = (cfg == 11 || cfg == 12);
         char tag[96];
-        std::snprintf(tag, sizeof(tag), "cfg %d", cfg);
+        std::snprintf(tag, sizeof(tag), "cfg %d%s", cfg, stage_only ? " (so' staging)" : "");
         print_attrs(tag, dt, true, cfg);
-        for (const int M : ms_list) {
+        if (stage_only) {
+          // o modo de staging nao calcula resultado, entao nao passa pelo gate
+          // de bit-exatidao -- mas TEM de passar pela prova de que o kernel
+          // existe: cronometrar um `gemm_launch_cfg` que devolve `false` mede um
+          // lambda vazio (a armadilha das bancadas que reportaram 1198 T-MAC/s).
+          if (!rdna4::gemm_launch_cfg(dt, dW, dAQ, dC, kNc, K, K / kQ8, kM16, cfg, nullptr) ||
+              !launch_ok("gemm_launch_cfg (probe do modo de staging)")) {
+            std::printf("    cfg %d indisponivel para este tipo -- pulado\n", cfg);
+            continue;
+          }
+        } else {
+          // gate de bit-exatidao contra o `vec_dot_*` DO MOTOR, o mesmo M/N do
+          // caminho de producao (M=16, N=256)
+          const int Me = kM16, Ne = kNc;
+          std::vector<float> engv((std::size_t)Me * Ne), gotv((std::size_t)Me * Ne);
+          (void)hipMemset(dC2, 0, engv.size() * sizeof(float));
+          td->ref((const void *)dW, dAQ, dC2, Me, Ne, (int)K);
+          if (!launch_ok("ref_engine_kernel (cfg)")) continue;
+          (void)hipMemset(dC, 0, gotv.size() * sizeof(float));
+          if (!rdna4::gemm_launch_cfg(dt, dW, dAQ, dC, Ne, K, K / kQ8, Me, cfg, nullptr) ||
+              !launch_ok("gemm_launch_cfg (verify)")) {
+            std::printf("    cfg %d indisponivel para este tipo -- pulado\n", cfg);
+            continue;
+          }
+          (void)hipDeviceSynchronize();
+          (void)hipMemcpy(engv.data(), dC2, engv.size() * sizeof(float), hipMemcpyDeviceToHost);
+          (void)hipMemcpy(gotv.data(), dC, gotv.size() * sizeof(float), hipMemcpyDeviceToHost);
+          const Diff dd = diff_bits(gotv, engv, engv.size());
+          std::size_t nz = 0, nnf = 0;
+          for (float v : gotv) {
+            if (v == 0.f) ++nz;
+            if (!std::isfinite(v)) ++nnf;
+          }
+          std::printf(
+              "    BIT-EXATIDAO vs `vec_dot_%s_q8_1` (M=%d N=%d): BITS diferentes %zu de %zu ; "
+              "max ulp %.0f ; zeros %zu ; nao-finitos %zu%s\n",
+              td->name, Me, Ne, dd.n_diff, dd.n, dd.max_ulps, nz, nnf,
+              dd.n_diff ? "   <-- DIVERGE" : "   (bit-exato)");
+        }
+        for (std::size_t mi = 0; mi < ms_list.size(); ++mi) {
+          const int M = ms_list[mi];
           bool warned = false;
           auto fn = [&] {
-            if (!rdna4::gemm_launch_cfg(dt, dW, dAQ, dC, Nr, Kr, act_full, M, cfg, nullptr) && !warned) {
+            if (!rdna4::gemm_launch_cfg(dt, dW, dAQ, dC, Nr, Kr, act_full, M, cfg, nullptr) &&
+                !warned) {
               warned = true;
               std::printf("  cfg %d indisponivel em M=%d\n", cfg, M);
             }
           };
           const Timing t = time_it(fn, reps, quick ? 60.0 : 200.0);
           if (!launch_ok("gemm_launch_cfg")) continue;
+          cfg_ms[ci][mi] = t.ms;
           const double macs = macs_per * (double)M;
-          std::printf("  %5d | %9.3f ms  %9.2f T-MAC/s\n", M, t.ms, macs / (t.ms * 1e-3) / 1e12);
+          std::printf("  %5d | %9.3f ms  %9.2f T-MAC/s%s\n", M, t.ms, macs / (t.ms * 1e-3) / 1e12,
+                      stage_only ? "   (so' staging: nao conta como GEMM)" : "");
+        }
+      }
+      // ---- fracao de staging: t(so' staging) / t(GEMM completo) -----------
+      // Mesma grade, mesmos threads, mesmo prologo e mesmo staging do caminho
+      // cheio; a conta vira 4 leituras da LDS. O modo NAO esconde a latencia
+      // das cargas globais (nao tem conta para sobrepor), entao a fracao e' um
+      // LIMITE SUPERIOR do custo de staging.
+      auto find_cfg = [&](const int cfg) -> int {
+        for (std::size_t i = 0; i < cfg_list.size(); ++i)
+          if (cfg_list[i] == cfg) return (int)i;
+        return -1;
+      };
+      const int i11 = find_cfg(11), i12 = find_cfg(12), i9 = find_cfg(9);
+      if ((i11 >= 0 || i12 >= 0) && dt == kIq3S) {
+        std::printf("\n  fracao de staging (t_so_staging / t_GEMM completo, mesma janela):\n");
+        for (std::size_t mi = 0; mi < ms_list.size(); ++mi) {
+          const int M = ms_list[mi];
+          if (i11 >= 0 && cfg_ms[i11][mi] > 0 && gemm_ms[mi] > 0)
+            std::printf("    M=%-4d caminho de producao (LDS int8): %.3f / %.3f ms = %.1f %%\n", M,
+                        cfg_ms[i11][mi], gemm_ms[mi], 100.0 * cfg_ms[i11][mi] / gemm_ms[mi]);
+          if (i12 >= 0 && cfg_ms[i12][mi] > 0 && i9 >= 0 && cfg_ms[i9][mi] > 0)
+            std::printf("    M=%-4d caminho CRU (LDS de campos):   %.3f / %.3f ms = %.1f %%\n", M,
+                        cfg_ms[i12][mi], cfg_ms[i9][mi], 100.0 * cfg_ms[i12][mi] / cfg_ms[i9][mi]);
         }
       }
     }
