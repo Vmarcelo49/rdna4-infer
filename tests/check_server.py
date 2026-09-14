@@ -372,6 +372,32 @@ def check_errors(check, cli, model_id, ctx_size):
     check.eq(status, 400, "400 for n > 1")
     check.eq((jbody(raw).get("error") or {}).get("code"), "unsupported_n", "error.code")
 
+    # 400: non-finite and out-of-range sampling parameters (audit finding H1).
+    # 1e400 is a legal JSON number that strtod turns into +inf, and inf used to be
+    # accepted: `temperature: inf` makes every logit logit/inf = 0 (uniform
+    # softmax), and `seed: inf` cast to uint64_t is undefined behaviour. The bodies
+    # are raw strings because json.dumps(float('inf')) would emit the invalid
+    # literal Infinity instead of the 1e400 the test is about.
+    for field, value, code in (
+            ("seed", "1e400", "invalid_seed"),
+            ("seed", "-1e400", "invalid_seed"),
+            ("seed", "1e16", "invalid_seed"),
+            ("temperature", "1e400", "invalid_temperature"),
+            ("temperature", "-1", "invalid_temperature"),
+            ("temperature", "1e9", "invalid_temperature"),
+            ("top_p", "1e400", "invalid_top_p"),
+            ("min_p", "1e400", "invalid_min_p"),
+            ("repeat_penalty", "1e400", "invalid_repeat_penalty"),
+            ("repeat_penalty", "0", "invalid_repeat_penalty"),
+            ("presence_penalty", "1e400", "invalid_presence_penalty"),
+            ("frequency_penalty", "-1e400", "invalid_frequency_penalty")):
+        body = ('{"model": "%s", "messages": [{"role": "user", "content": "hi"}], '
+                '"%s": %s, "max_tokens": 1}' % (model_id, field, value))
+        status, _, raw = cli.request("POST", "/v1/chat/completions", body)
+        check.eq(status, 400, f"400 for {field}={value}")
+        check.eq((jbody(raw).get("error") or {}).get("code"), code,
+                 f"error.code for {field}={value}")
+
     # 400: a prompt that cannot fit the context
     big = "word " * (ctx_size + 64)
     status, _, raw = cli.request("POST", "/v1/chat/completions", {

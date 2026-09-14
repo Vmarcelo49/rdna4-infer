@@ -1115,3 +1115,39 @@ o lock da GPU) e `make check-forge`. Nada aqui depende do modelo real.
   `graph.cuh`, `matvec.cuh`). Ficam registrados aqui com `file:line`.
 - **H7 (422 `nodiscard` nos testes)**: é ruído de teste, não caminho de produção
   (19/19 `hipMalloc` e 41/41 lançamentos de produção já são checados).
+
+### 7.4 Provas de execução das correções de `serve`/`info`
+
+Três das correções são de caminho de execução e ganharam teste onde ele roda de verdade,
+sem custo de GPU:
+
+**M4 — orçamento de VRAM com K e V de tipos diferentes** (`./build/rdna4-infer info`,
+que só lê o cabeçalho e não sobe peso nenhum):
+
+```
+$ ./build/rdna4-infer info -m Qwen3.8-27B-UD-IQ3_S.gguf --ctx-size 65536 \
+      --cache-type-k q4_0 --cache-type-v f16
+model: 11.21 GiB + kv(ctx=65536, k=q4_0/v=f16): 2.56 GiB + overhead: 1.00 GiB = need 14.78 GiB
+rdna4-infer: budget OK
+```
+
+A conta à mão dá 65536 × 16384 × (0,5625 + 2,0) = **2,5625 GiB**, que é o que saiu. A
+fórmula antiga diria 65536 × 32768 × 0,5625 = 1,125 GiB, **1,44 GiB a menos** — exatamente
+o cache misto que passava no orçamento e morria em `hipMalloc` no `serve`.
+
+**M5 — teto de `--ctx-size`** (falha na análise dos argumentos, antes de qualquer chamada
+HIP, então nem precisa de GPU):
+
+```
+$ ./build/rdna4-infer serve -m <modelo> --ctx-size 99999999
+rdna4-infer serve: --ctx-size must be in 1..16777216
+```
+
+**H1 — parâmetros de amostragem não finitos**: doze casos entraram no
+`tests/check_server.py` (`1e400` e `-1e400` para `seed`/`temperature`/`top_p`/`min_p`/
+`repeat_penalty`/`presence_penalty`/`frequency_penalty`, mais `seed=1e16`, `temperature=1e9`
+e `repeat_penalty=0`), cada um exigindo `400` com o `error.code` do campo. São enviados como
+corpo cru porque `json.dumps(float('inf'))` escreveria `Infinity`, que não é JSON — o teste
+tem de mandar o literal `1e400`. O `check_server.sh` roda esses casos na próxima sessão de
+GPU; os pedidos normais do mesmo script (temperatura 0, seed fixo) são o controle de que a
+validação nova não rejeita o que era aceito.
