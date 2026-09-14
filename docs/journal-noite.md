@@ -204,6 +204,23 @@ O orçamento antigo recusava `q8_0/q8_0` a 131K (estimava 16,46 GiB) para uma co
 **roda** (15,87 GiB em uso, medido). Ou seja: "a 131K só cabe com `q4_0`" era falso, e a
 diferença vinha de um chute de 1 GiB de overhead e de contar o bloco MTP que não é carregado.
 
+### C11. MTP: o ganho existe e é 1,75× (medido pela frente, 05:35)
+- **Referência**: `docs/mtp.md` §7 ("verify batelado" como a peça que falta), `docs/medicoes-m8.md`
+  (projeção de 1,3-1,5× com o `cf(N)` antigo).
+- **Resultado medido** (IQ3_S, `bench`-equivalente da própria frente, 2 repetições intercaladas,
+  mesmo md5 entre repetições): a 4K, **ganancioso 29,33 tok/s · `--mtp --draft 2` 50,15 (1,71×) ·
+  `--draft 3` 51,47 (1,75×) · `--draft 3 --mtp-serial` 25,99 (0,89×)**. O contraste com o
+  caminho serial (que era o único existente até hoje e é 9-11 % **mais lento** que o ganancioso)
+  é a prova de que o ganho vem da verificação em lote, não do rascunho.
+- **Peças que sustentam o número**: *snapshot/restore* do estado GDN bit-exato (max|d| = 0,
+  argmax igual) a 0,53 ms por par; `forward_batch_all` bit-exato em posição 4084 (linha a linha,
+  h e logits); linha extra na verificação a 7,0-7,2 ms contra 32,7 ms de um passo por token.
+- **Ressalva de escopo**: os números de **16K** da frente (0,86× e aceitação 54,9 %) estão
+  contaminados pelo achado **R1** (a atenção dividida em lote lia o `q` da primeira linha), que
+  foi consertado depois; a re-medição decide se o MTP paga também em contexto longo.
+- **Veredito**: MANTIDO. É a entrega da tarefa 2: o MTP saiu de "9-11 % mais lento" para
+  **1,71-1,75× mais rápido** com a saída idêntica ao ganancioso.
+
 ## Estado do alvo (atualizado pelo coordenador)
 
 - **131K**: ainda não medido nesta rodada. No baseline, 131K com KV `q4_0` roda a 14,0 tok/s
