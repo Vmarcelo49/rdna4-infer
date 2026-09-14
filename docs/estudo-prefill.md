@@ -32,6 +32,18 @@ C** (os das frentes continuam válidos em *razão*, que é como eles são usados
 - a curva do micro-lote continua com joelho em 128 (170 → 554 → 873 → 1054);
 - alvo do plano: **~1050 tok/s**, não 1200.
 
+**Caveat de janela, medido no fecho deste estudo**: o NOSSO absoluto de prefill (512 tokens, KV
+`f16`) varia **104,0 a 124,7 tok/s** entre janelas — a mesma árvore, o mesmo binário, o mesmo
+comando (`bench --prefill 512 --prefill-reps 3`: 123,68 de manhã, 122,66, 105,11 na janela da frente
+I, 104,03 no fecho da tarde). O harness não é a causa: `rdna4-infer bench` e `bench-phases-gpu`
+concordam **dentro** de cada janela (104,65 contra 105,11; 100,56 contra 100,38). **Todas as razões e
+porcentagens deste estudo são intra-janela**; os absolutos são de uma janela específica e devem ser
+re-medidos antes de comparar com qualquer número novo. A referência do llama.cpp foi medida nas
+DUAS pontas dessa variação (1054,29 e o A/B completo do coopmat) e o gap de 8,54× usa o nosso
+melhor valor; com o nosso pior valor (104,0) o gap seria 10,1× — ou seja, **a faixa honesta do gap é
+8,5-10×**, e é por isso que a decomposição em fatores (que é intra-janela) vale mais que o número
+único.
+
 O que **não** muda: a razão do coopmat (2,47× contra 2,50×), a ordem de grandeza de todos os
 fatores, e nenhuma conclusão — só a âncora absoluta cai 11 %. A lição de processo fica registrada:
 **um build de referência com uma linha local modificada contamina toda a comparação**, e o
