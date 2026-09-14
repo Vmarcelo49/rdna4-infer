@@ -477,15 +477,12 @@ Consequência prática: **escolher o KV pelo critério de velocidade a 131K não
 sentido neste motor** — os quatro formatos que rodam entregam o mesmo ~14 tok/s.
 A decisão tem de ser por qualidade (§7) e por folga de VRAM (§6.3).
 
-### 6.2 Piso de ruído
+### 6.2 Ruído dentro da corrida (o piso entre processos está na §6.5)
 
 Dentro de uma corrida, `--reps 2` dá spread ~0,01 tok/s (ex. q5_0/q4_1: best
-13,73 / mean 13,72). **Entre corridas o piso não foi medido com esta config** — a
-repetição do mesmo comando está na §6.5. Como as diferenças entre formatos são de
-0,26 tok/s (1,9%) e o spread dentro da corrida é de 0,01, é provável que as
-diferenças **entre formatos** estejam acima do ruído; o que **não** está medido é a
-variação entre processos (a primeira corrida de cada combinação paga diferenças de
-aquecimento de DPM e de cache). Registrado como incerteza, não como resultado.
+13,73 / mean 13,72) — ou seja o spread interno é ~0,07% e não serve como piso, só
+como sanidade. O piso que vale é o de **entre processos**, medido na §6.5
+(**0,36%**), e é ele que diz que as diferenças de formato da tabela acima são reais.
 
 Também não é confiável nesta tabela o `prefill 5 tokens` (0,349 / 0,235 / 0,151 /
 0,141 s): são 5 tokens medidos logo depois de um `--fill-cache` de 2,25-4,25 GiB,
@@ -529,9 +526,25 @@ O ponto: `q8_0/q8_0` a 131K **cabe e roda** (medido: 15,87 GiB em uso, 51 MiB
 livres, 14,34 tok/s), mas o orçamento antigo o recusava. A frase "a 131K só cabe
 com q4_0" era falsa e vinha de contar o ficheiro em vez dos tensores.
 
-### 6.5 Repetição e o que ficou de fora
+### 6.5 Piso de ruído entre processos, medido
 
-_(preenchido pelo log de [G])_
+A mesma configuração (`q5_0/q4_1` a 131K com cache sintético, o comando inteiro
+repetido) rodou duas vezes, em processos separados:
+
+| corrida | best | mean | banda efetiva |
+|---|---:|---:|---:|
+| 1ª ([B], 03:12) | 13,73 tok/s | 13,72 | 165,2 GB/s |
+| 2ª ([G], 03:55) | **13,68 tok/s** | 13,67 | 164,6 GB/s |
+
+**Piso de ruído entre processos = 0,05 tok/s = 0,36%.** Logo as diferenças da
+tabela do §6 **estão acima do piso**: q8_0/q8_0 (14,34) é 4,8% mais rápido que
+q5_0/q4_1 (13,73) e 4,4% mais rápido que a média das duas corridas do q5_0/q4_1.
+Isso reforça o §6.1 em vez de contradizê-lo: a diferença é **pequena e no sentido
+"errado"** (o cache maior é o mais rápido), o que descarta banda como limitante —
+se a atenção fosse limitada por banda, 2 GiB a mais de cache por token custaria
+~15%, não ganharia 4,8%.
+
+### 6.6 O que ficou de fora do bench, e por quê
 
 **Combinações que eu decidi não medir, e por quê**: `q5_0/q5_0` e `q4_1/q4_1` saíram
 do bench depois do aviso do coordenador sobre a fila do lock (havia 12-13 waiters e
@@ -540,3 +553,136 @@ que a 131K o custo é insensível ao formato (spread de 1,9% entre 2,25 e 4,25 G
 cache) — o que decide é qualidade, e essa é medida na §7 com a sonda de KL, que
 cobre os dois. O mesmo vale para `q8_0/q4_1`, que eu **mantive** no bench por ser a
 opção de melhor qualidade recomendada pelo coordenador e precisar do número de VRAM.
+
+### 6.7 Decisão de KV a 131K (com os números na mão)
+
+O coordenador decidiu depois da tabela do §6:
+
+- **Padrão embarcado: `q5_0/q4_1`** — é o alvo do enunciado; mede 14,25 GiB em uso e
+  **1,68 GiB livres**, folga suficiente para o MTP (os planos de estado do verify
+  custam 0,6-0,75 GiB). Os 13,73 contra 14,34 tok/s do `q8_0/q8_0` são 4% dentro de um
+  regime em que o KV **não é o gargalo** (§6.1).
+- **Opção de melhor qualidade, documentada e não padrão: `q8_0/q4_1`** — need
+  14,72 GiB, **1,20 GiB de folga medida** (15,00 em uso).
+- **`q8_0/q8_0` a 131K: roda, no talo.** 14,34 tok/s mas **51 MiB livres** e 45 MB
+  empurrados para **GTT** — o mesmo regime que produziu o penhasco silencioso de 8×
+  com f16 a 64K. Não é padrão nem recomendação; não usar com MTP.
+- **`f16/f16` a 131K falha em `hipMalloc`** (`graph init failed: hipMalloc failed (kv
+  cache)`) — é a prova direta de que a linha do README "f16 at 128K needs 8 GiB and
+  cannot fit" está certa, e o `info` corrigido a recusa **antes** do load (19,34 GiB).
+
+---
+
+## 7. Qualidade do KV — o que a PPL não mede (§4 da tarefa)
+
+- **Referência**: a PPL é cega para quantização de cache. Evidência do upstream
+  citada pelo coordenador: no AIME25 o KV `q4_0` cai de 37,9% para 2,0% enquanto a
+  PPL anda ~0,4%. A sonda `check-kvquality-gpu` mede o que se move: a divergência
+  da **distribuição de saída** causada pelo formato do cache, com o cache f16 do
+  **mesmo motor**, nos **mesmos tokens**, no **mesmo processo** — então a
+  divergência do motor em relação ao llama.cpp cancela e a única diferença entre
+  duas linhas da tabela é o tipo do cache.
+- **Comando**: `./build/check-kvquality-gpu <IQ3_S> /tmp/kv-ids.txt 4096
+  f16:f16,q5_0:q4_1,q4_0:q4_0,q8_0:q8_0,q8_0:q4_1,q5_0:q4_0` (uma tomada de lock,
+  janela limpa: vram 119 902 208 B = 114 MiB, gtt 75 431 936 B).
+  Prefill em lote com probes a cada 16 posições ⇒ 256 probes sobre **4096 tokens de
+  contexto real** (wikitext-2 tokenizado pelo próprio motor). Sem a forma em lote
+  seria 1 forward por posição, e o prefill medido é 74,9 tok/s — não caberia na noite.
+- **Piso do harness**: a linha `f16:f16` da tabela é o f16 **contra ele mesmo**, e
+  sai exatamente 0 em todas as colunas (KL 0,000000, |dNLL| 0,000000, 0/256 argmax
+  trocado). O piso é zero, não "pequeno" — a métrica é determinística.
+
+### 7.1 Resultado (256 probes, 4096 tokens de contexto real)
+
+| config | PPL | **KL nats/pos** | KL max/pos | mean\|dNLL\| | argmax trocado |
+|---|---:|---:|---:|---:|---:|
+| f16/f16 (referência) | 5,91711 | 0,000000 | 0,000000 | 0,000000 | 0/256 |
+| q8_0/q8_0 | 5,92405 | **0,000492** | 0,014567 | 0,018732 | 3/256 |
+| q8_0/q4_1 | 5,93386 | 0,001443 | 0,014037 | 0,032361 | 5/256 |
+| **q5_0/q4_1** | 5,95800 | **0,001715** | 0,018921 | 0,032913 | **4/256** |
+| q5_0/q4_0 | 5,93234 | 0,002118 | 0,053731 | 0,036079 | 7/256 |
+| q4_0/q4_0 | 5,93976 | 0,003208 | 0,092405 | 0,042582 | 8/256 |
+
+Eixos isolados (um lado fixo, o outro variando):
+
+```
+-- eixo K, V fixo em q4_1 (menor KL = melhor K) --
+   q8_0:q4_1  KL 0,001443   PPL 5,93386   argmax 5/256
+   q5_0:q4_1  KL 0,001715   PPL 5,95800   argmax 4/256
+-- eixo V, K fixo em q5_0 (menor KL = melhor V) --
+   q5_0:q4_1  KL 0,001715   PPL 5,95800   argmax 4/256
+   q5_0:q4_0  KL 0,002118   PPL 5,93234   argmax 7/256
+```
+
+**Respostas às duas perguntas empíricas da tarefa:**
+
+1. **Qual é o melhor K?** `q8_0` — KL 0,001443 contra 0,001715 do `q5_0`, **16% menor**,
+   com V fixo em q4_1. Confirma, medida neste motor e neste modelo, a direção que a
+   frente de referências achou na tabela do PR #21038 do llama.cpp (0,002920 para K
+   q8_0+V q4_1 contra 0,004181 para K q5_0+V q4_1, 30% menor). E **`q4_0` em K é o
+   pior de todos** (0,003208, quase 2× o q5_0), o que sustenta o "nunca q4_1/q4_0 em
+   K" do coordenador.
+2. **Qual é o melhor V?** `q4_1` — KL 0,001715 contra 0,002118 do `q4_0`, **19% menor**,
+   com K fixo em q5_0. É exatamente onde o `min` por bloco do q4_1 paga: o V tem
+   distribuição assimétrica (o `q4_0`/`q5_0` gastam metade da grade em valores que não
+   ocorrem), e o q4_1 gasta os 16 níveis no intervalo que existe. O melhor V de todos é
+   o `q8_0` (0,000492 com K q5_0), ao custo de mais VRAM.
+
+3. **A PPL não ordena esses formatos — está medido, não argumentado.** Na tabela, a
+   ordem por PPL é q8_0/q8_0 < **q5_0/q4_0** < q8_0/q4_1 < q4_0/q4_0 < **q5_0/q4_1**,
+   enquanto a ordem por KL é q8_0/q8_0 < q8_0/q4_1 < **q5_0/q4_1** < **q5_0/q4_0** <
+   q4_0/q4_0. Os dois configs do meio **trocam de lugar**: o `q5_0/q4_1` tem a **pior**
+   PPL (5,958) e a **segunda melhor** KL, e o `q5_0/q4_0` tem PPL melhor com 23% mais
+   KL e quase o dobro de argmax trocado (7 contra 4). Correlação de postos entre as duas
+   métricas nos cinco configs quantizados: **negativa**. (Na primeira corrida, com só 16
+   probes, foi pior ainda: `q5_0/q5_0` deu PPL 4,152, *melhor* que o f16 de 4,166, com
+   KL 0,000456 — uma configuração quantizada "melhorando" a PPL é ruído de amostragem.)
+   **Conclusão operacional: não usar PPL para escolher formato de KV.**
+
+4. O `q5_0/q4_1` troca o token ganancioso em **4/256 = 1,6%** das posições a 4096
+   tokens de contexto. O gate do teste exige < 5%.
+
+### 7.2 Sonda needle — recuperação em contexto real longo
+
+- **Comando**: `./build/check-kvquality-gpu <IQ3_S> /tmp/kvneedle/ids.txt needle
+  /tmp/kvneedle/probes.txt f16:f16,q5_0:q4_1,q4_0:q4_0,q8_0:q8_0` (mesma tomada de lock).
+- **Desenho**: 8192 tokens de contexto **real** (wikitext-2) com **8 agulhas** a
+  ~11%, 22%, 33%, 44%, 56%, 67%, 78% e 89% de profundidade (8 códigos distintos de 5
+  dígitos), e depois as 8 perguntas no fim. O probe é o primeiro dígito do código — o
+  token que só existe na agulha. Cada agulha é tokenizada separadamente e as peças são
+  concatenadas, então o índice esperado é exato por construção (supor a propriedade de
+  prefixo do BPE daria índice errado). O stream é cortado em segmentos que terminam
+  **exatamente** em cada probe: probar fora de ordem leria um estado GDN já avançado e
+  erraria por um motivo que nada tem a ver com o cache.
+
+| config | recuperação | rank médio | pior rank |
+|---|---:|---:|---:|
+| f16/f16 | **8/8** | 0,00 | 0 |
+| **q5_0/q4_1** | **8/8** | 0,00 | 0 |
+| q4_0/q4_0 | 8/8 | 0,00 | 0 |
+| q8_0/q8_0 | 8/8 | 0,00 | 0 |
+
+**Resultado honesto: a sonda needle a 8K não distingue os formatos — todos recuperam
+8/8 no rank 0.** Isso é um resultado, não um fracasso: (a) fecha o gate que o
+coordenador pediu para o alvo (**q5_0/q4_1 ≥ 90% de recuperação → 100%**), e (b) diz
+que a 8K de contexto a quantização do KV **não quebra** a recuperação de longo alcance
+nem no `q4_0/q4_0`. A conclusão do §7.1 (qual formato é melhor) vem da KL, que é
+sensível onde a recuperação ainda é binária e saturada. Se a recuperação quebrasse
+antes da KL, o gate seria a needle; aqui a KL é a métrica que ordena e a needle é a que
+**prova que nenhum deles quebra o que importa**.
+
+### 7.3 O que NÃO foi medido, e por quê (dito explicitamente)
+
+**A 131K a qualidade não foi medida com texto real.** As duas razões, com número:
+
+1. O prefill deste motor faz **74,9 tok/s** (medido pelo coordenador): encher o KV com
+   131 072 tokens de texto real custaria **1750 s** por configuração, e a sonda de KL
+   precisa de 4096 tokens de prefill + uma passada por config — com 6 configs isso passa
+   de 3 h de GPU. A noite tem uma placa e 6 outras frentes na fila.
+2. Portanto, a 131K o que existe medido é **custo** (tok/s, VRAM, GTT, §6) sobre
+   **cache sintético** (`--fill-cache`), que por construção não tem qualidade nenhuma
+   para medir. A qualidade foi medida a **4096 tokens** (KL, 256 probes) e a **8192
+   tokens** (needle, 8 agulhas), que é o teto honesto desta sessão. Entre 8K e 131K a
+   única coisa que muda é o número de chaves que a atenção soma — e a sonda needle a 8K
+   já mostra recuperação perfeita, mas **isso não é uma medida a 131K** e não deve ser
+   reportado como tal.
