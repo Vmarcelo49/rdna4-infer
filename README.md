@@ -486,6 +486,18 @@ Ordered by how much they cost the user, with the number that justifies each. Not
    against 21.32 ms for one per-token step (**1.12×**), so the break-even acceptance is 56 % —
    prose sits at 68 % (1.22×) and code at 95 % (2.03×). MTP's multiplier is therefore
    `2·acceptance / 1.12`, not a mystery and not a bug in the MTP machinery.
+   **There is a SECOND route to the same wall, found in a code study of NInfer**
+   (`docs/estudo-ninfer.md` §3.13): their MTP drafts autoregressively — **one forward per draft**,
+   which is our situation — while their DFlash2 drafter does **ONE masked-block forward** producing
+   all K candidates at once (`dflash_impl.h:242,255,261`). Measured on the same fixture and model
+   profile, per-token acceptance is *higher* for MTP and MTP is *slower*: MTP3 = 72.5 % acceptance,
+   3.17 tokens/round, 193.4 tok/s vs DFlash2 K=7 = 64.6 %, **5.52**, **224.2**. What decides is not
+   the acceptance rate but **how many drafts fit in one forward** — so if the cost per draft falls
+   from "one forward" to "1/K of a forward", our break-even acceptance falls with it and 68 % on
+   prose stops sitting on the knife edge. Not a port (a block drafter needs weights our GGUF does
+   not carry — an artifact blocker, not a kernel blocker); the cheap ordering is ReplaySSM + the
+   small-T launcher first, and the half-day measurement that decides which wall we are fighting is
+   **ms per proposed draft today vs 1/K of a forward**.
    **Conclusion for the next session:** MTP's multiplier is gated on the **marginal** per-token
    cost of the batched matvec, not on the MTP machinery. The obvious fixes were tried and
    refuted (`docs/journal-lote.md`): the activation re-read traffic is **not** the limit (forcing

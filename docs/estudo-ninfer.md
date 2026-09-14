@@ -690,6 +690,57 @@ correção — e é assim que deve ser reportado.
 
 ---
 
+### 3.13 O drafter em bloco muda *por que* a especulação paga — e é o caminho que falta para o nosso MTP
+
+Este item não é uma técnica de kernel; é uma correção de enquadramento, e é o que eu levaria
+para a próxima sessão se só pudesse levar uma coisa depois do §3.5.
+
+**(a)** O ninfer tem dois drafters com **formas diferentes de custo**:
+
+- **MTP** sorteia autoregressivamente: `for (std::uint32_t step = 0; step + 1 < k; ++step)`
+  chamando `mtp_forward_decode_batch` **mais** `mtp_propose_batch` a cada passo
+  (`mtp_impl.h:169,183,185`). Ou seja, **cada draft custa um forward** — exatamente a nossa
+  situação.
+- **DFlash2** faz **um** forward *masked-block* sobre a largura inteira: `const int width =
+  k + 1` (`dflash_impl.h:242`), `prepare_masked_block` (`:255`) e **um** laço de 5 camadas
+  (`:261`) produzem os `K` candidatos de uma vez. A documentação é explícita: *"DFlash2 不是多步
+  扩散采样器；它在一次五层 masked-block forward 中为运行配置指定的 K 个位置并行生成候选"*
+  (`ninfer docs/maintainer/qwen3.8-27b-dflash2.md:24-26`) e *"没有扩散 timestep 或
+  iterative-refinement state"* (`ninfer docs/maintainer/qwen3.8-27b-dflash2.md:427`).
+
+**(b)** **MTP.** O efeito está medido e publicado na mesma tabela, na mesma fixture
+(`long_decode_aime26_01`, Qwen3.8-27B `groupwise-int`):
+
+| | aceitação | tokens/rodada | tok/s |
+|---|---:|---:|---:|
+| MTP3 (`ninfer docs/performance/qwen3.8-27b.md:89`) | **72,5 %** | 3,17 | 193,4 |
+| DFlash2 K=7 (`ninfer docs/performance/qwen3.8-27b.md:108`) | **64,6 %** | **5,52** | **224,2** |
+
+**A aceitação por token é MAIOR no MTP3 e ele é mais lento.** O que decide não é a taxa de
+aceitação — é **quantos drafts cabem num forward**. Com 7 candidatos por forward contra 3
+candidatos por 3 forwards, o DFlash2 ganha mesmo aceitando menos por posição.
+
+Isto reenquadra exatamente a nossa limitação 3. O nosso diagnóstico atual é:
+`multiplicador = 2·aceitação / 1,12` com break-even em **56 %** de aceitação, e a conclusão
+escrita é que *"o multiplicador do MTP é refém do custo marginal por token do matvec em lote,
+não da maquinaria do MTP"* (`nosso README.md:483-497`). A leitura do ninfer acrescenta um
+segundo caminho para o mesmo muro: **se o custo por draft cai de "um forward" para
+"1/K de um forward", o break-even de aceitação cai junto** — e aí o nosso MTP com 68 % de
+aceitação em prosa deixa de estar no fio da navalha.
+
+**(c)** Não é um port: é um drafter novo (um forward por bloco, com máscara). Ordem de
+trabalho honesta: (1) §3.10 (ReplaySSM) e o item §3.3, que são **baratos** e atacam o custo que
+já temos; (2) só então, se o MTP ainda não pagar, estudar um drafter em bloco — e aí o
+`include/rdna4/mtp.cuh` / `mtp_gen.h` precisam de pesos que nós não temos no GGUF, o que é um
+**bloqueio de artefato**, não de kernel.
+
+**(d)** Parcialmente, e a medição que decide é barata: medir **ms por draft proposto** do nosso
+MTP hoje (é o coeficiente 6,04 ms/token dividido pela janela) contra `1/K` do mesmo. Se a razão
+não for próxima de `K`, o drafter em bloco é a explicação; se for, o gargalo é só o matvec e o
+§3.3/§3.10 bastam.
+
+---
+
 ## 4. O que o ninfer **não** faz, ou faz pior que nós
 
 Esta seção é a lista de "não copie isto", e é onde o repositório é mais útil por ausência.
@@ -845,7 +896,8 @@ esta tarefa é leitura de código.
 | 8 | **Tile de atenção de prefill `Br=Bc=64` com K/V na LDS** (§3.5b) | reescrever `attn_batch_kernel` (`include/rdna4/attn.cuh:320-380`) para grade `(ceil(n/64), n_head)` com 49 152 B de LDS | **0,031 → ?** ms/token em 64 chaves e **0,051 → ?** em 128 (`docs/estudo-prefill-j-atencao-kv.md:450-451`); pré-requisito do chunk de 128 |
 | 9 | **Kernel small-T dedicado para a verificação de MTP** (§3.3) | `gemm_small_t` com `KWarps=8`, `RowsPerCta=16`, redução por LDS, instanciado para T=2 e T=3 | o coeficiente **6,04 ms/token** de `pass_ms ≈ 13,9 + 6,04·N` (`nosso README.md:483-485`); hoje 8,0 ms por linha verificada (`:471`) |
 | 10 | **Ler o diff de `7f14d96` e `ce95491`** (§3.8) | `git show 7f14d96 --stat` e `git log -p` no clone | decide se o hint de L2 na cauda vale 1 dia de trabalho; hoje estamos a **436 GB/s** de 633 (`nosso README.md:209`) |
-| 11 | **Contar as arestas do grafo com dependência parcial** (§3.7) | script que, por kernel, compara o conjunto de buffers escritos pelo produtor com os lidos pelo consumidor | **~4,0 ms/token** de despacho (`nosso README.md:258`); decide se o PDL vale um protótipo |
+| 11 | **Medir ms por draft proposto do nosso MTP** (§3.13) — decide se o problema é o matvec ou a forma do drafter | cronometrar o laço de draft do `--mtp` e dividir pela janela; comparar com `1/K` de um forward | decide entre investir em §3.3/§3.10 (barato) ou num drafter em bloco (que exige **pesos novos**, bloqueio de artefato) |
+| 12 | **Contar as arestas do grafo com dependência parcial** (§3.7) | script que, por kernel, compara o conjunto de buffers escritos pelo produtor com os lidos pelo consumidor | **~4,0 ms/token** de despacho (`nosso README.md:258`); decide se o PDL vale um protótipo |
 
 **O que este repo sugere que NÃO se faça**, com o número que já foi medido por nós: fusão de
 kernels para o prefill (1,1 %, `plano-prefill.md:256`), duplo buffer de ativação (−17 %,

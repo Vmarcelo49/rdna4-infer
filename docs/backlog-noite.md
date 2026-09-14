@@ -408,3 +408,30 @@ Além dessas, os achados `F11` (números do README contra os docs, 5 de 12 com p
   para `kv_bytes_v_` nos dois sítios. **Gate novo** `scripts/check_kvbatch.sh` (5 pares, exige
   bit-exatidão) ligado ao `check_all.sh`; 5/5 OK. Alvo medido: `q5_0`/`q4_1` a 104,61 tok/s de
   prefill e 28,60 de decode.
+
+---
+
+## Trazido do estudo do NInfer (14/09, tarde) — `docs/estudo-ninfer.md`
+
+Cinco itens, cada um com o gargalo NOSSO que ele ataca (todos com `file:line` no doc):
+
+1. **GQA fundido no DECODE** (um CTA por cabeça de KV com as 6 cabeças do grupo dentro) — ataca
+   a limitação 4 do README (25,77 GB lógicos contra 4,295 GB únicos a 64K). É o item de maior
+   valor do estudo; o ninfer faz exatamente isso e o **prefill dele não faz** (releem 6× como nós),
+   então o alvo é o nosso decode.
+2. **Dequantizar LDS→registrador dentro do laço de consumo, nunca LDS→LDS** — ataca o staging
+   (50-61 % do `gemm_i8_kernel`) e a correção de escala (53-56 % do miolo).
+3. **`ColsPerTile ≤ 8` com `static_assert`, paralelismo em warps e não em acumuladores** — é a
+   regra que faltou ao D1 (N↑ → 62→133 VGPR, +71 %). O limiar deles (`T ≤ 16 → SIMT`) confirma o
+   nosso.
+4. **GDN em blocos de 64 com três estágios** (`prepare_wy_wu`/`state_passing`/`output`) — ataca
+   os 0,852 ms/token da recorrência.
+5. **Launcher por T exato com K dividido entre warps e redução na LDS** — ataca o coeficiente
+   `6,04 ms/token` de `pass_ms ≈ 13,9 + 6,04·N` e o custo marginal do MTP.
+
+Mais: **ReplaySSM** (registrar as entradas de transição e reexecutar, em vez de snapshot+restore:
+86,1× menos tráfego de estado) contra os nossos 0,54 ms por par; **PDL** (28 sítios) contra os
+~1.940 lançamentos/token; política de split em degraus com teto 85 contra o nosso 16.
+
+**Bloqueio de artefato registrado**: um drafter em bloco (DFlash2-like) precisaria de pesos que o
+nosso GGUF não tem — não é bloqueio de kernel.
