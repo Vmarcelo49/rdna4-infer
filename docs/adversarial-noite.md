@@ -16,7 +16,7 @@ tocados; só os três `.md` desta frente em `docs/`).
 
 | verificação | custo | resultado |
 |---|---|---|
-| build completo da árvore (`cmake -S . -B build -DCMAKE_BUILD_TYPE=Release` + `--build -j3`) | CPU, ~6 min | exit 0; **428** avisos, **todos** em `tests/*.hip`, **zero** em `src/` e `include/` |
+| build completo da árvore (`cmake -S . -B build -DCMAKE_BUILD_TYPE=Release` + `--build -j3`) | CPU, alguns minutos | exit 0; **428** avisos, **todos** em `tests/*.hip`, **zero** em `src/` e `include/` |
 | `CHECK_ALL_CPU_ONLY=1 scripts/check_all.sh` | CPU, ~5 s | 10 gates, PASS |
 | o mesmo com `build/check-tuning` renomeado | CPU, ~5 s | **9 gates, PASS** (achado F3) |
 | `git archive aa15eea include src` + `g++` do probe antigo + `gen_forged_gguf.py` | CPU, ~10 s | a tabela antes/depois da §7.1 da auditoria **reproduzida linha a linha** |
@@ -566,10 +566,12 @@ orçamento em `device.h` e do sítio de checagem em `main.hip:918-925`.
 ## O que eu **não** consegui verificar (e por quê)
 
 1. **A medida que fecha F5** (PPL a 8192 chaves, `RD_ATTN_SPLITS` 15/16/default, ordem rotacionada):
-   **abandonada na fila da GPU**. Das ~1500 s em que o comando existiu, ~260 s foram espera de
-   `flock` com 11-12 processos na frente e um `rdna4-infer` de outra frente segurando 12,02 GiB; o
-   `timeout 900` que a regra 2 do contrato exige não cobre a espera **mais** as 6 corridas de PPL
-   (~9 min). O desenho completo está no diário (entrada 13) e é re-executável em uma janela livre.
+   **abandonada na fila da GPU**: ~4,5 min de espera de `flock` (11-12 processos na frente, um
+   `rdna4-infer` de outra frente segurando 12,0-12,9 GiB), e depois a primeira corrida de PPL passou
+   de **7 min** sem terminar com a máquina carregada (load average ~8, outras frentes lendo o modelo
+   de `/mnt/raid0`); o `timeout 900` da regra 2 não cobre a espera **mais** 6 corridas, e eu matei o
+   meu próprio comando para devolver o lock à fila. **Zero pontos de dados.** O desenho completo está
+   no diário (entrada 13) e é re-executável em uma janela livre.
    **Consequência**: F5 fica com a garantia por construção e sem a medida — eu não afirmo que há
    regressão, afirmo que a evidência que o doc apresenta não cobre a combinação embarcada.
 2. **Os números da tabela final do README** (30,4 / 29,3 / 26,7 / 19,3 / 14,0 tok/s, 72,9 prefill):

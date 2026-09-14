@@ -247,12 +247,17 @@ GPU desta frente foram feitas depois disso e ficaram **na fila** (ver entrada 13
   `timeout 900 ./scripts/gpu-lock.sh bash /tmp/attn-wpb-ppl.sh`, que roda
   `rdna4-infer ppl -m IQ3_S -f reference/data/wikitext-2-raw/wiki.test.raw --ctx-size 8192
   --stride 8192 --chunks 2 --no-stats` com `RD_ATTN_SPLITS` = 15, 16, default, 16, 15, default.
-- **Resultado**: **ABANDONADO (fila da GPU)**. O `flock` ficou com **12 esperando** e um
-  `rdna4-infer` de outra frente segurando 12,02 GiB durante toda a janela desta frente; o
-  `timeout 900` expira antes de a vez chegar e não houve nenhum PPL medido. A lacuna de evidência do
-  achado 10 **continua aberta** e este é o comando que a fecha (custa ~1,5 min por corrida depois do
-  lock, 6 corridas).
-- **Veredito**: ABANDONADO com o motivo medido (fila). Registrado no backlog como o gate que falta.
+- **Resultado**: **ABANDONADO (fila da GPU, com número)**. Cronologia medida: o comando entrou na
+  fila às 02:20 (`flock` com 11-12 processos esperando e um `rdna4-infer` de outra frente segurando
+  12,02-12,9 GiB), **conseguiu o lock ~4,5 min depois** (`window before: vram_used=1527418880`), e a
+  primeira corrida (`RD_ATTN_SPLITS=15`) **ficou >7 min sem terminar** (máquina com load average ~8,
+  outras frentes carregando o modelo de `/mnt/raid0` ao mesmo tempo): eram precisas 6 corridas de
+  ~4-5 min e o `timeout 900` (regra 2 do contrato) mataria o comando no meio, sem par completo.
+  **Matei o meu próprio comando** (regra 5) para devolver o lock às outras cinco frentes — o `fuser`
+  mostrou outro processo assumindo o lock 3 s depois. **Zero pontos de dados.**
+- **Veredito**: ABANDONADO com o motivo medido (fila + parede). A lacuna de evidência do achado 10
+  **continua aberta**; em janela livre o desenho custa ~30 s de lock por corrida (6 corridas, uma
+  aquisição de lock) e é o gate que falta (`rev-attn-wide-branch-gate` no backlog, posição 15).
 
 ## 14. `kv_row_bytes` devolve 0 para tipo desconhecido — o que quebra quando `q5_0`/`q4_1` entrarem?
 
