@@ -8,26 +8,39 @@ Formato: `docs/noite-regras.md` §5. Todo número diz o comando exato e a janela
 
 ## TL;DR (para quem só vai ler isto)
 
-1. **RoPE em posição longa: nenhum bug, nenhum scaling faltando.** O GGUF não tem
-   `rope.scaling.*`; o llama.cpp resolve `freq_scale=1,0`/`ext_factor=0,0` (nenhum
+1. **RoPE em posição longa: fórmula certa, NENHUM scaling faltando. Sem P0.** Os dois GGUF não
+   têm `rope.scaling.*`; o llama.cpp resolve `freq_scale=1,0`/`ext_factor=0,0` (nenhum
    YaRN/NTK/linear) e, para texto, o IMROPE do qwen35 **é** um RoPE split-half comum sobre
    `n_rot=64` (medido: `rel-L2 = 0,000e+00` contra o NEOX-64 do ggml, até 262 143). O nosso
-   kernel bate com o `ggml_rope_multi` real a `3,6e-4` de rel-L2 em 131 071 — que é o **piso
-   de fp32** (1 ulp de fase). Um YaRN×4 configurado daria 0,24-0,42: 3 ordens de grandeza
-   acima. Gate novo: `check-rope-long-gpu` (§1, §2).
-2. **Qualidade por contexto**: a 512 o desvio motor↔llama.cpp é 0,185 % no pior chunk
-   (baseline M5: 0,250 %); os pontos de 2K/4K/8K/14K estão em §6. A 131K **não foi medida
-   com texto real** dentro do `timeout 900` — o prefill em lote a 74,9 tok/s leva ~29 min só
-   para encher o KV (§5.2).
-3. **Curva da atenção** (f16, ×16 camadas): 1,16 ms/token a 4K → 3,89 (16K) → 15,47 (64K) →
-   **30,93 (131K)**; a política de splits que embarca está a ≤5 % do ótimo em todos eles, e a
-   melhor célula alternativa (4 splits × 16 warps) vale 0,05-0,18 ms/token a 4K/16K (§3.1).
-4. **GQA 6:1**: com **f16** (onde o motor vive, 4K-16K) compartilhar K/V **perde 1,1-1,8×
-   medido** — a releitura 6× é servida pelo cache a 1,67 TB/s e o gargalo é paralelidade
-   (CTAs). Com **q4_0 a 64K/131K** (o KV que cabe de verdade nesses contextos) o protótipo C
-   `HG=3` é **9,5-11,8 % mais rápido** que o kernel que embarca (2,1-3,3 ms/token ≈ 4 % do
-   passo) porque corta as passadas de desquantização de 6 para 2. Recomendação: **não
-   implementar para 4K-16K; levar o protótipo adiante para q4_0 longo** (§4.3).
+   kernel bate com o `ggml_rope_multi` real a `3,6e-4` em 131 071 = **piso do fp32** (1 ulp de
+   fase). Um YaRN×4 configurado daria 0,24-0,42: 3 ordens de grandeza acima. Gate novo:
+   `check-rope-long-gpu` (§1, §2).
+2. **Fim-a-fim em posição longa (17 639 tokens, prefill em lote nos dois lados): os 5 primeiros
+   ids são os mesmos, na mesma ordem, argmax 16 nos dois**; |Δlogit| de 0,085-0,118, do qual
+   −0,0995 é deslocamento uniforme (invariante no softmax) ⇒ espalhamento real de ±0,018 contra
+   gaps de 0,16-0,64 (§6.2).
+3. **Qualidade vs contexto (PPL por posição, mesma janela nos dois motores): o desvio do motor
+   NÃO cresce com o contexto** — 0,185 % (512) → 0,163 % (2 048) → 0,108 % (14 336). A 14K o
+   dNLL médio é **plano** por faixa de posição (−0,0017 / −0,0008 / −0,0010 / −0,0008) (§6.1).
+4. **Curva da atenção (×16 camadas)**: 1,16 ms/token a 4K → 3,89 (16K) → 15,5 (64K f16) / 18,4
+   (q8_0) / 19,9 (q4_0) → 30,8 (131K f16) / 36,2 (q8_0) / 38,1 (q4_0). A atenção sai de ~3 % do
+   passo a 4K para ~53 % a 131K (§3.1, §3.3). **`q8_0` é mais rápido que `q4_0`** a 64K/131K
+   apesar de mover 1,9× mais bytes (o `q4_0` paga desempacotamento de nibble).
+5. **Política de splits**: a que embarca está a ≤5 % do ótimo a 4K/16K (piso de ruído 0,995-1,000)
+   e **não é o ótimo a 131K q4_0**: 48×16 é 1,064× melhor (2,33 ms/token = 3,3 % do passo) —
+   confirma a frente de autotuning de forma independente (§3.5).
+6. **GQA 6:1**: com **f16** (4K-16K, onde o motor vive) compartilhar K/V **perde 1,1-1,8×** —
+   a releitura 6× é servida pelo cache a 1,67 TB/s medidos e o gargalo é paralelidade (CTAs).
+   Com **q4_0/q8_0 a 64K/131K** o protótipo `HG=3` (2 passadas, mesma grade, 6× menos CTAs) é
+   **9-12 % mais rápido** que o kernel que embarca (2,1-3,3 ms/token ≈ 4 % do passo), com
+   equivalência numérica medida. Recomendação: **não implementar para 4K-16K; levar adiante só
+   para KV quantizado em contexto longo** (§4.2-4.3).
+7. **Decode a 64K/131K com cache sintético** (o que o baseline reporta): 19,24 tok/s (64K q8_0,
+   13,75 GiB), 19,92 (64K f16, 15,62 GiB), **14,09 (131K q4_0, 13,87 GiB)**; **zero derrame para
+   GTT** nas três (§3.4).
+8. **131K de verdade não foi medido**: o prefill em lote medido é 64,5 tok/s a 17,6K ⇒ ~33 min
+   só para encher o KV de 131K, fora do `timeout 900`. Os números de 128K do README são cache
+   sintético (§5.2, §5.4). **É o buraco a fechar na manhã.**
 
 ---
 
@@ -35,6 +48,7 @@ Ferramenta oficial de perfil (`rocprof`/`omniperf`) **não existe nesta máquina
 (`noite-regras.md` §3.5): tudo abaixo é evento HIP, `bench --layers`, A/B e subtração.
 
 ---
+
 
 ## 1. RoPE em posição longa: o que a referência realmente faz (leitura + medição)
 
@@ -216,6 +230,93 @@ medido como 3 células independentes).
 
 ---
 
+### 3.2 Onde o tempo do passo vai (motor real, `bench-phases-gpu --level 2`)
+
+Comandos (timeout dentro do lock): `./scripts/gpu-lock.sh timeout 850 ./build/bench-phases-gpu
+<modelo> --ctx <n> --pos <n-64> --tokens 24 --level 2 --kv-k T --kv-v T` (16K/64K f16 e 131K
+q4_0). A tabela preenchida sai daqui; os números de referência que já existiam no repo, para
+comparação, são: passo de **45 ms/token a 4K**, **174 ms a 64K (f16)**, e a atenção a 64K
+q4_0 = **20,97 ms** (38 % do passo) — `docs/medicoes-banda-e-gargalos.md` §3.2.
+
+| ctx / KV | passo (ms/token) | atenção (ms) | fatia | matvec (ms) | GB/s do matvec | splits |
+|---|---|---|---|---|---|---|
+| 16 384 f16 | (job A2) | | | | | |
+| 65 536 f16 | (job A2) | | | | | |
+| 131 072 q4_0 | (job A2) | | | | | |
+
+Estimativa independente (com os números da autotuning + baseline, para o relatório ter a
+ordem de grandeza mesmo se o bench não rodar): a 131K q4_0 o passo é **71,4 ms** (14,0 tok/s)
+e a atenção medida por camada é 2,446 ms × 16 = **39,1 ms ⇒ ~55 % do passo é atenção**.
+A 64K f16 o passo é 174 ms e a atenção 0,9955 × 16 = 15,9 ms ⇒ ~9 %.
+
+### 3.3 Curva da atenção por **tipo de KV** (a comparação que faltava a 64K+)
+
+Comandos: `./scripts/gpu-lock.sh timeout 900 ./build/bench-attn-gpu <tipo> <ctx...> --splits 16
+--wpb 8` (job C) e a varredura completa em f16 (job A). Números por camada × 16 = ms/token do
+passo; "fatia" usa o tok/s de decode do baseline (`docs/medicoes-m5.md`, cache sintético).
+
+| ctx | f16 (ms/layer → ms/token) | q8_0 | q4_0 | passo medido (tok/s) | fatia da atenção (q4_0/q8_0) |
+|---|---|---|---|---|---|
+| 4 096 | 0,0723 → **1,16** | — | — | 28,6 (34,9 ms) | 3 % |
+| 16 384 | 0,2429 → **3,89** | — | — | 26,7 (37,5 ms) | 10 % |
+| 65 536 | 0,9671 → **15,47** | 1,1512 → **18,42** | 1,2428 → **19,88** | 19,3 q8_0 (51,8 ms) | **36 %** |
+| 131 072 | 1,9234 → **30,77** | 2,2653 → **36,24** | 2,3837 → **38,14** | 14,0 q4_0 (71,4 ms) | **53 %** |
+
+- **A atenção sai de ~3 % do passo a 4K para ~53 % a 131K** (q4_0), com os dois tipos
+  quantizados medidos na mesma janela.
+- **q8_0 é mais rápido que q4_0** na atenção, a 64K (7,4 %) e a 131K (5,0 %), apesar de mover
+  ~1,9× mais bytes: o `q4_0` paga desempacotamento de nibble por elemento. Consequência
+  prática para a noite: se o KV `q5_0`/`q4_1` da frente KV tiver um caminho de leitura
+  vetorizado, ele deve ser **mais rápido e mais preciso** que o `q4_0` — e é isso que o
+  `kv_load8` do `q4_0` não faz hoje.
+
+### 3.4 Custo de decode a 64K/131K com cache sintético (o que o baseline reporta) — medido
+
+**Comando**: `./scripts/gpu-lock.sh timeout 900 ./build/rdna4-infer bench -m <modelo>
+--ctx-size <n> --start-pos <n-64> -n 32 --reps 3 --cache-type-k T --cache-type-v T`
+(`--start-pos` semeia o KV por kernel: é **custo**, não qualidade — o próprio binário imprime
+"[synthetic keys/values: cost measurement, not quality]").
+
+| ctx | KV | VRAM em uso (de 15,92 GiB) | **decode** | ms/token | GTT | banda efetiva |
+|---|---|---|---|---|---|---|
+| 65 536 | q8_0/q8_0 | **13,75 GiB** (2,18 livres) | **19,24 tok/s** | 52,0 | 75 MB | 231 GB/s |
+| 65 536 | f16/f16 | **15,62 GiB** (0,30 livres) | **19,92 tok/s** | 50,2 | 75 MB | 240 GB/s |
+| 131 072 | q4_0/q4_0 | **13,87 GiB** (2,05 livres) | **14,09 tok/s** | 71,0 | 75 MB | 170 GB/s |
+
+- **Nenhum derrame para GTT em nenhuma das três** (`mem_info_gtt_used` = 75 MB antes e depois;
+  a VRAM volta a 4,3 GB ao fim). **Contradição medida** com `docs/medicoes-banda-e-gargalos.md`
+  §2.4/§5 ("o caso 64K f16: 2,1 GB vão para GTT e o decode cai 8×, de 18,1 para 2,2-8,0 tok/s")
+  e com `docs/journal-noite.md:148` ("com f16 não cabe"): nesta árvore e nesta janela, **64K com
+  KV f16 CABE** — 15,62 GiB em uso de 15,92 (0,30 GiB livres), GTT inalterado em 75 MB e
+  **19,92 tok/s**, ou seja *mais* rápido que o `q8_0` (19,24) e sem penhasco nenhum.
+  Consequência para a decisão de default acima de 56K (`docs/backlog-noite.md` item 1): a troca
+  para `q8_0` continua defensável — mesmo tempo, o **dobro da precisão** — mas **não** pelo
+  motivo escrito ("matar o penhasco de 8× do GTT"), que não se reproduz aqui. Se alguém mediu o
+  penhasco, ou era outra configuração (MTP/`--layers` alocados junto) ou a janela estava suja;
+  fica como item a re-medir com o mesmo comando dos dois lados.
+- Os 131K em q4_0 a 14,09 tok/s reproduzem o 14,0 do baseline ✓ (mesma metodologia de cache
+  sintético, agora com a janela limpa documentada).
+
+### 3.5 Política de splits a 64K/131K — confirmação independente (job H)
+
+Comando: `./scripts/gpu-lock.sh timeout 850 ./build/bench-attn-gpu <tipo> 131072 --splits
+8,16,24,32,48 --wpb 8,16 --smax 48` (e o mesmo a 64K). Piso de ruído 1,000-1,003×.
+
+| ctx / KV | política que embarca (16×8) | melhor célula | ganho | ms/token em jogo |
+|---|---|---|---|---|
+| 131 072 q4_0 | 2,4315 ms | **48×16 = 2,2859** | **1,064× (6,4 %)** | 2,33 ms (3,3 % do passo) |
+| 131 072 q8_0 | 2,3420 | **24×16 = 2,2721** | 1,031× (3,1 %) | 1,12 ms |
+| 131 072 f16 | (0,991× medido no job A: 16×8 = 1,9330) | 24×16 = 1,9406 | 0,996× (nada) | — |
+
+- **Confirma de forma independente a frente de autotuning** (`docs/autotuning-gfx1201.md` §3.2:
+  "24/32/48/64 splits ≥ 8-16 splits, exceto no KV q4_0 a 131K", e o `kAttnSplitWpbWide` já
+  embarcado): a 131K **q4_0** a política de 16×8 **não é o ótimo** — 48×16 é 6,4 % melhor. A
+  131K **f16** os 24 splits não ajudam (0,996×), como o job A mediu na varredura completa.
+- Isto é uma decisão de política que depende do **tipo de KV** (o número de splits ótimo cresce
+  quando a linha é pequena) e está registrada como candidata em `docs/autotuning-gfx1201.md` §5.
+
+---
+
 ## 4. GQA 6:1 — quanto custa a releitura, e o compartilhamento compensa?
 
 - **Referência**: `docs/kv-memoria-desenho.md` §4.2 (tabela lógica vs única),
@@ -252,6 +353,146 @@ medido como 3 células independentes).
 - **Resultado / veredito**: §4.1.
 
 ---
+
+### 4.1 Resultado medido (atenção sintética, `bench-attn-gpu`)
+
+**Comando**: `./scripts/gpu-lock.sh timeout 900 ./build/bench-attn-gpu f16 4096 16384 --splits 8 --wpb 8 --gqa-hg 6,3,2,1`
+(+ as corridas de 64K/131K e q4_0/q8_0 em §4.2). Coordenação: 24 cabeças de consulta / 4 KV,
+head_dim 256, 1 token de consulta, **por camada** (× 16 camadas para ms/token).
+Piso de ruído da própria corrida: **0,999× (4K) e 0,998× (16K)** (o mesmo kernel sem split
+medido como 3 células independentes, mínimo de 3 rodadas).
+
+**Recursos dos kernels** (`hipFuncGetAttributes`; `multiProcessorCount` = 32 = **32 WGP** =
+64 CU, conforme `docs/rdna4-gfx1201-hardware-brief.md:9`; o joelho de ocupação é ~96 VGPR):
+
+| kernel | VGPR/lane | derrame | leitura |
+|---|---|---|---|
+| `attn_kernel<f16>` (sem split) | 95 | 0 B | no joelho de ocupação |
+| `attn_split_kernel<f16>` | 97 | 0 B | no joelho |
+| `attn_gqa_kernel<f16>` (**protótipo B do M7**) | 42 | **1232 B** | derrama 1,2 KB por lane |
+| `gqa_split HG=6` (protótipo C) | 68 | 400 B | derrama pouco |
+| `gqa_split HG=3` | 125 | 0 B | sem derrame |
+| `gqa_split HG=1` | 56 | 0 B | sem derrame |
+| `attn_merge_kernel` | 10 | 0 B | — |
+
+| t (chaves) | ship (split 8×8) ms | gqa-split HG=1 ms | HG=3 ms | HG=6 ms | HG=6 vs ship | HG=6 vs HG=1 | protótipo B (M7) ms | piso de ruído |
+|---|---|---|---|---|---|---|---|---|
+| 4 097 | **0,0715** | 0,1358 | 0,1293 | 0,1694 | 2,37× mais lento | 1,25× mais lento | 5,168 | 0,999× |
+| 16 385 | **0,2343** | 0,2652 | 0,2657 | 0,4834 | 2,06× mais lento | 1,82× mais lento | 20,149 | 0,998× |
+
+- **Equivalência numérica**: todos os HG medem `rel-L2 = 3,2e-07` (4K) e `6,3e-07` (16K)
+  contra o kernel sem split — o mesmo valor que o kernel com splits que embarca (3,24e-07 /
+  6,45e-07). O protótipo C está correto; e o `HG=1` (seis passadas, mesmo tráfego do kernel
+  que embarca) mede o mesmo, o que fecha a checagem de que a grade `(4,S)` com passadas
+  sequenciais não introduz erro.
+- **O que isso diz, com o número**: com a **mesma grade** `(4,S)`, cortar o tráfego de K/V
+  em 6× (`HG=1` → `HG=6`) deixa o kernel **1,25× (4K) e 1,82× (16K) MAIS LENTO**. Ou seja:
+  a releitura 6× **não é o gargalo** nesses contextos — ela é absorvida pelo cache — e o
+  custo de servir 6 cabeças por CTA (laço serial de 6 reduções/softmax por linha + pressão
+  de registrador: 68 VGPR e 400 B de derrame no HG=6, contra 56 VGPR e 0 B no HG=1) é maior
+  que os bytes economizados.
+- **Correção de leitura do repo**: `docs/medicoes-banda-e-gargalos.md` §3.2 lê "1.315 GB/s
+  emitidos a 16K = limitada por cache (88 % do IC)" como prova de que a atenção é limitada
+  por cache. Essa banda é **derivada do tempo medido** (bytes emitidos ÷ tempo), então não é
+  evidência independente do limitador; o experimento HG=1 vs HG=6 no mesmo grid é: se a
+  banda fosse o limitador, 1/6 dos bytes teria que ser ≥1× mais rápido. Não é. O limitador
+  mensurável é a **paralelidade (CTAs)**: o mesmo kernel com grade `(24,S)` ganha 4,73× (4K)
+  e 5,62× (16K) do kernel sem split, e com grade `(4,S)` perde ~1,9×/1,1× para ele.
+- **Sobre o protótipo B do M7**: os 8-12× de lentidão têm agora **duas** causas medidas — o
+  derrame de **1232 B/lane** (42 VGPR alocados, o compilador preferiu derramar) e a grade de
+  4 CTAs. A hipótese "grade estreita" que o `docs/rocm-estudo.md` §D.8 registrou estava
+  incompleta: metade do problema é registrador.
+
+### 4.2 GQA 6:1 — a resposta completa (f16, 4K→131K), e onde o compartilhamento ganha
+
+Tabela de `bench ms` por **camada** (1 token de consulta, 24 cabeças / 4 KV); ×16 camadas =
+ms/token. Piso de ruído medido em cada contexto: 0,995-1,000×.
+
+| ctx | sem split | **embarca** (grid 24×S) | GQA HG=1 (6 passadas) | HG=3 (2 passadas) | HG=6 (1 passada) | GQA S=24 HG=3 | ganho do GQA vs embarca |
+|---|---|---|---|---|---|---|---|
+| 4 097 | 0,3434 | **0,0723** (S=8) | 0,1358 | 0,1293 | 0,1694 | — | **0,56× (perde 1,8×)** |
+| 16 385 | 1,3433 | **0,2429** (S=16) | 0,2652 | 0,2657 | 0,4834 | — | **0,91× (perde 1,1×)** |
+| 65 537 | 6,5226 | **0,9671** (S=16) | 2,5523 | 1,0378 | 1,5059 | — | 0,93× (perde 1,07×) |
+| 131 073 | 13,0183 | 1,9234 (S=16) / 2,0866 (S=24) | 5,0749 | 2,0536 (S=16) | 3,9803 | **1,7793** (S=24) | **1,08× vs S=16; 1,17× vs S=24** |
+| protótipo B (M7) | — | — | 5,168 / 20,149 / 79,2 / 160,7 | | | | 0,014-0,012× (72-86× mais lento) |
+
+- **4K/16K (onde o motor passa a vida): compartilhar K/V não compensa.** Com a mesma grade,
+  cortar o tráfego 6× (HG=1→HG=6) deixa o kernel **1,25× (4K) e 1,82× (16K) mais lento**: a
+  releitura 6× é absorvida pelo Infinity Cache e o que custa é servir 6 cabeças por CTA
+  (laço serial de reduções/softmax + registrador: HG=6 = 68 VGPR **e 400 B de derrame**,
+  HG=1 = 56 VGPR sem derrame). A grade de 4 CTAs por split não substitui a de 24.
+- **131K f16: aí sim o tráfego pesa** — HG=1 (6× tráfego) explode para 5,07 ms e o HG=6 (1× )
+  fica em 3,98 ms; e com **S=24** o HG=3 chega a **1,7793 ms**, ou seja **1,08× mais rápido que
+  a política de 16 splits** (2,3 ms/token × 16 camadas = ~3 % do passo a 131K) e 1,17× mais
+  rápido que o mesmo kernel que embarca com 24 splits (2,0866). **Mas 131K f16 não cabe na
+  VRAM** (8 GiB de KV + 11,2 de pesos): o tipo que a noite pode usar a 131K é q4_0 (§4.3).
+- **Recomendação (com o número)**: **não implementar atenção agrupada por GQA para os
+  contextos onde o motor vive (4K-16K): perde 1,1-1,8× medido.** A 131K f16 ela ganha 8 %, e o
+  número que justifica ou mata isso é o de q4_0/q8_0 a 131K (§4.3) — se lá o kernel for
+  limitado por desquantização (como a frente de banda mediu: 346-372 GB/s emitidos contra um
+  teto de cache de ~1,6 TB/s), o ganho de tráfego não se converte e a resposta continua "não
+  vale". Independentemente disso, o custo de implementação não é o de um ajuste: é um kernel
+  novo com merge próprio (o protótipo C tem 130 linhas e um parâmetro HG).
+- **O que a releitura 6× custa de fato, medido**: em 131K f16 uma execução do kernel que
+  embarca move `24 cabeças × 131 072 chaves × 1 024 B (K+V) = 3,22 GB` de tráfego **emitido**
+  em 1,9234 ms = **1,67 TB/s** de L2 (contra 279 GB/s de bytes *únicos*, `2 × 268 MB`). Ou
+  seja: o 6× está sendo **servido pelo cache** a 1,67 TB/s, não indo à DRAM. Um kernel que
+  elimina a releitura economiza bytes de L2 que não são o gargalo a 4K/16K (medido: HG=6 é
+  mais lento que HG=1 lá) e que só passam a pesar a 131K (medido: HG=1 2,6× pior que HG=3).
+
+### 4.3 q4_0 e q8_0 a 64K/131K — onde o compartilhamento **ganha** (e por quê)
+
+Tabela atualizada com o **q8_0** (job C completo, `--splits 16 --wpb 8`, grade do protótipo
+`4×16`, piso de ruído 1,000-1,009× em todas as linhas):
+
+| ctx / KV | embarca 16×8 | **GQA HG=3** (S=16) | ganho | ms/token em jogo (×16) |
+|---|---|---|---|---|
+| 65 536 q4_0 | 1,2428 | **1,1115** | **11,8 %** | 2,10 ms |
+| 131 072 q4_0 | 2,3837 | **2,1767** | **9,5 %** | 3,31 ms |
+| 65 536 q8_0 | 1,1512 | **1,0558** | **9,0 %** | 1,53 ms |
+| 131 072 q8_0 | 2,2653 | **2,0775** | **9,0 %** | 3,00 ms |
+| 65 536 f16 | 0,9671 | 1,0378 | −7,3 % (perde) | −1,13 ms |
+| 131 072 f16 | 1,9234 (S=16) | 2,0536 (S=16) / **1,7793** (S=24) | −6,8 % / **+8,1 %** | +2,30 ms (S=24) |
+
+- **Efeito colateral útil para a escolha de KV**: a atenção com **q8_0 é mais rápida que com
+  q4_0** nos dois contextos (64K: 1,1512 vs 1,2428 ms = 7,4 %; 131K: 2,2653 vs 2,3837 = 5,0 %)
+  **apesar de mover ~1,9× mais bytes** — confirma de forma independente o que a frente de banda
+  suspeitava (a 64K+ o `q4_0` é limitado pelo desempacotamento de nibble, não por banda) e
+  reforça o alvo da noite (K/V quantizado mais largo é mais rápido *e* mais preciso).
+
+
+Mesmo comando de §4.1, com `--splits 16 --wpb 8` (a política que embarca nesses contextos) e
+`--gqa-hg 6,3,2,1` (grade `4×16` no protótipo C). Piso de ruído: **1,009× (64K q4_0)** e
+**1,000× (131K q4_0)** — as diferenças abaixo estão muito acima dele.
+
+| ctx / KV | sem split | **embarca** 16×8 | GQA HG=2 | **GQA HG=3** | GQA HG=6 | protótipo B (M7) | **HG=3 vs embarca** | ms/token em jogo (×16) |
+|---|---|---|---|---|---|---|---|---|
+| 65 536 q4_0 | 6,6315 | **1,2428** | 1,2753 | **1,1115** | 1,3933 | 82,473 | **1,118× (11,8 % mais rápido)** | 2,10 ms |
+| 131 072 q4_0 | 13,6355 | **2,3837** | 2,5176 | **2,1767** | 3,7435 | 160,414 | **1,095× (9,5 % mais rápido)** | 3,31 ms |
+| 131 072 f16 | 13,0183 | 1,9234 (16×8) | 2,5817 | 2,0536 (S=16) / **1,7793 (S=24)** | 3,9803 | 160,703 | 0,94× (S=16) / **1,08× (S=24)** | −3,3 ms (S=24) |
+| 65 536 f16 | 6,5226 | 0,9671 | 1,3105 | 1,0378 | 1,5059 | 79,211 | 0,93× | −1,13 ms |
+| 16 385 f16 | 1,3433 | 0,2429 | 0,2834 | 0,2657 | 0,4834 | 20,398 | 0,91× | −0,36 ms |
+| 4 097 f16 | 0,3434 | 0,0723 | 0,1397 | 0,1293 | 0,1694 | 5,296 | 0,56× | −0,91 ms |
+
+- **O padrão é coerente e tem mecanismo**: o protótipo C **ganha onde a linha de KV é
+  pequena** (q4_0: 144 B por chave) e **perde onde é grande** (f16: 512 B). Com q4_0 o kernel
+  que embarca paga desquantização/issue por linha lida 6× (a frente de banda já tinha medido
+  346-372 GB/s emitidos contra um teto de cache de ~1,6 TB/s: é issue, não banda), e o
+  agrupamento por GQA com `HG=3` reduz essas passadas de 6 para **2** — corta exatamente o
+  trabalho que é o gargalo. Com f16 a linha é grande, o kernel fica limitado por banda de
+  cache (1,67 TB/s medidos) e aí o que importa é a paralelidade (CTAs), que o agrupamento
+  tira.
+- **Recomendação (com o número)**: **não implementar para 4K-16K f16** (perde 1,1-1,8×
+  medido — é onde o motor passa a vida) e **levar o protótipo adiante para q4_0 a 64K/131K**,
+  onde ganha **9,5-11,8 % (2,1-3,3 ms/token, ~4 % do passo)** já com `S=16` (mesma grade do
+  kernel que embarca, 6× menos CTAs) e com equivalência numérica medida (`rel-L2 1,1e-06` a
+  64K e `1,6e-06` a 131K, o mesmo valor do caminho com split que embarca).
+- **O que falta para fechar**: comparar contra a **melhor célula** do kernel que embarca (24/32
+  splits, que a frente de autotuning mediu como melhores em q4_0 a 131K) — está na fila
+  (`bench-attn-gpu q4_0 131072 --splits 8,16,24,32,48 --wpb 8,16`), e o q8_0 a 64K/131K
+  (o tipo que a frente de banda deixou "não medido"), também na fila. Se a melhor célula do
+  kernel que embarca chegar perto de 2,18 ms, o ganho do GQA a 131K some e a recomendação
+  volta a "não vale".
 
 ## 5. Achados colaterais (bugs encontrados, com evidência)
 
@@ -307,6 +548,51 @@ nenhuma frente — este é o número que falta para a manhã.
 
 ---
 
+### 5.3 `timeout` fora do `gpu-lock.sh` queima o orçamento esperando a fila (medido, com custo)
+
+- **O contrato manda** `timeout 900 ./scripts/gpu-lock.sh <cmd>`, mas com sete frentes na
+  mesma placa o `flock` espera. O `timeout` começa a contar **antes** do lock, então os 900 s
+  são consumidos na fila: a minha primeira corrida do `compare_ppl.sh` de 512 morreu com
+  **RC=124 no meio do prefill** depois de ~11 min de espera (log `/tmp/longctx-ppl512.log`:
+  `RC=124` com a linha "== this engine:" já impressa e o motor ainda rodando).
+- **Correção usada nesta frente**: `./scripts/gpu-lock.sh timeout 900 <cmd>` — o timeout passa
+  a valer só para o trabalho, e a espera de fila fica limitada pelo `flock -w 3600` do próprio
+  wrapper (que já existe para isso). Todos os comandos deste diário a partir de §4 usam essa
+  forma. **Vale para as outras frentes**: quem rodar `timeout` por fora perde a corrida inteira
+  quando a placa está ocupada.
+
+### 5.4 O que **não** foi medido, com o motivo e a receita
+
+- **Diff de nó (Qcur/Kcur pós-RoPE) numa posição longa** contra o dump do llama.cpp: é o que
+  fecharia o item 1 do briefing com nó em vez de argmax. O dump só dá os valores de um grafo
+  cujo último *ubatch* tem 1 token (`scripts/capture_oracle.sh` usa `UB=1` por isso), então são
+  **N grafos de 1 token**; a 16 385 tokens isso é 16 385 decodes per-token (CPU ~3 tok/s =
+  1,5 h; Vulkan ~15-25 tok/s = 11-18 min, acima do `timeout 900`) e o dump com filtro de
+  tensores fica pequeno (~20 nós/grafo), mas o tempo não cabe na noite.
+  Receita para a manhã: `UB=1 NGL=99` + filtro de nomes (`^Qcur$ ^Kcur$ ^attn_pregate$`) num
+  prompt de ~16K, e então `GRAPH_LAST_TOKEN=1 ./build/check-graph-gpu <modelo> <dump> -`.
+  Com `-ub 16` (barato) o último grafo tem 16 tokens e os "últimos 3 valores" do nó passam a
+  ser do token 15, não do último — por isso `UB=1` é obrigatório.
+- **Qualidade a 64K/131K**: fora do alcance por tempo (§5.2). O que existe hoje a 131K são
+  medidas de *decode* com cache sintético (`bench --start-pos`), não texto real.
+
+OBS de merge: `scripts/gpu-lock.sh` **não** está nos meus commits — a correção de
+reentrância que o coordenador aplicou nos 5 worktrees está no meu working tree como alteração
+não commitada (`if [ "${GPU_LOCK_HELD:-0}" = 1 ]; then exec "$@"; fi`). Meus commits são
+`tests/` + `docs/` + `CMakeLists.txt` apenas (regra do briefing).
+
+### 5.5 O lock da GPU ficou preso num auto-deadlock de outra frente (03:00)
+
+Árvore medida às 03:00 (`pstree -p 27622`):
+`flock(27622, segura) → bash /tmp/matrix-mtp.sh → timeout 3600 /tmp/mtp-matrix.sh → timeout 900
+./scripts/gpu-lock.sh ./build/rdna4-infer run … → flock(30740), ESPERANDO o lock que o próprio
+avô segura`. É a armadilha que o cabeçalho do `scripts/gpu-lock.sh` descreve (flock não é
+reentrante entre processos; um script que trava por dentro de uma corrida travada espera o
+próprio pai até o timeout). Consequência: ~2,25 h de espera improdutiva (9 configs × 900 s),
+VRAM em 198 MB (nenhum kernel rodando) e **todas as frentes paradas atrás do lock**.
+Reportado ao coordenador (não matei processo de outra frente, regra §1.5). Este é o motivo de
+todo comando desta frente entre 02:43 e o fim do bloqueio aparecer como "esperando" no diário.
+
 ## 6. Qualidade vs contexto: PPL por posição, motor vs llama.cpp
 
 - **Referência**: `scripts/compare_ppl.sh` (mesma tiling do `llama-perplexity --ppl-stride`:
@@ -329,6 +615,22 @@ nenhuma frente — este é o número que falta para a manhã.
 - **Resultado**: §6.1 (PPL) e §6.2 (posição longa).
 
 ### 6.1 PPL por posição — resultado medido
+
+**Tabela consolidada (mesma metodologia em todos os pontos: mesma janela e mesmos ids nos
+dois motores, desvio por chunk e por posição; o critério do script é 1 % por chunk):**
+
+| ctx (janela) | chunks | PPL motor | PPL llama.cpp | **pior desvio de chunk** | pior \|dNLL\| de uma posição |
+|---|---|---|---|---|---|
+| 512 (768) | 6 | 3,8231…7,7695 | 3,8160…7,7698 | **0,185 %** | 0,458 |
+| 2 048 (3 072) | 2 | 5,9218 / 8,3859 | 5,9222 / 8,3722 | **0,163 %** | 0,434 |
+| 4 096 (6 144) | 1 | (job B, na fila) | | | |
+| 8 192 (10 240) | 1 | (job B, na fila) | | | |
+| 14 336 | 1 | 3,9792 | 3,9835 | **0,108 %** | 0,929 |
+
+- **O desvio do motor NÃO cresce com o contexto**: 0,185 % (512) → 0,163 % (2K) → 0,108 %
+  (14K). Se houvesse um erro de posição/limite/overflow no caminho longo, este número subiria
+  com o contexto; ele *cai*.
+- A cauda de uma posição isolada fica em 0,43-0,46 nats até 2K e 0,93 a 14K.
 
 **Ponto de 14K (o mais longo que a noite alcança em PPL)**: janela única de **14 336 tokens**
 (1 chunk), posições pontuadas **6 144-14 335** (8 192 posições, cada uma com 6 144 a 14 336
@@ -377,156 +679,6 @@ janela: `mem_info_vram_used` 12,9 GB no início — o lock foi esperado dentro d
   M5 — o harness e o binário deste worktree reproduzem o baseline dígito a dígito.
 - `compare-ppl: OK` (o critério do script é 1 % por chunk).
 
-### 4.1 Resultado medido (atenção sintética, `bench-attn-gpu`)
-
-**Comando**: `./scripts/gpu-lock.sh timeout 900 ./build/bench-attn-gpu f16 4096 16384 --splits 8 --wpb 8 --gqa-hg 6,3,2,1`
-(+ as corridas de 64K/131K e q4_0/q8_0 em §4.2). Coordenação: 24 cabeças de consulta / 4 KV,
-head_dim 256, 1 token de consulta, **por camada** (× 16 camadas para ms/token).
-Piso de ruído da própria corrida: **0,999× (4K) e 0,998× (16K)** (o mesmo kernel sem split
-medido como 3 células independentes, mínimo de 3 rodadas).
-
-**Recursos dos kernels** (`hipFuncGetAttributes`; `multiProcessorCount` = 32 = **32 WGP** =
-64 CU, conforme `docs/rdna4-gfx1201-hardware-brief.md:9`; o joelho de ocupação é ~96 VGPR):
-
-| kernel | VGPR/lane | derrame | leitura |
-|---|---|---|---|
-| `attn_kernel<f16>` (sem split) | 95 | 0 B | no joelho de ocupação |
-| `attn_split_kernel<f16>` | 97 | 0 B | no joelho |
-| `attn_gqa_kernel<f16>` (**protótipo B do M7**) | 42 | **1232 B** | derrama 1,2 KB por lane |
-| `gqa_split HG=6` (protótipo C) | 68 | 400 B | derrama pouco |
-| `gqa_split HG=3` | 125 | 0 B | sem derrame |
-| `gqa_split HG=1` | 56 | 0 B | sem derrame |
-| `attn_merge_kernel` | 10 | 0 B | — |
-
-| t (chaves) | ship (split 8×8) ms | gqa-split HG=1 ms | HG=3 ms | HG=6 ms | HG=6 vs ship | HG=6 vs HG=1 | protótipo B (M7) ms | piso de ruído |
-|---|---|---|---|---|---|---|---|---|
-| 4 097 | **0,0715** | 0,1358 | 0,1293 | 0,1694 | 2,37× mais lento | 1,25× mais lento | 5,168 | 0,999× |
-| 16 385 | **0,2343** | 0,2652 | 0,2657 | 0,4834 | 2,06× mais lento | 1,82× mais lento | 20,149 | 0,998× |
-
-- **Equivalência numérica**: todos os HG medem `rel-L2 = 3,2e-07` (4K) e `6,3e-07` (16K)
-  contra o kernel sem split — o mesmo valor que o kernel com splits que embarca (3,24e-07 /
-  6,45e-07). O protótipo C está correto; e o `HG=1` (seis passadas, mesmo tráfego do kernel
-  que embarca) mede o mesmo, o que fecha a checagem de que a grade `(4,S)` com passadas
-  sequenciais não introduz erro.
-- **O que isso diz, com o número**: com a **mesma grade** `(4,S)`, cortar o tráfego de K/V
-  em 6× (`HG=1` → `HG=6`) deixa o kernel **1,25× (4K) e 1,82× (16K) MAIS LENTO**. Ou seja:
-  a releitura 6× **não é o gargalo** nesses contextos — ela é absorvida pelo cache — e o
-  custo de servir 6 cabeças por CTA (laço serial de 6 reduções/softmax por linha + pressão
-  de registrador: 68 VGPR e 400 B de derrame no HG=6, contra 56 VGPR e 0 B no HG=1) é maior
-  que os bytes economizados.
-- **Correção de leitura do repo**: `docs/medicoes-banda-e-gargalos.md` §3.2 lê "1.315 GB/s
-  emitidos a 16K = limitada por cache (88 % do IC)" como prova de que a atenção é limitada
-  por cache. Essa banda é **derivada do tempo medido** (bytes emitidos ÷ tempo), então não é
-  evidência independente do limitador; o experimento HG=1 vs HG=6 no mesmo grid é: se a
-  banda fosse o limitador, 1/6 dos bytes teria que ser ≥1× mais rápido. Não é. O limitador
-  mensurável é a **paralelidade (CTAs)**: o mesmo kernel com grade `(24,S)` ganha 4,73× (4K)
-  e 5,62× (16K) do kernel sem split, e com grade `(4,S)` perde ~1,9×/1,1× para ele.
-- **Sobre o protótipo B do M7**: os 8-12× de lentidão têm agora **duas** causas medidas — o
-  derrame de **1232 B/lane** (42 VGPR alocados, o compilador preferiu derramar) e a grade de
-  4 CTAs. A hipótese "grade estreita" que o `docs/rocm-estudo.md` §D.8 registrou estava
-  incompleta: metade do problema é registrador.
-
-### 5.3 `timeout` fora do `gpu-lock.sh` queima o orçamento esperando a fila (medido, com custo)
-
-- **O contrato manda** `timeout 900 ./scripts/gpu-lock.sh <cmd>`, mas com sete frentes na
-  mesma placa o `flock` espera. O `timeout` começa a contar **antes** do lock, então os 900 s
-  são consumidos na fila: a minha primeira corrida do `compare_ppl.sh` de 512 morreu com
-  **RC=124 no meio do prefill** depois de ~11 min de espera (log `/tmp/longctx-ppl512.log`:
-  `RC=124` com a linha "== this engine:" já impressa e o motor ainda rodando).
-- **Correção usada nesta frente**: `./scripts/gpu-lock.sh timeout 900 <cmd>` — o timeout passa
-  a valer só para o trabalho, e a espera de fila fica limitada pelo `flock -w 3600` do próprio
-  wrapper (que já existe para isso). Todos os comandos deste diário a partir de §4 usam essa
-  forma. **Vale para as outras frentes**: quem rodar `timeout` por fora perde a corrida inteira
-  quando a placa está ocupada.
-
-### 5.4 O que **não** foi medido, com o motivo e a receita
-
-- **Diff de nó (Qcur/Kcur pós-RoPE) numa posição longa** contra o dump do llama.cpp: é o que
-  fecharia o item 1 do briefing com nó em vez de argmax. O dump só dá os valores de um grafo
-  cujo último *ubatch* tem 1 token (`scripts/capture_oracle.sh` usa `UB=1` por isso), então são
-  **N grafos de 1 token**; a 16 385 tokens isso é 16 385 decodes per-token (CPU ~3 tok/s =
-  1,5 h; Vulkan ~15-25 tok/s = 11-18 min, acima do `timeout 900`) e o dump com filtro de
-  tensores fica pequeno (~20 nós/grafo), mas o tempo não cabe na noite.
-  Receita para a manhã: `UB=1 NGL=99` + filtro de nomes (`^Qcur$ ^Kcur$ ^attn_pregate$`) num
-  prompt de ~16K, e então `GRAPH_LAST_TOKEN=1 ./build/check-graph-gpu <modelo> <dump> -`.
-  Com `-ub 16` (barato) o último grafo tem 16 tokens e os "últimos 3 valores" do nó passam a
-  ser do token 15, não do último — por isso `UB=1` é obrigatório.
-- **Qualidade a 64K/131K**: fora do alcance por tempo (§5.2). O que existe hoje a 131K são
-  medidas de *decode* com cache sintético (`bench --start-pos`), não texto real.
-
-OBS de merge: `scripts/gpu-lock.sh` **não** está nos meus commits — a correção de
-reentrância que o coordenador aplicou nos 5 worktrees está no meu working tree como alteração
-não commitada (`if [ "${GPU_LOCK_HELD:-0}" = 1 ]; then exec "$@"; fi`). Meus commits são
-`tests/` + `docs/` + `CMakeLists.txt` apenas (regra do briefing).
-
-### 5.5 O lock da GPU ficou preso num auto-deadlock de outra frente (03:00)
-
-Árvore medida às 03:00 (`pstree -p 27622`):
-`flock(27622, segura) → bash /tmp/matrix-mtp.sh → timeout 3600 /tmp/mtp-matrix.sh → timeout 900
-./scripts/gpu-lock.sh ./build/rdna4-infer run … → flock(30740), ESPERANDO o lock que o próprio
-avô segura`. É a armadilha que o cabeçalho do `scripts/gpu-lock.sh` descreve (flock não é
-reentrante entre processos; um script que trava por dentro de uma corrida travada espera o
-próprio pai até o timeout). Consequência: ~2,25 h de espera improdutiva (9 configs × 900 s),
-VRAM em 198 MB (nenhum kernel rodando) e **todas as frentes paradas atrás do lock**.
-Reportado ao coordenador (não matei processo de outra frente, regra §1.5). Este é o motivo de
-todo comando desta frente entre 02:43 e o fim do bloqueio aparecer como "esperando" no diário.
-
-### 4.2 GQA 6:1 — a resposta completa (f16, 4K→131K), e onde o compartilhamento ganha
-
-Tabela de `bench ms` por **camada** (1 token de consulta, 24 cabeças / 4 KV); ×16 camadas =
-ms/token. Piso de ruído medido em cada contexto: 0,995-1,000×.
-
-| ctx | sem split | **embarca** (grid 24×S) | GQA HG=1 (6 passadas) | HG=3 (2 passadas) | HG=6 (1 passada) | GQA S=24 HG=3 | ganho do GQA vs embarca |
-|---|---|---|---|---|---|---|---|
-| 4 097 | 0,3434 | **0,0723** (S=8) | 0,1358 | 0,1293 | 0,1694 | — | **0,56× (perde 1,8×)** |
-| 16 385 | 1,3433 | **0,2429** (S=16) | 0,2652 | 0,2657 | 0,4834 | — | **0,91× (perde 1,1×)** |
-| 65 537 | 6,5226 | **0,9671** (S=16) | 2,5523 | 1,0378 | 1,5059 | — | 0,93× (perde 1,07×) |
-| 131 073 | 13,0183 | 1,9234 (S=16) / 2,0866 (S=24) | 5,0749 | 2,0536 (S=16) | 3,9803 | **1,7793** (S=24) | **1,08× vs S=16; 1,17× vs S=24** |
-| protótipo B (M7) | — | — | 5,168 / 20,149 / 79,2 / 160,7 | | | | 0,014-0,012× (72-86× mais lento) |
-
-- **4K/16K (onde o motor passa a vida): compartilhar K/V não compensa.** Com a mesma grade,
-  cortar o tráfego 6× (HG=1→HG=6) deixa o kernel **1,25× (4K) e 1,82× (16K) mais lento**: a
-  releitura 6× é absorvida pelo Infinity Cache e o que custa é servir 6 cabeças por CTA
-  (laço serial de reduções/softmax + registrador: HG=6 = 68 VGPR **e 400 B de derrame**,
-  HG=1 = 56 VGPR sem derrame). A grade de 4 CTAs por split não substitui a de 24.
-- **131K f16: aí sim o tráfego pesa** — HG=1 (6× tráfego) explode para 5,07 ms e o HG=6 (1× )
-  fica em 3,98 ms; e com **S=24** o HG=3 chega a **1,7793 ms**, ou seja **1,08× mais rápido que
-  a política de 16 splits** (2,3 ms/token × 16 camadas = ~3 % do passo a 131K) e 1,17× mais
-  rápido que o mesmo kernel que embarca com 24 splits (2,0866). **Mas 131K f16 não cabe na
-  VRAM** (8 GiB de KV + 11,2 de pesos): o tipo que a noite pode usar a 131K é q4_0 (§4.3).
-- **Recomendação (com o número)**: **não implementar atenção agrupada por GQA para os
-  contextos onde o motor vive (4K-16K): perde 1,1-1,8× medido.** A 131K f16 ela ganha 8 %, e o
-  número que justifica ou mata isso é o de q4_0/q8_0 a 131K (§4.3) — se lá o kernel for
-  limitado por desquantização (como a frente de banda mediu: 346-372 GB/s emitidos contra um
-  teto de cache de ~1,6 TB/s), o ganho de tráfego não se converte e a resposta continua "não
-  vale". Independentemente disso, o custo de implementação não é o de um ajuste: é um kernel
-  novo com merge próprio (o protótipo C tem 130 linhas e um parâmetro HG).
-- **O que a releitura 6× custa de fato, medido**: em 131K f16 uma execução do kernel que
-  embarca move `24 cabeças × 131 072 chaves × 1 024 B (K+V) = 3,22 GB` de tráfego **emitido**
-  em 1,9234 ms = **1,67 TB/s** de L2 (contra 279 GB/s de bytes *únicos*, `2 × 268 MB`). Ou
-  seja: o 6× está sendo **servido pelo cache** a 1,67 TB/s, não indo à DRAM. Um kernel que
-  elimina a releitura economiza bytes de L2 que não são o gargalo a 4K/16K (medido: HG=6 é
-  mais lento que HG=1 lá) e que só passam a pesar a 131K (medido: HG=1 2,6× pior que HG=3).
-
-### 3.2 Onde o tempo do passo vai (motor real, `bench-phases-gpu --level 2`)
-
-Comandos (timeout dentro do lock): `./scripts/gpu-lock.sh timeout 850 ./build/bench-phases-gpu
-<modelo> --ctx <n> --pos <n-64> --tokens 24 --level 2 --kv-k T --kv-v T` (16K/64K f16 e 131K
-q4_0). A tabela preenchida sai daqui; os números de referência que já existiam no repo, para
-comparação, são: passo de **45 ms/token a 4K**, **174 ms a 64K (f16)**, e a atenção a 64K
-q4_0 = **20,97 ms** (38 % do passo) — `docs/medicoes-banda-e-gargalos.md` §3.2.
-
-| ctx / KV | passo (ms/token) | atenção (ms) | fatia | matvec (ms) | GB/s do matvec | splits |
-|---|---|---|---|---|---|---|
-| 16 384 f16 | (job A2) | | | | | |
-| 65 536 f16 | (job A2) | | | | | |
-| 131 072 q4_0 | (job A2) | | | | | |
-
-Estimativa independente (com os números da autotuning + baseline, para o relatório ter a
-ordem de grandeza mesmo se o bench não rodar): a 131K q4_0 o passo é **71,4 ms** (14,0 tok/s)
-e a atenção medida por camada é 2,446 ms × 16 = **39,1 ms ⇒ ~55 % do passo é atenção**.
-A 64K f16 o passo é 174 ms e a atenção 0,9955 × 16 = 15,9 ms ⇒ ~9 %.
-
 ### 6.2 Posição longa de verdade: motor vs llama.cpp no MESMO ids
 
 **Comando (motor)**: `./scripts/gpu-lock.sh timeout 850 ./build/rdna4-infer run -m <modelo>
@@ -546,40 +698,51 @@ Medido até agora (o motor):
 - decode do 1 token seguinte: 37,6 ms (26,1 tok/s) a 17 639 de contexto.
 - **top-5 do motor na posição 17 638**: `16(16.786) 17(16.137) 18(15.497) 20(15.301) 19(15.115)`
   (o prompt termina numa sequência numérica; o modelo continua a lista).
-- Referência com o mesmo ids: **em fila** (a placa está ocupada por outras frentes com
-  `timeout 2400`/`5400` na fila); o resultado entra aqui quando rodar — §6.3.
+- **Referência com o mesmo ids** (llama.cpp Vulkan, `ORACLE_NUBATCH=512`, mesmo id stream):
 
-### 4.3 q4_0 e q8_0 a 64K/131K — onde o compartilhamento **ganha** (e por quê)
+| top-5 (posição 17 638) | id | logit |
+|---|---|---|
+| motor | **16** | 16,786 |
+| motor | 17 | 16,137 |
+| motor | 18 | 15,497 |
+| motor | 20 | 15,301 |
+| motor | 19 | 15,115 |
+| llama.cpp | **16** | 16,8713 |
+| llama.cpp | 17 | 16,2301 |
+| llama.cpp | 18 | 15,6146 |
+| llama.cpp | 20 | 15,3875 |
+| llama.cpp | 19 | 15,2302 |
 
-Mesmo comando de §4.1, com `--splits 16 --wpb 8` (a política que embarca nesses contextos) e
-`--gqa-hg 6,3,2,1` (grade `4×16` no protótipo C). Piso de ruído: **1,009× (64K q4_0)** e
-**1,000× (131K q4_0)** — as diferenças abaixo estão muito acima dele.
+- **Os cinco ids são os mesmos, na mesma ordem** (argmax 16 nos dois), em 17 639 tokens de
+  contexto. |Δlogit| = 0,085-0,118; desses, **−0,0995 é um deslocamento uniforme** (o softmax é
+  invariante a isso: não muda probabilidade nenhuma) e o que sobra é um espalhamento de
+  **−0,018 a +0,014** contra gaps de 0,157-0,641 entre os cinco primeiros. Ou seja: a 17,6K de
+  contexto o motor reproduz a distribuição da referência com erro relativo de ~2-3 % nos
+  candidatos do topo — e acerta o argmax.
+- Isto é a evidência fim-a-fim de posição longa que o briefing pedia no item 1 (no nível de
+  logits em vez de nó; o diff de nó está bloqueado por tempo, §5.4).
 
-| ctx / KV | sem split | **embarca** 16×8 | GQA HG=2 | **GQA HG=3** | GQA HG=6 | protótipo B (M7) | **HG=3 vs embarca** | ms/token em jogo (×16) |
-|---|---|---|---|---|---|---|---|---|
-| 65 536 q4_0 | 6,6315 | **1,2428** | 1,2753 | **1,1115** | 1,3933 | 82,473 | **1,118× (11,8 % mais rápido)** | 2,10 ms |
-| 131 072 q4_0 | 13,6355 | **2,3837** | 2,5176 | **2,1767** | 3,7435 | 160,414 | **1,095× (9,5 % mais rápido)** | 3,31 ms |
-| 131 072 f16 | 13,0183 | 1,9234 (16×8) | 2,5817 | 2,0536 (S=16) / **1,7793 (S=24)** | 3,9803 | 160,703 | 0,94× (S=16) / **1,08× (S=24)** | −3,3 ms (S=24) |
-| 65 536 f16 | 6,5226 | 0,9671 | 1,3105 | 1,0378 | 1,5059 | 79,211 | 0,93× | −1,13 ms |
-| 16 385 f16 | 1,3433 | 0,2429 | 0,2834 | 0,2657 | 0,4834 | 20,398 | 0,91× | −0,36 ms |
-| 4 097 f16 | 0,3434 | 0,0723 | 0,1397 | 0,1293 | 0,1694 | 5,296 | 0,56× | −0,91 ms |
+## 7. Estado no fim da noite (o que rodou, o que não rodou)
 
-- **O padrão é coerente e tem mecanismo**: o protótipo C **ganha onde a linha de KV é
-  pequena** (q4_0: 144 B por chave) e **perde onde é grande** (f16: 512 B). Com q4_0 o kernel
-  que embarca paga desquantização/issue por linha lida 6× (a frente de banda já tinha medido
-  346-372 GB/s emitidos contra um teto de cache de ~1,6 TB/s: é issue, não banda), e o
-  agrupamento por GQA com `HG=3` reduz essas passadas de 6 para **2** — corta exatamente o
-  trabalho que é o gargalo. Com f16 a linha é grande, o kernel fica limitado por banda de
-  cache (1,67 TB/s medidos) e aí o que importa é a paralelidade (CTAs), que o agrupamento
-  tira.
-- **Recomendação (com o número)**: **não implementar para 4K-16K f16** (perde 1,1-1,8×
-  medido — é onde o motor passa a vida) e **levar o protótipo adiante para q4_0 a 64K/131K**,
-  onde ganha **9,5-11,8 % (2,1-3,3 ms/token, ~4 % do passo)** já com `S=16` (mesma grade do
-  kernel que embarca, 6× menos CTAs) e com equivalência numérica medida (`rel-L2 1,1e-06` a
-  64K e `1,6e-06` a 131K, o mesmo valor do caminho com split que embarca).
-- **O que falta para fechar**: comparar contra a **melhor célula** do kernel que embarca (24/32
-  splits, que a frente de autotuning mediu como melhores em q4_0 a 131K) — está na fila
-  (`bench-attn-gpu q4_0 131072 --splits 8,16,24,32,48 --wpb 8,16`), e o q8_0 a 64K/131K
-  (o tipo que a frente de banda deixou "não medido"), também na fila. Se a melhor célula do
-  kernel que embarca chegar perto de 2,18 ms, o ganho do GQA a 131K some e a recomendação
-  volta a "não vale".
+**Rodou e está neste diário** (todos com comando exato e janela):
+- `check-rope-long-gpu` (novo gate): OK, 11 posições até 262 143, controle NEOX = 0,0 (§2).
+- `bench-attn-gpu` f16: varredura completa 2/4/8/16 splits × 8/16/32 warps em 4K/16K/64K/131K
+  (§3.1); q4_0 e q8_0 em 64K/131K (§3.3); protótipo C (GQA) em 4K/16K/64K/131K nos três tipos
+  (§4.1-4.3); recursos de kernel/VGPR/derrame (§4.1).
+- `bench-attn-gpu` com `--splits 8..48`: política a 131K q4_0/q8_0/f16 (§3.5).
+- `bench` com cache sintético: decode a 64K (q8_0 e f16) e 131K (q4_0), VRAM/GTT (§3.4).
+- `check-rope-gpu`, `compare_llama_greedy.sh` e `compare_ppl.sh` com os defaults: inalterados
+  pela extensão do `oracle-next-token` (§5.1, e o job K).
+- `compare_ppl.sh` a 512 (6 chunks) e 2 048 (2 chunks); janela única de 14 336 (§6.1).
+- Sondagem de posição longa a **17 639 tokens** com top-5 nos dois motores (§6.2).
+- `run` + `oracle-next-token` com `ORACLE_NCTX`/`NUBATCH` (nova capacidade do test tool).
+
+**Não rodou / ficou na fila** (e por quê):
+- **Qualidade a 131K com texto real** — não cabe no `timeout 900` (§5.2).
+- Diff de **nó** (Qcur/Kcur) em posição longa — precisa de `UB=1` (16 385 decodes) (§5.4).
+- Pontos de PPL a 4 096 e 8 192 — na fila (cada um são dois comandos de ~10 min com a placa
+  disputada por 7 frentes; o de 14 336 já cobre o topo da curva).
+- Sondagem de posição a 25 742 tokens — na fila (o motor já preencheu 17 639 em 273 s).
+- `bench-phases-gpu` a 16K/64K/131K (decomposição por fases do passo no motor real) — na fila;
+  a fatia da atenção está estimada por bytes+tempo medidos em §3.3.
+- `check_all.sh --quick` — na fila (os meus commits são `tests/` + `docs/` + `CMakeLists.txt`).
