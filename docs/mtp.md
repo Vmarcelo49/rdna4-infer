@@ -1,5 +1,20 @@
 # rdna4-infer — MTP (NextN): o bloco 64 como cabeça de rascunho
 
+> **Atualização (rodada noturna de 2026-09-14, frente MTP).** O verify batelado
+> que este documento pedia em §7 **existe agora** e o MTP **paga**: em IQ3_S, f16
+> KV, greedy, prompt de wiki enchendo o contexto,
+> ganancioso **29,33 tok/s** contra **51,47 tok/s** com `--mtp --draft 3`
+> (**1,75×** a 4K; 1,71× com `--draft 2`), com a saída **byte-idêntica** ao
+> ganancioso (`md5` do stdout igual) e os gates numéricos verdes. O que mudou:
+> `Graph::forward_batch_all` (hidden **e** logits de todas as linhas),
+> `Graph::state_snapshot/state_restore` (rollback do estado recorrente GDN, 149,6
+> MiB, 0,54 ms por par) e a rodada especulativa de `mtp_gen.h` — ver
+> `docs/journal-mtp.md`. Limite medido: `matvec_launch_batch` só tem instanciações
+> 2/3/4/8/16, então o verify de `k` rascunhos usa `k+1` linhas e o caminho batelado
+> para em **k = 3** (`--draft 4` exigiria `N = 5` em `matvec.cuh`). A 16K o ganho
+> medido foi menor e a taxa de aceitação caiu (§4.3 do diário); o texto abaixo é o
+> estudo original, mantido como registro.
+
 O GGUF tem 65 blocos: 64 camadas de trunk mais o bloco 64, que é o cabeça
 **MTP / NextN** (`qwen35.nextn_predict_layers = 1`). O trunk nunca o executava
 (`Graph::n_layer()` = `block_count - nextn_predict_layers` = 64). Este trabalho
@@ -186,15 +201,30 @@ um forward. O custo extra é o bloco de rascunho:
 Daí os −6 % a −10 %: o trunk custa o mesmo e o rascunho entra por cima
 (`--mtp-score` paga 1 passo de rascunho por token, `--mtp --draft 3` paga ~5,4).
 
-### O que faria valer a pena (extrapolação, não medição)
+### O que faria valer a pena (corrigido: o teto não é 2,5×)
+
+> **Correção (2026-09-14, frente MTP da rodada noturna).** A conta abaixo supunha
+> que um passe batelado de `D+1` tokens custa o mesmo que o passe de 1 token
+> (`cf = 1,0`). Isso é falso, e está medido: o `matvec_kernel_batch` do M6/M8 gasta
+> por token dentro do batch `cf(2)=16,3`, `cf(3)=7,7`, `cf(4)=4,9`, `cf(8)=1,9`,
+> `cf(16)=0,87` ms (bit-exato contra o caminho por token,
+> `tests/check_batch_gpu.hip`), contra ~18,9 ms do caminho de 1 token. Refazendo a
+> projeção com esses fatores, o teto honesto é **1,3-1,5×** para `D = 2..4`
+> (e `D = 8` fica *pior* que `D = 4`, porque o batch de 8 já não é grátis), não
+> 2,5×. A hipótese `cf = 1,0` também está escondida na análise de Leviathan
+> (Teorema 3.8) e é o erro que este documento propagava. Os números de
+> *aceitação* (86,7 % em texto natural) continuam válidos — são a outra metade da
+> conta.
 
 Com um verify **batelado** (um passe de trunk para os D+1 tokens, via o
 `matvec_launch_batch` do M6 + um kernel de atenção multi-query com máscara
 causal, que não existe hoje — `attn.cuh` é do outro agente), a conta com os
 números medidos fica: uma rodada de D=4 custaria ~36 ms (um passe) + 10 passos de
 rascunho (~23 ms) para ~4,0 tokens commitados ≈ **14,7 ms/token**, contra 36,1 ms
-agora — **~2,5×**. É a taxa de aceitação medida (63-87 % por rascunho, 3,5-4,0
-tokens por rodada) que sustenta essa conclusão; sem ela, nada disso importaria.
+agora — **~2,5×** *(número riscado: ver a correção acima — com o custo de batch
+real, a mesma rodada fica em ~1,3-1,5×)*. É a taxa de aceitação medida
+(63-87 % por rascunho, 3,5-4,0 tokens por rodada) que sustenta essa conclusão;
+sem ela, nada disso importaria.
 
 ## 5. Correção: o que é garantido
 
@@ -262,11 +292,22 @@ scripts/gpu-lock.sh ./build/check-mtp-gpu $IQ4_XS 64 3
 
 ## 7. O que ficou de fora
 
-- **Verify batelado** (o que daria o ganho): precisa de atenção multi-query com
-  máscara causal e do forward batelado do trunk, que toca `attn.cuh`/`gdn.cuh`.
+- ~~**Verify batelado** (o que daria o ganho)~~ **feito na rodada noturna de
+  2026-09-14**: `forward_batch_all` + `state_snapshot/state_restore` +
+  `mtp_gen.h`, medido em 1,71-1,75× a 4K (ver o topo deste arquivo e
+  `docs/journal-mtp.md`). A atenção multi-query com máscara causal acabou vindo da
+  frente de prefill (`feat/noite-prefill`, o andaime em lote dentro do
+  `forward_batch`), e o verify a herda sem mudança nenhuma.
 - **Amostragem especulativa correta** (rejection sampling) para `temp > 0`.
-- **MTP em contexto longo**: medido só a 4K; a cache KV do bloco é f16 e custa
-  8 MiB a 4K (2 MB por 1K de contexto), então a 64K são 128 MiB.
+- **MTP em contexto longo**: medido só a 4K; a cache KV do bloco é f16 e são
+  **duas** caches (K e V, `d_ck_`/`d_cv_` em `MtpHead::alloc_kv`): 16 MiB a 4K
+  (4 MB por 1K de contexto), 256 MiB a 64K, 512 MiB a 128K. Somados aos 335 MiB
+  dos 15 tensores, o bloco custa ~0,35 GiB além do trunk em contexto curto. Isso
+  **não** entrava no orçamento de `device.h` (`required_bytes` só conhece as 16
+  camadas de atenção do trunk), então `info` aprovava uma configuração em que
+  `run --mtp` morria em `hipMalloc`: agora `cmd_run` soma
+  `mtp_required_bytes()` antes de mapear o modelo e recusa alto (frente MTP da
+  rodada noturna).
 - **Ajuste do custo do passo de rascunho**: 2,28 ms para 334,7 MiB de pesos é
   ~147 GB/s efetivos, bem abaixo dos ~600 GB/s da placa — são 8 matvecs pequenos
   mais dois readbacks por passo. Se o verify batelado acontecer, esse custo passa

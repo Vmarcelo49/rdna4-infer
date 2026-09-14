@@ -240,6 +240,34 @@ inline bool split_batch_enabled() {
   int n_vocab() const { return output_.dim1; }
 
   // ---- MTP (feat/mtp) -----------------------------------------------------
+  // Batched *verification* (feat/noite-mtp). Same layer pass as forward_batch(),
+  // but it returns the post-output_norm hidden state of EVERY token in the batch
+  // (h_all, n*n_embd) and the LM head's logits for EVERY token (logits_all,
+  // n*n_vocab). Verification needs both: the trunk's own greedy token at each
+  // drafted position is read from rows 0..n-2 of logits_all, and the hidden rows
+  // are what the draft block's own KV rows are rebuilt from.
+  //
+  // Row t of both outputs is the value the per-token path produces for `tokens[t]`
+  // at position start_pos+t: the layer pass is forward_batch_layer() (the function
+  // tests/check_batch_gpu.hip proves bit-identical to per-token forwards), the
+  // final norm is the same rms_norm_launch, and the head is the batched matvec —
+  // the same kernel family the M6/M8 gates hold bit-exact against the GEMV path.
+  // forward_batch() itself is untouched, so the prefill gates keep their numbers.
+  bool forward_batch_all(const std::vector<std::int32_t> &tokens, int start_pos,
+                         std::vector<float> &h_all, std::vector<float> &logits_all,
+                         std::string &err);
+
+  // Rollback of the recurrent (GDN) state for speculative decoding: a batched
+  // verification advances d_state_/d_convst_ for every row it processes, and a
+  // rejected draft must not leave that advance behind. These copy the two state
+  // buffers device-to-device (156.4 MiB for this model, ~0.5 ms at the measured
+  // 633 GB/s) — the KV caches need no snapshot, since attention is causal and
+  // every row is rewritten by position before it is read again.
+  bool state_snapshot(std::string &err);
+  bool state_restore(std::string &err);
+  std::size_t state_bytes() const;
+  // Byte cost of one snapshot + one restore (the number the journal reports).
+  bool state_snapshot_allocated() const { return d_state_snap_ != nullptr; }
   // Read-only borrow of the two weights the draft block shares with the trunk:
   // `token_embd.weight` (the draft's input embedding) and `output.weight` (the
   // shared LM head). Additive: nothing in the trunk forward changes, and the MTP
@@ -406,6 +434,12 @@ inline bool split_batch_enabled() {
   float *d_ffn_a_ = nullptr, *d_ffn_b_ = nullptr;
   float *d_q8_ = nullptr;
   float *d_logits_ = nullptr;  // cached LM-head output (allocated on first use)
+  // feat/noite-mtp: one logits row per batch row (forward_batch_all) and the
+  // recurrent-state snapshot (state_snapshot/state_restore). Both are allocated
+  // on first use, so a run without --mtp pays nothing for them.
+  float *d_logitsb_ = nullptr;
+  std::size_t logitsb_rows_ = 0;
+  float *d_state_snap_ = nullptr, *d_convst_snap_ = nullptr;
   std::size_t q8_blocks_ = 0;
   int cur_token_ = 0;
   int *d_pos_ = nullptr;
@@ -1390,6 +1424,165 @@ inline bool Graph::forward_batch(const std::vector<std::int32_t> &tokens, int st
   return true;
 }
 
+// feat/noite-mtp: batched verification. Everything up to the layer loop is the
+// same sequence forward_batch() runs (same checks, same one-shot position upload,
+// same per-row embedding dequant), then the final norm is applied to EVERY row and
+// the shared LM head runs once for the whole batch through the batched matvec.
+inline bool Graph::forward_batch_all(const std::vector<std::int32_t> &tokens, int start_pos,
+                                     std::vector<float> &h_all, std::vector<float> &logits_all,
+                                     std::string &err) {
+  const int E = n_embd();
+  const int n = (int)tokens.size();
+  if (n < 2 || n > kMaxBatch) {
+    err = "forward_batch_all needs 2.." + std::to_string(kMaxBatch) + " tokens";
+    return false;
+  }
+  if (!batch_supported(n)) {
+    err = "no batched kernel for n=" + std::to_string(n);
+    return false;
+  }
+  const std::int32_t n_vocab_in = (std::int32_t)tok_embd_.dim1;
+  for (std::int32_t tk : tokens) {
+    if (tk < 0 || tk >= n_vocab_in) {
+      err = "token id " + std::to_string(tk) + " out of range [0, " + std::to_string(n_vocab_in) +
+            ")";
+      return false;
+    }
+  }
+  if (start_pos < 0 || (std::size_t)start_pos + (std::size_t)n > (std::size_t)max_ctx_) {
+    err = "positions exceed the allocated context (" + std::to_string(max_ctx_) + ")";
+    return false;
+  }
+
+  int pos_host[kMaxBatch];
+  for (int t = 0; t < n; ++t) pos_host[t] = start_pos + t;
+  if (hipMemcpy(d_posb_, pos_host, (std::size_t)n * sizeof(int), hipMemcpyHostToDevice) !=
+      hipSuccess) {
+    err = "batch position upload failed";
+    return false;
+  }
+  const std::size_t emb_row = (std::size_t)tensor_bytes(tok_embd_.dt, (std::uint64_t)E);
+  for (int t = 0; t < n; ++t) {
+    const char *src = (const char *)tok_embd_.ptr + (std::size_t)tokens[t] * emb_row;
+    if (!dequant_row_launch(tok_embd_.dt, src, d_xb_ + (std::size_t)t * E, E)) {
+      err = "batch embedding dequant failed";
+      return false;
+    }
+  }
+
+  for (int il = 0; il < debug_layer_limit(); ++il) {
+    if (!forward_batch_layer(il, n, start_pos, err)) {
+      err = "layer " + std::to_string(il) + ": " + err;
+      return false;
+    }
+  }
+
+  // final norm over every row, in place: row t becomes the post-output_norm h of
+  // position start_pos+t, i.e. exactly what forward_tokens() returns for it
+  if (!rms_norm_launch(d_xb_, (const float *)output_norm_.ptr, d_xb_, n, E,
+                       (float)cfg_.rms_norm_eps)) {
+    err = "batch output_norm launch failed";
+    return false;
+  }
+  h_all.resize((std::size_t)n * E);
+  if (hipMemcpy(h_all.data(), d_xb_, (std::size_t)n * E * sizeof(float),
+                hipMemcpyDeviceToHost) != hipSuccess) {
+    err = "batch hidden readback failed";
+    return false;
+  }
+
+  const int n_vocab = output_.dim1;
+  if (logitsb_rows_ < (std::size_t)n) {
+    if (d_logitsb_ != nullptr) {
+      (void)hipFree(d_logitsb_);
+      d_logitsb_ = nullptr;
+      logitsb_rows_ = 0;
+    }
+    if (hipMalloc(&d_logitsb_, (std::size_t)n * (std::size_t)n_vocab * sizeof(float)) !=
+        hipSuccess) {
+      err = "hipMalloc batch logits failed";
+      return false;
+    }
+    logitsb_rows_ = (std::size_t)n;
+  }
+  if (!proj_batch(output_, d_xb_, d_logitsb_, n_vocab, E, n, false, err)) return false;
+  logits_all.resize((std::size_t)n * (std::size_t)n_vocab);
+  if (hipMemcpy(logits_all.data(), d_logitsb_,
+                (std::size_t)n * (std::size_t)n_vocab * sizeof(float),
+                hipMemcpyDeviceToHost) != hipSuccess) {
+    err = "batch logits readback failed";
+    return false;
+  }
+  return true;
+}
+
+// Row layout of the two recurrent buffers (d_state_ is [layer][nvh][S][S],
+// d_convst_ is [layer][K-1][chan]); both are contiguous allocations, so one
+// hipMemcpy each is the whole snapshot.
+inline std::size_t Graph::state_bytes() const {
+  const int n_recr = count_recr();
+  if (n_recr == 0) return 0;
+  const int S = (int)cfg_.ssm_state_size;
+  const int nvh = (int)cfg_.ssm_time_step_rank;
+  const int K = (int)cfg_.ssm_conv_kernel;
+  const int chan = 2 * (int)cfg_.ssm_group_count * S + nvh * S;
+  return ((std::size_t)n_recr * (std::size_t)nvh * (std::size_t)S * (std::size_t)S +
+          (std::size_t)n_recr * (std::size_t)(K - 1) * (std::size_t)chan) *
+         sizeof(float);
+}
+
+inline bool Graph::state_snapshot(std::string &err) {
+  const int n_recr = count_recr();
+  if (n_recr == 0) return true;  // no recurrent layer: nothing to roll back
+  const int S = (int)cfg_.ssm_state_size;
+  const int nvh = (int)cfg_.ssm_time_step_rank;
+  const int K = (int)cfg_.ssm_conv_kernel;
+  const int chan = 2 * (int)cfg_.ssm_group_count * S + nvh * S;
+  const std::size_t n_st = (std::size_t)n_recr * (std::size_t)nvh * (std::size_t)S * (std::size_t)S;
+  const std::size_t n_cv = (std::size_t)n_recr * (std::size_t)(K - 1) * (std::size_t)chan;
+  if (d_state_snap_ == nullptr) {
+    if (hipMalloc(&d_state_snap_, n_st * sizeof(float)) != hipSuccess ||
+        hipMalloc(&d_convst_snap_, n_cv * sizeof(float)) != hipSuccess) {
+      err = "state snapshot allocation failed";
+      return false;
+    }
+  }
+  // Async on the same (default) stream the kernels use: ordered against them
+  // without draining the queue, which is what keeps the snapshot off the
+  // critical path (it is 0.5 ms of traffic, not a pipeline flush).
+  if (hipMemcpyAsync(d_state_snap_, d_state_, n_st * sizeof(float), hipMemcpyDeviceToDevice,
+                     nullptr) != hipSuccess ||
+      hipMemcpyAsync(d_convst_snap_, d_convst_, n_cv * sizeof(float), hipMemcpyDeviceToDevice,
+                     nullptr) != hipSuccess) {
+    err = "state snapshot copy failed";
+    return false;
+  }
+  return true;
+}
+
+inline bool Graph::state_restore(std::string &err) {
+  const int n_recr = count_recr();
+  if (n_recr == 0) return true;
+  if (d_state_snap_ == nullptr) {
+    err = "state_restore without a snapshot";
+    return false;
+  }
+  const int S = (int)cfg_.ssm_state_size;
+  const int nvh = (int)cfg_.ssm_time_step_rank;
+  const int K = (int)cfg_.ssm_conv_kernel;
+  const int chan = 2 * (int)cfg_.ssm_group_count * S + nvh * S;
+  const std::size_t n_st = (std::size_t)n_recr * (std::size_t)nvh * (std::size_t)S * (std::size_t)S;
+  const std::size_t n_cv = (std::size_t)n_recr * (std::size_t)(K - 1) * (std::size_t)chan;
+  if (hipMemcpyAsync(d_state_, d_state_snap_, n_st * sizeof(float), hipMemcpyDeviceToDevice,
+                     nullptr) != hipSuccess ||
+      hipMemcpyAsync(d_convst_, d_convst_snap_, n_cv * sizeof(float), hipMemcpyDeviceToDevice,
+                     nullptr) != hipSuccess) {
+    err = "state restore copy failed";
+    return false;
+  }
+  return true;
+}
+
 inline bool Graph::forward(const std::vector<float> &embeddings, std::vector<float> &hidden,
                            std::vector<float> &logits, std::string &err) {
   return forward(embeddings, 0, hidden, logits, err);
@@ -1682,6 +1875,14 @@ inline void Graph::release() {
   d_q8_ = nullptr;
   d_pos_ = nullptr;
   d_logits_ = nullptr;
+  // feat/noite-mtp: the batch logits rows and the recurrent-state snapshot
+  if (d_logitsb_) (void)hipFree(d_logitsb_);
+  if (d_state_snap_) (void)hipFree(d_state_snap_);
+  if (d_convst_snap_) (void)hipFree(d_convst_snap_);
+  d_logitsb_ = nullptr;
+  d_state_snap_ = nullptr;
+  d_convst_snap_ = nullptr;
+  logitsb_rows_ = 0;
 }
 
 }  // namespace rdna4
