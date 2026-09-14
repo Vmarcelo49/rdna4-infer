@@ -63,8 +63,11 @@ struct MtpGenStats {
   int rounds = 0;        // speculative rounds
   long long drafted = 0; // draft tokens proposed (speculative) / scored (score)
   long long accepted = 0;  // drafts the trunk's own greedy token agreed with
-  double draft_ms = 0.0;   // host time queueing the MTP head's kernels
-  double trunk_ms = 0.0;   // host time queueing the trunk's kernels
+  // ATENCAO: os tres acumuladores abaixo estao em SEGUNDOS (now_s()), apesar do
+  // sufixo `_ms`. Quem imprime tem de converter (main.hip faz x1e3). O sufixo ficou
+  // por compatibilidade de nome; a alternativa e' renomear e tocar em 10 sitios.
+  double draft_ms = 0.0;   // SEGUNDOS: host time queueing the MTP head's kernels
+  double trunk_ms = 0.0;   // SEGUNDOS: host time queueing the trunk's kernels
   // True end-to-end wall time of the whole generation loop. The per-step numbers
   // above only measure host-side queueing (the graph is asynchronous, so they do
   // not attribute GPU time); this one is the number to compare between modes.
@@ -75,7 +78,7 @@ struct MtpGenStats {
                             // prefix after a rejected draft (state rollback)
   int rollbacks = 0;        // rounds that needed that rollback
   long long rollback_tokens = 0;  // tokens re-forwarded by those replays
-  double snapshot_ms = 0.0;  // host time spent copying the recurrent state
+  double snapshot_ms = 0.0;  // SEGUNDOS: host time spent copying the recurrent state
   double acceptance() const { return drafted > 0 ? (double)accepted / (double)drafted : 0.0; }
 };
 

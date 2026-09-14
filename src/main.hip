@@ -1485,6 +1485,11 @@ int cmd_run(int argc, char **argv) {
           // Where the time goes: the verify pass is one weight read for the whole
           // draft block, and a rejected draft costs a second one (rollback +
           // re-run of the committed prefix).
+          // gs.*_ms acumulam SEGUNDOS (mtp_gen.h usa now_s()), entao a conversao e'
+          // aqui. Antes desta correcao os dois fprintf imprimiam segundos com o rotulo
+          // "ms" -- 1000x errado, e foi a origem de um residuo de 16,8 ms/round que
+          // nao existia (medido por instrumentacao no laco: o residuo real e' 1,1-1,7
+          // ms/round, 1,7-2,5 %).
           std::fprintf(stderr,
                        "rdna4-infer: MTP verify: %d batched forwards (%.2f rows/round), "
                        "%d rollbacks (%d replay forwards, %lld rows re-forwarded), "
@@ -1493,14 +1498,19 @@ int cmd_run(int argc, char **argv) {
                        gs.verify_forwards > 0 ? (double)(gs.drafted + gs.rounds) /
                                                     (double)gs.verify_forwards
                                               : 0.0,
-                       gs.rollbacks, gs.replay_forwards, gs.rollback_tokens, gs.snapshot_ms);
+                       gs.rollbacks, gs.replay_forwards, gs.rollback_tokens, gs.snapshot_ms * 1e3);
         }
       }
       std::fprintf(stderr, "rdna4-infer: generated %zu tokens in %.2f s (%.2f tok/s)%s\n",
                    gs.ids.size(), gen, gen > 0 ? (double)gs.ids.size() / gen : 0.0,
                    gs.hit_eos ? " [eos]" : "");
-      std::fprintf(stderr, "rdna4-infer: trunk %.2f ms/step, draft total %.2f ms\n",
-                   gs.trunk_steps > 0 ? gs.trunk_ms / gs.trunk_steps : 0.0, gs.draft_ms);
+      // Total, nao por passo: `trunk_steps` conta so' os forwards POR TOKEN do
+      // caminho serial, enquanto trunk_ms acumula tambem os forwards em lote do
+      // verify e do replay (que nao incrementam esse contador) -- dividir um pelo
+      // outro nao da' ms/step de nada. O total e' o numero honesto e e' o que a
+      // medicao de 14/09 usou (verify + replay = 82 % do round).
+      std::fprintf(stderr, "rdna4-infer: trunk %.2f ms total (%d per-token steps), draft %.2f ms\n",
+                   gs.trunk_ms * 1e3, gs.trunk_steps, gs.draft_ms * 1e3);
     }
     return 0;
   }

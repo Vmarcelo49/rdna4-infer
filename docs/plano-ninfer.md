@@ -87,27 +87,30 @@ Duas medições baratas que decidem dois itens grandes:
    reexecutar" moveria (a razão do ninfer é 86,1×) — dimensiona o ReplaySSM antes de escrevê-lo.
 Entregável: números para mim; o doc sou eu que escrevo.
 
-### N4b — Implementação (nova, e agora a de MAIOR valor): argmax no device no laço do MTP
-Medido por N4: o round do MTP tem um **resíduo não atribuído de 7-17 ms (12-20 %)**, e a causa
-provável é o **sampler no host** — o laço chama `Sampler::sample` **2D+1 vezes por round**, e cada
-chamada monta um vetor `Candidate` de **248 320** entradas (~6 MB) e faz uma varredura completa
-mesmo no caminho ganancioso (`src/backend/sampler.cpp:56-95`); a diferença
-`run` (35,25 ms/token) − `bench` (31,56, com argmax no device) é **3,7 ms por chamada**. O motor
-**já tem** o `argmax_kernel`/`last_argmax` (C1/R9 da noite) — é trocar o caminho ganancioso do laço
-pelo device, mantendo o host para `temp > 0`. Alvo: **2-5 ms/token** e o break-even de aceitação
-caindo ~5-10 pontos; o gate é o md5 do `--mtp` igual ao ganancioso, que a noite já estabeleceu.
+### N4b — FECHADO: o sampler do host foi REFUTADO como causa (3,2 %, não 12-20 %)
+A hipótese era minha e a medição a matou. Custo direto, medido: `Sampler::sample` ganancioso =
+**0,309 ms** por chamada (0,318 dentro do laço), e o laço faz **2D+1** chamadas por round
+(3,05 / 5,00 / 6,79 medidos em D=1/2/3) ⇒ **0,97 / 1,59 / 2,17 ms por round = 3,2 %** de um round
+de 67,29 ms. Apagar TODAS as chamadas vale **+3,4 %** (51,0 → ~52,7 tok/s) — 4-6× menos que os
+12-20 % que eu supunha.
 
-### N-GDN — Implementação pronta para decidir (especificada em `docs/estudo-ninfer-gdn.md`)
-O port é **exato** (float64: 1,0e-15…1,7e-15 para B ∈ {8,16,32,64}; fp32: 5,0e-7…1,0e-6, a mesma
-ordem do nosso sequencial), **não** amplifica (cond(I−A) ≤ 6,2) e o layout do estado é **idêntico
-ao nosso** (fp32 `[valor][chave]`, sem conversão). **Mas ele quebra o contrato bit-exato do caminho
-em lote** (`tests/check_batch_gpu.hip` exige `BIT-EXACT`) — é a mesma classe de decisão que fixou o
-chunk default em 16. Saídas honestas, as duas registradas: (a) cobrir **todos** os tamanhos de lote
-com o caminho em blocos + preenchimento inerte do último bloco (a aritmética passa a depender só da
-posição, não do corte — resolve CLI/servidor/MTP de uma vez); (b) ficar atrás de `RD_GDN_CHUNKED=0`
-por padrão. Barra proposta: `gdn_delta` de **0,625 → ≤0,30 ms/token**. Custo de infraestrutura:
-workspace novo (789 504 B com n=16/B=16) + espelho em `device.h` + pino de `check-kvtype`
-(172 258 340 → 173 047 844 B). **Decisão do dono do repo, não minha.**
+**E o resíduo de 7-17 ms/round não existe**: com o orçamento fechado na janela do medidor, o
+não-atribuído é **1,1-1,7 ms/round (1,7-2,5 %)**. Duas causas para o meu número errado:
+1. **Bug de unidade no motor (corrigido)**: `st.trunk_ms`/`draft_ms`/`snapshot_ms` acumulam
+   **SEGUNDOS** (`mtp_gen.h` usa `now_s()`), e `main.hip:1491,1502` imprimiam com o rótulo "ms" —
+   1000× errado. Provado por instrumentação no laço: "trunk 1,59 ms/step" = (43,21+12,14)×28 =
+   1549,8 ms. **Corrigido**: conversão ×1e3 no `main.hip`, e o rótulo "/step" virou "total" porque
+   `trunk_steps` conta só os forwards por token do caminho serial (o verify e o replay em lote não
+   incrementam) — dividir um pelo outro não dava ms/step de nada.
+2. **Janela**: a minha rodava ~25 % mais devagar que a do medidor (greedy 28,37 contra 35,45
+   tok/s), e a diferença entre tempo-de-round e soma-das-fases foi atribuída a um resíduo que era
+   só isso.
+
+**Re-ranking do MTP, com o orçamento medido (D=3, 67,29 ms/round): verify 43,2 (64 %) + replay do
+rollback 12,1 (18 %) = 82 % é trabalho de forward do tronco**; drafts/KV-rebuild 8,6 (13 %);
+sampler 2,2 (3,2 %); não-atribuído 1,1-1,7. O **replay do rollback é 5,6× o sampler** e dispara em
+10 de 28 rounds — é o próximo item do MTP, não o sampler. E D=1/2/3 já empatam em ~51 tok/s, ou seja
+o eixo do número de drafts saturou.
 
 ### N-POL — Implementação imediata e gratuita: a política de splits do kernel que embarca
 O E0 mediu, em A/B intercalado de 15 rodadas com a ordem trocada, que **o próprio kernel que
