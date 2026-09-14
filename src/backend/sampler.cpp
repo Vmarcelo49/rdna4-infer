@@ -13,8 +13,9 @@ void Sampler::init(const SamplerParams &params, std::int32_t n_vocab) {
   params_ = params;
   n_vocab_ = n_vocab;
   rng_.seed(params.seed);
-  cands_.clear();
-  cands_.reserve((std::size_t)std::min<std::int32_t>(n_vocab, 1 << 16));
+  // (a `cands_` member used to be reserved here and never touched again: ~512 KB
+  // of idle heap per process, review finding M9. The working candidate list is a
+  // local in sample(), which is the only place that needs it.)
 }
 
 void Sampler::softmax(std::vector<Candidate> &cands) {

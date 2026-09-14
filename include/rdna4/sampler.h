@@ -64,7 +64,6 @@ class Sampler {
   SamplerParams params_;
   std::int32_t n_vocab_ = 0;
   std::mt19937_64 rng_;
-  std::vector<Candidate> cands_;
 };
 
 }  // namespace rdna4

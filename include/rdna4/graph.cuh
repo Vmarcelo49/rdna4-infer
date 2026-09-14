@@ -174,9 +174,12 @@ class Graph {
   int n_full_attn() const { return n_layer() - count_recr(); }
   int max_ctx() const { return max_ctx_; }
 
-  void readback(const float *d, std::size_t n, std::vector<float> &out) const {
+  // Returns false when the copy failed. Without the check the destination keeps
+  // the zeros from resize() and the caller treats them as real hidden state (the
+  // MTP draft then runs on noise, with no message) — review finding H2.
+  bool readback(const float *d, std::size_t n, std::vector<float> &out) const {
     out.resize(n);
-    (void)hipMemcpy(out.data(), d, n * sizeof(float), hipMemcpyDeviceToHost);
+    return hipMemcpy(out.data(), d, n * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess;
   }
 
   int n_embd() const { return (int)cfg_.embedding_length; }
@@ -538,7 +541,10 @@ inline bool Graph::init(int max_ctx, KvType kv_k, KvType kv_v, std::string &err)
   }
   if (!alloc(d_state_, (std::size_t)n_recr * nvh * S * S, err)) return false;
   if (!alloc(d_convst_, (std::size_t)n_recr * (K - 1) * chan, err)) return false;
-  if (hipMalloc(&d_pos_, sizeof(int)) != hipSuccess) return false;
+  if (hipMalloc(&d_pos_, sizeof(int)) != hipSuccess) {
+    err = "hipMalloc failed (pos)";
+    return false;
+  }
 
   // ssm_a is read with nvh floats (the reference broadcasts it), so a
   // single-element ssm_a would read out of bounds (review M4)
@@ -1068,7 +1074,10 @@ inline bool Graph::forward_batch(const std::vector<std::int32_t> &tokens, int st
     err = "batch output_norm launch failed";
     return false;
   }
-  readback(xlast, E, hidden);
+  if (!readback(xlast, E, hidden)) {
+    err = "batch hidden readback failed";
+    return false;
+  }
 
   const int n_vocab_i = output_.dim1;
   if (d_logits_ == nullptr) {
@@ -1190,7 +1199,10 @@ inline bool Graph::forward_run(std::size_t n_tokens, int start_pos, const float 
   const clock::time_point t_queued = clock::now();
   host_launch_ms_ += std::chrono::duration<double, std::milli>(t_queued - t_queue0).count();
   // (2) the first blocking read: this is where the queued trunk is waited for.
-  if (want_hidden_) readback(d_x_, E, hidden);
+  if (want_hidden_ && !readback(d_x_, E, hidden)) {
+    err = "hidden readback failed";
+    return false;
+  }
   const clock::time_point t_drained = clock::now();
 
   const int n_vocab = output_.dim1;

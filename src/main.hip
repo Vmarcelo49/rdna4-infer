@@ -433,7 +433,12 @@ int cmd_bench(int argc, char **argv) {
     total_tokens_timed += done;
     // rewind: the sequence length must stay in range across reps
     history.resize(ids.size());
-    if (fill_cache) (void)graph.debug_fill_caches((unsigned)seed, err);
+    if (fill_cache && !graph.debug_fill_caches((unsigned)seed, err)) {
+      // Without this the rep would time the attention over uninitialised
+      // VRAM and print tok/s for a different experiment (review finding H4).
+      std::fprintf(stderr, "rdna4-infer: cache fill failed: %s\n", err.c_str());
+      return 1;
+    }
     if (!prefill_ids(graph, ids, hidden, logits, err)) {
       std::fprintf(stderr, "rdna4-infer: reset failed: %s\n", err.c_str());
       return 1;
@@ -445,7 +450,7 @@ int cmd_bench(int argc, char **argv) {
   const double gb_s = (double)bytes_per_token / sec_per_token / 1e9;
 
   std::size_t free_b = 0, tot_b = 0;
-  (void)hipMemGetInfo(&free_b, &tot_b);
+  const bool have_vram = hipMemGetInfo(&free_b, &tot_b) == hipSuccess;
   std::printf("model: %s\n", model_path);
   std::printf("arch %s, %d layers (%d full-attn), embd %d, vocab %d\n", arch, graph.n_layer(),
               graph.n_full_attn(), graph.n_embd(), graph.n_vocab());
@@ -458,8 +463,12 @@ int cmd_bench(int argc, char **argv) {
               fill_cache ? " (synthetic cache)" : "", t_load);
   std::printf("decode positions: %zu..%zu%s\n", first_pos, first_pos + (std::size_t)best_n,
               start_pos > 0 ? "  [synthetic keys/values: cost measurement, not quality]" : "");
-  std::printf("vram in use: %.2f GiB (free %.2f of %.2f GiB)\n",
-              (double)(tot_b - free_b) / gib, (double)free_b / gib, (double)tot_b / gib);
+  if (have_vram) {
+    std::printf("vram in use: %.2f GiB (free %.2f of %.2f GiB)\n",
+                (double)(tot_b - free_b) / gib, (double)free_b / gib, (double)tot_b / gib);
+  } else {
+    std::printf("vram in use: unavailable (hipMemGetInfo failed)\n");
+  }
   std::printf("prefill %zu tokens: %.3f s (%.2f tok/s, batched N<=16)\n", ids.size(), t_prefill,
               (double)ids.size() / t_prefill);
   std::printf("decode %zu tokens x %lld reps (warmup %lld): best %.3f s (%.2f tok/s), "

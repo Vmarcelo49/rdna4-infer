@@ -128,7 +128,7 @@ class MtpHead {
   // h_nextn of the last step (the post shared_head_norm hidden state), read back
   // to the host: tests check its finiteness, and it is what a chained step
   // feeds back as its `h` input.
-  void read_h_out(std::vector<float> &h) const;
+  bool read_h_out(std::vector<float> &h) const;
 
   const MtpDims &dims() const { return d_; }
   int n_vocab() const { return shared_.n_vocab; }
@@ -381,7 +381,12 @@ inline bool MtpHead::alloc_kv(std::string &err) {
 
 inline bool MtpHead::proj(const W &w, const float *d_x, float *d_y, int nrows, int ncols,
                           std::string &err) {
-  if (w.dim0 != ncols || w.dim1 != nrows) {
+  // Same check the trunk's Graph::proj makes: the dims alone do not pin the byte
+  // size, so a blk.64.* tensor with the right dims but an inconsistent dtype or
+  // block count would be read past its end — inside this process's own VRAM, so
+  // without a fault, silently wrong (review finding M3).
+  if (w.dim0 != ncols || w.dim1 != nrows ||
+      w.bytes != tensor_bytes(w.dt, (std::uint64_t)nrows * (std::uint64_t)ncols)) {
     err = "MTP: proj shape mismatch";
     return false;
   }
@@ -642,12 +647,15 @@ inline bool MtpHead::run(std::int32_t tok, int pos, bool h_from_host, const floa
   return true;
 }
 
-// h_nextn of the last step (the post shared_head_norm hidden state).
-inline void MtpHead::read_h_out(std::vector<float> &h) const {
+// h_nextn of the last step (the post shared_head_norm hidden state). Returns
+// false when the copy failed: the caller would otherwise feed zeros back as the
+// previous hidden state (review finding H2). `have_h_out_ == false` is not a
+// failure, it is "no draft ran yet" and leaves `h` as it was.
+inline bool MtpHead::read_h_out(std::vector<float> &h) const {
+  if (!have_h_out_) return true;
   h.resize((std::size_t)d_.n_embd);
-  if (!have_h_out_) return;
-  (void)hipMemcpy(h.data(), d_hout_, (std::size_t)d_.n_embd * sizeof(float),
-                  hipMemcpyDeviceToHost);
+  return hipMemcpy(h.data(), d_hout_, (std::size_t)d_.n_embd * sizeof(float),
+                   hipMemcpyDeviceToHost) == hipSuccess;
 }
 
 inline void MtpHead::release() {
@@ -663,6 +671,11 @@ inline void MtpHead::release() {
   for (float *p : ptrs) {
     if (p) (void)hipFree(p);
   }
+  // `ptrs` holds copies: nulling the members is what makes release() idempotent
+  // (same defect as Graph::release, review finding M1).
+  d_e_ = d_h_ = d_in_ = d_x_ = d_xn_ = d_qf_ = d_q_ = d_gate_ = nullptr;
+  d_kst_ = d_vst_ = d_attn_ = d_out_ = d_ffn_a_ = d_ffn_b_ = d_hout_ = nullptr;
+  d_logits_ = nullptr;
   if (d_q8_) (void)hipFree(d_q8_);
   if (d_pos_) (void)hipFree(d_pos_);
   if (d_ck_) (void)hipFree(d_ck_);

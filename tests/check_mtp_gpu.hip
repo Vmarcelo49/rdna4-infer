@@ -508,7 +508,7 @@ int main(int argc, char **argv) {
   ok(all_finite(dlogits), "draft logits are finite");
   ok(did >= 0 && did < graph.n_vocab(), "draft argmax is a valid token id");
   std::vector<float> hout;
-  mtp.read_h_out(hout);
+  ok(mtp.read_h_out(hout), "h_nextn readback succeeded");
   ok(all_finite(hout), "h_nextn is finite");
   std::printf("   draft argmax %d '%s' (logit %.3f, max %.3f)\n", did,
               tk.decode({did}, true).c_str(), dlogits[(std::size_t)did],

@@ -71,8 +71,13 @@ class Tokenizer {
     return id >= 0 && (std::size_t)id < eog_.size() && eog_[(std::size_t)id];
   }
 
-  // Text of one token, un-byte-decoded (the raw vocab entry).
-  const std::string &token_text(std::int32_t id) const { return tokens_[id]; }
+  // Text of one token, un-byte-decoded (the raw vocab entry). Out-of-range ids
+  // return an empty string instead of reading outside the vocab (review finding
+  // M9: the sibling accessors is_eog()/is_special() already bounds-check).
+  const std::string &token_text(std::int32_t id) const {
+    static const std::string kEmpty;
+    return id >= 0 && (std::size_t)id < tokens_.size() ? tokens_[(std::size_t)id] : kEmpty;
+  }
 
  private:
   // BPE merges one pre-tokenized, byte-encoded word into ids.

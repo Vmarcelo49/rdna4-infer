@@ -234,6 +234,14 @@ bool parse_qwen35_config(const gguf::File &f, Qwen35Config &cfg, std::string &er
     err = "qwen35.block_count must be >= 2 (got " + std::to_string(cfg.block_count) + ")";
     return false;
   }
+  // Upper bound too: block_count sized a vector of maps and drove a loop over
+  // every block, so a file claiming 10^7 blocks burned minutes of CPU in `info`
+  // and 2^32-1 threw bad_alloc from a path with no catch (review finding M6).
+  // The real model has 65.
+  if (cfg.block_count > 1024) {
+    err = "qwen35.block_count must be <= 1024 (got " + std::to_string(cfg.block_count) + ")";
+    return false;
+  }
   if (cfg.full_attention_interval < 1) {
     err = "qwen35.full_attention_interval must be >= 1 (got " +
           std::to_string(cfg.full_attention_interval) + ")";

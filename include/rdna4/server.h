@@ -118,6 +118,10 @@ void request_stop();
 class HttpServer {
  public:
   HttpServer(const ServerOptions &opts, const Router *router) : opts_(opts), router_(router) {}
+  // Not copyable: the destructor closes listen_fd_, so a copy would double-close
+  // it (review finding M9).
+  HttpServer(const HttpServer &) = delete;
+  HttpServer &operator=(const HttpServer &) = delete;
   ~HttpServer();
   bool open(std::string &err);
   bool serve(std::string &err);

@@ -1093,6 +1093,13 @@ soma checada elimina.
 | M5 | `-(int)` de `ctx_size` | `src/server/serve.hip`: `--ctx-size` limitado a `1..2^24` |
 | M1 | `release()` não era idempotente | `include/rdna4/graph.cuh`: os 18 ponteiros de `ptrs[]`/`batch_ptrs[]` são zerados (o array guarda cópias, então zerar o array não bastava) |
 | B2 | avisos reais do build padrão | `quants.h` guarda `IQ3S_N_SCALE`; `dequant_cpu_oracle.cpp` faz `#undef` antes do header do llama.cpp (colisão de macro, 5 alvos); `check_kvctx_gpu.hip:287` tinha `%zu` com argumento `int` (`ctx`) |
+| H2 | leitura D2H descartada devolvia zeros como se fossem estado oculto | `Graph::readback` e `MtpHead::read_h_out` devolvem `bool` e os dois chamadores (mais o `check-mtp-gpu`) propagam o erro |
+| H3 | o `hipMalloc(d_pos_)` do `init` era o único que falhava sem preencher `err` | mensagem `hipMalloc failed (pos)`, igual à do equivalente no `mtp.cuh` |
+| H4 | `bench --fill-cache` descartava o resultado do `debug_fill_caches` | falha agora aborta o `bench` em vez de cronometrar VRAM não inicializada (era o caminho de toda medição de contexto longo) |
+| H5 | `hipMemGetInfo` descartado imprimia `0.00 of 0.00 GiB` | checado; imprime "unavailable" quando falha |
+| M3 | `MtpHead::proj` validava dims mas não o tamanho em bytes do tensor | compara `w.bytes` com `tensor_bytes(...)`, como o `Graph::proj` do tronco |
+| M6 | `block_count` do arquivo virava tamanho de container sem teto | teto de 1024 ao lado do `< 2` que já existia (o modelo real tem 65) |
+| M9 | `token_text()`/`read_h_out` sem limites, `HttpServer` copiável, `cands_` morto | bounds no `token_text`, cópia do `HttpServer` deletada, `cands_` removido (~512 KB de heap ocioso), `open()` sem vazar `FILE*` no reabrir |
 | — | código morto que o compilador apontava | `graph.cuh`: `const int L = n_layer()` não usado (era o único `-Wunused-variable`); `model.cpp` e `unicode.cpp`: as duas funções estáticas sem uso (`prod`, `unicode_cpts_to_utf8`) foram apagadas — a primeira era um produto **sem** checagem de overflow ao lado do `prod_dims()` checado do loader |
 
 Gate novo: `scripts/check_hardening.sh [worktree-pré-correção]` (CPU puro, não pega
@@ -1110,9 +1117,13 @@ o lock da GPU) e `make check-forge`. Nada aqui depende do modelo real.
   cauda/`WPB` de `attn.cuh` (M2/E2 deste relatório — muda o kernel, então foi
   adiado para depois do merge da frente de autotuning), marcar os três parâmetros
   não usados, e só então ligar `-Wall -Wextra` no motor e no servidor.
-- **H2/H3/H4, M3, M9-M10, E2-E12**: não são CRITICOS e vários exigem mexer nos
+- **M10 (47 sítios de alargamento implícito) e E2/E6/E8-E12**: exigem mexer nos
   mesmos arquivos que a frente de autotuning está editando (`attn.cuh`,
-  `graph.cuh`, `matvec.cuh`). Ficam registrados aqui com `file:line`.
+  `matvec.cuh`) ou são refatorações de estilo sem ganho de correção; ficam
+  registrados aqui com `file:line`.
+- Gates CPU re-executados depois destas correções: `check-sampler`,
+  `check-server-http` (70 checagens), `check-chat`, `check-tokenizer` (corpus
+  completo), `check-loader` (modelo real) e `check-hardening`: todos OK.
 - **H7 (422 `nodiscard` nos testes)**: é ruído de teste, não caminho de produção
   (19/19 `hipMalloc` e 41/41 lançamentos de produção já são checados).
 
