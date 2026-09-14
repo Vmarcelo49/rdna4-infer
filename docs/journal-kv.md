@@ -756,27 +756,55 @@ espelho. Todo merge que encoste em `Graph::init`/`release` exige reconferir
 `graph_buffer_bytes` contra `graph.cuh` à mão. Blindar isso de verdade é gerar o
 total a partir do alocador (ou instrumentar `hipMalloc`), o que é mudança de desenho.
 
-### 8.2 `Memory access fault` no SEGUNDO `Graph` do mesmo processo (pós-merge) — ABERTO
+### 8.2 `Memory access fault` no SEGUNDO `Graph` do mesmo processo (pós-merge) — RESOLVIDO
 
-Medido duas vezes na tomada de 05:31-05:37, e o mesmo padrão passava **pré-merge**:
+**Reprodução mínima `[K1]` (2 configs, contexto 64, janela com 2,0 GiB de resíduo do
+processo que acabara de faultar): NÃO faultou.** Ou seja **não é uma regressão P0 do
+merge no sentido "segundo Graph quebra"** — a hipótese mais grave caiu.
 
-- `[I]` KL a 4096: a referência `f16/f16` (Graph nº 1) roda inteira e imprime; o fault
-  vem na config seguinte (`q8_0:q4_1`, Graph nº 2).
-- `[J]` needle a 16384: idem — `f16/f16` faz 8/8 e imprime; o fault vem no
-  `q5_0:q4_1` (Graph nº 2).
-- **Pré-merge**, `[F]` fez **7 Graphs em sequência** no mesmo processo sem fault.
-- Não é o par K/V (`[J]` usa `q5_0:q4_1` como segunda config, que pré-merge era a
-  segunda e funcionava) nem o tamanho (4104 e 16 387 tokens). O endereço do fault
-  (`0x7f...`) é típico de ponteiro de device não mapeado.
-- **Não separado ainda**: (a) regressão do merge no caminho "segundo Graph no mesmo
-  processo" em `graph.cuh`/`gdn.cuh`/`nn.cuh`; (b) janela suja — `[I]` começou com
-  **1,46 GiB** de resíduo do dono anterior, `[J]` com **12,6 GiB** (o processo que
-  acabara de faultar). Reprodução mínima na fila (`/tmp/kv-repro.sh`: 2 configs com
-  contexto 64, que separa bug de código de pressão de VRAM).
-- **Consequência**: até isso ser explicado, **nada que crie mais de um `Graph` no
-  mesmo processo serve como gate**. Os gates que passaram no §8 são todos de um Graph
-  por vez e continuam válidos; as medições de 131K (`bench`) também (um Graph por
-  processo).
-- **O que se perdeu**: os eixos completos da KL e a needle a 16K (§9). A tabela de
-  131K, a KL de 256 probes, a needle a 8K e o orçamento foram medidos **pré-merge**,
-  em janelas limpas, e o merge não toca essas contas.
+**Mas produziu NaN**, e isso é um achado de verdade:
+```
+q5_0:q4_1          -nan         -nan     0.000148          nan      3/4
+```
+`mean KL`, `PPL` e `mean|dNLL|` = NaN com `KL max` finito (0,000148): pelo menos uma
+das 4 probes teve logits NaN, e `std::max(kl_max, NaN)` devolve `kl_max`, então o NaN
+fica escondido na coluna do máximo. A segunda config no mesmo processo **não se
+comporta como a primeira**.
+
+**Causa encontrada por leitura, e é uma assimetria concreta do motor:**
+`Graph::alloc()` faz `hipMemset(p, 0, ...)` (`graph.cuh:439-448`) — por isso
+`d_state_`/`d_convst_` (o estado GDN) nascem zerados e o teste de continuação do
+`check_kvctx_gpu` passa — mas **`balloc()`, o alocador do bloco em lote, NÃO zerava**
+(`graph.cuh:585-587`: só `hipMalloc`). São 18 buffers × `kMaxBatch`.
+Para o **primeiro** Graph de um processo isso não aparece: `hipMalloc` devolve páginas
+frescas, que o driver entrega zeradas. Para o **segundo**, as páginas são recicladas
+do primeiro Graph, que acabou de rodar um prompt inteiro — os buffers de batch
+começam com as ativações do grafo anterior. É a única parte do motor cujo
+comportamento dependia do histórico de alocação do processo, e é exatamente o que um
+teste com vários Graphs por processo expõe.
+
+**Conserto** (`graph.cuh`): `balloc` passou a zerar, como `alloc`. ~7,6 MiB de memset
+por `init()`, irrelevante ao lado dos 10,9 GiB de upload de pesos, e **semanticamente
+no-op para o primeiro Graph de um processo** (as páginas já vinham zeradas) — por isso
+os gates bit-exatos (`check_regression`, `check_golden_run`) não podem mudar.
+Verificação na fila (`/tmp/kv-final.sh`): `[L1]` o mesmo caso que dava NaN, e `[L2]`
+3 configs a 1024 tokens exigindo números finitos e coerentes.
+
+**O que isso NÃO explica**: o `Memory access fault` de `[I]`/`[J]`, que aconteceu a
+4096/16 387 tokens e **não** se reproduziu a 64. Um fault precisa de ponteiro ruim, e
+lixo em buffer de dados não produz ponteiro ruim — então o fault continua sem
+explicação, e a hipótese que sobrou para ele é a janela suja (1,46 GiB em `[I]`,
+12,6 GiB em `[J]`, este último resíduo do processo que acabara de faultar). **Não
+afirmo que está explicado.** O que afirmo é o que medi: a 64 tokens não faulta, e o
+NaN tem causa nomeada e conserto no `balloc`.
+
+**Cuidado que fica registrado sobre os meus próprios números**: `[E]`, `[F]` e `[I]`
+são as únicas corridas que criam vários Graphs num processo. `[E]`/`[F]` (pré-merge)
+deram resultados internamente coerentes — duas sessões independentes concordam na
+ordem (q4_0/q4_0 pior, q8_0/q8_0 melhor), a linha `f16:f16` sai exatamente 0 e a
+needle deu 8/8 nos quatro formatos — mas com esta assimetria no `balloc` elas **não
+estão limpas por construção**. A tabela de 131K (§6) e o orçamento (§4/§5) não são
+afetados: `bench` e `info` criam **um** Graph por processo.
+
+
+
