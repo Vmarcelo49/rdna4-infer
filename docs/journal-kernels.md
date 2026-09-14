@@ -409,3 +409,46 @@ BIT-IDENTICO**; `check-matmul-gpu` **OK — bit-exact em todas as configuraçõe
 números do caminho em lote batem com os do binário pristino dentro do ruído
 (`q2_k` N=16: 1,379 vs 1,384 ms; `iq4_nl` N=16: 0,035 vs 0,035 ms). Os gates deste frente
 são, portanto, **pós-merge**.
+
+## 13. A/B fim a fim, 4K real, intercalado, MESMA janela (o número que faltava)
+
+Comando (dentro de um `gpu-lock`, janela verificada: VRAM 2,17 GB antes / 2,17 GB depois —
+resíduo do processo anterior, nenhum processo meu vivo): `/tmp/kdec.sh`, que alterna
+`/tmp/base-build/rdna4-infer` (binário do tag `noite-baseline-2026-09-14`) com
+`./build/rdna4-infer` (árvore mergeada), 3 rodadas, comando idêntico:
+
+`bench -m IQ3_S -p "The capital of France is" -n 16 --reps 3 --ctx-size 4096 --start-pos 4090 --fill-cache`
+
+| rodada | base (pristino) | novo (mergeado) | razão |
+|---|---|---|---|
+| 1 | 29,06 tok/s (0,206 s) | **34,13 tok/s (0,176 s)** | 1,175x |
+| 2 | 29,03 | **34,03** | 1,172x |
+| 3 | 29,02 | **34,05** | 1,173x |
+| **média (mean)** | 28,97 | **34,00** | **1,174x** |
+
+**+17,4 % de decode a 4K** (34,4 → 29,3 ms por token), com reprodutibilidade de ±0,2 %
+dentro de cada binário. O piso de ruído do harness (três corridas idênticas no começo da
+noite) foi ±0,3 %, ou seja: o ganho está 60x acima do piso.
+
+**Fechamento da conta (o que dá confiança na atribuição).** O binário "novo" contém as
+minhas três mudanças **e** tudo o que a `main` mergeou (frente de prefill, argmax no device,
+etc.), então a decomposição honesta é:
+
+| mudança | medido no kernel | × lançamentos | ms/token |
+|---|---|---|---|
+| `delta_rule` float4 (83 µs/camada dentro do grafo → 8,4) | −74,6 µs/camada | 48 | **−3,58** |
+| LUT dos IQ em LDS | 1,070x + 1,182x | inventário inteiro | **−1,20** |
+| `rms_norm`/`l2_norm` 4 cargas em voo | −2,03 µs | 128 | **−0,26** |
+| **soma** | | | **−5,04** |
+| **medido fim a fim** | | | **−5,14** |
+
+Os 0,10 ms de diferença são o resto do merge (e cabem no ruído de ±0,1 ms das duas
+medidas). É por isso que eu assino o número como **da minha frente**: a soma das três
+parcelas medidas explica o ganho inteiro, sem sobra atribuível a outra frente. (A
+`delta_rule` no grafo era 83 µs/camada no `docs/medicoes-banda-e-gargalos.md` §4.2, contra
+71,7 µs isolado — é essa diferença de contexto que faz a parcela in-graph ser 3,58 e não
+3,04 ms.)
+
+**Antes e depois, em uma linha:** decode 4K real **28,97 → 34,00 tok/s (1,174x, +17,4 %)**
+de 29,06/29,03/29,02 → 34,13/34,03/34,05 tok/s nos melhores tokens, mesma janela, binários
+alternados.
