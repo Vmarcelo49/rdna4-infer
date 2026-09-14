@@ -49,6 +49,11 @@ if [ "$PHASE" = all ]; then
   step "check-hardening"   "$ROOT/scripts/check_hardening.sh"
   [ -x "$B/check-tuning" ] && step "check-tuning" "$B/check-tuning"
 
+  if [ "${CHECK_ALL_CPU_ONLY:-0}" = 1 ]; then
+    if [ "$fail" -eq 0 ]; then echo "check_all (CPU half): PASS"; else echo "check_all (CPU half): FAIL"; fi
+    exit "$fail"
+  fi
+
   echo "== B. GPU gates under a single lock =="
   if ! "$ROOT/scripts/gpu-lock.sh" env CHECK_ALL_PHASE=gpu "$0" "$MODEL" $(quick_arg); then
     fail=1
