@@ -438,7 +438,11 @@ Ordered by how much they cost the user, with the number that justifies each. Not
    4.295 GB of unique bytes). The attention kernel saturates ~1.35 TB/s of L2, so the L2 hides
    most of it — but a Vulkan-style grouped attention (one row loaded once for the 6 query
    heads) is a known, unclaimed win. Decode was attention-bound before M7 (4.2 tok/s at 64K);
-   `docs/medicoes-m7.md` has the fix and the curve.
+   `docs/medicoes-m7.md` has the fix and the curve. The split path is not bit-exact and its
+   deviation is now measured on real text as a ladder: **5.1989** unsplit, **5.2054** at 4
+   splits (+0.125 %), **5.2114** at 16 splits with the wide CTA (+0.240 %) — all inside the
+   0.5 % gate, but the wide end costs twice the deviation of the narrow one, which is the
+   price of the +5 % kernel speed it buys at 131K.
 5. **"Runs at 131K" is not "is good at 131K", and we say exactly which half is measured.**
    (a) *Implementation*: our RoPE was diffed against the real `ggml_rope_multi` up to position
    262 143 (`check-rope-long-gpu`) — relative L2 ≤ 1e-3 at the far end, explained by one ulp of

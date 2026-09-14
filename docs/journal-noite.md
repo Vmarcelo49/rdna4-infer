@@ -117,3 +117,16 @@ pior. Repassado à frente KV.
 - **MTP**: implementado, aceitação 86,7 % e saída idêntica ao greedy, mas **9-10 % mais lento**
   porque cada token aceito roda um forward do tronco (sem verificação em batch). Com o
   `Graph::forward_batch` do M8 já no lugar, a verificação em batch é o trabalho da frente MTP.
+
+### C5. Gate em texto real para a ponta larga da regra de WPB (achado F5) — FECHADO
+- **Referência**: `docs/adversarial-noite.md` F5 (a combinação embarcada ≥16 splits × 16 warps
+  não tinha gate em texto real; só um teste com cache sintético e tolerância 5e-2).
+- **Comando**: `./scripts/gpu-lock.sh timeout 1500 ./scripts/check_attn_split.sh` (o caso novo
+  roda com `RD_ATTN_SPLITS=16`, exatamente a ponta larga) em wikitext-2, ctx 1024, 2 chunks.
+- **Resultado**: PPL sem split **5,1989** · 4 splits **5,2054** (+0,125 %) · **16 splits × 16
+  warps 5,2114 (+0,240 %)** contra o sem-split. Limite do gate 0,5 %. Ou seja: a regra larga é
+  numericamente equivalente ao caminho sem split, com **o dobro** do desvio do caso de 4 splits
+  — coerente com mais reordenação da soma das chaves, e dentro da mesma classe numérica.
+- **Veredito**: MANTIDO (gate novo em `scripts/check_attn_split.sh`, `WIDE=0` pula). De quebra,
+  o número entra no README como a escada de desvio do split-KV: 0,125 % (4 splits), 0,240 %
+  (16 splits × 16 warps).
