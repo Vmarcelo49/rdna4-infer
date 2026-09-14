@@ -118,6 +118,40 @@ exige, além do GEMM, atacar a recorrência do GDN (é o item 5 da tabela do §3
 andaime com tamanho para importar). A frente C chegou ao mesmo teto por outro caminho (446 tok/s
 com o matvec na banda de 633 GB/s).
 
+## 1c. Estado do D2 depois de implementado (14/09, tarde) — e por que ele NÃO é default
+
+O GEMM tilejado está implementado em `include/rdna4/gemm.cuh` (frente D2, com verificação antes de
+cronometrar) e integrado no despacho do `proj_batch`. Medições:
+
+| | medido |
+|---|---|
+| T-MAC/s do GEMM (M=64/128/512, `blk.3.ffn_up` iq3_s) | 13,49 / 15,69 / **17,42** |
+| contra o GEMV em lote que embarca | 2,17× / 2,53× / **3,33×** |
+| contra o chunk de 16 de hoje | 2,31× / 2,69× / **3,42×** |
+| em M=16 | 0,96× (perde, como o §0.1 previu) |
+| cobertura de tipos | `iq3_s` + `iq3_xxs` + `iq4_xs` = **68,0 %** dos bytes de peso |
+| bit-exatidão | **0 de 4096** contra o `vec_dot_*` do motor (max ulp 0) nos três tipos |
+| pegada | 157-164 VGPR, 24 576 B de LDS, **0 spill** (BM=64; o BM=128 do V6 gastava 256 VGPR + 56 B de spill e era 1,25-1,43× PIOR) |
+| **prefill de ponta a ponta, 512 tokens** | chunk 16 = 104,86 tok/s · chunk 64 = 189,40 · **chunk 128 = 231,83 (2,21×)** |
+| no alvo 131K com `q5_0`/`q4_1` | prefill **229,36 tok/s**, decode 31,09 tok/s, `need` 14,19 GiB (cabe) |
+
+**E mesmo assim o chunk maior ficou OPT-IN (`RD_PREFILL_CHUNK=128`), por uma razão medida:**
+o GEMM é bit-exato contra o `vec_dot` **mas não** contra o `matvec_launch_batch` que embarca
+(rel-L2 2,4e-7, `max|d|` 3,3e-6) — a partição da soma em k é outra (bloco de 32 em int32 com fator
+inteiro, contra o acumulador por lane com redução butterfly). Como o `prefill_ids` do CLI e o loop
+do servidor cortam o mesmo prompt em chunks diferentes, um prefill pode **misturar** os dois
+caminhos, e aí dois consumidores do mesmo modelo divergem no último bit — e às vezes no último
+token: foi o que o gate do `serve` pegou (**2 falhas com chunk 128, 0 com 16**). O `check-batch-gpu`
+não pega porque **só chama chunks ≤ 16**: ele nunca exercita o GEMM. (Essa foi a correção de uma
+afirmação minha errada de que o gate provava bit-exatidão em chunk 128.)
+
+**O que falta para o chunk maior virar default** (é o próximo trabalho, e é gating, não kernel):
+1. re-gate **numérico** do caminho em lote (PPL/regressão com tolerância declarada, no lugar da
+   bit-exatidão estrita), como o `PLAN.md` M2/M3 já exige para mudança numérica;
+2. fazer CLI e servidor cortarem o prompt **do mesmo jeito** (ou aceitar a divergência de último
+   bit explicitamente);
+3. e então o `check-batch-gpu` precisa de casos com n > 16, senão continua cego para o GEMM.
+
 ## 2. Decisões fixadas pelo estudo
 
 1. **f16, não int8, para os tipos IQ** (frente B §7, com argumento de precisão e de código):
