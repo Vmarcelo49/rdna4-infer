@@ -152,6 +152,22 @@ com o matvec na banda de 633 GB/s).
 | 5 | laço sequencial do GDN dentro de um chunk de 128 | `include/rdna4/gdn.cuh` (`delta_rule`, conv) | a recorrência continua sequencial; só a *projeção* vira GEMM (é o que o llama.cpp faz: matmul com M grande e o scan por dentro) |
 | 6 | laço interno `coopmat` f16→f32 | `gemm.cuh` (só o corpo interno muda) | D3 |
 
+### Atenção e KV no prefill (frente J) — o que entra no P0 e o que não entra
+
+- **Atenção não é alavanca de tempo**: 2,1 % do nosso prefill (87,7 ms de 4174 ms); zerá-la levaria
+  122,66 → 125,30 tok/s e o gap de 8,54× viraria 8,41×. Do lado deles, 1,76 ms por chunk de 512 =
+  0,39 %.
+- **Mas o *tile* de atenção entra no P0 como pré-requisito**: `Br=16` linhas de consulta por
+  workgroup (`ggml-vulkan.cpp:4014-4023`) é o que permite o chunk de 128/512 na atenção; sem ele,
+  subir o chunk só multiplica CTAs. É o port nº 1 da frente J
+  (`docs/estudo-prefill-j-atencao-kv.md` §6).
+- **KV no prefill**: `f16` no caminho deles **não passa por LDS** (o fragmento coopmat lê direto da
+  global); quantizado **é obrigado** a estagiar na LDS, e `q8_0` tem um caminho que copia **o cache
+  inteiro** para um rascunho f16 por camada por chunk. Ou seja: **no prefill o formato quantizado é
+  custo de instrução, não economia de banda** — a razão inverte em relação ao decode noturno. Isso
+  não contradiz o alvo de `q5_0`/`q4_1` (que é uma escolha de *memória*, para caber 131K), mas
+  significa que não se deve esperar ganho de velocidade de prefill vindo do formato.
+
 ## 4. Gates (o caminho **não** é bit-exato, e isso é uma decisão consciente)
 
 O GEMM muda a ordem das somas e o tipo da ativação, então **não vale bit-exatidão** — o

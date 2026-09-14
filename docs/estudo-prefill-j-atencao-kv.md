@@ -107,7 +107,8 @@ SubGroupSize=64, SHMEM_STAGING=0, Flags, LIMIT_OCCUPANCY_SHMEM=0, FaTypeK/V, FaB
 `Flags` = `USE_MASK_OPT | MASK_ENABLE<<1 | LOGIT_SOFTCAP<<2 | OLD_AMD_WINDOWS<<3`
 (`get_fa_pipeline_state`) ⇒ para nós **`Flags = 2`** (tem máscara, sem mask_opt, sem softcap).
 
-**`aligned`** (`:11286-11289`): `KV % Bc = 512 % 64 = 0`, `q_stride = 256 & 7 = 0`,
+**`aligned`** (`:11286-11289`, com `q_stride = nbq1/4` — depois do `permute` o passo entre linhas
+de Q é `n_head × head_dim` elementos, não `head_dim`): `KV % Bc = 512 % 64 = 0`, `q_stride & 7 = 0`,
 `k_stride = nbk1/2 = 1024 & 7 = 0`, `v_stride = 1024 & 7 = 0` ⇒ **`aligned = true`** ⇒ variante
 `_aligned_` e `Clamp = 0`, isto é **o shader não faz checagem de limites** (`KV_bounds_check =
 false`, `flash_attn_base.glsl:32`).
@@ -253,7 +254,7 @@ Ou seja, o `Q·Kᵀ` é escrito **transposto** (`Bc × Br`, `K` como A e `Q` com
 | `sfsh` (escores + softmax) | f32 | `:52`, `ACC_TYPEV4` |
 | `Psh` (P, entrada do 2º MMA) | **f16** | `:48`, `FLOAT_TYPEV4` |
 | `Of` (acumulador do laço `j`) | **f16** | `:105`, `O_TYPEV4 = FLOAT_TYPEV4` |
-| saída/`L`/`M` finais | f16 com `1/L` | `:607-620` |
+| `L`, `M` e a divisão final | f32 (`Lf`), normalizada em `O_TYPE` = f16, store em `D_TYPE` = f32 | `:112`, `:531`, `:607-620` |
 
 Ou seja: **`Q·Kᵀ` e `P·V` acumulam em f32; P e o acumulador que atravessa os blocos de chave são
 f16.** (É o oposto do `mul_mm` deles, que roda `f16acc` por não haver correção depois —
@@ -313,9 +314,9 @@ sempre f16.
 Sem medição, só aritmética **DERIVADO**: por camada, por chunk, o `dequant_q8_0_transpose` move
 `KV × 4 × 256` elementos — a 512 chaves são 524 288 elementos = **0,56 MB lidos (q8_0) e 1,05 MB
 escritos (f16)**, mais 2 despachos (K e V). Irrelevante a 512. A **4096 chaves por chunk** já são
-4,2 M elementos por tensor (13,9 MB de leitura + 16,8 MB de escrita **por camada**, ~490 MB de
-tráfego por chunk de 512 tokens somando 16 camadas). O custo **cresce com o contexto** e é pago
-**inteiro a cada chunk** — é o oposto de um cache.
+4,2 M elementos por tensor (8,9 MB de leitura + 16,8 MB de escrita **por camada** contando K e V,
+**411 MB de tráfego por chunk de 512 tokens** somando 16 camadas). O custo **cresce com o
+contexto** e é pago **inteiro a cada chunk** — é o oposto de um cache.
 
 ---
 
@@ -357,12 +358,13 @@ De KV ≥ 1024 em diante o pré-passe `flash_attn_mask_opt` (`:11446-11464`, sha
 
 ### 3.3 A escrita do chunk no cache: fusão quando f16, `copy_to_quant` quando quantizado
 
-- **f16**: a fusão `ROPE_VIEW_SET_ROWS` / `RMS_NORM_MUL_ROPE_VIEW_SET_ROWS`
-  (`ggml-vulkan.cpp:18251-18258` e `:18182-18193`) faz **um** despacho que calcula o rope e escreve
-  a linha **dentro do cache** (`ggml_vk_rms_norm_mul_rope`, `set_rows_stride` em `:13924-13936`).
-  Para o nosso grafo não há `RMS_NORM` antes do rope do K (a qk-norm é do qwen35 — o nosso motor
-  tem `rms_norm` de k e v também: `graph.cuh:1069-1076`), então o padrão é o de 3 nós:
-  `ROPE + VIEW + SET_ROWS` ⇒ **1 despacho por camada**.
+- **f16**: a cadeia do K no qwen35 é `rms_norm(Kcur)` → `mul(attn_k_norm)` → `rope` →
+  `view` → `set_rows` (`qwen35.cpp:286` chama `build_norm(..., attn_k_norm, nullptr, LLM_NORM_RMS,
+  il)`, que emite `ggml_rms_norm` **e** `ggml_mul` do peso), e essa cadeia de 5 nós é exatamente o
+  padrão `RMS_NORM_MUL_ROPE_VIEW_SET_ROWS` (`ggml-vulkan.cpp:18182-18193`; a variante de 3 nós sem
+  a norma é `:18251-18258`). Resultado: **um** despacho faz norma + peso + rope + escrita da linha
+  **dentro do cache** (`ggml_vk_rms_norm_mul_rope`, `set_rows_stride` em `:13924-13936`), e o V
+  (sem norma nem rope) é o outro `SET_ROWS`. ⇒ **2 despachos** (K e V) por camada por chunk.
 - **quantizado**: a fusão é **desligada por tipo** — `if (set_rows->type != GGML_TYPE_F32 &&
   set_rows->type != GGML_TYPE_F16) return false;` (`:17750`). A linha então vai por
   `copy_to_quant.comp` com `SET_ROWS` (`:9285` seleciona `pipeline_cpy_f32_quant[dst]`;
@@ -371,24 +373,27 @@ De KV ≥ 1024 em diante o pré-passe `flash_attn_mask_opt` (`:11446-11464`, sha
   (K e V separados) **mais** o rope. É o mesmo trabalho que o nosso `kv_write_batch` faz
   (`graph.cuh:872-882`, 2 lançamentos: K e V, cada um com `width = n_tok*NKV*HD` elementos).
 
-Nosso caminho **já é o barato aqui**: `kv_write_batch` = 2 lançamentos por camada por chunk contra
-1 (f16) ou 2-3 (quantizado) deles, e a diferença total é lançamento, que é 1,6 % do prefill
+Nosso caminho **já é o barato aqui**: `kv_write_batch` = 2 lançamentos por camada por chunk (`K` e
+`V`, `graph.cuh:873-874`) contra 2 (f16, K fundido com norma+rope) ou 3-4 (quantizado: K e V por
+`copy_to_quant` mais o rope), e a diferença total é lançamento, que é **1,6 %** do prefill
 (`docs/estudo-prefill-c-nosso.md` §4.2).
 
 ### 3.4 Contagem de despachos por camada de atenção no prefill
 
-| peça | nós | eles (512 tokens, KV f16) |
-|---|---:|---:|
-| atenção | 1 por camada por chunk (`attn.cuh:423-425` via `forward_batch_layer`) | **1 por camada** (`split_k=1`, `:11512-11514`) |
-| máscara | 0 (o `t` é o laço) | 0 com KV < 1024; **1** com KV ≥ 1024 |
-| escrita do KV | 2 (`graph.cuh:873-874`) | **1** (`ROPE_VIEW_SET_ROWS`) |
+| peça | nós (por camada, por chunk de 16) | eles (por camada, um ubatch de 512) |
+|---|---|---|
+| atenção | 1 (`attn.cuh:423-425`, via `forward_batch_layer`) | **1** (`split_k=1`, `:11512-11514`) |
+| máscara | 0 (a causalidade é o `t` do laço) | 0 com KV < 1024; **1** com KV ≥ 1024 |
+| escrita do KV | 2 (`graph.cuh:873-874`, K e V) | **2** (K fundido com `RMS_NORM_MUL_ROPE`; V por `SET_ROWS`) |
+| norma+peso do K | 1 (`graph.cuh:1069`) | **0** (fundido no de cima) |
+| rope do k | 1 (`graph.cuh:1076`) | **0** (fundido no de cima) |
+| norma+rope do q | 2 (`graph.cuh:1067`, `:1075`) | 1 (`RMS_NORM_MUL_ROPE`) |
 | dequant do cache | 0 | 0 (f16); **2** com `q8_0` |
-| rope do q/k | 2 (`graph.cuh:1075-1076`) | fundido no de cima / no `RMS_NORM_MUL_ROPE` |
-| **por camada de atenção** | **~11** (o resto é norma/qk-norm/projeções) | ~7 |
 
 A 512 tokens o nosso prefill faz **32 chunks** por camada ⇒ **32 despachos de atenção por camada**
 num kernel que aceita `gridDim.y = 16` tokens; eles fazem **1** que aceita N = 512. A diferença de
-despacho é ruído (1,6 %); a diferença de **forma paralela** não é (§4).
+despacho é ruído (1,6 %, `docs/estudo-prefill-c-nosso.md` §4.2); a diferença de **forma paralela**
+não é (§4).
 
 ---
 
@@ -417,10 +422,10 @@ trabalho com 32 instruções de MMA por 64 chaves e uma redução por **coluna d
 ### 4.2 A releitura de 6× (nossa) e 192× (deles)
 
 `kvh = h / (n_head / n_head_kv)` (`attn.cuh:331`): as 6 cabeças de consulta de um grupo leem as
-mesmas linhas. Medido/derivado no estudo de contexto longo: **25,77 GB lógicos contra 4,295 GB
-únicos a 64K, f16** (`docs/kv-memoria-desenho.md:303`, `docs/journal-longctx.md:197`). A taxa
-efetiva do kernel é **~1,36 TB/s de L2** e **~225 GB/s de DRAM** a 4K e a 64K — ou seja, ele
-satura pedidos, não banda (`docs/kv-memoria-desenho.md:355-362`).
+mesmas linhas. Medido/derivado no estudo de contexto longo, **por token e para as 16 camadas**:
+**25,77 GB lógicos contra 4,295 GB únicos a 64K, f16** (`docs/kv-memoria-desenho.md:303`,
+`docs/journal-longctx.md:197`). A taxa efetiva do kernel é **~1,36 TB/s de L2** e **~225 GB/s de
+DRAM** a 4K e a 64K — ou seja, ele satura pedidos, não banda (`docs/kv-memoria-desenho.md:355-362`).
 
 Do lado deles a amplificação é **maior**, não menor: 6 (GQA) × 32 (blocos de 16 linhas) = **192×**
 o byte único (§2.1). A diferença é que **eles pedem 16× menos por MAC** (0,125 B/MAC contra 2 B/MAC
@@ -478,13 +483,15 @@ deles, **3,44 µs/token** [M].
 | MACs/s emitidos (eles fazem 2× o trabalho causal) | 0,294e12 | 29,2e12 | **99×** |
 
 O `99×` é o número que dói: **por MAC emitido, a FA deles é ~100× a nossa** — 17,5 ps por par
-(consulta, chave, cabeça, camada) contra 1 740 ps. É pior que os 8,5× do prefill inteiro e pior que
-os ~9× do matvec, e a razão é a forma: 512 MACs por par feitos com 2 pedidos de 16 B + um `fmaf` de
-8 elementos + 5 `shfl` + 2 `expf` (§4.1), contra 1 `coopMatMulAdd` por 16 pares × 16 chaves.
+(consulta, chave, cabeça, camada) contra 1 740 ps. É pior que os **8,54×** do prefill inteiro (que
+já embute o fator de micro-lote) e pior que os **9,1×** da fase de matmul
+(`docs/estudo-prefill-a-vulkan.md` §0.2), e a razão é a forma: 512 MACs por par feitos com 2
+pedidos de 16 B + um `fmaf` de 8 elementos + 5 `shfl` + 2 `expf` (§4.1), contra 1
+`coopMatMulAdd` por 16 pares × 16 chaves.
 
 **A resposta à pergunta: atenção é nota de rodapé no prefill, e o número que decide é 2,1 %.** Se a
 nossa atenção custasse **zero**, o prefill de 512 iria de **122,66 para 125,30 tok/s** (+2,2 %) e o
-gap de 8,54× viraria **8,41×** — a atenção explica **1,5 % do gap**. Mesmo igualando-a exatamente à
+gap de 8,54× viraria **8,41×** — a atenção explica **≤ 2 % do gap**. Mesmo igualando-a exatamente à
 deles, sobra ≤ 2 %. O que **não** é nota de rodapé é o que a forma da FA deles habilita:
 
 - **16 linhas de consulta por workgroup** é o mecanismo que torna um micro-lote grande barato na
@@ -524,7 +531,7 @@ por latência/ocupação (**165-172 GB/s efetivos**, 27-29 % do pico) e não por
 3. **O `q8_0` deles resolve isso pior**: sai do shader e vira uma **cópia do cache inteiro** por
    camada por chunk (§2.3a, `:11232-11442`), cujo custo cresce com o contexto e é pago por chunk.
    É uma escolha defensável a 512 tokens (0,56 MB lidos por camada) e indefensável a 4096
-   (≥ 490 MB de tráfego extra por chunk de 512 tokens, DERIVADO).
+   (411 MB de tráfego extra por chunk de 512 tokens, DERIVADO — §2.4).
 4. **Do nosso lado o custo da desquantização é hoje 16× maior do que seria com tile**: nós
    desquantizamos por par (consulta, chave) — `kv_load8<Q4_0>` roda uma vez por lane por linha por
    token (`attn.cuh:373`, `kv.h:281-296`) — enquanto a forma tiled desquantiza uma vez por tile de
@@ -561,9 +568,10 @@ por latência/ocupação (**165-172 GB/s efetivos**, 27-29 % do pico) e não por
 2. **A P em `f16` na LDS e o acumulador do laço de chaves em `f16`, com `Q·Kᵀ`/`P·V` em f32.**
    *Portável.* `flash_attn_cm1.comp:48` (`Psh` = `FLOAT_TYPEV4`), `:105` (`O_TYPEV4`), `:257`
    (`ACC_TYPE`), `:496`; o porquê do `f32acc` está em `llama-graph.cpp:2639` + `ggml-vulkan.cpp:11221`.
-   Toca `attn.cuh` (a P hoje nunca é materializada: `p` é escalar por chave, `:368`) e é o que
-   **barateia a P**: 16 consultas × 1 valor por chave em vez de 256 lanes recalculando o mesmo
-   `expf`. Custo zero em precisão nova: eles já aceitam P em f16.
+   Toca `attn.cuh` (a P hoje nunca é materializada: `p` é escalar e os 32 lanes do warp calculam
+   o **mesmo** `expf` para a sua chave, `:368`) e é o que **barateia a P**: no tile, um `vec4` de
+   pesos sai de um `exp` por lane (`flash_attn_cm1.comp:389`), contra 2 `expf` por chave por warp
+   hoje. Custo zero em precisão nova: eles já aceitam P em f16.
 3. **Desquantizar para a LDS uma vez por tile (e não por par consulta×chave).**
    *Portável com ressalva.* Vem de `flash_attn_cm1.comp:236-245`/`:406-414` (`dequantize4` →
    `kvsh`) e `flash_attn_dequant.glsl:46-105`; o preço medido por elemento está na tabela da §2.3.
@@ -578,11 +586,12 @@ por latência/ocupação (**165-172 GB/s efetivos**, 27-29 % do pico) e não por
    Serve **ao contrário** para nós: o item 1 introduz o desperdício que eles têm (com um bloco de 16
    consultas, o `t` do bloco é o maior `t`, então as linhas iniciais pagam chaves futuras); o
    bitmask devolve isso a partir de ~1024 chaves, e **abaixo disso nós podemos fazer melhor que
-   eles** (pular por `t` real dentro do bloco custa zero e eles não fazem).
+   eles**: o `t` de cada linha do bloco é conhecido e uma comparação por bloco evita o trabalho,
+   enquanto eles não têm atalho nenhum abaixo de 1024 chaves (`:11309-11310`).
 5. **Escrever o K com o rope direto no cache (`ROPE_VIEW_SET_ROWS`).** *Portável.*
    `ggml-vulkan.cpp:18251-18258`, `:13924-13936`; o teto do ganho é o custo de lançamento: **1,6 %**
    do prefill, dos quais isto é uma fração (`docs/estudo-prefill-c-nosso.md` §4.2). Toca
-   `graph.cuh:1076`+`:1080` (fundir `rope_launch` de k com `kv_write_batch`).
+   `graph.cuh:1076` + `graph.cuh:1080` (fundir `rope_launch` de k com `kv_write_batch`).
 6. **`dequant_transpose` do cache inteiro para `q8_0`.** *Não portável como ganho* — é o
    contrário: é o que o llama.cpp faz para **não** desquantizar no shader no prefill, e o custo
    cresce com o contexto (§2.3a, §5). Serve só como A/B de referência.
