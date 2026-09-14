@@ -81,6 +81,33 @@ inline MtpDims mtp_dims(const Qwen35Config &cfg, int block) {
   return d;
 }
 
+// Bytes MtpHead::init() allocates on top of what the trunk already holds: the 15
+// block tensors (335 MiB in the IQ3_S file) plus **two** KV caches of
+// max_ctx x n_head_kv x kv_row_bytes each. device.h's required_bytes() only knows
+// the trunk's own 16 attention layers, so a `--mtp` configuration it approves can
+// still die in hipMalloc (review finding: the budget and the MTP path disagreed by
+// 0.25 GiB at 64K and 0.5 GiB at 128K before this). Computable without loading a
+// single tensor, so the CLI can check it before it maps 12 GiB.
+inline std::uint64_t mtp_required_bytes(const GgufLoader &ld, const Qwen35Config &cfg, int max_ctx,
+                                        KvType kv_k, KvType kv_v) {
+  if (cfg.nextn_predict_layers == 0 || max_ctx <= 0) return 0;
+  const MtpDims d = mtp_dims(cfg, (int)cfg.block_count - (int)cfg.nextn_predict_layers);
+  char prefix[32];
+  std::snprintf(prefix, sizeof(prefix), "blk.%d.", d.block);
+  const std::size_t plen = std::strlen(prefix);
+  std::uint64_t bytes = 0;
+  const auto &tensors = ld.meta().tensors;
+  for (std::size_t i = 0; i < tensors.size(); ++i) {
+    const std::string &name = tensors[i].name;
+    if (name.size() < plen || name.compare(0, plen, prefix) != 0) continue;
+    bytes += ld.tensor_bytes(i);
+  }
+  bytes += (std::uint64_t)max_ctx * (std::uint64_t)d.n_head_kv *
+           ((std::uint64_t)kv_row_bytes(kv_k, d.head_dim) +
+            (std::uint64_t)kv_row_bytes(kv_v, d.head_dim));
+  return bytes;
+}
+
 class MtpHead {
  public:
   // Same contract as Graph::NodeCb: the node names are llama.cpp's own, so the
@@ -112,13 +139,19 @@ class MtpHead {
   // position pos-1 — the plain post-final-norm state forward_tokens() returns;
   // `tok` is the token at position `pos`. Fills `logits` (n_vocab) with the
   // draft distribution for position pos+1 and sets `argmax`.
+  //
+  // `want_logits = false` skips the shared LM head (874 MiB of weights, ~2/3 of
+  // the step's traffic) and the logits readback, keeping everything else — the
+  // block's own KV row, h_nextn — identical. That is what the MTP KV *rebuild*
+  // after a speculative round needs: it re-derives the block's rows from the
+  // trunk's h and never proposes a token, so the head would be pure cost.
   bool step_host(const float *h_prev, std::int32_t tok, int pos, std::vector<float> *logits,
-                 std::int32_t *argmax, std::string &err);
+                 std::int32_t *argmax, std::string &err, bool want_logits = true);
   // Chained step: the `h` input is this block's own previous output (h_nextn)
   // instead of a trunk row, which is how llama.cpp drafts more than one token
   // ahead without the trunk (common/speculative.cpp `pending_h`).
   bool step_chained(std::int32_t tok, int pos, std::vector<float> *logits,
-                    std::int32_t *argmax, std::string &err);
+                    std::int32_t *argmax, std::string &err, bool want_logits = true);
 
   // New sequence: the KV cache needs no clearing (attention is causal and every
   // row is rewritten by position before it is read — same argument as
@@ -152,7 +185,8 @@ class MtpHead {
   bool alloc_kv(std::string &err);
   bool proj(const W &w, const float *d_x, float *d_y, int nrows, int ncols, std::string &err);
   bool run(std::int32_t tok, int pos, bool h_from_host, const float *h_host,
-           std::vector<float> *logits, std::int32_t *argmax, std::string &err);
+           std::vector<float> *logits, std::int32_t *argmax, std::string &err,
+           bool want_logits = true);
   void emit(const char *name, const float *d_ptr, std::int64_t n) const {
     if (cb_) cb_(name, d_ptr, n);
   }
@@ -409,25 +443,26 @@ inline bool MtpHead::proj(const W &w, const float *d_x, float *d_y, int nrows, i
 
 inline bool MtpHead::step_host(const float *h_prev, std::int32_t tok, int pos,
                                std::vector<float> *logits, std::int32_t *argmax,
-                               std::string &err) {
+                               std::string &err, bool want_logits) {
   if (h_prev == nullptr) {
     err = "MTP: h_prev is null";
     return false;
   }
-  return run(tok, pos, /*h_from_host=*/true, h_prev, logits, argmax, err);
+  return run(tok, pos, /*h_from_host=*/true, h_prev, logits, argmax, err, want_logits);
 }
 
 inline bool MtpHead::step_chained(std::int32_t tok, int pos, std::vector<float> *logits,
-                                  std::int32_t *argmax, std::string &err) {
+                                  std::int32_t *argmax, std::string &err, bool want_logits) {
   if (!have_h_out_) {
     err = "MTP: step_chained before any step (no h_nextn to chain from)";
     return false;
   }
-  return run(tok, pos, /*h_from_host=*/false, nullptr, logits, argmax, err);
+  return run(tok, pos, /*h_from_host=*/false, nullptr, logits, argmax, err, want_logits);
 }
 
 inline bool MtpHead::run(std::int32_t tok, int pos, bool h_from_host, const float *h_host,
-                         std::vector<float> *logits, std::int32_t *argmax, std::string &err) {
+                         std::vector<float> *logits, std::int32_t *argmax, std::string &err,
+                         bool want_logits) {
   using clock = std::chrono::steady_clock;
   const clock::time_point t0 = clock::now();
 
@@ -608,6 +643,13 @@ inline bool MtpHead::run(std::int32_t tok, int pos, bool h_from_host, const floa
   have_h_out_ = true;
   emit("h_nextn", d_hout_, E);
   emit("mtp_shared_head_norm", d_hout_, E);
+  if (!want_logits) {
+    // KV-rebuild step: the block's own row and h_nextn are what the caller
+    // consumes, the LM head (874 MiB, ~2/3 of the step) and its readback are
+    // skipped. Nothing else changes, so the restored rows are identical.
+    last_ms_ = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+    return true;
+  }
   const int n_vocab = shared_.n_vocab;
   if (d_logits_ == nullptr) {
     if (hipMalloc(&d_logits_, (std::size_t)n_vocab * sizeof(float)) != hipSuccess) {

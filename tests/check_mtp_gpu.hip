@@ -346,7 +346,7 @@ int main(int argc, char **argv) {
   // overshoots would print text the plain path never printed).
   std::size_t streamed = 0;
   auto run = [&](bool use_mtp, bool score, int draft, rdna4::MtpGenStats &st,
-                 std::vector<std::int32_t> &out) -> bool {
+                 std::vector<std::int32_t> &out, bool batch_verify = true) -> bool {
     streamed = 0;
     if (use_mtp) {
       if (!prefill()) return false;
@@ -359,6 +359,7 @@ int main(int argc, char **argv) {
     gp.n_predict = n_tokens;
     gp.draft = draft;
     gp.score_only = score;
+    gp.batch_verify = batch_verify;
     if (!rdna4::mtp_generate(graph, use_mtp ? &mtp : nullptr,
                              [&](std::int32_t id) { return tk.is_eog(id); }, sampler, prompt,
                              hidden, logits, gp, st, err,
@@ -555,12 +556,13 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "score run: %s\n", err.c_str());
     return 1;
   }
-  if (!run(true, false, draft_n, s_spec, ids_spec)) {
+  if (!run(true, false, draft_n, s_spec, ids_spec, /*batch_verify=*/false)) {
     std::fprintf(stderr, "spec run: %s\n", err.c_str());
     return 1;
   }
   ok(ids_score == ids_plain, "draft-and-score changes nothing (same ids as plain greedy)");
   ok(ids_spec == ids_plain, "speculative decoding is token-for-token plain greedy decode");
+  ok(s_spec.rollbacks == 0, "the serial path needs no rollback (it never forwards a rejected draft)");
   std::printf("   plain     : %zu tokens, %d trunk steps\n", ids_plain.size(), s_plain.trunk_steps);
   std::printf("   score     : %lld/%lld drafts matched (%.1f%%), %d draft steps\n", s_score.accepted,
               s_score.drafted, s_score.acceptance() * 100.0, s_score.draft_steps);
@@ -579,7 +581,7 @@ int main(int argc, char **argv) {
   ok(streamed <= (std::size_t)n_tokens,
      "no mode streamed more than n_predict tokens (a round cannot overshoot)");
   ok(s_spec.trunk_steps == (int)ids_spec.size(),
-     "speculative decode made one trunk step per committed token (an unbatched trunk cannot "
+     "the serial path made one trunk step per committed token (an unbatched trunk cannot "
      "verify a whole draft block in one pass)");
   std::printf("   ACCEPTANCE RATE (documented number, score mode): %.1f%% over %lld drafts\n",
               s_score.acceptance() * 100.0, s_score.drafted);
@@ -602,6 +604,112 @@ int main(int argc, char **argv) {
                           " speculative ids are still plain greedy's").c_str());
   }
 
+  // ------------------------------------------------- batched verification
+  // feat/noite-mtp. The batched path has to be *bit-identical* to the serial one:
+  // the drafts are the same MTP steps, the trunk arithmetic is the forward_batch
+  // machinery the M8 gate already holds bit-exact, and a rejected draft rolls the
+  // recurrent state back to exactly where it was. So the ids — and the logits the
+  // loop ends on — must match bit for bit, not "closely".
+  {
+    std::printf("== batched verification vs serial (feat/noite-mtp) ==\n");
+    for (int D : {1, 2, 3}) {
+      rdna4::MtpGenStats s_b, s_s;
+      std::vector<std::int32_t> ids_b, ids_s;
+      if (!run(true, false, D, s_b, ids_b, /*batch_verify=*/true)) {
+        std::fprintf(stderr, "batched run D=%d: %s\n", D, err.c_str());
+        return 1;
+      }
+      const std::vector<float> lg_b = logits;
+      if (!run(true, false, D, s_s, ids_s, /*batch_verify=*/false)) {
+        std::fprintf(stderr, "serial run D=%d: %s\n", D, err.c_str());
+        return 1;
+      }
+      const std::vector<float> lg_s = logits;
+      double maxd = 0.0, l2 = 0.0, l2r = 0.0;
+      for (std::size_t i = 0; i < lg_b.size() && i < lg_s.size(); ++i) {
+        const double d = (double)lg_b[i] - (double)lg_s[i];
+        maxd = std::max(maxd, std::fabs(d));
+        l2 += d * d;
+        l2r += (double)lg_s[i] * (double)lg_s[i];
+      }
+      const double rel = l2r > 0.0 ? std::sqrt(l2 / l2r) : 0.0;
+      std::printf("   D=%d batched: %lld/%lld accepted (%.1f%%), %d rounds, %d verify forwards, "
+                  "%d rollbacks/%d replays (%lld rows), %d draft steps\n",
+                  D, s_b.accepted, s_b.drafted, s_b.acceptance() * 100.0, s_b.rounds,
+                  s_b.verify_forwards, s_b.rollbacks, s_b.replay_forwards, s_b.rollback_tokens,
+                  s_b.draft_steps);
+      std::printf("   D=%d serial : %lld/%lld accepted (%.1f%%), %d rounds, %d trunk steps, "
+                  "%d draft steps; final logits rel-L2 %.3e max|d| %.3e\n",
+                  D, s_s.accepted, s_s.drafted, s_s.acceptance() * 100.0, s_s.rounds,
+                  s_s.trunk_steps, s_s.draft_steps, rel, maxd);
+      ok(ids_b == ids_plain,
+         (std::string("D=") + std::to_string(D) +
+          ": batched verification is token-for-token plain greedy decode").c_str());
+      ok(ids_b == ids_s,
+         (std::string("D=") + std::to_string(D) +
+          ": batched and serial verification commit the same ids").c_str());
+      ok(maxd == 0.0,
+         (std::string("D=") + std::to_string(D) +
+          ": the batched path ends on bit-identical logits (rollback restores the state exactly)")
+             .c_str());
+      ok(s_b.verify_forwards + s_b.trunk_steps <= (int)ids_plain.size() + 1,
+         (std::string("D=") + std::to_string(D) + ": fewer trunk passes than committed tokens")
+             .c_str());
+      if (D == 3) {
+        ok(s_b.drafted > 0 && s_b.rollbacks > 0,
+           "D=3 exercised the rollback path at least once (a draft was rejected)");
+        ok(s_b.rollback_tokens > 0, "D=3 re-forwarded the committed prefix after a rejection");
+        ok(s_b.verify_forwards == s_b.rounds,
+           "exactly one batched verify per round");
+        ok(s_b.draft_steps >= D && s_b.draft_steps <= s_b.drafted + s_b.accepted,
+           "one draft step per proposal plus one KV-rebuild row per accepted token");
+        ok(s_b.verify_forwards == s_b.rounds && s_b.rollbacks <= s_b.rounds,
+           "at most one batched verify and one rollback per round");
+      }
+    }
+  }
+
+  // ------------------------------------------------- the rollback, isolated
+  // Snapshot, advance four positions with ONE batched call, restore, then re-run
+  // only the first three: their last row must come back bit-identical (the state
+  // is where it was, not where the batched call left it). Without the rollback
+  // the state would be four positions ahead and the rows would differ.
+  {
+    if (!prefill()) {
+      std::fprintf(stderr, "rollback prefill: %s\n", err.c_str());
+      return 1;
+    }
+    const int p0 = (int)prompt.size();
+    std::vector<float> h_all, l_all, h_re, l_re;
+    std::printf("== rollback (state snapshot/restore) ==\n");
+    std::printf("   recurrent state: %.1f MiB (d_state_ + d_convst_)\n",
+                (double)graph.state_bytes() / (1024.0 * 1024.0));
+    ok(graph.state_bytes() > 0, "the hybrid model has a recurrent state to roll back");
+    ok(graph.state_snapshot(err), "state_snapshot succeeds");
+    const std::vector<std::int32_t> four = {prompt[0], prompt[1], prompt[2], prompt[3]};
+    ok(graph.forward_batch_all(four, p0, h_all, l_all, err), "batched verify over 4 rows");
+    ok(graph.state_restore(err), "state_restore succeeds");
+    const std::vector<std::int32_t> three = {prompt[0], prompt[1], prompt[2]};
+    ok(graph.forward_batch_all(three, p0, h_re, l_re, err), "re-run of the committed prefix");
+    const std::size_t E = (std::size_t)graph.n_embd(), nv = (std::size_t)graph.n_vocab();
+    double maxd = 0.0;
+    for (std::size_t i = 0; i < E; ++i) {
+      maxd = std::max(maxd, (double)std::fabs(h_re[2 * E + i] - h_all[2 * E + i]));
+    }
+    std::size_t arg_a = 0, arg_b = 0;
+    for (std::size_t i = 1; i < nv; ++i) {
+      if (l_all[2 * nv + i] > l_all[2 * nv + arg_a]) arg_a = i;
+      if (l_re[2 * nv + i] > l_re[2 * nv + arg_b]) arg_b = i;
+    }
+    for (std::size_t i = 0; i < nv; ++i) {
+      maxd = std::max(maxd, (double)std::fabs(l_re[2 * nv + i] - l_all[2 * nv + i]));
+    }
+    std::printf("   row 2 of the 4-row batch vs the 3-row re-run after the restore: "
+                "max|d| %.3e, argmax %zu vs %zu\n",
+                maxd, arg_a, arg_b);
+    ok(maxd == 0.0, "the restored state reproduces the batched rows bit-identically");
+  }
+
   // ------------------------------------------------- what a draft step costs
   // The decode loop never synchronises, so its per-step numbers only measure
   // host-side queueing. These two measure the block itself: 24 steps back to
@@ -609,7 +717,36 @@ int main(int argc, char **argv) {
   // what the loop actually pays because it reads the drafted token back).
   {
     const int n_rep = 24;
+    int p0 = (int)prompt.size();
     auto sync = [] { (void)hipDeviceSynchronize(); };
+    // Optional: push the context up to RD_MTP_BENCH_POS before timing, so the
+    // per-token / batched / MTP costs are measured where they actually run. The
+    // attention part of a step grows with the context, so a short-context number
+    // is not the one the decode loop pays (cost block only, no assertions on it).
+    if (const char *pe = std::getenv("RD_MTP_BENCH_POS")) {
+      const int want = std::atoi(pe);
+      if (want > p0 + 32) {
+        if (!prefill()) {
+          std::fprintf(stderr, "bench fill prefill: %s\n", err.c_str());
+          return 1;
+        }
+        std::printf("== cost block at a long context (filling to %d) ==\n", want);
+        std::vector<std::int32_t> chunk(16);
+        std::vector<float> hh, ll;
+        const double f0 = now_s();
+        while (p0 + 16 <= want) {
+          for (int i = 0; i < 16; ++i) {
+            chunk[(std::size_t)i] = prompt[(std::size_t)((p0 + i) % (int)prompt.size())];
+          }
+          if (!graph.forward_batch_all(chunk, p0, hh, ll, err)) {
+            std::fprintf(stderr, "bench fill: %s\n", err.c_str());
+            return 1;
+          }
+          p0 += 16;
+        }
+        std::printf("   at position %d (fill %.1f s)\n", p0, now_s() - f0);
+      }
+    }
     double t_lo0 = now_s();
     for (int i = 0; i < n_rep; ++i) {
       if (!mtp.step_host(hidden.data(), prompt.back(), i, nullptr, nullptr, err)) {
@@ -630,17 +767,81 @@ int main(int argc, char **argv) {
     const double t_hi1 = now_s();
     const double ms_pipelined = (t_lo1 - t_lo0) * 1000.0 / n_rep;
     const double ms_synced = (t_hi1 - t_hi0) * 1000.0 / n_rep;
+    // Same step with the shared LM head skipped (the KV rebuild's shape): the
+    // head is 874 MiB of the 1.2 GiB the step reads, so this is the difference
+    // between "a rebuild costs a draft" and "a rebuild is nearly free".
+    double t_nh0 = now_s();
+    for (int i = 0; i < n_rep; ++i) {
+      if (!mtp.step_host(hidden.data(), prompt.back(), i, nullptr, nullptr, err,
+                         /*want_logits=*/false)) {
+        std::fprintf(stderr, "cost step (no head): %s\n", err.c_str());
+        return 1;
+      }
+      sync();
+    }
+    const double ms_nohead = (now_s() - t_nh0) * 1000.0 / n_rep;
+    // What the rollback costs: one device-to-device copy of the recurrent state
+    // in each direction.
+    double t_snap0 = now_s();
+    for (int i = 0; i < 8; ++i) {
+      ok(graph.state_snapshot(err) && graph.state_restore(err), "state copy succeeds");
+    }
+    sync();
+    const double ms_snap = (now_s() - t_snap0) * 1000.0 / 8.0 / 2.0;
+    // Per-token trunk forward vs one batched verify over 2..4 rows, at the same
+    // position: this is the ratio the whole idea rests on.
+    auto time_batch = [&](int n) -> double {
+      std::vector<std::int32_t> tk;
+      for (int i = 0; i < n; ++i) tk.push_back(prompt[(std::size_t)i]);
+      std::vector<float> h, l;
+      double best = 0.0;
+      for (int rep = 0; rep < 3; ++rep) {
+        const double a = now_s();
+        if (!graph.forward_batch_all(tk, p0, h, l, err)) return -1.0;
+        sync();
+        const double ms = (now_s() - a) * 1000.0;
+        if (rep > 0 && (best == 0.0 || ms < best)) best = ms;
+      }
+      return best;
+    };
+    double ms_token = 0.0;
+    {
+      std::vector<float> h, l;
+      for (int rep = 0; rep < 3; ++rep) {
+        const double a = now_s();
+        if (!graph.forward_tokens({prompt[0]}, p0, h, l, err)) return 1;
+        sync();
+        const double ms = (now_s() - a) * 1000.0;
+        if (rep > 0 && (ms_token == 0.0 || ms < ms_token)) ms_token = ms;
+      }
+    }
+    const double b2 = time_batch(2), b3 = time_batch(3), b4 = time_batch(4);
     std::printf("== draft step cost (%.1f MiB of weights) ==\n",
                 (double)mtp.weight_bytes() / (1024.0 * 1024.0));
     std::printf("   %.2f ms/step back to back, %.2f ms/step with a sync per step "
                 "(the per-mode numbers above only measure host queueing: the graph is "
                 "asynchronous)\n",
                 ms_pipelined, ms_synced);
+    std::printf("   same step without the shared LM head (KV rebuild): %.2f ms\n", ms_nohead);
+    std::printf("   state snapshot+restore: %.2f ms per pair (%.1f MiB)\n", ms_snap,
+                (double)graph.state_bytes() / (1024.0 * 1024.0));
+    std::printf("   one per-token trunk forward at position %d: %.1f ms; one batched forward: "
+                "2 rows %.1f ms, 3 rows %.1f ms, 4 rows %.1f ms (weight pass shared)\n",
+                p0, ms_token, b2, b3, b4);
     std::printf("   a trunk step at 4K is ~%.1f ms (measured plain runs above), so a\n",
                 s_plain.wall_ms / (double)std::max(1, (int)ids_plain.size()));
     std::printf("   draft step costs %.1f%%-%.1f%% of a trunk step\n",
                 100.0 * ms_pipelined / (s_plain.wall_ms / (double)std::max(1, (int)ids_plain.size())),
                 100.0 * ms_synced / (s_plain.wall_ms / (double)std::max(1, (int)ids_plain.size())));
+    ok(b4 < 4.0 * ms_token, "one batched forward over 4 rows beats four per-token forwards");
+    // The marginal cost of one more ROW inside a batch is what decides D: it is
+    // the number to compare against the weight pass, not against a whole token.
+    const double row_marginal = b4 > b3 ? (b4 - b3) : 0.0;
+    std::printf("   marginal cost of an extra row inside the batch: %.1f ms "
+                "(vs %.1f ms for a whole extra token)\n",
+                row_marginal, ms_token);
+    ok(row_marginal < ms_token,
+       "an extra verified row costs less than an extra per-token forward");
   }
 
   std::printf("%s (%d failure%s)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail, g_fail == 1 ? "" : "s");

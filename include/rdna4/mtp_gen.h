@@ -44,6 +44,15 @@ struct MtpGenParams {
   int draft = 3;            // drafts per round in speculative mode
   bool score_only = false;  // draft-and-score instead of speculation
   bool verbose = false;
+  // feat/noite-mtp: verify the whole draft block with ONE forward_batch call
+  // (Graph::forward_batch_all) instead of one per-token trunk forward per draft.
+  // false restores the pre-existing one-forward-per-committed-token path, which
+  // is what the A/B in tests/check_mtp_gpu.hip measures against.
+  bool batch_verify = true;
+  // Diagnostics/A-B only: run the shared LM head on the MTP KV *rebuild* steps
+  // too (they never read a logits row, so it is 874 MiB of pure cost). Off, which
+  // is what the shipping path does.
+  bool rebuild_logits = false;
 };
 
 struct MtpGenStats {
@@ -60,6 +69,13 @@ struct MtpGenStats {
   // above only measure host-side queueing (the graph is asynchronous, so they do
   // not attribute GPU time); this one is the number to compare between modes.
   double wall_ms = 0.0;
+  // ---- feat/noite-mtp: the batched verification path ------------------------
+  int verify_forwards = 0;  // forward_batch_all calls that verified a draft block
+  int replay_forwards = 0;  // forward_batch_all calls that re-ran the committed
+                            // prefix after a rejected draft (state rollback)
+  int rollbacks = 0;        // rounds that needed that rollback
+  long long rollback_tokens = 0;  // tokens re-forwarded by those replays
+  double snapshot_ms = 0.0;  // host time spent copying the recurrent state
   double acceptance() const { return drafted > 0 ? (double)accepted / (double)drafted : 0.0; }
 };
 
@@ -194,11 +210,6 @@ inline bool mtp_generate(Graph &g, MtpHead *mtp, const std::function<bool(std::i
     }
 
     // ---- speculative: draft up to D tokens, then verify with the trunk -----
-    std::vector<std::int32_t> decisions;
-    decisions.push_back(id);
-    std::vector<std::vector<float>> hs;  // hs[i] = trunk h at position pos+i
-    hs.push_back(h_prev);
-
     // A round commits 1..D_eff+1 tokens at positions pos+1..pos+1+len(decisions),
     // so it needs D_eff+2 free positions — and it must not commit past
     // n_predict, or the CLI would stream bytes the plain path never produces
@@ -206,9 +217,14 @@ inline bool mtp_generate(Graph &g, MtpHead *mtp, const std::function<bool(std::i
     // overshooting round cannot be fixed up by truncating `gen` afterwards).
     const int room = ctx_size - (pos + 1);
     const int room_pred = (int)((long long)p.n_predict - (long long)gen.size());
+    // The batched path runs [id, d1..dk] as one forward_batch call and, after a
+    // rejection, re-runs [id, d1..d_a, t] as a second one: BOTH sizes need a
+    // batched matvec instantiation (2/3/4/8/16), and 2..4 is the largest range
+    // that covers every replay size, so the batched draft is capped at 3. A
+    // larger D stays available on the serial path (MtpGenParams::batch_verify).
+    const int D_max = p.batch_verify ? std::min(D, 3) : D;
     const int D_eff =
-        std::min(D, std::min(std::max(0, room - 1), std::max(0, room_pred - 1)));
-    std::vector<std::int32_t> draft((std::size_t)std::max(1, D_eff), 0);
+        std::min(D_max, std::min(std::max(0, room - 1), std::max(0, room_pred - 1)));
     if (D_eff == 0) {
       // no room left to verify a draft: keep the block's cache in step and
       // advance exactly like plain decode
@@ -218,6 +234,153 @@ inline bool mtp_generate(Graph &g, MtpHead *mtp, const std::function<bool(std::i
       ++pos;
       continue;
     }
+
+    // ================= batched verification (feat/noite-mtp) ================
+    // One trunk pass over the whole draft block instead of one per committed
+    // token: the D_eff+1 tokens share a single read of every weight (the M8
+    // matvec), so a round costs one weight pass plus the per-token scaffolding.
+    if (p.batch_verify) {
+      // (1) drafts. The first uses the trunk's h at `pos` with the token just
+      //     committed at pos+1, exactly like llama.cpp's process(); the rest
+      //     chain through the head's own h_nextn (pending_h), which is how it
+      //     drafts past the trunk without another trunk pass.
+      std::vector<float> draft_logits;
+      std::vector<std::int32_t> draft((std::size_t)D_eff, 0);
+      ++st.rounds;
+      if (!draft_step_host(h_prev.data(), id, pos + 1, &draft_logits)) return false;
+      draft[0] = propose(sampler, draft_logits, history);
+      for (int k = 1; k < D_eff; ++k) {
+        const double t0 = now_s();
+        if (!mtp->step_chained(draft[(std::size_t)k - 1], pos + 1 + k, &draft_logits, nullptr,
+                               err)) {
+          return false;
+        }
+        st.draft_ms += now_s() - t0;
+        ++st.draft_steps;
+        draft[(std::size_t)k] = propose(sampler, draft_logits, history);
+      }
+      st.drafted += D_eff;
+
+      // (2) ONE batched trunk forward over [id, d1..dk] at pos+1. It advances the
+      //     KV cache and the GDN state for every row it holds, so the recurrent
+      //     state is snapshotted first: a rejected draft must not leave that
+      //     advance behind. (The KV caches need no snapshot — attention is causal
+      //     and every row is rewritten by position before it is read again.)
+      std::vector<std::int32_t> vtoks;
+      vtoks.reserve((std::size_t)D_eff + 1);
+      vtoks.push_back(id);
+      vtoks.insert(vtoks.end(), draft.begin(), draft.end());
+      std::vector<float> h_rows, l_rows;
+      const double ts0 = now_s();
+      if (!g.state_snapshot(err)) return false;
+      const double tv0 = now_s();
+      if (!g.forward_batch_all(vtoks, pos + 1, h_rows, l_rows, err)) return false;
+      const double tv1 = now_s();
+      st.snapshot_ms += tv0 - ts0;
+      st.trunk_ms += tv1 - tv0;
+      ++st.verify_forwards;
+
+      // (3) the trunk's own greedy token at each drafted position, read from row
+      //     k of the verification logits: row j holds the distribution for
+      //     position pos+2+j, which is where draft j guessed. Same sampler chain
+      //     and same history as the serial path, so the decisions are the same.
+      const int nv = mtp->n_vocab();
+      std::vector<std::int32_t> committed;  // committed tokens beyond `id`
+      bool rejected = false;
+      for (int k = 0; k < D_eff; ++k) {
+        const std::int32_t tid = sampler.sample(l_rows.data() + (std::size_t)k * nv, history);
+        if (tid < 0) {
+          err = "mtp_generate: sampler produced no token (empty candidate set)";
+          return false;
+        }
+        if (tid != draft[(std::size_t)k]) {
+          // The trunk's own token here (EOG included) is NOT committed in this
+          // round: the round's state stops at the last accepted draft, so this
+          // token opens the *next* round instead. The replayed logits reproduce
+          // it exactly, so the committed sequence is unchanged — and the replay
+          // stays one row shorter than it would be if the replacement were
+          // committed and forwarded here.
+          rejected = true;
+          break;
+        }
+        committed.push_back(draft[(std::size_t)k]);
+        history.push_back(draft[(std::size_t)k]);
+        ++st.accepted;
+      }
+
+      // Every token in `committed` is one the trunk itself produced (an accepted
+      // draft is by definition the trunk's own greedy token), so committing them
+      // is what keeps this path token-for-token plain greedy decode.
+      for (std::int32_t t : committed) {
+        gen.push_back(t);
+        stream();
+      }
+
+      // (4) the authoritative token list of the round: all committed. Full
+      //     acceptance keeps the verification batch (its state is already exactly
+      //     at the last row); a rejection restores the snapshot and re-runs the
+      //     committed prefix, whose last row then holds the state, the h and the
+      //     logits of the next round. A prefix of one token (every draft
+      //     rejected) takes the per-token path: it is the same arithmetic and it
+      //     is cheaper than the smallest batch.
+      std::vector<std::int32_t> ftoks;
+      ftoks.reserve((std::size_t)D_eff + 1);
+      ftoks.push_back(id);
+      ftoks.insert(ftoks.end(), committed.begin(), committed.end());
+      if (rejected) {
+        const double tr0 = now_s();
+        if (!g.state_restore(err)) return false;
+        const double tr1 = now_s();
+        bool ok_replay = false;
+        if (ftoks.size() == 1) {
+          ok_replay = g.forward_tokens(ftoks, pos + 1, hidden, logits, err);
+          if (ok_replay) {
+            h_rows = hidden;
+            l_rows = logits;
+          }
+        } else {
+          ok_replay = g.forward_batch_all(ftoks, pos + 1, h_rows, l_rows, err);
+        }
+        if (!ok_replay) return false;
+        const double tr2 = now_s();
+        st.snapshot_ms += tr1 - tr0;
+        st.trunk_ms += tr2 - tr1;
+        ++st.replay_forwards;
+        ++st.rollbacks;
+        st.rollback_tokens += (long long)ftoks.size();
+      }
+
+      // (5) rebuild this block's own KV rows for the committed positions from the
+      //     TRUNK's h instead of the chained one — llama.cpp's process() does the
+      //     same (it re-decodes the draft region with the target's h rows), so a
+      //     row's K/V never depends on which guesses preceded it. h_rows[i-1] is
+      //     the trunk h at the position of ftoks[i]; the row for `id` was written
+      //     by the first draft step above and needs no rebuild. The shared LM head
+      //     is skipped here (want_logits = false): nothing reads a logits row, and
+      //     it is 874 MiB of the step's traffic.
+      const int E = g.n_embd();
+      for (std::size_t i = 1; i < ftoks.size(); ++i) {
+        const double t0 = now_s();
+        if (!mtp->step_host(h_rows.data() + (i - 1) * (std::size_t)E, ftoks[i], pos + 1 + (int)i,
+                            nullptr, nullptr, err, /*want_logits=*/p.rebuild_logits)) {
+          return false;
+        }
+        st.draft_ms += now_s() - t0;
+        ++st.draft_steps;
+      }
+
+      pos += (int)ftoks.size();  // ftoks[0] is at pos+1, the last at pos+len
+      h_prev.assign(h_rows.end() - E, h_rows.end());
+      logits.assign(l_rows.end() - nv, l_rows.end());
+      continue;
+    }
+    // =============== end batched verification ==============================
+
+    std::vector<std::int32_t> decisions;
+    decisions.push_back(id);
+    std::vector<std::vector<float>> hs;  // hs[i] = trunk h at position pos+i
+    hs.push_back(h_prev);
+    std::vector<std::int32_t> draft((std::size_t)std::max(1, D_eff), 0);
 
     // (1) first draft: the trunk's h at `pos` with the token just committed at
     //     pos+1, i.e. exactly the canonical step llama.cpp's process() replays
@@ -304,6 +467,60 @@ inline bool mtp_generate(Graph &g, MtpHead *mtp, const std::function<bool(std::i
     err = "mtp_generate: a round overshot n_predict (" + std::to_string(gen.size()) + " > " +
           std::to_string(p.n_predict) + ")";
     return false;
+  }
+  return true;
+}
+
+// Batched MTP prefill (feat/noite-mtp). The prompt runs through the trunk in
+// chunks of up to Graph::kMaxBatch tokens via forward_batch_all (one weight pass
+// per chunk, the M8 kernels), and the draft block is stepped once per token with
+// want_logits = false: its rows are (token i, trunk h of i-1), so the only thing
+// the prompt pass needs from the head is the block's own KV row — never a logits
+// row. Bit-identical to the per-token prefill: the trunk chunks are the same
+// arithmetic (tests/check_batch_gpu.hip) and the block's steps are the same calls
+// with the same h rows. On `hidden`/`logits` it leaves exactly what the per-token
+// loop leaves: the h of the last prompt position and the distribution for the
+// position after it.
+inline bool mtp_prefill_batched(Graph &g, MtpHead &mtp, const std::vector<std::int32_t> &ids,
+                                std::vector<float> &hidden, std::vector<float> &logits,
+                                std::string &err) {
+  static const int kSizes[] = {16, 8, 4, 3, 2};
+  const int E = g.n_embd();
+  std::vector<float> h_rows, l_rows;
+  std::vector<float> h_prev((std::size_t)E, 0.0f);  // h at position -1 (pending_h)
+  std::size_t pos = 0;
+  while (pos < ids.size()) {
+    std::size_t take = 1;
+    for (int sz : kSizes) {
+      if (ids.size() - pos >= (std::size_t)sz) {
+        take = (std::size_t)sz;
+        break;
+      }
+    }
+    if (take == 1) {
+      if (!g.forward_tokens({ids[pos]}, (int)pos, hidden, logits, err)) return false;
+      if (!mtp.step_host(h_prev.data(), ids[pos], (int)pos, nullptr, nullptr, err,
+                         /*want_logits=*/false)) {
+        return false;
+      }
+      h_prev = hidden;
+      pos += 1;
+      continue;
+    }
+    const std::vector<std::int32_t> chunk(ids.begin() + (long)pos,
+                                          ids.begin() + (long)(pos + take));
+    if (!g.forward_batch_all(chunk, (int)pos, h_rows, l_rows, err)) return false;
+    for (std::size_t t = 0; t < take; ++t) {
+      const float *h_in = t == 0 ? h_prev.data() : h_rows.data() + (t - 1) * (std::size_t)E;
+      if (!mtp.step_host(h_in, chunk[t], (int)(pos + t), nullptr, nullptr, err,
+                         /*want_logits=*/false)) {
+        return false;
+      }
+    }
+    h_prev.assign(h_rows.end() - E, h_rows.end());
+    hidden.assign(h_rows.end() - E, h_rows.end());
+    logits.assign(l_rows.end() - g.n_vocab(), l_rows.end());
+    pos += take;
   }
   return true;
 }

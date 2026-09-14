@@ -66,6 +66,8 @@ void usage_run() {
       "  --mtp-score             draft-and-score only: report the head's acceptance rate\n"
       "                          against the trunk's own greedy tokens (generation is\n"
       "                          unchanged); implies --mtp\n"
+      "  --mtp-serial            verify drafts one trunk forward per token (the pre-\n"
+      "                          batching path: kept as the A/B reference)\n"
       // ---- end feat/mtp ----
       "  -v                      verbose: per-step timings and the token ids\n"
       "  --no-stats              suppress the stderr statistics\n");
@@ -943,7 +945,7 @@ int cmd_run(int argc, char **argv) {
   bool chat = false, thinking = true, verbose = false, stats = true;
   std::string effort = "xhigh";
   // ---- feat/mtp ----
-  bool mtp_on = false, mtp_score = false;
+  bool mtp_on = false, mtp_score = false, mtp_serial = false;
   long long mtp_draft = 3;
   // ---- end feat/mtp ----
 
@@ -1062,6 +1064,9 @@ int cmd_run(int argc, char **argv) {
     } else if (std::strcmp(a, "--mtp-score") == 0) {
       mtp_on = true;
       mtp_score = true;
+    } else if (std::strcmp(a, "--mtp-serial") == 0) {
+      mtp_on = true;
+      mtp_serial = true;
     } else if (std::strcmp(a, "--draft") == 0) {
       const char *v = need_arg("--draft");
       if (!v || !parse_i64(v, &mtp_draft) || mtp_draft < 1 || mtp_draft > 16) {
@@ -1117,6 +1122,36 @@ int cmd_run(int argc, char **argv) {
   if (!rdna4::parse_qwen35_config(gf, cfg, err)) {
     std::fprintf(stderr, "rdna4-infer: config failed: %s\n", err.c_str());
     return 1;
+  }
+
+  // ---- feat/noite-mtp: the MTP head's own VRAM is NOT in device.h's budget ---
+  // required_bytes() counts the trunk's 16 attention layers, the file and 1 GiB of
+  // overhead; the draft block adds its own 15 tensors plus TWO KV caches
+  // (max_ctx x n_head_kv x kv_row_bytes each), which is 0.25 GiB extra at 64K and
+  // 0.5 GiB at 128K — enough to turn a configuration `info` approved into a
+  // hipMalloc failure after 12 GiB were already mapped. Refuse it up front.
+  if (mtp_on) {
+    const std::uint64_t mtp_need =
+        rdna4::mtp_required_bytes(loader, cfg, (int)ctx_size, kv_k, kv_v);
+    const std::uint64_t base = (std::uint64_t)st.st_size +
+                               rdna4::kv_cache_bytes(ctx_size, kv_k, kv_v) +
+                               rdna4::kOverheadBytes;
+    const double gib = (double)(1u << 30);
+    if (stats) {
+      std::fprintf(stderr,
+                   "rdna4-infer: MTP budget: trunk+file %.2f GiB + draft block and its 2 KV caches "
+                   "%.2f GiB = %.2f GiB of %.2f GiB\n",
+                   base / gib, mtp_need / gib, (base + mtp_need) / gib,
+                   (double)total_vram / gib);
+    }
+    if (base + mtp_need > (std::uint64_t)total_vram) {
+      std::fprintf(stderr,
+                   "rdna4-infer: insufficient VRAM for --mtp at ctx %llu (need %.2f GiB, have "
+                   "%.2f GiB): lower --ctx-size or use --cache-type-k/-v q4_0\n",
+                   (unsigned long long)ctx_size, (base + mtp_need) / gib,
+                   (double)total_vram / gib);
+      return 3;
+    }
   }
 
   // sampler defaults from the metadata unless the user overrode them (see
@@ -1256,19 +1291,34 @@ int cmd_run(int argc, char **argv) {
     std::vector<float> hidden, logits;
     std::vector<float> h_prev((std::size_t)graph.n_embd(), 0.0f);  // h at position -1
     const double t_pre0 = now_s();
-    for (std::size_t i = 0; i < prompt_ids.size(); ++i) {
-      if (!graph.forward_tokens({prompt_ids[i]}, (int)i, hidden, logits, mtop_err)) {
-        std::fprintf(stderr, "rdna4-infer: prefill failed: %s\n", mtop_err.c_str());
+    // feat/noite-mtp: the prompt runs through the trunk in batched chunks (the M8
+    // forward_batch_all) with the draft block stepped once per token, which is
+    // bit-identical to the per-token loop below and turns a 16K-token prompt from
+    // ~10 minutes into seconds. RD_MTP_PREFILL=serial restores the old loop for
+    // A/B; the decode measurements below are unaffected either way.
+    const char *mtp_prefill_env = std::getenv("RD_MTP_PREFILL");
+    const bool mtp_prefill_serial =
+        mtp_prefill_env != nullptr && std::strcmp(mtp_prefill_env, "serial") == 0;
+    if (!mtp_prefill_serial) {
+      if (!rdna4::mtp_prefill_batched(graph, mtp, prompt_ids, hidden, logits, mtop_err)) {
+        std::fprintf(stderr, "rdna4-infer: MTP batched prefill failed: %s\n", mtop_err.c_str());
         return 1;
       }
-      // row `i` of the draft block's cache: token i with the trunk h of i-1
-      // (zeros for i == 0, which is what llama.cpp's zero-initialised pending_h
-      // row holds)
-      if (!mtp.step_host(h_prev.data(), prompt_ids[i], (int)i, nullptr, nullptr, mtop_err)) {
-        std::fprintf(stderr, "rdna4-infer: MTP prefill step failed: %s\n", mtop_err.c_str());
-        return 1;
+    } else {
+      for (std::size_t i = 0; i < prompt_ids.size(); ++i) {
+        if (!graph.forward_tokens({prompt_ids[i]}, (int)i, hidden, logits, mtop_err)) {
+          std::fprintf(stderr, "rdna4-infer: prefill failed: %s\n", mtop_err.c_str());
+          return 1;
+        }
+        // row `i` of the draft block's cache: token i with the trunk h of i-1
+        // (zeros for i == 0, which is what llama.cpp's zero-initialised pending_h
+        // row holds)
+        if (!mtp.step_host(h_prev.data(), prompt_ids[i], (int)i, nullptr, nullptr, mtop_err)) {
+          std::fprintf(stderr, "rdna4-infer: MTP prefill step failed: %s\n", mtop_err.c_str());
+          return 1;
+        }
+        h_prev = hidden;
       }
-      h_prev = hidden;
     }
     const double t_pre1 = now_s();
 
@@ -1276,6 +1326,7 @@ int cmd_run(int argc, char **argv) {
     gp.n_predict = (int)n_predict;
     gp.draft = (int)mtp_draft;
     gp.score_only = mtp_score;
+    gp.batch_verify = !mtp_serial;
     gp.verbose = verbose;
     rdna4::MtpGenStats gs;
     std::string emitted_mtp;
@@ -1321,11 +1372,26 @@ int cmd_run(int argc, char **argv) {
                      gs.draft_steps);
       } else {
         std::fprintf(stderr,
-                     "rdna4-infer: MTP spec: %lld/%lld drafts matched the trunk (%.1f%%), "
+                     "rdna4-infer: MTP spec%s: %lld/%lld drafts matched the trunk (%.1f%%), "
                      "%d trunk steps, %d draft steps, %d rounds (%.2f tokens/round)\n",
-                     gs.accepted, gs.drafted, gs.acceptance() * 100.0, gs.trunk_steps,
-                     gs.draft_steps, gs.rounds,
+                     gp.batch_verify ? " (batched verify)" : " (serial verify)", gs.accepted,
+                     gs.drafted, gs.acceptance() * 100.0, gs.trunk_steps, gs.draft_steps,
+                     gs.rounds,
                      gs.rounds > 0 ? (double)gs.ids.size() / (double)gs.rounds : 0.0);
+        if (gp.batch_verify) {
+          // Where the time goes: the verify pass is one weight read for the whole
+          // draft block, and a rejected draft costs a second one (rollback +
+          // re-run of the committed prefix).
+          std::fprintf(stderr,
+                       "rdna4-infer: MTP verify: %d batched forwards (%.2f rows/round), "
+                       "%d rollbacks (%d replay forwards, %lld rows re-forwarded), "
+                       "state copy %.2f ms total\n",
+                       gs.verify_forwards,
+                       gs.verify_forwards > 0 ? (double)(gs.drafted + gs.rounds) /
+                                                    (double)gs.verify_forwards
+                                              : 0.0,
+                       gs.rollbacks, gs.replay_forwards, gs.rollback_tokens, gs.snapshot_ms);
+        }
       }
       std::fprintf(stderr, "rdna4-infer: generated %zu tokens in %.2f s (%.2f tok/s)%s\n",
                    gs.ids.size(), gen, gen > 0 ? (double)gs.ids.size() / gen : 0.0,
