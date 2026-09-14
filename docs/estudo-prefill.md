@@ -293,7 +293,15 @@ E o número que mata uma hipótese que estava no plano desde a noite:
 - copiar **todas as sete fusões nomeadas do Vulkan** (`ggml-vulkan.cpp:18149-18327`) remove 640
   desses 916 lançamentos ⇒ **1,1 % do prefill**.
 
-**Conclusão: para o prefill, fusão de kernels não é alavanca.** Ela continua valendo no decode,
+**No decode a conta é outra, e também é pequena e medida**: o motor emite ~1 940-2 200
+lançamentos por token no decode, e a medida direta do que eles custam juntos é o replay por grafo
+HÍP da passagem de 497 matvecs, que economiza **0,76 ms/token** (2,6 % de um token de decode de
+29,4 ms). Das ~1 940 instâncias, o conjunto que as sete fusões nomeadas do Vulkan removeria é 640 —
+ou seja, a fusão vale **~1-2 % do decode**, não os 6-15 % que o piso de 2,25-3,5 µs por kernel
+sugere quando se multiplica ingenuamente (o piso não é aditivo quando os kernels fazem trabalho:
+os lançamentos se sobrepõem à execução).
+
+**Conclusão: fusão de kernels não é alavanca nem no prefill (1,1 %) nem no decode (~1-2 %).** Ela continua valendo no decode,
 onde o custo é por token e não amortizado por 16 — mas o plano do prefill não deve gastar um dia
 nela. Isso contradiz a ordem que eu mesmo tinha escrito de manhã (P2 = fusões) e fica corrigido
 aqui.

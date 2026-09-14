@@ -68,7 +68,6 @@ using rdna4::block_iq3_s;
 
 constexpr int kQK = 256;   // pesos por super-bloco iq3_s
 constexpr int kQ8 = 32;    // QK8_1: valores por bloco q8_1
-constexpr int kQBytes = 36;  // sizeof(block_q8_1)
 constexpr int kBlockBytes = 110;
 constexpr int kIq3S = 12;  // ggml_type id (ver matvec.cuh dt_name)
 

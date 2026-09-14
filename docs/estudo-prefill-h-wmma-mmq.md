@@ -275,8 +275,8 @@ warp com MT=1 × NT=4 (32 acumuladores por lane, o desenho do BM128/BN64 W8×1):
 | `v_cvt_f32_i32` | **32** | `(float)sumi` (um por acumulador) |
 | `v_fmac_f32` | **32** | `acc = fma(d, sumi_f, acc)` (um por acumulador) |
 | `ds_load_b128` | **2** | os 8 floats de `d_a` = **8 floats consecutivos por lane** |
-| `ds_load` (d_w + 1+2·sc) | **4** | 1 `int2` por tile de N (4 tiles) |
-| **total** | **134** | 128 VALU + 6 LDS |
+| `ds_load_2addr_b64` | **2** | os 4 `int2` (`d_w`, `1+2·sc`) — 1 por tile de N, que o compilador funde 2 a 2 |
+| **total** | **132** | 128 VALU + 4 LDS |
 
 Contado na ISA do binário (o corpo do kernel contém exatamente 2 blocos de 32,
 por causa do desenrolar de `BK=64`): `v_mul_lo_u32` = 64, `v_mul_f32` = 64,
@@ -296,7 +296,8 @@ instrução o miolo é 94 % correção; em tempo ele é 53-56 %, porque o WMMA c
 
 O que a transposição de fato entrega, medido: a leitura de `d_a` sai como **2
 `ds_load_b128` por lane por bloco** e a de `d_w`/`sc` como **1 `int2` por tile de
-N** — 6 LDS para 32 acumuladores, e o modo 1 da frente F já tinha mostrado que a
+N** — 4 instruções de LDS para 32 acumuladores (64 B), e o modo 1 da frente F já
+tinha mostrado que a
 LDS não é o gargalo (as leituras de fragmento custam <1 % do kernel). A
 transposição resolveu o que prometia; o que ela não resolve é o número de
 instruções de VALU.
@@ -366,7 +367,7 @@ blocos reais e é bit-exato — e não, ele não entrega os 4,2×.** Ele entrega
 f16** da frente F, porque a correção de escala que a bit-exatidão exige custa
 53-56 % do miolo. O teto de 4,2× do pico é real (§2 da frente D, reproduzido aqui
 em 4,12× na mesma janela), mas ele é um teto de *instrução de MAC*, não de
-kernel: 8 WMMA contra 134 instruções de correção por bloco de 32.
+kernel: 8 WMMA contra 132 instruções de correção por bloco de 32.
 
 **2. O que decide o D4 não é a família, é o staging — de novo.** Ele é 50-61 % do
 kernel em M≥64 e o miolo saturado é ~16-19 %. Mesmo uma correção gratuita levaria
@@ -378,7 +379,7 @@ apontou e que esta bancada não testou); (ii) só depois, o matrix core.
 
 **3. O caminho barato continua sendo o de M=16.** Com BM=16 e 4 warps de um tile
 de 16 em N, o WMMA int8 faz **7,63 T-MAC/s = 2,4× o prefill de hoje sem mudar o
-M do lote**, com 82 % do tempo em staging. Se o motor não puder processar 64-128
+M do lote**, com 80-82 % do tempo em staging. Se o motor não puder processar 64-128
 tokens por GEMM, este é o número que ele pode embarcar; se puder, o alvo é
 **19,7-22,8 T-MAC/s (0,60-0,70× o llama.cpp)** com os tiles da tabela do §3.
 
