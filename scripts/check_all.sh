@@ -71,7 +71,8 @@ step "check-graph-gpu"    env GRAPH_LAST_TOKEN=1 "$B/check-graph-gpu" "$MODEL" \
                                "$ROOT/reference/oracle_prompt6_ub1_tok7_cpu.txt" -
 step "check-dequant-gpu"  "$B/check-dequant-gpu" "$MODEL"
 step "check-matvec-gpu"   "$B/check-matvec-gpu" "$MODEL"
-step "check-nn-gpu"       "$B/check-nn-gpu" "$MODEL"
+step "check-nn-gpu"       "$B/check-nn-gpu" "$MODEL" \
+                               "$ROOT/reference/oracle_hello_cpu.txt" 9419
 step "check-rope-gpu"     "$B/check-rope-gpu"
 step "check-matmul-gpu"   "$B/check-matmul-gpu" "$MODEL"
 step "check-batch-gpu"    "$B/check-batch-gpu" "$MODEL"
