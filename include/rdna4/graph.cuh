@@ -641,7 +641,7 @@ inline bool Graph::add_residual(float *d_src, float *d_dst, int n, std::string &
 }
 
 // ---------------------------------------------------------------------------
-inline bool Graph::full_attn(int il, int t, int pos, std::string &err) {
+inline bool Graph::full_attn(int il, [[maybe_unused]] int t, int pos, std::string &err) {
   const int E = n_embd(), HD = head_dim(), NH = n_head(), NKV = n_head_kv();
   const LayerW &L = w_[il];
   RD_PHASE(prof_, "attn_norm");  // RD_PHASE_PROF

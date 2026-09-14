@@ -392,17 +392,24 @@ __global__ void attn_split_kernel(const float *__restrict__ q, const void *__res
       out[1] = lsum;
     }
   }
-  if (threadIdx.x < head_dim) {
+  // Strided over the whole block, not `threadIdx.x < head_dim`: with head_dim
+  // > WPB*32 the old form wrote only the first WPB*32 dims of the partial and the
+  // merge then read uninitialized VRAM (review finding M2). For head_dim == 256
+  // and WPB == 8 (the shipped configuration) the loop runs exactly once per
+  // thread, so this is the same work in the same order. It also removes the
+  // unsigned/signed comparison that produced 98 -Wsign-compare warnings, which is
+  // what kept -Wall -Wextra off the engine targets (finding B1).
+  for (int d = (int)threadIdx.x; d < head_dim; d += (int)blockDim.x) {
     float a = 0.0f;
     for (int i = 0; i < WPB; ++i)
-      a += smem[(std::int64_t)i * (2 + head_dim) + 2 + threadIdx.x] * wts[i];
-    out[2 + threadIdx.x] = a;
+      a += smem[(std::int64_t)i * (2 + head_dim) + 2 + d] * wts[i];
+    out[2 + d] = a;
   }
 }
 
 // Combine the n_splits partials of each query head (one warp per head).
 __global__ void attn_merge_kernel(const float *__restrict__ partial, float *__restrict__ out,
-                                  int n_head, int head_dim, int n_splits) {
+                                  [[maybe_unused]] int n_head, int head_dim, int n_splits) {
   const int h = blockIdx.x;
   const int lane = threadIdx.x & 31;
   const int dpw = head_dim / 32;

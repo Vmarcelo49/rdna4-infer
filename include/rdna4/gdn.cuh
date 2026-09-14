@@ -57,7 +57,8 @@ inline bool conv1d_state_launch(const float *d_qkv, const float *d_w, float *d_o
 __global__ void delta_rule_kernel(const float *__restrict__ q, const float *__restrict__ k,
                                   const float *__restrict__ v, const float *__restrict__ gate,
                                   const float *__restrict__ beta, float *__restrict__ state,
-                                  float *__restrict__ out, int n_v_heads, int n_k_heads, int S) {
+                                  float *__restrict__ out, [[maybe_unused]] int n_v_heads,
+                                  int n_k_heads, int S) {
   const int h = blockIdx.x;      // value head
   const int j = threadIdx.x;     // row index (value dim)
   if (j >= S) return;

@@ -17,4 +17,11 @@ if ! command -v flock >/dev/null; then
   echo "gpu-lock: flock not found; running without serialisation" >&2
   exec "$@"
 fi
-exec flock -w "$WAIT" "$LOCK" "$@"
+# GPU_LOCK_HELD=1 tells the gates that already self-lock (scripts/check_golden_run.sh,
+# compare_llama_greedy.sh, check_attn_split.sh, compare_ppl.sh, check_server.sh,
+# check_regression.sh) not to take the lock again: flock is NOT reentrant between
+# processes, so a gate that locks inside a locked run waits for its own parent until
+# the timeout and then fails. Setting it here makes that impossible instead of
+# relying on every caller to export it (measured the hard way: an ad-hoc wrapper
+# without it hung check_golden_run.sh for 18 minutes).
+exec flock -w "$WAIT" "$LOCK" env GPU_LOCK_HELD=1 "$@"

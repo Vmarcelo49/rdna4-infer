@@ -29,7 +29,15 @@ add_executable(rdna4-infer src/main.hip src/backend/gguf.cpp src/backend/loader.
                      src/backend/unicode_data.cpp src/backend/tokenizer.cpp
                      src/backend/sampler.cpp src/backend/chat.cpp)
 
+# Warnings on the shipping targets (review finding B1: they were enabled nowhere, so
+# with no flags at all the build never reported anything). Measured per translation
+# unit before turning this on: src/backend/*.cpp 0 warnings, src/main.hip 0,
+# serve.hip 0 -- the tree is clean under this set, so anything it prints from now on
+# is new. The test binaries are deliberately left out: ROCm 7.2 marks hipError_t
+# [[nodiscard]] and their 422 ignored returns are test noise, not engine risk.
+set(RDNA4_WARNINGS -Wall -Wextra)
 target_compile_options(rdna4-infer PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_compile_options(rdna4-infer PRIVATE ${RDNA4_WARNINGS})
 target_link_options(rdna4-infer PRIVATE --offload-arch=gfx1201)
 
 target_include_directories(rdna4-infer PRIVATE include)
@@ -235,6 +243,7 @@ target_include_directories(check-server-http PRIVATE include)
 add_library(rdna4_serve SHARED src/server/serve.hip src/server/http.cpp src/server/json.cpp)
 target_include_directories(rdna4_serve PRIVATE include)
 target_compile_options(rdna4_serve PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_compile_options(rdna4_serve PRIVATE ${RDNA4_WARNINGS})
 target_link_options(rdna4_serve PRIVATE --offload-arch=gfx1201)
 target_link_libraries(rdna4_serve PRIVATE ${AMDHIP64})
 target_link_libraries(rdna4-infer PRIVATE rdna4_serve)

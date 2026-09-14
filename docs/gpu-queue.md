@@ -65,3 +65,14 @@ Verificação final na árvore mergeada, uma janela limpa e **um** lock (`script
 `compare_llama_greedy.sh 32`, `check_attn_split.sh` (PPL 0,125 %), `compare_ppl.sh`,
 `check_server.sh` (com os 12 casos novos de parâmetro inválido), `check-hardening.sh`,
 `check-tuning` e a suíte de regressão (79 s).
+
+### Segundo furo, do próprio coordenador: lock aninhado trava
+
+Depois de os gates passarem a se travar sozinhos, um wrapper ad-hoc meu
+(`gpu-lock.sh bash script-com-gates.sh`, sem exportar `GPU_LOCK_HELD=1`) fez o
+`check_golden_run.sh` **esperar 18 minutos pelo lock que o próprio pai segurava** — `flock` não
+é reentrante entre processos, então o filho bloqueia até o timeout e o gate falha. Conserto: o
+próprio `scripts/gpu-lock.sh` passa a exportar `GPU_LOCK_HELD=1` para o comando que executa
+(`exec flock -w "$WAIT" "$LOCK" env GPU_LOCK_HELD=1 "$@"`), de modo que qualquer script aninhado
+— gate, wrapper ou `check_all.sh` — detecta que o lock já está tomado sem que ninguém precise
+lembrar. Verificado: `./scripts/gpu-lock.sh bash -c 'echo $GPU_LOCK_HELD'` imprime `1`.
