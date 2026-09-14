@@ -50,6 +50,16 @@ Nosso motor, mesma máquina e modelo: **prefill 123,68 tok/s a 512** (117,47 a 4
 | baseline (tudo ligado) | **1196,49 ± 1,72** | — | |
 | `GGML_VK_DISABLE_COOPMAT=1 GGML_VK_DISABLE_COOPMAT2=1` | **478,38 ± 0,64** | **−60,0 %** | matrix cores valem **2,50×** |
 | `GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1` | 1179,51 ± 2,88 | −1,4 % | o caminho coopmat **não é int8** |
+| coopmat off **+** integer-dot off | 461,78 ± 2,76 | −61,4 % | **nem o fallback é int8/dp4a** (−3,5 % apenas) |
+| `GGML_VK_DISABLE_DOT2=1` | 1121,81 ± 8,12 | −6,2 % | o f16 empacotado contribui ~6 % |
+| `GGML_VK_DISABLE_F16=1` | 1161,72 ± 76,09 | — | ruidoso; f16 não é gargalo de armazenamento |
+
+O achado que reorganiza o plano: **o llama.cpp não faz dp4a/int8 neste modelo** — nem no caminho
+rápido nem no fallback. Os dois caminhos são **f16**: o peso k-quant é dequantizado para **f16 na
+LDS** e o produto é feito com FMA f16 vetorial empacotado (fallback, `dot2`) ou com **coopmat
+f16** (rápido). Desligar o integer-dot não muda quase nada nos dois casos. Ou seja: a família de
+instrução que nós escolhemos para o prefill (`v_dot4_i32_iu8`) **não é a que o concorrente usa**, e
+o nosso caminho não tem *nenhum* f16.
 
 Duas conclusões, e a segunda é a que mais muda o nosso plano:
 
