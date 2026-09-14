@@ -1,17 +1,28 @@
 # Por que o prefill do llama.cpp é 9,7× mais rápido — estudo com medição (14/09, dia)
 
 Pergunta do usuário, literal: *"how does llama.cpp prefill is 9 to 10 times faster than us? what
-did we skip? what should we port or optimize?"*. Este arquivo é o documento-síntese do dia;
-cada frente tem o seu próprio relatório (`docs/estudo-prefill-{a-vulkan,b-mmq,c-nosso,d-wmma}.md`).
+did we skip? what should we port or optimize?"*. Este arquivo é o documento-síntese do dia; cada
+frente tem o seu relatório (`docs/estudo-prefill-{a-vulkan,b-mmq,c-nosso,d-wmma}.md`).
 
-## TL;DR — a resposta em três linhas
+## TL;DR — o gap tem TRÊS fatores, todos medidos nesta máquina
 
-O gap é **multiplicativo e já está decomposto por medição**: **3,86×** vem de *tiling de saída +
-staging na LDS* (llama.cpp faz esse número **com os matrix cores desligados** por variável de
-ambiente) e **2,50×** adicionais vêm do **cooperative matrix** (f16, não int8 — desligar o
-integer-dot não muda nada). 3,86 × 2,50 = **9,66×**, contra os **9,66×** medidos de ponta a ponta.
-Nós não estamos a "9× de distância de um kernel bom": estamos a **3,9× de um kernel de GEMM
-tilejado comum** e depois a 2,5× de usar os matrix cores.
+| fator | de → para | ganho | como foi medido |
+|---|---|---|---|
+| **1. tamanho do micro-lote** | chunk de 16 → 512 tokens | **2,39×** | `llama-bench -b/-ub`: o **próprio llama.cpp** cai de 1168,49 para **200,25 tok/s** quando o micro-lote desce de 512 para 16 (frente C) |
+| **2. estrutura do kernel** | GEMV em lote → GEMM tilejado com LDS | **1,62×** (em M=16) / **3,9×** (em M≥128) | protótipo `bench-gemm-gpu` verificado: 3,46 T MACs/s em M=16 (1,08× o nosso!) contra **12,74 T em M=512** (104 % do llama.cpp sem coopmat) |
+| **3. unidades de matriz** | dp4a → coopmat/WMMA | **2,50×** | `GGML_VK_DISABLE_COOPMAT=1`: 1196,49 → **478,38 tok/s** (mesma forma de tile, mesma precisão de referência) |
+
+1,62 × 2,39 × 2,50 = **9,68×**, contra os **9,66×** medidos de ponta a ponta (1196,49 contra
+123,68). **A maior alavanca isolada não é o kernel: é o chunk de 16 tokens** — e ela é
+*pré-requisito* da segunda, porque em M=16 um GEMM tilejado não ganha nada (medido: 1,08×).
+
+### A frase que resume o "o que foi pulado"
+
+O nosso motor faz **1 byte de ativação carregado por MAC** e **1 elemento de saída por thread**
+(sem tiling de registrador); o caminho do llama.cpp faz **0,0156 byte por MAC** — 64× menos — com
+tile de 128×128 por workgroup e o peso dequantizado **na LDS** (`docs/estudo-prefill-a-vulkan.md`
+§2). É a mesma instrução de multiplicação com uma **forma** diferente: eles emitem ~840-1100 MACs
+por instrução emitida, nós 38.
 
 ## 1. Referência ancorada (mesma máquina, mesmo modelo, mesma janela)
 
@@ -76,7 +87,9 @@ Duas conclusões, e a segunda é a que mais muda o nosso plano:
 ## 3. A conta em TOPS (aritmética sobre as medições acima)
 
 Trunk = 497 tensores, 11,122 GB de pesos lidos por token (medido pelo nosso
-`bench-matvec-shapes-gpu`), ≈25,8 G pesos (11,122 GB a 3,44 bpw). 512 tokens ⇒ **13,2 T MACs**.
+`bench-matvec-shapes-gpu`), **25,622e9 pesos** (contagem independente da frente A e a minha,
+que concordam; o número 30,2e9 de uma versão anterior deste documento estava errado). 512
+tokens ⇒ **13,12 T MACs**.
 
 | | ms para 512 tokens | T MACs/s | TOPS (int8-equivalente) | % do pico dp4a |
 |---|---|---|---|---|

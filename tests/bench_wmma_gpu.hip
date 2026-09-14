@@ -1115,18 +1115,17 @@ int main(int argc, char **argv) {
     // decide quantos warps cabem por SIMD, i.e. se o numero medido e' limite de
     // vazao do pipe ou de latencia de UMA cadeia.
     {
-      hipFuncAttributes a{};
-      if (hipFuncGetAttributes(&a, (const void *)peak_wmma_i8_kernel<8, 8>) == hipSuccess)
-        std::printf("  regs/lane: peak_wmma_i8<8,8> %d, peak_wmma_f16<8,8,f32> %d, "
-                    "peak_dp4a<8,8> %d (256 VGPRS/lane -> %d warps por SIMD no maximo)\n",
-                    a.numRegs, 0, 0, 256 / std::max(1, a.numRegs));
-      hipFuncAttributes b{};
-      if (hipFuncGetAttributes(&b, (const void *)peak_wmma_f16_kernel<8, 8, false>) == hipSuccess)
-        std::printf("  regs/lane: peak_wmma_f16<8,8,f32> %d -> %d warps/SIMD; ", b.numRegs,
-                    256 / std::max(1, b.numRegs));
-      hipFuncAttributes c{};
-      if (hipFuncGetAttributes(&c, (const void *)peak_dp4a_kernel<8, 8>) == hipSuccess)
-        std::printf("peak_dp4a<8,8> %d -> %d warps/SIMD\n", c.numRegs, 256 / std::max(1, c.numRegs));
+      hipFuncAttributes a{}, b{}, c{};
+      const int ra = hipFuncGetAttributes(&a, (const void *)peak_wmma_i8_kernel<8, 8>) == hipSuccess
+                         ? a.numRegs : 0;
+      const int rb =
+          hipFuncGetAttributes(&b, (const void *)peak_wmma_f16_kernel<8, 8, false>) == hipSuccess
+              ? b.numRegs : 0;
+      const int rc = hipFuncGetAttributes(&c, (const void *)peak_dp4a_kernel<8, 8>) == hipSuccess
+                         ? c.numRegs : 0;
+      std::printf("  regs/lane (U=8, 8 acumuladores): wmma_i8 %d -> %d warps/SIMD; wmma_f16 %d -> "
+                  "%d; dp4a %d -> %d (teto de 256 VGPRS por lane)\n", ra, 256 / std::max(1, ra), rb,
+                  256 / std::max(1, rb), rc, 256 / std::max(1, rc));
     }
 
     auto calibrate = [&](const std::function<void(int)> &launch) {
@@ -1139,32 +1138,38 @@ int main(int argc, char **argv) {
     };
 
     // --- relogio, pelo laco de FMA fp32 ---
-    const double clk_nominal = clk_khz * 1e3;
     // O driver reporta 32 "multiprocessors" para esta placa, que tem 64 CU: o
     // que ele conta sao WGPs (par de CU). Quem decide isso e' a medicao: o laco
     // de FMA da' os lanes de fp32, e com 128 lanes/CU a contagem sai certa.
+    const double clk_nominal = clk_khz * 1e3;
     const int cu_phys = 2 * cu;
-    {
+    auto fma_cell = [&](const char *tag) {
       const int U = 8;
       std::function<void(int)> launch = [&](int iters) {
-        peak_fma_kernel<U><<<blocks, threads>>>(iters, d_f);
+        peak_fma_kernel<U><<<2 * blocks, threads>>>(iters, d_f);
       };
-      const int iters = calibrate(launch);
-      const double ms = best_ms([&] { launch(iters); }, reps, rounds);
-      const double ops = (double)nthreads * iters * U * 8;
-      fma_per_s = ops / (ms * 1e-3);
-      clk_hz = fma_per_s / ((double)cu_phys * 4.0 * 32.0);
-      std::printf("  laco de FMA fp32 (U=%d, 8 cadeias, %d CTAs): %.3f ms -> %.1f GFMA/s\n", U,
-                  blocks, ms, fma_per_s / 1e9);
-      std::printf("  clock derivado %.3f GHz com %d CU x 128 lanes (driver diz %d "
-                  "\"multiprocessors\" = %d WGP e %.3f GHz)\n", clk_hz / 1e9, cu_phys, cu, cu / 2,
-                  clk_nominal / 1e9);
-      std::printf("  [SUPOSICAO: fp32 FMA e' 1 instrucao/ciclo/SIMD32 (128 lanes/CU). Se a issue "
-                  "nao saturar\n   o clock derivado sai SUBESTIMADO e os ciclos/WMMA "
-                  "SUPERESTIMADOS; se o driver JA' contasse CU\n   o clock sairia em %.2f GHz, "
-                  "que esta placa nao tem]\n", fma_per_s / ((double)cu * 4.0 * 32.0) / 1e9);
-    }
-    // slots de issue de SIMD por segundo: nao dependem da contagem de CU
+      launch(200);
+      HIPCHECK(hipDeviceSynchronize());
+      EvPair ev;
+      const double t1 = std::max(1e-6, ev([&] { launch(200); }) / 200.0);
+      const int iters = iters_override ? iters_override : (int)std::max(200.0, 40.0 / t1);
+      const double ms = best_ms([&] { launch(iters); }, 2, rounds, 1500.0);
+      const double ops = (double)(2 * blocks * threads) * iters * U * 8;
+      const double per_s = ops / (ms * 1e-3);
+      std::printf("  laco de FMA fp32 %s (U=%d, 8 cadeias, %d CTAs): %.3f ms -> %.2f T-FMA/s = "
+                  "%.2f T-FLOP/s\n", tag, U, 2 * blocks, ms, per_s / 1e12, 2.0 * per_s / 1e12);
+      std::printf("    %s: %.1f%% do pico de fp32 desta placa a 2,97 GHz (24,35 T-FMA/s); "
+                  "o laco de FMA e'\n    a referencia de issue (SUPOSICAO: 1 FMA/ciclo/SIMD32), "
+                  "logo os ciclos abaixo saem\n    normalizados por ELE, nao por um clock "
+                  "suposto\n", tag, 100.0 * per_s / 24.35e12);
+      return per_s;
+    };
+    fma_per_s = fma_cell("inicio");
+    clk_hz = fma_per_s / ((double)cu_phys * 4.0 * 32.0);
+    std::printf("  clock implicito %.3f GHz com %d CU x 128 lanes (driver: %d multiprocessors, "
+                "%.3f GHz)\n", clk_hz / 1e9, cu_phys, cu, clk_nominal / 1e9);
+    // slots de issue de SIMD por segundo: nao dependem da contagem de CU, so' da
+    // suposicao de que o FMA fp32 e' 1 instrucao por ciclo por SIMD32.
     const double simd_slots = fma_per_s / 32.0;
 
     struct Res {
@@ -1228,7 +1233,7 @@ int main(int argc, char **argv) {
       char tag[64];
       std::snprintf(tag, sizeof(tag), "wmma_i8 U=8");
       Res r = measure(tag, nb, 8, l_i8(nb, 8), 64.0, 4096.0);
-      Res d = measure("dp4a U=8", nb, 8, l_dp(nb, 8), 64.0, 4.0);
+      Res d = measure("dp4a U=8", nb, 8, l_dp(nb, 8), 64.0, 128.0);
       sweep.push_back({nb, r, d});
     }
     // ajuste linear em U (normalizado por iteracao, porque `iters` difere):
@@ -1237,7 +1242,7 @@ int main(int argc, char **argv) {
       const int nb = sweep[0].nb;
       const Res w1 = measure("wmma_i8 U=1", nb, 1, l_i8(nb, 1), 8.0, 4096.0);
       const Res w8 = sweep[0].wi8;
-      const Res d1 = measure("dp4a U=1", nb, 1, l_dp(nb, 1), 8.0, 4.0);
+      const Res d1 = measure("dp4a U=1", nb, 1, l_dp(nb, 1), 8.0, 128.0);
       const Res d8 = sweep[0].dp;
       const double aw = (w8.per_iter - w1.per_iter) / 7.0;
       const double ad = (d8.per_iter - d1.per_iter) / 7.0;
@@ -1246,7 +1251,7 @@ int main(int argc, char **argv) {
       std::printf("    WMMA int8: a=%.5f ms -> %.2f T-MACs/s no limite U->inf\n", aw,
                   4096.0 * 8.0 * nw / (aw * 1e-3) / 1e12);
       std::printf("    dp4a     : a=%.5f ms -> %.2f G-instr-warp/s = %.2f T-MACs/s\n", ad,
-                  8.0 * nw / (ad * 1e-3) / 1e9, 4.0 * 8.0 * nw / (ad * 1e-3) / 1e12);
+                  8.0 * nw / (ad * 1e-3) / 1e9, 128.0 * 8.0 * nw / (ad * 1e-3) / 1e12);
       std::printf("    (o desenrolar tira o overhead de laco; o valor por U das linhas acima ja'\n"
                   "     e' o do laco cheio, a diferenca mede o custo de controle)\n");
     }
@@ -1258,7 +1263,7 @@ int main(int argc, char **argv) {
     const Res wi8_8 = sweep[best_cell].wi8;
     const Res dp_8 = sweep[best_cell].dp;
     const Res wi8_8b = measure("wmma_i8 (repetido)", nb_best, 8, l_i8(nb_best, 8), 64.0, 4096.0);
-    const Res dp_8b = measure("dp4a (repetido)", nb_best, 8, l_dp(nb_best, 8), 64.0, 4.0);
+    const Res dp_8b = measure("dp4a (repetido)", nb_best, 8, l_dp(nb_best, 8), 64.0, 128.0);
     const Res f16_8 = measure("wmma_f16 acc f32", nb_best, 8, l_f16(nb_best, false, 8), 64.0, 4096.0);
     const Res f16_1 = measure("wmma_f16 acc f32", nb_best, 1, l_f16(nb_best, false, 1), 8.0, 4096.0);
     const Res f16a_8 = measure("wmma_f16 acc f16", nb_best, 8, l_f16(nb_best, true, 8), 64.0, 4096.0);
@@ -1290,15 +1295,35 @@ int main(int argc, char **argv) {
                   simd_slots / 4.0 / dp4a_per_s);
       std::printf("  MACs/ciclo/SIMD: WMMA int8 %.1f, WMMA f16 %.1f, dp4a %.2f; MACs/ciclo/CU: "
                   "%.0f / %.0f / %.1f\n", 4096.0 * wmma_per_s / simd_slots,
-                  4096.0 * f16_8.instr_per_s() / simd_slots, 4.0 * dp4a_per_s / simd_slots,
+                  4096.0 * f16_8.instr_per_s() / simd_slots, 128.0 * dp4a_per_s / simd_slots,
                   4.0 * 4096.0 * wmma_per_s / simd_slots, 4.0 * 4096.0 * f16_8.instr_per_s() / simd_slots,
-                  4.0 * 4.0 * dp4a_per_s / simd_slots);
-      std::printf("  razoes de MACs/s: WMMA int8 / dp4a = %.1fx; WMMA f16 / dp4a = %.1fx; f16 acc "
+                  4.0 * 128.0 * dp4a_per_s / simd_slots);
+      std::printf("  razoes de MACs/s: WMMA int8 / dp4a = %.2fx; WMMA f16 / dp4a = %.2fx; f16 acc "
                   "f32 / f16 acc f16 = %.2fx\n", wi8_8.macs_per_s() / dp_8.macs_per_s(),
                   f16_8.macs_per_s() / dp_8.macs_per_s(), f16_8.macs_per_s() / f16a_8.macs_per_s());
-      std::printf("  piso de ruido (mesma celula, min de %d rodadas): wmma_i8 %.4f vs %.4f ms "
-                  "(%.3fx); dp4a %.4f vs %.4f ms (%.3fx)\n", rounds, wi8_8.ms, wi8_8b.ms,
-                  wi8_8b.ms / wi8_8.ms, dp_8.ms, dp_8b.ms, dp_8b.ms / dp_8.ms);
+      std::printf("  piso de ruido (mesma celula, min de %d rodadas, em TAXA que e' o que nao\n"
+                  "  depende do numero de iteracoes calibrado): wmma_i8 %.2f vs %.2f T-MACs/s "
+                  "(%.3fx); dp4a %.2f vs %.2f (%.3fx)\n", rounds, wi8_8.macs_per_s() / 1e12,
+                  wi8_8b.macs_per_s() / 1e12, wi8_8b.macs_per_s() / wi8_8.macs_per_s(),
+                  dp_8.macs_per_s() / 1e12, dp_8b.macs_per_s() / 1e12,
+                  dp_8b.macs_per_s() / dp_8.macs_per_s());
+      std::printf("  taxa de instrucao: WMMA %.1f G-instr-warp/s, dp4a %.1f G-instr-warp/s "
+                  "(razao %.2fx)\n", wmma_per_s / 1e9, dp4a_per_s / 1e9, dp4a_per_s / wmma_per_s);
+      // O que o motor faz HOJE, em unidades comparaveis: 30,2e9 pesos por token
+      // = 236e6 instrucoes de warp de dp4a por token (128 MACs cada). No lote de
+      // N=16 o custo marginal e' 6,04 ms/token, i.e. 16 tokens em 96,6 ms
+      // (docs/journal-lote.md, Medida 1).
+      {
+        const double eng_dp4a_per_s = 16.0 * 236e6 / (16.0 * 6.04e-3);
+        const double eng_macs = eng_dp4a_per_s * 128.0;
+        std::printf("  --- referencia do motor (docs/journal-lote.md, Medida 1) ---\n");
+        std::printf("  16 tokens = 3,78e9 instr-warp de dp4a em 96,6 ms (custo marginal 6,04 "
+                    "ms/token em N=16)\n");
+        std::printf("  = %.1f G-instr-warp/s = %.2f T-MACs/s = %.1f TOPS-equivalente -> %.1f%% do "
+                    "pico de dp4a e %.1f%% do pico de WMMA medidos aqui\n",
+                    eng_dp4a_per_s / 1e9, eng_macs / 1e12, 2.0 * eng_macs / 1e12,
+                    100.0 * eng_dp4a_per_s / dp4a_per_s, 100.0 * eng_macs / wi8_8.macs_per_s());
+      }
     }
     HIPCHECK(hipFree(d_i));
     HIPCHECK(hipFree(d_f));
@@ -1310,7 +1335,7 @@ int main(int argc, char **argv) {
   // -----------------------------------------------------------------------
   if (do_lds) {
     std::printf("== 4. LDS: banda medida contra a que o staging do minigemm pede ==\n");
-    const int threads = 256, blocks = cu, nthreads = blocks * threads;
+    const int threads = 256, blocks = 2 * cu, nthreads = blocks * threads;
     const size_t smem = 1024 * sizeof(int4);  // 16 KB (o kernel indexa & 1023)
     int *d_i = nullptr;
     HIPCHECK(hipMalloc(&d_i, (size_t)nthreads * sizeof(int)));

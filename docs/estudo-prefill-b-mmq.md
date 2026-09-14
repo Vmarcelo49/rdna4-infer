@@ -31,7 +31,9 @@ existe é o enum `MMQ_Q8_1_DS_LAYOUT_{D4,DS4,D2S6}` (`mmq.cuh:18-22`) e a união
    **27 TOPS** nos `3,07e11` slots/s do cartão; o tile WMMA rende ~340 MAC/instrução (estimativa INFERIDO).
 5. Os 67 TOPS do llama.cpp **não são alcançáveis com dp4a**: exigiriam `2,6e11` dp4a/s = 85 % de *todos* os
    slots de issue do cartão antes de qualquer carga de ativação ou conta de endereço — e o pico vetorial
-   f16/fp32 do cartão (39-49 TOPS) também fica abaixo de 67 TOPS, logo a referência usa unidades de matriz.
+   f16/fp32 (39-49 TOPS) também fica abaixo disso, logo a referência usa unidades de matriz; entre int8 e
+   f16 a diferença **medida** neste cartão é 3,5 % (§7.3), então a aposta é o pipe de matriz, com
+   **f16 + acumulador f32** como primeiro passo e o int8 (WMMA iu8) como teto e caminho de decode (§7.6).
 
 ---
 
@@ -436,12 +438,142 @@ caminho RDNA4 e contar a ISA (`--save-temps`/`llvm-objdump`) como já foi feito 
 
 ---
 
+## 7. As duas famílias de implementação (int8 vs f16) para pesos de 3-4 bits
+
+Pergunta do coordenador: **para IQ3_S/IQ3_XXS/IQ4_XS (59 % dos bytes), qual é a aposta certa no
+gfx1201 — int8 (a família do MMQ do ggml-cuda) ou f16 (a família que o Vulkan usa)?** Medições novas
+no mesmo cartão/modelo (`llama-bench -p 512 -n 0 -r 2`, backend Vulkan, feitas pelo coordenador):
+baseline **1 196,49 tok/s**; `GGML_VK_DISABLE_COOPMAT=1` → **478,38**; coopmat OFF +
+`GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1` → **461,78**; `GGML_VK_DISABLE_DOT2=1` → **1 121,81**.
+
+### 7.1 O que cada família faz no laço interno (verificado no código)
+
+| | **(a) int8** | **(b) f16** |
+|---|---|---|
+| dequantização do peso | LUT + sinal + empacotamento em `int8` na LDS — `mmq-load-tiles.cuh:1359-1426` (IQ3_S), `:1295-1357` (IQ3_XXS), `:1428-1494` (IQ4_XS) | LUT + escala em fp32 + arredondamento para f16 na escrita — `mul_mm_funcs.glsl:238-261` (IQ3_S), com a LDS em `shared FLOAT_TYPEV2 buf_a[...]`, `mul_mm.comp:194` |
+| ativação | precisa ser **quantizada**: `block_q8_1_mmq` de 128 valores + 16 B de cauda — `mmq.cuh:27-46`; quantizador em `quantize.cu:457-556` | **não** precisa: B entra como f16 (de f32 no palco, `mul_mm.comp:378-413`) |
+| instrução de MAC (vetorial) | `v_dot4_i32_iu8` = **128 MAC/instrução** (`common.cuh:718-719`) | `v_dot2_f32_f16` = **64 MAC/instrução** (`dot_product_funcs.glsl:4-14`, SPIR-V id 6916) ou 2 `v_fma_f32` (idem, `#else`) |
+| instrução de MAC (matriz) | `v_wmma_i32_16x16x16_iu8` = **4 096 MAC** (`mma.cuh:1324`) | `v_wmma_f32_16x16x16_f16` = **4 096 MAC** (`mma.cuh:1232`; no Vulkan, `coopmat<FLOAT_TYPE,...>`, `mul_mm.comp:340-342`) |
+| correção de escala | obrigatória para tipos com mínimo: `dmA.y*dsB.y` (`mmq-vec-dot.cuh:359-361`), `mul_mmq_funcs.glsl:33-41` (`dm*(q_sum*ds.x - ds.y)`) | nenhuma: a escala entra multiplicada no próprio f16 estagiado |
+| arredondamento do peso | **nenhum**: o inteiro da grade entra exato e a escala é aplicada em fp32 no epílogo | cada peso é arredondado para f16 (mantissa de 11 bits) |
+
+### 7.2 MAC por slot de issue e instruções por 4 MACs
+
+Base de issue: `3,07e11` instruções de warp/s (§4). "Por 4 MACs" = por lane, para comparar com o dp4a,
+que vale 1 instrução por 4 MACs por lane.
+
+| caminho | MAC por instrução (warp) | instruções por 4 MACs | MAC por instrução de warp, com o overhead | onde vem o número |
+|---|---|---|---|---|
+| **int8 dp4a, o nosso kernel em lote** | 128 | **3,31** (1 dp4a + 2,3 não-dot, 33 % de esperas) | **44,7** (medido) | `docs/journal-kernels.md` §10 |
+| **int8 dp4a, num tile bom** (4×4 de registrador, LDS) | 128 | ~2,5-3,0 | ~45-50 | INFERIDO da estrutura de `mul_mmq_funcs.glsl:33-41` + `l_warptile_mmq_int` (`ggml-vulkan.cpp:4495`, TM=TN=4) |
+| **int8 WMMA (MMQ-RDNA4)** | 4 096 | **0,0103** (16 WMMA + 25 cargas LDS + 128 FMA de epílogo por 65 536 MACs) | **~300-350** | INFERIDO, §6.5 |
+| **f16 `v_dot2_f32_f16`, tile do `mul_mm.comp`** | 64 | **~2,56** (por lane por passo `BK_STEP`: 36 cargas LDS + 128 `dot_product` para 256 MACs; `mul_mm.comp:395-424`) | ~50 | INFERIDO, contado no shader |
+| **f16 sem DOT2** (2 `v_fma_f32` por `dot_product`) | 32 | ~4,75 | ~27 | idem, ramo `#else` de `dot_product_funcs.glsl:18-25` |
+| **f16 coopmat / WMMA f16** | 4 096 | ~0,01 | ~300+ | idem |
+
+Peak de cada família, para referência: int8 dp4a **78,6 TOPS** (100 % dos slots, zero outra instrução);
+f16/fp32 vetorial **39-49 TOPS** (2 FMA/slot, *brief* §2); matriz (i8 ou f16) ≥ **2 500 TOPS** de issue.
+Ou seja: **o teto da família int8 é 1,6-2× o da família f16 no pipe vetorial, e as duas estão ~30-50×
+abaixo do pipe de matriz.**
+
+### 7.3 O que o A/B do Vulkan mede — e o que ele **não** mede
+
+Fato de código que muda a leitura das medições: **o Vulkan não tem caminho int8 para os tipos IQ.**
+As pipelines de `q8_1` (inteiro, dp4a) são criadas uma a uma e a lista é fechada
+(`ggml-vulkan.cpp:5235-5246`): Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, MXFP4, Q2_K, Q3_K, Q4_K, Q5_K,
+Q6_K — **nenhum IQ1/IQ2/IQ3/IQ4**. O seletor pede primeiro o mapa `(type_a, Q8_1)` e só cai no f16 se
+ele estiver vazio (`ggml-vulkan.cpp:9490-9501`), então para IQ3_S/IQ3_XXS/IQ4_XS o Vulkan usa **sempre
+f16**, com ou sem `integer_dot_product`.
+
+Consequências para ler as quatro medições:
+
+- O `-3,5 %` de `GGML_VK_DISABLE_INTEGER_DOT_PRODUCT` só pode afetar os tipos que **têm** as duas
+  famílias: q5_K 9,4 % + q3_K 9,0 % + q6_K 3,3 % + q4_K 2,2 % + q2_K 1,1 % + q8_0 0,3 % ≈ **25 % dos
+  bytes** (`docs/quants-inventario.md`). É, portanto, um A/B direto **int8-dp4a × f16** num kernel
+  bem-tileado deste cartão: **3,5 %**, ou seja empate técnico.
+- Os 59 % de bytes IQ rodam em f16, coopmat ou não. Os 2,50× do coopmat (1 196 / 478) são, para esses
+  tipos, o ganho de **matriz f16 × vetor f16** — não de "int8 × f16".
+- `GGML_VK_DISABLE_DOT2` custando 6 % mostra que trocar `v_dot2_f32_f16` por 2 `v_fma_f32` quase não
+  muda nada: **o caminho f16 vetorial não está limitado pelo dot**, está limitado por carga/issue.
+
+**Calibração de quanto vale o empate de 3,5 %.** O fallback f16 a 478 tok/s = 28,9 TOPS exige, pela
+contagem de §7.2, `1,44e13/4 × 2,56/32 = 2,9e11` instruções de warp/s = **~94 % dos 3,07e11 slots**
+(com a incerteza da minha contagem, entre 70 % e 95 %). Ou seja: o kernel f16 vetorial do Vulkan está
+saturado de issue. Nesse regime, trocar 1 dp4a (4 MAC por lane) por 2 dot2 (2 MAC cada) só mexe na
+*fatia* que o MAC ocupa dos slots — e como boa parte dos slots vai para cargas LDS, staging e endereço,
+o ganho medido é 3,5 %. Mesma leitura do `DISABLE_DOT2` (6 %): **nestes kernels o MAC não é o gargalo,
+a carga é.** Consequência para nós: o nosso teto de família (78,6 TOPS com dp4a) não se alcança
+"trocando a instrução", e sim cortando instruções de carga/espera por MAC — que é onde os nossos 3,31
+por 4 MACs (contra ~2,5-2,6 do f16 tileado) moram.
+
+### 7.4 Precisão: o peso de 3-4 bits cabe exato em f16?
+
+| | peso | ativação | erro dominante |
+|---|---|---|---|
+| **int8** | exato: a grade do IQ3_S são inteiros ímpares ≤127 (cabe em `int8`), a escala por 32 vai em fp32 e é aplicada no epílogo (`mmq-load-tiles.cuh:1421`, `mmq-vec-dot.cuh:196`) | **q8_1**: 8 bits com absmax por bloco de 32 (`quantize.cu:499-521`) → erro relativo até 1/254 no maior elemento do bloco e pior nos pequenos | **a ativação** (≈4e-3) |
+| **f16** | arredondado para f16: erro relativo ≤ 2⁻¹¹ = **4,9e-4** — o IQ3_S quantiza o peso original com erro de ~1-5 %, logo o arredondamento f16 é **20-100× menor que o erro da própria quantização** | f16: 11 bits, **sem** escala por bloco e sem penalidade de outlier | nenhum dos dois domina; ~4,9e-4 em ambos |
+
+Ressalva séria do lado f16: **o acumulador**. `v_pk_fma_f16` acumula em f16 (inviável para K=5120);
+é obrigatório usar a variante de acumulador f32 — `v_dot2_f32_f16` (`dot_product_funcs.glsl:12-15`)
+ou coopmat com `f32acc`/`SPV_DOT2` (`ggml-vulkan.cpp:5225-5227`). O Vulkan tem as duas variantes
+(`_f32` e `_f32_f16acc`) e escolhe por `ggml_vk_get_mul_mat_mat_f16acc` (`ggml-vulkan.cpp:9135`), com
+fallback para f32acc se a pipeline f16acc não existir (idem, `:9136-9146`) — **INFERIDO**: qual das duas
+rodou nos 1 196 tok/s não está dito na medição; confirmar com `GGML_VK_...`/log ou comparando a precisão
+da saída. Se for f16acc, o número é 2,5× mas a precisão não é a do caminho f32.
+
+### 7.5 Custo de dequantização e de LDS por byte de peso
+
+| | instruções por byte de peso estagiado | bytes de LDS por byte de peso | correção de escala |
+|---|---|---|---|
+| int8 (IQ3_S, `load_tiles_iq3_s`) | ~0,039 de warp (≈40 por 1024 pesos, §6.2) = **1,2 por lane por peso** | 1 B escrito + 1 B lido = 2 | sim (só para tipos com mínimo) |
+| f16 (mesma LUT, `mul_mm_funcs.glsl:238-261`) | INFERIDO: mesma ordem de grandeza (a escala entra em fp32 no próprio staging e o sinal é aplicado por elemento, sem `__vcmpne4`/`__vsub4`) | 2 B escritos + 2 B lidos = **4** | não |
+
+O custo em LDS dobra no f16, mas o total continua na casa de 1-5 % da banda (§6.2) — **não é o
+critério**. O critério é a *largura* do tile: com f16 os operandos ocupam 2× por valor, então o tile
+`I=128 × K=256` do MMQ int8 (38 912 B só de x) viraria ~78 KB e **não cabe nos 65 536 B** do gfx1201.
+Na prática o caminho f16 fatia o K (BK=32-64 com duplo buffer, como o Vulkan faz: `mul_mm.comp:194-195`
+usa `SHMEM_STRIDE = BK/2 + 4`), o que resolve o orçamento de LDS mas multiplica os pontos de
+`__syncthreads()` e a matemática de índice por passo de K.
+
+### 7.6 Veredito para IQ3_S / IQ3_XXS / IQ4_XS
+
+1. **Entre as duas famílias vetoriais, a decisão não move o ponteiro:** 3,31 (nosso dp4a) / ~2,5-3
+   (dp4a tileado) / 2,56 (f16 com dot2) instruções por 4 MACs, e o A/B medido neste cartão dá 3,5 %.
+   O teto do int8 no papel é 1,6-2× maior (78,6 × 39-49 TOPS), mas **nós não estamos perto de nenhum dos
+   dois tetos**: 7,5 TOPS = 9,5 % do teto int8, enquanto o fallback f16 do Vulkan (478 tok/s = 28,9 TOPS)
+   está a 59-74 % do teto f16. O nosso problema é estrutural, não de família.
+2. **A aposta certa é o pipe de matriz, não a família.** 2,50× medido (coopmat), e ambos os WMMA do
+   gfx12 existem no compilador deste host. A 4 096 MAC por instrução, a diferença i8 × f16 no MAC/instrução
+   (a matriz i8 costuma ser 2× a f16) é irrelevante: os 67-72 TOPS pedem <3 % dos slots em qualquer um
+   dos dois (§4).
+3. **Como primeiro passo, f16 (com acumulador f32)** — pelas três razões que decidem de fato:
+   (i) **precisão**: para pesos de 3-4 bits o arredondamento f16 do peso (4,9e-4) é 20-100× menor que o
+   erro da própria quantização, enquanto o caminho int8 *introduz* uma quantização nova de 8 bits na
+   ativação — f16 é mais preciso ponta a ponta nestes tipos; (ii) **código**: f16 não precisa do
+   quantizador q8_1 no layout MMQ (§6.3, ~120 linhas + kernel), nem dos termos de correção, nem do
+   truque de sinal `__vcmpne4`/`__vsub4` do `load_tiles_iq3_s`; (iii) **existe implementação medida
+   neste cartão e neste modelo** (1 196 tok/s com coopmat f16), enquanto o caminho int8 não tem
+   *nenhuma* medição no gfx1201 (Vulkan não tem pipeline int8 para IQ; o backend HIP do llama.cpp não
+   está construído).
+4. **Manter o int8 onde ele é estruturalmente melhor**: (a) no **decode/M=1**, onde `v_dot4` faz 4 MAC
+   por lane contra 2 do dot2 e não há dimensão de matriz para amortizar (é o caminho que já temos,
+   `include/rdna4/vecdotq.cuh`); (b) como **fallback de cauda** (`J` pequeno, `fallback=true`) via
+   `mmq.cuh:541-679`; (c) para tipos em que o arredondamento f16 do peso for inaceitável — **INFERIDO**:
+   nos três tipos do P0 ele não é (§7.4); só uma medição de perplexidade/KL com pesos em f16 confirma.
+5. **O que mediria a decisão em vez de inferi-la** (nesta ordem, tudo no nosso motor): um microbench de
+   `v_wmma_i32_16x16x16_iu8` e de `v_wmma_f32_16x16x16_f16` com acumulador f32 no gfx1201 (MAC/s por
+   SIMD e intervalo de issue de cada um); depois o mesmo par de microbenches para `v_dot4_i32_iu8` ×
+   `v_dot2_f32_f16` com **o mesmo tile de registrador** (é o que separa "família" de "estrutura"); e só
+   então o kernel de IQ3_S nas duas versões, com o gate de precisão (`rel-L2` contra o caminho atual,
+   mais KL no prompt de referência).
+
 ## Portar ou não portar (ordenado por ganho esperado)
 
-1. **O caminho WMMA int8 para os tipos que dominam os bytes** — `mma.cuh:1306-1337` (builtin `_gfx12` em
-   `:1324-1325`), `mmq-vec-dot.cuh:142-278` (`vec_dot` com escalas), `mmq-load-tiles.cuh:1359-1426`
-   (IQ3_S) e `:1295-1357` (IQ3_XXS), ligados em `mmq.cuh:810-815` (IQ3_S) e `:804-809` (IQ3_XXS), com o
-   tile `mmq-config-rdna4.cuh:222-233`. Cobre **52,6 %** dos bytes do nosso inventário (iq3_s 34,8 % +
+1. **O caminho de matriz (WMMA) para os tipos que dominam os bytes** — `mma.cuh:1306-1337` (int8:
+   builtin `_gfx12` em `:1324-1325`; f16: `:1232`), `mmq-vec-dot.cuh:142-278` (`vec_dot` com escalas),
+   `mmq-load-tiles.cuh:1359-1426` (IQ3_S) e `:1295-1357` (IQ3_XXS), ligados em `mmq.cuh:810-815` (IQ3_S)
+   e `:804-809` (IQ3_XXS), com o tile `mmq-config-rdna4.cuh:222-233`. Qual das duas variantes de matriz
+   primeiro — **§7.6: f16 com acumulador f32**, e o int8 como teto e caminho de decode**. Cobre **52,6 %** dos bytes do nosso inventário (iq3_s 34,8 % +
    iq3_xxs 17,8 %, `docs/quants-inventario.md`) e é o único item que muda a ordem de grandeza: leva o
    teto de 27 para >250 TOPS de issue e a nossa execução de 7,5 para a casa dos 40-70.
 2. **O staging de peso em LDS com a LUT** — `mmq-load-tiles.cuh` (os 5 tipos: `:1359-1426`, `:1295-1357`,
