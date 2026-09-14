@@ -1010,76 +1010,57 @@ inline bool attn_split_batch_launch(const float *d_q, const void *d_k, const voi
                                     hipStream_t stream = nullptr) {
   // Same WPB policy as the per-token split path, so the arithmetic matches.
   const int wpb = attn_split_wpb(n_splits);
-#define RD_ATTN_SB_CASE(K, V, W)                                                                  \
-  if (kt == KvType::K && vt == KvType::V && wpb == W)                                             \
-  return attn_split_batch_launch_typed<KvType::K, KvType::V, W>(                                   \
-      d_q, d_k, d_v, d_out, d_partial, d_pos, n_tok, n_head, n_head_kv, head_dim, scale, n_splits, \
-      stream)
-  RD_ATTN_SB_CASE(F32, F32, 16);
-  RD_ATTN_SB_CASE(F32, F16, 16);
-  RD_ATTN_SB_CASE(F32, Q8_0, 16);
-  RD_ATTN_SB_CASE(F32, Q4_0, 16);
-  RD_ATTN_SB_CASE(F16, F32, 16);
-  RD_ATTN_SB_CASE(F16, F16, 16);
-  RD_ATTN_SB_CASE(F16, Q8_0, 16);
-  RD_ATTN_SB_CASE(F16, Q4_0, 16);
-  RD_ATTN_SB_CASE(Q8_0, F32, 16);
-  RD_ATTN_SB_CASE(Q8_0, F16, 16);
-  RD_ATTN_SB_CASE(Q8_0, Q8_0, 16);
-  RD_ATTN_SB_CASE(Q8_0, Q4_0, 16);
-  RD_ATTN_SB_CASE(Q4_0, F32, 16);
-  RD_ATTN_SB_CASE(Q4_0, F16, 16);
-  RD_ATTN_SB_CASE(Q4_0, Q8_0, 16);
-  RD_ATTN_SB_CASE(Q4_0, Q4_0, 16);
-  RD_ATTN_SB_CASE(F32, F32, 8);
-  RD_ATTN_SB_CASE(F32, F16, 8);
-  RD_ATTN_SB_CASE(F32, Q8_0, 8);
-  RD_ATTN_SB_CASE(F32, Q4_0, 8);
-  RD_ATTN_SB_CASE(F16, F32, 8);
-  RD_ATTN_SB_CASE(F16, F16, 8);
-  RD_ATTN_SB_CASE(F16, Q8_0, 8);
-  RD_ATTN_SB_CASE(F16, Q4_0, 8);
-  RD_ATTN_SB_CASE(Q8_0, F32, 8);
-  RD_ATTN_SB_CASE(Q8_0, F16, 8);
-  RD_ATTN_SB_CASE(Q8_0, Q8_0, 8);
-  RD_ATTN_SB_CASE(Q8_0, Q4_0, 8);
-  RD_ATTN_SB_CASE(Q4_0, F32, 8);
-  RD_ATTN_SB_CASE(Q4_0, F16, 8);
-  RD_ATTN_SB_CASE(Q4_0, Q8_0, 8);
-  RD_ATTN_SB_CASE(Q4_0, Q4_0, 8);
-  // Q5_0/Q4_1 (frente KV): the list above was added by the prefill front while the KV
-  // front was adding the two formats, so the merge left it without them -- and the
-  // caller in graph.cuh treats `false` as a HARD error ("batch attn (batched) launch
-  // failed"), so with --cache-type-k q5_0 / --cache-type-v q4_1 and >=512 keys the
-  // batched prefill aborted instead of degrading. Review finding R11; the same hole was
-  // fixed for attn_batch_launch / attn_launch_split in the KV branch (a1fc8bd).
-  RD_ATTN_SB_CASE(Q5_0, Q4_1, 16);
-  RD_ATTN_SB_CASE(Q5_0, Q5_0, 16);
-  RD_ATTN_SB_CASE(Q4_1, Q4_1, 16);
-  RD_ATTN_SB_CASE(Q4_1, Q5_0, 16);
-  RD_ATTN_SB_CASE(Q5_0, F16, 16);
-  RD_ATTN_SB_CASE(Q5_0, Q8_0, 16);
-  RD_ATTN_SB_CASE(Q5_0, Q4_0, 16);
-  RD_ATTN_SB_CASE(F16, Q5_0, 16);
-  RD_ATTN_SB_CASE(F16, Q4_1, 16);
-  RD_ATTN_SB_CASE(Q8_0, Q5_0, 16);
-  RD_ATTN_SB_CASE(Q8_0, Q4_1, 16);
-  RD_ATTN_SB_CASE(Q4_0, Q5_0, 16);
-  RD_ATTN_SB_CASE(Q4_0, Q4_1, 16);
-  RD_ATTN_SB_CASE(Q5_0, Q4_1, 8);
-  RD_ATTN_SB_CASE(Q4_1, Q5_0, 8);
-  RD_ATTN_SB_CASE(Q5_0, Q5_0, 8);
-  RD_ATTN_SB_CASE(Q4_1, Q4_1, 8);
-  RD_ATTN_SB_CASE(Q5_0, F16, 8);
-  RD_ATTN_SB_CASE(Q5_0, Q8_0, 8);
-  RD_ATTN_SB_CASE(Q5_0, Q4_0, 8);
-  RD_ATTN_SB_CASE(F16, Q5_0, 8);
-  RD_ATTN_SB_CASE(F16, Q4_1, 8);
-  RD_ATTN_SB_CASE(Q8_0, Q5_0, 8);
-  RD_ATTN_SB_CASE(Q8_0, Q4_1, 8);
-  RD_ATTN_SB_CASE(Q4_0, Q5_0, 8);
-  RD_ATTN_SB_CASE(Q4_0, Q4_1, 8);
-#undef RD_ATTN_SB_CASE
+  // Written as SWITCHes over both enums with NO `default:` on purpose: a new
+  // KvType added to kv.h (the KV front is adding q5_0/q4_1 tonight) makes the
+  // compiler warn (-Wswitch is part of -Wall on the engine target) instead of
+  // silently falling through to `return false` -- which at >= 512 keys would look
+  // like a broken prefill rather than a missing kernel (review finding R11/F6).
+  // The caller (graph.cuh) falls back to the per-token split kernel for any pair
+  // that is not instantiated here: a missing pair costs speed, never correctness.
+#define RD_ATTN_SB_PAIR(K, V)                                                                     \
+  case KvType::V:                                                                                 \
+    if (wpb == 16)                                                                                \
+      return attn_split_batch_launch_typed<K, KvType::V, 16>(d_q, d_k, d_v, d_out, d_partial,     \
+                                                             d_pos, n_tok, n_head, n_head_kv,     \
+                                                             head_dim, scale, n_splits, stream);  \
+    return attn_split_batch_launch_typed<K, KvType::V, 8>(d_q, d_k, d_v, d_out, d_partial, d_pos, \
+                                                          n_tok, n_head, n_head_kv, head_dim,     \
+                                                          scale, n_splits, stream)
+  switch (kt) {
+    case KvType::F32:
+      switch (vt) {
+        RD_ATTN_SB_PAIR(KvType::F32, F32);
+        RD_ATTN_SB_PAIR(KvType::F32, F16);
+        RD_ATTN_SB_PAIR(KvType::F32, Q8_0);
+        RD_ATTN_SB_PAIR(KvType::F32, Q4_0);
+      }
+      break;
+    case KvType::F16:
+      switch (vt) {
+        RD_ATTN_SB_PAIR(KvType::F16, F32);
+        RD_ATTN_SB_PAIR(KvType::F16, F16);
+        RD_ATTN_SB_PAIR(KvType::F16, Q8_0);
+        RD_ATTN_SB_PAIR(KvType::F16, Q4_0);
+      }
+      break;
+    case KvType::Q8_0:
+      switch (vt) {
+        RD_ATTN_SB_PAIR(KvType::Q8_0, F32);
+        RD_ATTN_SB_PAIR(KvType::Q8_0, F16);
+        RD_ATTN_SB_PAIR(KvType::Q8_0, Q8_0);
+        RD_ATTN_SB_PAIR(KvType::Q8_0, Q4_0);
+      }
+      break;
+    case KvType::Q4_0:
+      switch (vt) {
+        RD_ATTN_SB_PAIR(KvType::Q4_0, F32);
+        RD_ATTN_SB_PAIR(KvType::Q4_0, F16);
+        RD_ATTN_SB_PAIR(KvType::Q4_0, Q8_0);
+        RD_ATTN_SB_PAIR(KvType::Q4_0, Q4_0);
+      }
+      break;
+  }
+#undef RD_ATTN_SB_PAIR
   return false;
 }
 

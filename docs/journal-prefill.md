@@ -194,10 +194,28 @@ Interruptor de A/B **no binário**: `RD_PREFILL_BATCH=0` volta ao andaime por to
 
 ## 5. Orçamento por fase DEPOIS do float4 (binário reconstruído)
 
-- **Comando**: `./build/bench-phases-gpu IQ3_S --prefill 16 --level 2` (com `bench-phases-gpu`
-  reconstruído — a corrida de §3 usou o binário anterior e por isso mostra `gdn_delta` = 2,19).
-- **Resultado**: ver `/tmp/gates3.log` + `/tmp/speed-prefill.log` (preenchido abaixo).
-- **Veredito**: —
+- **Comando**: `./build/bench-phases-gpu IQ3_S --prefill 16 --prefill-reps 2 --level 2` e
+  `--prefill 1024 --level 1` (binários reconstruídos; janela: ver §8.1).
+- **Resultado** (passada limpa **8,025 ms/token = 124,6 tok/s** para o chunk de 16; instrumentada
+  8,404 ms/token, inflação +4,7 %, 93,1 marcas/token):
+
+  | bucket | ms/token | % | marcas/token | antes do float4 (§3) |
+  |---|---|---|---|---|
+  | **matvec** | **6,943** | **83,7 %** | 31,0 | 6,926 (70,4 %) |
+  | **gdn_delta** | **0,616** | **7,4 %** | 3,0 | 2,186 (22,2 %) |
+  | act_quant | 0,198 | 2,4 % | 20,1 | 0,200 |
+  | ffn_residual | 0,093 | 1,1 % | 4,0 | 0,089 |
+  | post_norm | 0,084 | 1,0 % | 4,0 | 0,084 |
+  | gdn_l2norm | 0,070 | 0,8 % | 3,0 | 0,070 |
+  | gdn_scalars / norm_silu / conv | 0,052 / 0,052 / 0,050 | 1,8 % | 3,0 cada | 0,052 / 0,052 / 0,051 |
+  | qk_norm_rope_kv / attention | 0,032 / 0,026 | 0,7 % | 1,0 cada | 0,032 / 0,030 |
+  | ffn_gate_up / ffn_down / outras projeções | ≤ 0,017 | ~0,6 % | | ≤ 0,017 |
+
+  Leitura: o **float4 cortou o `gdn_delta` por 3,5×** (2,186 → 0,616 ms/token) e o prefill passou
+  a ser **84 % matvec**. Em N=1024 (2 splits, 64 chunks) o total é 8,159 ms/token = 122,6 tok/s.
+- **Veredito**: medido. Nada mais nesta frente move o ponteiro: dos 1,08 ms/token que não são
+  matvec, 0,20 são quantização da ativação e o resto é ≤ 0,09 por bucket (cada um já no piso de
+  despacho de 2,2-4,0 µs por lançamento).
 
 ## 6. Chunking e staging (prioridade 3 do briefing)
 
@@ -237,6 +255,13 @@ Interruptor de A/B **no binário**: `RD_PREFILL_BATCH=0` volta ao andaime por to
 - **O que daria**: dequantizar o bloco uma vez em registrador e fazer N `dp4a` (bit-exato, mesma
   ordem) vale ~2-2,5× no matvec ⇒ prefill ~200 tok/s; o caminho MMQ/int8 WMMA vale os 446 GB/s
   ⇒ ~380 tok/s (a distância para o llama.cpp está aqui, não no andaime).
+- **CORREÇÃO (registro honesto)**: a frente de kernels checou por ISA que a dequantização do
+  bloco **não** é reexecutada por token dentro de `matvec_kernel_batch` (o laço sobre `n` só
+  repete o `dp4a`), o que **elimina a minha hipótese (a)** — dequantizar uma vez não vale os 2-2,5×
+  que eu estimei. O que continua medido e sem explicação fechada é o fato bruto: **109 GB/s no
+  caminho em lote contra 446 GB/s no mesmo matvec por token**. As duas hipóteses concorrentes
+  ficam registradas para quem pegar o item: (i) banda amortizada × (ii) issue de ALU/ocupação do
+  kernel com N linhas por bloco de peso. A pergunta está aberta, não respondida.
 - **Por que não foi feito**: `matvec.cuh`/`vecdotq.cuh` são da frente de kernels nesta rodada
   (regra 6.5 do `docs/noite-regras.md`); o protótipo MMQ autorizado no briefing exigiria
   reimplementar a desquantização de 15 dtypes num arquivo novo e não caberia no resto da noite
@@ -305,3 +330,66 @@ Interruptor de A/B **no binário**: `RD_PREFILL_BATCH=0` volta ao andaime por to
   1024/2048/4096 da curva estão em §8.2.
 - **Onde o caminho dividido aparece**: prompt acima de ~1040 tokens (chunk de 16 com a última
   chave ≥ 1024) e a verificação do MTP em contexto ≥ 512 chaves.
+
+### 8.2 Curva de escala re-medida (binário consertado, 2 passadas cada, janela limpa)
+
+| N | baseline (antes de tudo) | depois (todos os commits) | ganho |
+|---|---|---|---|
+| 64 | 75,42 tok/s (13,26 ms/token) | 105,05 (9,52) [§2.4, sem splits] | +39 % |
+| 256 | 74,17 (13,48) | 104,75 (9,55) [§2.4] | +41 % |
+| 512 | 73,05 (13,69) | **123,68** (8,09) | **+69 %** |
+| 1024 | — | **123,10** (8,13) | — |
+| 2048 | 72,41 (13,81) | **120,74** (8,28) | **+67 %** |
+| 4096 | 71,82 (13,92) | **117,47** (8,51) | **+64 %** |
+
+- O de 64/256 tokens é da corrida de §2.4 (binário com os commits 1 e 2, sem a atenção dividida em
+  lote — que nesses tamanhos de prompt não é acionada de qualquer forma: `splits == 1` até 512
+  chaves). Os de 512 a 4096 são do binário consertado (commit do §8).
+- Piso de ruído do harness: as duas passadas de cada configuração ficaram dentro de **1,2 %**
+  (em 4096: 34,869 e 34,925 s = 0,16 %; em 512: 0,58 %). Nenhum número desta tabela depende de
+  uma única passada.
+- Comparação com a origem do problema: 72,9 → 123,7 tok/s em 512 tokens, contra os 1143 tok/s do
+  llama.cpp `pp512` — a distância caiu de 15,7× para **9,2×**.
+- **Nota de honestidade**: a medição de 123,9 tok/s de §4.1 é do caminho em lote **sem split**
+  (512 chaves ⇒ `splits == 1`) e a mudança de 03:16 (atenção dividida em lote) **não estava
+  coberta por gate nenhum** quando foi commitada — o gate só passou a existir no commit do §8,
+  depois do achado R1. Os pontos de 1024/2048/4096 desta tabela são posteriores aos dois.
+
+## 9. Achado R11/F6: o despacho de pares (K,V) e o fallback por token
+
+- **Referência**: revisão adversarial 2, achados R11 e F6 (`docs/adversarial-noite2.md`): a lista de
+  pares (K,V) da atenção dividida em lote era escrita à mão, com os 4 tipos de KV que o `kv.h`
+  tinha no baseline; um tipo novo (o `q5_0`/`q4_1` da frente KV) cairia em `return false` e o
+  prefill em lote a ≥ 1024 chaves **abortaria em erro duro** em vez de ficar mais lento.
+- **Hipótese**: dá para atacar a *classe* do defeito em vez do caso: (i) escrever o despacho como
+  `switch` aninhado **sem `default:`**, para um `KvType` novo virar aviso de compilação
+  (`-Wswitch`, parte de `-Wall` no alvo do motor) em vez de silêncio; (ii) **cair no kernel
+  dividido por token** quando não houver instanciação em lote — o caminho por token cobre todos os
+  pares que o `kv.h` define, então um tipo novo custa velocidade, nunca correção; (iii)
+  `RD_ATTN_SPLIT_BATCH=0` força esse fallback, o que torna o caminho alcançável **e testável**
+  hoje, sem depender de um tipo de KV que ainda não existe neste worktree.
+- **Comando** (janela: VRAM 9,2 GB antes — atividade de outra frente; um único lock):
+  `nm -C build/check-batch-gpu | grep -c attn_split_batch_kernel` (64 símbolos),
+  `./build/check-batch-gpu IQ3_S` e `RD_ATTN_SPLIT_BATCH=0 ./build/check-batch-gpu IQ3_S`,
+  `RD_ATTN_SPLIT_BATCH=0 ./scripts/check_regression.sh`, e o A/B do §9.1.
+- **Resultado**: com o knob ligado (fallback por token) o caso de **1104 chaves** continua
+  **1024/1024 linhas BIT-EXACT** (rel-L2 0,00e+00) e a suíte de regressão continua **OK, 7/7 ids
+  bit-exatos** com o prefill real de **4217 tokens** (que usa o fallback em todas as 16 camadas de
+  atenção plena). Com o knob desligado (padrão, lote) os mesmos gates dão os mesmos resultados.
+- **Veredito**: MANTIDO. Não posso instanciar `q5_0`/`q4_1` aqui (o `kv.h` deste worktree ainda não
+  tem esses enumeradores); o que entrego é a garantia de que, quando eles chegarem, o `switch`
+  avisa e o fallback mantém a correção.
+
+### 9.1 Quanto vale a atenção dividida em lote (A/B no mesmo binário, `RD_ATTN_SPLIT_BATCH`)
+
+| N | lote | por token | diferença |
+|---|---|---|---|
+| 1024 | 121,80 tok/s | 122,00 tok/s | −0,2 % (dentro do piso de ruído) |
+| 4096 | **117,33** | 114,13 | **+2,8 %** |
+
+- Leitura: o ganho é pequeno e cresce com o contexto, como o orçamento previa — a atenção é 0,3 %
+  do prefill em lote a 1024 chaves e ~1 % a 4096 (a 4096 o caminho por token pagava 32 lançamentos
+  por chunk por camada de atenção plena). **Não é uma alavanca grande**; o valor da mudança é
+  tirar da frente a última parte que ainda era por token, e ela passa a valer também para a
+  verificação do MTP em contexto longo.
+- **Veredito**: MANTIDO (+2,8 % a 4096, zero a 1024, bit-exato nos dois).

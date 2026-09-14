@@ -156,7 +156,20 @@ class Graph {
   bool forward_tokens(const std::vector<std::int32_t> &tokens, int start_pos,
                       std::vector<float> &hidden, std::vector<float> &logits, std::string &err);
 
-  // Diagnostic hook (M5): run only the first `n` trunk layers. The bench uses it
+  // feat/noite-prefill: RD_ATTN_SPLIT_BATCH=0 forces the per-token split kernel even
+// when a batched instantiation exists. Two uses: (a) the gate that proves the
+// fallback path -- taken by any (K,V) pair without a batched instantiation, e.g. a
+// future KV type -- is bit-exact, (b) an in-binary A/B of the batched split
+// attention. Default 1 (batched).
+inline bool split_batch_enabled() {
+  static const bool v = [] {
+    const char *e = getenv("RD_ATTN_SPLIT_BATCH");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return v;
+}
+
+// Diagnostic hook (M5): run only the first `n` trunk layers. The bench uses it
   // to attribute the per-token cost between the layer loop and the head/glue; it
   // produces wrong text by construction, so it is only reachable from the bench.
   void debug_set_layer_limit(int n) { layer_limit_ = n < 0 ? n_layer() : n; }
@@ -1058,10 +1071,21 @@ inline bool Graph::forward_batch_layer(int il, int n, int pos0, std::string &err
             float *part0 = d_attn_partial_ +
                            (std::size_t)t0 * attn_partial_bytes(NH, HD, kAttnMaxSplits) /
                                sizeof(float);
-            if (!attn_split_batch_launch(an0, kc, vc, an0, part0, d_posb_ + t0, cnt, NH, NKV, HD,
+            // A (K,V) pair with no batched instantiation must cost SPEED, not
+            // correctness: fall back to the per-token split kernel, which covers
+            // every pair kv.h defines (review finding R11). RD_ATTN_SPLIT_BATCH=0
+            // forces this path, which is how the gate exercises it.
+            if (!split_batch_enabled() ||
+                !attn_split_batch_launch(an0, kc, vc, an0, part0, d_posb_ + t0, cnt, NH, NKV, HD,
                                          scale, kv_k_, kv_v_, sp)) {
-              err = "batch attn split launch failed";
-              return false;
+              for (int t = t0; t < t1; ++t) {
+                float *an = d_attnb_ + (std::size_t)t * NH * HD;
+                if (!attn_launch_split(an, kc, vc, an, d_attn_partial_, pos0 + t, NH, NKV, HD,
+                                       scale, kv_k_, kv_v_, sp)) {
+                  err = "batch attn split fallback launch failed";
+                  return false;
+                }
+              }
             }
           } else if (!attn_batch_launch(an0, kc, vc, an0, d_posb_ + t0, cnt, NH, NKV, HD, scale,
                                         kv_k_, kv_v_)) {
