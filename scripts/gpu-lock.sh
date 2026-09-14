@@ -13,6 +13,17 @@
 set -u
 LOCK="${GPU_LOCK:-/tmp/rdna4-gpu.lock}"
 WAIT="${GPU_LOCK_WAIT:-3600}"
+# Reentrancy: GPU_LOCK_HELD=1 means an ANCESTOR of this process already holds the
+# lock (this script sets it for every command it runs), so taking it again would
+# wait for our own parent until the timeout. That is not hypothetical: a matrix
+# script that took one lock and then called this wrapper per configuration spent
+# 2 h of the night with the GPU idle and every configuration dying on RC=124.
+# Fixing it here makes nesting safe for every caller, including ad-hoc scripts
+# that nobody told about the convention.
+if [ "${GPU_LOCK_HELD:-0}" = 1 ]; then
+  exec "$@"
+fi
+
 if ! command -v flock >/dev/null; then
   echo "gpu-lock: flock not found; running without serialisation" >&2
   exec "$@"

@@ -143,8 +143,88 @@ __global__ void scale_kernel(const float *__restrict__ x, float *__restrict__ y,
 }
 
 // ---------------------------------------------------------------------------
+// Broadcast elementwise, for the BATCHED prefill path (feat/noite-prefill).
+// y[i] = a[i] (+|*) b[i % nb]: the per-token path applies a length-`nb` array
+// (ssm_dt, ssm_a) to one token at a time, so folding the token index into the
+// thread index reproduces each token's arithmetic exactly -- same operand values,
+// same single rounding, one launch for the whole batch instead of one per token.
+__global__ void add_bcast_kernel(const float *__restrict__ a, const float *__restrict__ b,
+                                 float *__restrict__ y, std::int64_t n, int nb) {
+  const std::int64_t i = (std::int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = a[i] + b[i % nb];
+}
+
+__global__ void mul_bcast_kernel(const float *__restrict__ a, const float *__restrict__ b,
+                                 float *__restrict__ y, std::int64_t n, int nb) {
+  const std::int64_t i = (std::int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = a[i] * b[i % nb];
+}
+
+// ---------------------------------------------------------------------------
 // Host launchers. All return false on a failed launch (never a silent fallback).
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Argmax on the device (greedy decoding).
+//
+// The greedy path used to copy the whole vocab (248 320 floats = 993 KB) back to
+// the host just to take a maximum on the CPU: 0.2-0.4 ms per token of pure
+// round-trip, and one more host sync in the middle of the decode loop.
+//
+// The rule is the one the host sampler uses for temp <= 0: **the first maximum in
+// id order**. That is what makes this kernel's result identical to the host
+// argmax and not merely equivalent to it: ties keep the lower id, both inside a
+// thread's stride and when combining partial results (strict `>` comparisons,
+// lower index wins).
+// ---------------------------------------------------------------------------
+constexpr int kArgmaxThreads = 256;
+constexpr int kArgmaxBlocks = 64;
+
+__global__ void argmax_kernel(const float *__restrict__ x, std::int64_t n, float *__restrict__ best,
+                              int *__restrict__ best_i) {
+  __shared__ float sval[kArgmaxThreads];
+  __shared__ int sidx[kArgmaxThreads];
+  const std::int64_t stride = (std::int64_t)gridDim.x * blockDim.x;
+  float v = -INFINITY;
+  std::int64_t vi = -1;
+  for (std::int64_t i = (std::int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+    const float xi = x[i];
+    // strict > : equal values keep the lower id (and the first one seen, which is
+    // the lower id because the stride walks upwards)
+    if (xi > v || (vi < 0 && xi == xi)) {
+      v = xi;
+      vi = i;
+    }
+  }
+  const int t = threadIdx.x;
+  sval[t] = v;
+  sidx[t] = (int)vi;
+  __syncthreads();
+  for (int off = kArgmaxThreads / 2; off > 0; off >>= 1) {
+    if (t < off) {
+      const float ov = sval[t + off];
+      const int oi = sidx[t + off];
+      if (ov > sval[t] || (sidx[t] < 0 && oi >= 0)) {
+        sval[t] = ov;
+        sidx[t] = oi;
+      }
+    }
+    __syncthreads();
+  }
+  if (t == 0 && sidx[0] >= 0) {
+    // One candidate per CTA: append it (the caller reduces the 64 partials).
+    best[blockIdx.x] = sval[0];
+    best_i[blockIdx.x] = sidx[0];
+  }
+}
+
+// 64 partials -> the final index, on the host (4 bytes copied instead of 993 KB).
+inline bool argmax_launch(const float *d_x, std::int64_t n, float *d_partial_val,
+                          int *d_partial_idx, hipStream_t stream = nullptr) {
+  argmax_kernel<<<kArgmaxBlocks, kArgmaxThreads, 0, stream>>>(d_x, n, d_partial_val,
+                                                              d_partial_idx);
+  return hipGetLastError() == hipSuccess;
+}
+
 inline bool rms_norm_launch(const float *d_x, const float *d_w, float *d_y, std::int64_t nrows,
                             std::int64_t ncols, float eps, hipStream_t stream = nullptr) {
   rms_norm_kernel<<<(unsigned)nrows, kRmsNormThreads, 0, stream>>>(d_x, d_w, d_y, ncols, eps);
@@ -182,6 +262,23 @@ inline bool scale_launch(const float *d_x, float *d_y, std::int64_t n, float s,
                          hipStream_t stream = nullptr) {
   const int threads = 256;
   scale_kernel<<<(unsigned)((n + threads - 1) / threads), threads, 0, stream>>>(d_x, d_y, n, s);
+  return hipGetLastError() == hipSuccess;
+}
+
+// nb = length of the broadcast operand (elements per token in the batch).
+inline bool add_bcast_launch(const float *d_a, const float *d_b, float *d_y, std::int64_t n, int nb,
+                             hipStream_t stream = nullptr) {
+  const int threads = 256;
+  add_bcast_kernel<<<(unsigned)((n + threads - 1) / threads), threads, 0, stream>>>(d_a, d_b, d_y,
+                                                                                    n, nb);
+  return hipGetLastError() == hipSuccess;
+}
+
+inline bool mul_bcast_launch(const float *d_a, const float *d_b, float *d_y, std::int64_t n, int nb,
+                             hipStream_t stream = nullptr) {
+  const int threads = 256;
+  mul_bcast_kernel<<<(unsigned)((n + threads - 1) / threads), threads, 0, stream>>>(d_a, d_b, d_y,
+                                                                                    n, nb);
   return hipGetLastError() == hipSuccess;
 }
 
