@@ -229,6 +229,40 @@ diferença vinha de um chute de 1 GiB de overhead e de contar o bloco MTP que n�
   **1,18× a 4K e 1,14× a 16K**, com a saída byte-idêntica ao ganancioso (md5) e a aceitação
   subindo de 54,9 % para 67,7 % quando o R1 foi consertado.
 
+### C12. Duas medidas da noite se contradizem: 64K com KV `f16` cabe ou não?
+- **Frente de medições (tarefa 2/5, 03:5x)**: a 64K com KV `f16` o motor transborda ~2,1 GB para
+  GTT (`gtt_used` 2557 MB contra 466-472 MB quando cabe) e o decode cai para **2,16 e 7,97
+  tok/s**; o limite medido seria 48K.
+- **Frente de contexto longo (06:27)**: a 64K com KV `f16` mede **19,92 tok/s, 15,62 GiB em uso
+  e zero GTT** — não reproduz o penhasco.
+- **O que já é certo**: a 131K o `f16/f16` **não aloca** (`hipMalloc failed`, 8 GiB de KV) — isso
+  as duas frentes não discutem, e o `info` recusa antes do load.
+- **Como o coordenador resolve**: medida própria na bateria final (`bench --ctx-size 65536
+  --start-pos 65408 --fill-cache` com `f16`, com `vram_used` e `gtt_used` antes e depois, em
+  janela limpa). Enquanto isso, o README mantém a formulação conservadora e as **duas** medidas
+  ficam registradas — o que **não** pode acontecer é o relatório escolher a que é mais
+  conveniente. Se as duas se sustentarem, a explicação provável é estado do alocador do driver
+  (fragmentação/resíduo de outra execução) e a conclusão prática passa a ser: "64K `f16` é
+  fronteira, não penhasco; prefira `q8_0`".
+- **Consequência para o backlog**: o item nº 1 (tornar `q8_0` o padrão acima de 56K) muda de
+  justificativa se o penhasco não se reproduzir — `q8_0` continua valendo pelo **dobro da
+  precisão** (KLD 0,000492 contra 0,003208 do `q4_0`), não por evitar um colapso de 8×.
+
+### C13. O contexto longo passou no teste de qualidade que importava (frente longctx)
+- **RoPE**: sem scaling faltando (nenhuma chave `rope.scaling.*` nos GGUFs; o IMROPE do qwen35
+  é bit-equivalente a RoPE split-half sobre `n_rot=64`), e o gate novo `check-rope-long-gpu`
+  compara com o `ggml_rope_multi` real até a posição **262 143** com rel-L2 ~1e-3 (= piso do
+  fp32, 1 ulp de theta). Controle de sensibilidade: um YaRN×4 configurado daria 0,24-0,42.
+- **Fim a fim a 17 639 tokens de contexto real**: os cinco ids do topo e a ordem são **os mesmos
+  do llama.cpp** (argmax igual); o espalhamento real (±0,018) é **menor** que a discordância da
+  própria referência entre `ub=512` e `ub=16` (0,056-0,090). A 25 743 tokens, top-4 iguais e o
+  quinto decidido por 0,010 de logit.
+- **O desvio não cresce com o contexto**: pior chunk 0,185 % (512) → 0,163 % (2048) →
+  0,081 % (4096) → 0,108 % (14 336).
+- **Onde o tempo vai a 131K**: atenção **54,2 %** do passo (12,1 % a 16K, 33,6 % a 64K), matvec
+  constante em 24 ms/token, e a banda emitida cai para 378 GB/s a 131K `q4_0` — confirma que ali
+  a atenção é *issue*, não banda.
+
 ## Estado do alvo (atualizado pelo coordenador)
 
 - **131K**: ainda não medido nesta rodada. No baseline, 131K com KV `q4_0` roda a 14,0 tok/s
