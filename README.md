@@ -187,28 +187,46 @@ paying for the extra precision costs nothing.
 
 ## Measured numbers
 
-Every number was measured on this machine and has its exact command in the docs named below.
-The llama.cpp column is `llama-bench -p 64 -n 64 -r 3` (Vulkan/RADV, hot model) unless
-stated — the same reference `docs/medicoes-m5.md` uses, so the prompt length is comparable
-(64 tokens). IQ3_S unless stated.
+Final table, measured on the merged tree in one quiet window (2026-09-14, nothing else on
+the GPU, `scripts/gpu-lock.sh` held), IQ3_S, `f16` KV unless stated; the exact command of
+every row is right below it. The llama.cpp column is `llama-bench -p 64 -n 64 -r 3`
+(Vulkan/RADV, hot model), the same reference `docs/medicoes-m5.md` uses, so the prompt length
+is comparable (64 tokens).
 
 | | this engine | llama.cpp Vulkan, same machine |
 |---|---|---|
-| decode, 4K `f16` | 29.3 tok/s (start of 4K) / 26.8 (end of 4K) | 40.0 ± 0.02 tok/s (tg64; 39.7 in M5) |
-| decode, 16K `f16` | 24.3 tok/s (39.7 ms/token) | 37-38 tok/s at 32K (`llama-cli`) |
+| decode, short context (positions 5-37) | **30.4 tok/s** (best of 3; 29.5 mean) | 40.0 ± 0.02 tok/s (tg64; 39.7 in M5) |
+| decode, end of 4K `f16` | **29.3 tok/s** (34.2 ms/token, 352 GB/s of weights) | 37-38 tok/s at 32K (`llama-cli`) |
+| decode, 16K `f16` | **26.7 tok/s** (321 GB/s of weights) | — |
 | decode, 64K `f16` | **does not fit**: 2.1 GB spill to GTT, 2.16-7.97 tok/s | — |
-| decode, 64K `q8_0` / `q4_0` | 18.28 / 18.10-18.17 tok/s | — |
-| decode, 128K `q4_0` | 13.0 tok/s | — |
-| prefill, batched (N≤16) | 70.2 tok/s; 69.5 on a 512-token prompt; 56.7 on a 64-token prompt | 575 ± 65 tok/s (pp64, re-measured; 440 ± 77 recorded in M5 — pp64 is noisy), 1143 ± 30 (pp512) |
-| weight bandwidth, end to end (12.02 GB/token inventory) | **331 GB/s = 52 %** of the measured DRAM roofline | ≥442 GB/s (derived) |
+| decode, 64K `q8_0` | **19.3 tok/s** (13.75 GiB of VRAM in use) | — |
+| decode, 128K `q4_0` | **14.0 tok/s** (13.88 GiB in use) | — |
+| prefill, batched (N≤16) | **72.9 tok/s** on a 512-token prompt; 56.7 on a 64-token prompt | 575 ± 65 tok/s (pp64, re-measured; 440 ± 77 recorded in M5 — pp64 is noisy), 1143 ± 30 (pp512) |
+| weight bandwidth, end to end | **352 GB/s at 4K = 56 %** of the measured 633 GB/s DRAM roofline | ≥442 GB/s (derived) |
 | weight bandwidth, matvec alone | **436 GB/s = 69 %**; the LM head reaches 620 GB/s = 98 % | — |
 | IQ4_XS decode, 4K `f16` | 27.0 tok/s | — |
 | perplexity (wikitext-2, 10×512 tokens, per position) | within **0.25 %** (IQ3_S) / **0.15 %** (IQ4_XS) | reference |
 | MTP (NextN) draft acceptance | 86.7 % on natural text (output identical) | 87.5 % (its own driver) |
 
-The prefill row is the honest one to look at twice: the gap is real (70 vs 440-1143) and it
-*widens* with prompt length, because a longer prompt amortizes per-call overhead while our
-per-token scaffolding does not. Sources: `docs/medicoes-m5.md` (both files, KV types,
+```bash
+# the engine rows, in order (one command each):
+./build/rdna4-infer bench -m IQ3_S.gguf -n 32 --reps 3
+./build/rdna4-infer bench -m IQ3_S.gguf -n 32 --reps 3 --ctx-size 4096  --start-pos 4000  --fill-cache
+./build/rdna4-infer bench -m IQ3_S.gguf -n 32 --reps 3 --ctx-size 16384 --start-pos 16256 --fill-cache
+./build/rdna4-infer bench -m IQ3_S.gguf -n 32 --reps 3 --ctx-size 65536 --start-pos 65408 --fill-cache \
+    --cache-type-k q8_0 --cache-type-v q8_0
+./build/rdna4-infer bench -m IQ3_S.gguf -n 16 --reps 2 --ctx-size 131072 --start-pos 131000 --fill-cache \
+    --cache-type-k q4_0 --cache-type-v q4_0
+./build/rdna4-infer bench -m IQ3_S.gguf -n 32 --reps 3 --prefill 512
+./build/rdna4-infer info -m IQ3_S.gguf --ctx-size 65536 --cache-type-k f16 --cache-type-v f16   # insufficient VRAM
+```
+
+Two notes that keep the table honest. **The window matters**: these numbers are 8-9 % *better*
+than the M7/M8 records at the same positions (4K: 26.8 → 29.3), while the controlled A/B of the
+tuning changes that landed since measured +1.2 % there — the rest is machine state, because the
+earlier records were taken while other jobs shared the GPU. **The prefill row deserves a second
+look**: the gap is real (73 vs 440-1143) and it *widens* with prompt length, since a long prompt
+amortizes per-call overhead while our per-token scaffolding does not. Sources: `docs/medicoes-m5.md` (both files, KV types,
 contexts, perplexity), `medicoes-m7.md` (long context), `medicoes-m8.md` (batched prefill,
 MTP projection), `medicoes-banda-e-gargalos.md` (per-phase time and the traffic budget).
 
