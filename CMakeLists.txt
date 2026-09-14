@@ -201,3 +201,15 @@ if(EXISTS "/opt/rocm/include")
   target_include_directories(bench-attn-gpu PRIVATE /opt/rocm/include)
 endif()
 target_link_libraries(bench-attn-gpu PRIVATE ${AMDHIP64})
+
+# M8 (estudo ROCm) — bench do matvec por forma real: quanto custa cada tensor do
+# inventario por token (nao por tipo) e A/B do knob rows-por-CTA (bit-exato).
+add_executable(bench-matvec-shapes-gpu tests/bench_matvec_shapes_gpu.hip
+               src/backend/gguf.cpp src/backend/loader.cpp)
+target_compile_options(bench-matvec-shapes-gpu PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_link_options(bench-matvec-shapes-gpu PRIVATE --offload-arch=gfx1201)
+target_include_directories(bench-matvec-shapes-gpu PRIVATE include)
+if(EXISTS "/opt/rocm/include")
+  target_include_directories(bench-matvec-shapes-gpu PRIVATE /opt/rocm/include)
+endif()
+target_link_libraries(bench-matvec-shapes-gpu PRIVATE ${AMDHIP64})

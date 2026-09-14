@@ -115,11 +115,23 @@ RD_MATVEC_TRAITS(TIQ3S_NOLOOKUP, vec_dot_iq3_s_q8_1_diag_nolookup, 256, QI3_S, V
 
 #undef RD_MATVEC_TRAITS
 
-// L2 prefetch (from llama.cpp mmvq.cu, MIT). Only used where measured to help.
+// L2 prefetch (from llama.cpp mmvq.cu, MIT).
+//
+// WARNING (measured, docs/rocha-estudo): `__builtin_prefetch` compiles to
+// NOTHING on gfx1201 — the kernel it is called from contains no prefetch
+// instruction at all (verified by dumping the ISA with --save-temps). So the
+// PF=true variants below are only meaningful with the arch's own intrinsic,
+// `__builtin_amdgcn_s_prefetch_data`. That one requires a WAVE-UNIFORM address
+// (the compiler emits v_readfirstlane + s_prefetch_data), which the matvec
+// happens to have: every lane of a warp walks the same weight row at the same
+// block index. M2's "prefetch is neutral/harmful" was therefore a measurement of
+// a no-op, and it is re-tested here with an instruction that actually executes.
 static __device__ __forceinline__ void rdna4_prefetch_l2(const void *p) {
-  // __builtin_prefetch instead of llama.cpp's inline asm: the asm form uses the
-  // "l" (64-bit register) constraint, which the host pass of amdclang++ rejects.
-  __builtin_prefetch(p, 0, 3);
+#if defined(__HIP_DEVICE_COMPILE__)
+  __builtin_amdgcn_s_prefetch_data(p, 64);
+#else
+  (void)p;
+#endif
 }
 
 // Generalized kernel: ROWS rows per CTA, WPR warps cooperating per row
@@ -133,7 +145,18 @@ static __device__ __forceinline__ void rdna4_prefetch_l2(const void *p) {
 // budget so more warps fit per CU. The lookup-heavy IQ vec_dots otherwise use
 // 80-120 registers (iq4_xs: 119 -> only ~8 warps/CU) and become latency bound:
 // read-only walks of the same blocks run at 1700 GB/s while the matvec gets 196.
-template <class T, int ROWS, int WPR, int ILP = 1, bool PF = false, int MINB = 0>
+//
+// UNROLL > 1 processes UNROLL blocks per loop iteration into the SAME
+// accumulator, in the SAME order the ILP=1 loop walks them: the two bodies are
+// independent (different weight blocks, different activation blocks) so their
+// loads and dp4a chains overlap, but the floating-point adds happen in exactly
+// the sequence they would without the unroll. That makes it a bit-exact way to
+// buy memory-level parallelism -- the thing PLAN.md M2 identified as the actual
+// limiter ("the per-thread loop has little ILP (5-20 iterations, dependency
+// sum += dot(...)), so memory latency is not hidden"). ILP does NOT have this
+// property: it changes the summation order, so it stays a measured per-type
+// constant.
+template <class T, int ROWS, int WPR, int ILP = 1, bool PF = false, int MINB = 0, int UNROLL = 1>
 __global__ void
 #if defined(__HIP_DEVICE_COMPILE__)
 __launch_bounds__(ROWS * WPR * 32, MINB > 0 ? MINB : 1)
@@ -141,6 +164,8 @@ __launch_bounds__(ROWS * WPR * 32, MINB > 0 ? MINB : 1)
 matvec_kernel_gen(const void *__restrict__ vx, const block_q8_1 *__restrict__ vy,
                   float *__restrict__ dst, int64_t nrows, int64_t blocks_per_row) {
   static_assert(ILP >= 1, "ILP must be >= 1");
+  static_assert(UNROLL >= 1, "UNROLL must be >= 1");
+  static_assert(ILP == 1 || UNROLL == 1, "ILP and UNROLL are mutually exclusive");
   constexpr int PF_DIST = 2;  // prefetch distance, in loop iterations
   constexpr int vdr = T::vdr;
   constexpr int qi = T::qi;
@@ -171,17 +196,36 @@ matvec_kernel_gen(const void *__restrict__ vx, const block_q8_1 *__restrict__ vy
   for (int i = 0; i < ILP; ++i) acc[i] = 0.0f;
 
   int64_t kb = slot;
-  for (; kb + (ILP - 1) * blocks_per_iter < blocks_per_row; kb += ILP * blocks_per_iter) {
-    if (PF) {
-      const int64_t kp = kb + PF_DIST * blocks_per_iter;
-      if (kp < blocks_per_row) {
-        rdna4_prefetch_l2((const char *)rowp + kp * (int64_t)sizeof(typename T::block_t));
+  if (UNROLL == 1) {
+    for (; kb + (ILP - 1) * blocks_per_iter < blocks_per_row; kb += ILP * blocks_per_iter) {
+      if (PF) {
+        const int64_t kp = kb + PF_DIST * blocks_per_iter;
+        if (kp < blocks_per_row) {
+          rdna4_prefetch_l2((const char *)rowp + kp * (int64_t)sizeof(typename T::block_t));
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < ILP; ++u) {
+        const int64_t k = kb + u * blocks_per_iter;
+        acc[u] += T::dot((const void *)rowp, vy + k * (qk / QK8_1), (const int)k, kqs);
       }
     }
+  } else {
+    // Single accumulator, UNROLL blocks per iteration, walked in the SAME order
+    // the ILP=1 loop walks them: the arithmetic of every output element is
+    // unchanged (same ops, same order), only the memory-level parallelism grows.
+    for (; kb + (UNROLL - 1) * blocks_per_iter < blocks_per_row; kb += UNROLL * blocks_per_iter) {
+      if (PF) {
+        const int64_t kp = kb + PF_DIST * blocks_per_iter;
+        if (kp < blocks_per_row) {
+          rdna4_prefetch_l2((const char *)rowp + kp * (int64_t)sizeof(typename T::block_t));
+        }
+      }
 #pragma unroll
-    for (int u = 0; u < ILP; ++u) {
-      const int64_t k = kb + u * blocks_per_iter;
-      acc[u] += T::dot((const void *)rowp, vy + k * (qk / QK8_1), (const int)k, kqs);
+      for (int u = 0; u < UNROLL; ++u) {
+        const int64_t k = kb + u * blocks_per_iter;
+        acc[0] += T::dot((const void *)rowp, vy + k * (qk / QK8_1), (const int)k, kqs);
+      }
     }
   }
   for (; kb < blocks_per_row; kb += blocks_per_iter) {
@@ -360,12 +404,12 @@ struct MatvecConfig {
 };
 
 
-template <class T, int ROWS, int WPR, int ILP = 1, bool PF = false, int MINB = 0>
+template <class T, int ROWS, int WPR, int ILP = 1, bool PF = false, int MINB = 0, int UNROLL = 1>
 inline bool launch_gen(const void *d_weights, const block_q8_1 *d_act, float *d_out, int64_t nrows,
                        int64_t bpr, hipStream_t stream) {
   const int grid = (int)((nrows + ROWS - 1) / ROWS);
   const int threads = ROWS * WPR * 32;
-  matvec_kernel_gen<T, ROWS, WPR, ILP, PF, MINB>
+  matvec_kernel_gen<T, ROWS, WPR, ILP, PF, MINB, UNROLL>
       <<<grid, threads, 0, stream>>>(d_weights, d_act, d_out, nrows, bpr);
   return hipGetLastError() == hipSuccess;
 }
@@ -670,6 +714,88 @@ inline bool matvec_kernel_attrs(int dt, hipFuncAttributes &attr) {
 #undef RD_ATTR
 }
 
+
+// ---------------------------------------------------------------------------
+// ROWS is a FREE knob: it changes only which CTA computes which output row, so
+// the arithmetic of every output element (the thread -> (slot, kqs) mapping, the
+// k-walk, the ILP slots and both reduction stages) is bit-identical for any
+// ROWS at a fixed (WPR, ILP). That is what makes the adaptive selection below
+// safe to ship: it is validated as bit-exact by tests/check_matmul_gpu.hip
+// (batch == N GEMV) and by the oracle gate, not merely inside a tolerance.
+//
+// WPR and ILP are NOT free: both change the summation order of an output
+// element, so they stay compile-time per type (measured once, PLAN.md M2/M6).
+//
+// ROWS is clamped to the largest value that keeps ROWS*WPR*32 <= 1024 (the
+// hardware workgroup limit): with WPR=8 (q3_K) only ROWS=1..4 is legal, so asking
+// for 8 must not produce a silent launch failure (hipGetLastError reports it, but
+// a caller looping over types would have to special-case the table).
+inline bool matvec_launch_rows(int dt, const void *d_w, const block_q8_1 *d_a, float *d_o,
+                               int64_t nrows, int64_t ncols, hipStream_t stream, int rows) {
+  const int max_rows = 1024 / (matvec_default_config(dt).wpr * 32);
+  if (rows > max_rows) rows = max_rows;
+  if (rows < 1) return false;
+#define RD_ROWS(Traits, Dt, QK)                                                              \
+  case Dt:                                                                                   \
+    switch (rows) {                                                                          \
+      case 1: return launch_gen<Traits, 1, MtShape<Dt>::wpr, MtIlp<Dt>::value, false>(       \
+                  d_w, d_a, d_o, nrows, ncols / QK, stream);                                 \
+      case 2: return launch_gen<Traits, 2, MtShape<Dt>::wpr, MtIlp<Dt>::value, false>(       \
+                  d_w, d_a, d_o, nrows, ncols / QK, stream);                                 \
+      case 4: return launch_gen<Traits, 4, MtShape<Dt>::wpr, MtIlp<Dt>::value, false>(       \
+                  d_w, d_a, d_o, nrows, ncols / QK, stream);                                 \
+      case 8: return launch_gen<Traits, 8, MtShape<Dt>::wpr, MtIlp<Dt>::value, false>(       \
+                  d_w, d_a, d_o, nrows, ncols / QK, stream);                                 \
+      case 16: return launch_gen<Traits, 16, MtShape<Dt>::wpr, MtIlp<Dt>::value, false>(     \
+                  d_w, d_a, d_o, nrows, ncols / QK, stream);                                 \
+      default: return false;                                                                 \
+    }
+  switch (dt) {
+    RD_ROWS(TQ8_0, 1, 32)   RD_ROWS(TQ2K, 2, 256)    RD_ROWS(TQ3K, 3, 256)   RD_ROWS(TQ4K, 4, 256)
+    RD_ROWS(TQ5K, 5, 256)   RD_ROWS(TQ6K, 6, 256)    RD_ROWS(TIQ2XXS_S, 7, 256)
+    RD_ROWS(TIQ2XS_S, 8, 256) RD_ROWS(TIQ3XXS_S, 9, 256) RD_ROWS(TIQ1S, 10, 256)
+    RD_ROWS(TIQ4NL, 11, 32) RD_ROWS(TIQ3S_S, 12, 256) RD_ROWS(TIQ2S_S, 13, 256)
+    RD_ROWS(TIQ4XS, 14, 256)
+    default: return false;
+  }
+#undef RD_ROWS
+}
+
+// Manual single-accumulator unroll (bit-exact MLP) and the real L2 prefetch.
+// Both are bench-only candidates: they are instantiated here so a measurement can
+// compare them against the shipping kernel with the same shapes.
+inline bool matvec_launch_unroll(int dt, const void *d_w, const block_q8_1 *d_a, float *d_o,
+                                 int64_t nrows, int64_t ncols, hipStream_t stream, int unroll,
+                                 bool pf) {
+#define RD_UNROLL(Traits, Dt, QK)                                                          \
+  case Dt: {                                                                               \
+    constexpr int R = MtShape<Dt>::rows, W = MtShape<Dt>::wpr;                             \
+    if (unroll == 2 && !pf)                                                                \
+      return launch_gen<Traits, R, W, 1, false, 0, 2>(d_w, d_a, d_o, nrows, ncols / QK, stream); \
+    if (unroll == 4 && !pf)                                                                \
+      return launch_gen<Traits, R, W, 1, false, 0, 4>(d_w, d_a, d_o, nrows, ncols / QK, stream); \
+    if (unroll == 2 && pf)                                                                 \
+      return launch_gen<Traits, R, W, 1, true, 0, 2>(d_w, d_a, d_o, nrows, ncols / QK, stream); \
+    if (unroll == 4 && pf)                                                                 \
+      return launch_gen<Traits, R, W, 1, true, 0, 4>(d_w, d_a, d_o, nrows, ncols / QK, stream); \
+    if (unroll == 1 && pf)                                                                 \
+      return launch_gen<Traits, R, W, MtIlp<Dt>::value, true>(d_w, d_a, d_o, nrows, ncols / QK, stream); \
+    return false;                                                                          \
+  }
+  switch (dt) {
+    RD_UNROLL(TQ8_0, 1, 32)   RD_UNROLL(TQ2K, 2, 256)    RD_UNROLL(TQ3K, 3, 256)
+    RD_UNROLL(TQ4K, 4, 256)   RD_UNROLL(TQ5K, 5, 256)    RD_UNROLL(TQ6K, 6, 256)
+    RD_UNROLL(TIQ2XXS_S, 7, 256) RD_UNROLL(TIQ2XS_S, 8, 256) RD_UNROLL(TIQ3XXS_S, 9, 256)
+    RD_UNROLL(TIQ1S, 10, 256) RD_UNROLL(TIQ4NL, 11, 32)  RD_UNROLL(TIQ3S_S, 12, 256)
+    RD_UNROLL(TIQ2S_S, 13, 256) RD_UNROLL(TIQ4XS, 14, 256)
+    default: return false;
+  }
+#undef RD_UNROLL
+}
+
+// Rows per CTA the shipping path would use for this type if nothing else is
+// known (the historical, measured-per-type value).
+inline int matvec_default_rows(int dt) { return matvec_default_config(dt).rows; }
 
 // Sweeps __launch_bounds__ min-blocks (register budget) on each type's
 // shipping shape; used by the bench to see if capping registers buys occupancy.
