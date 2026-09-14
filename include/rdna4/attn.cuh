@@ -443,6 +443,32 @@ inline bool attn_batch_launch(const float *d_q, const void *d_k, const void *d_v
   RD_ATTN_B_CASE(Q4_0, F16);
   RD_ATTN_B_CASE(Q4_0, Q8_0);
   RD_ATTN_B_CASE(Q4_0, Q4_0);
+  // Q5_0/Q4_1 (frente KV): the full product, for the same reason as attn_launch
+  // above -- this dispatcher was added by the prefill front while the KV front was
+  // adding the two formats, and the merge left it as a 4x4 minus-mirrors list. The
+  // caller in graph.cuh treats `false` as a hard error ("batch attn (batched)
+  // launch failed"), so a missing pair here does NOT degrade: it aborts the batched
+  // prefill of any run with --cache-type-k q5_0. Found by re-reading the merge.
+  RD_ATTN_B_CASE(F32, Q5_0);
+  RD_ATTN_B_CASE(F32, Q4_1);
+  RD_ATTN_B_CASE(F16, Q5_0);
+  RD_ATTN_B_CASE(F16, Q4_1);
+  RD_ATTN_B_CASE(Q8_0, Q5_0);
+  RD_ATTN_B_CASE(Q8_0, Q4_1);
+  RD_ATTN_B_CASE(Q4_0, Q5_0);
+  RD_ATTN_B_CASE(Q4_0, Q4_1);
+  RD_ATTN_B_CASE(Q5_0, F32);
+  RD_ATTN_B_CASE(Q5_0, F16);
+  RD_ATTN_B_CASE(Q5_0, Q8_0);
+  RD_ATTN_B_CASE(Q5_0, Q4_0);
+  RD_ATTN_B_CASE(Q5_0, Q5_0);
+  RD_ATTN_B_CASE(Q5_0, Q4_1);
+  RD_ATTN_B_CASE(Q4_1, F32);
+  RD_ATTN_B_CASE(Q4_1, F16);
+  RD_ATTN_B_CASE(Q4_1, Q8_0);
+  RD_ATTN_B_CASE(Q4_1, Q4_0);
+  RD_ATTN_B_CASE(Q4_1, Q5_0);
+  RD_ATTN_B_CASE(Q4_1, Q4_1);
 #undef RD_ATTN_B_CASE
   return false;
 }
