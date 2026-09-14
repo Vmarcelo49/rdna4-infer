@@ -80,10 +80,19 @@ void fill_x(std::vector<float> &x, std::int64_t n, unsigned seed) {
   }
 }
 
-// The launch used by every A/B variant: `kind` 0 = shipping (per-type rows/ILP),
-// 1 = forced rows, 2 = forced __launch_bounds__ min-blocks.
+// The launch used by every A/B variant:
+//   kind 0 = shipping (per-type rows/WPR/ILP)
+//   1 = forced rows, 2 = forced __launch_bounds__ min-blocks
+//   3 = single-accumulator unroll (bit-exact MLP), 4 = L2 prefetch
+//   5 = forced ILP (independent accumulators; changes the summation order)
+//   6 = the shipping launch AGAIN, as its own variant -> the noise floor of this
+//       very bench (same kernel, same shapes, measured independently)
+//   7 = the LANDED tuning candidate: UNROLL=2 for the types whose shipping ILP is
+//       already 1 (bit-exact: same ops, same order, more loads in flight) and the
+//       shipping launch for every other type.
 inline bool launch_variant(int kind, int value, const Tensor &t, const block_q8_1 *d_a, float *d_y) {
-  if (kind == 0) return rdna4::matvec_launch(t.dt, t.d_w, d_a, d_y, t.nrows, t.ncols, nullptr);
+  if (kind == 0 || kind == 6)
+    return rdna4::matvec_launch(t.dt, t.d_w, d_a, d_y, t.nrows, t.ncols, nullptr);
   if (kind == 1)
     return rdna4::matvec_launch_rows(t.dt, t.d_w, d_a, d_y, t.nrows, t.ncols, nullptr, value);
   if (kind == 3)
@@ -92,6 +101,14 @@ inline bool launch_variant(int kind, int value, const Tensor &t, const block_q8_
   if (kind == 4)
     return rdna4::matvec_launch_unroll(t.dt, t.d_w, d_a, d_y, t.nrows, t.ncols, nullptr, 1,
                                        /*pf=*/true);
+  if (kind == 5)
+    return rdna4::matvec_launch_tuned(t.dt, t.d_w, d_a, d_y, t.nrows, t.ncols, nullptr, value,
+                                      /*pf=*/false);
+  if (kind == 7)
+    return rdna4::matvec_default_ilp(t.dt) == 1
+               ? rdna4::matvec_launch_unroll(t.dt, t.d_w, d_a, d_y, t.nrows, t.ncols, nullptr, 2,
+                                             /*pf=*/false)
+               : rdna4::matvec_launch(t.dt, t.d_w, d_a, d_y, t.nrows, t.ncols, nullptr);
   return rdna4::matvec_launch_minb(t.dt, t.d_w, d_a, d_y, t.nrows, t.ncols, nullptr, value);
 }
 
@@ -122,7 +139,8 @@ struct EvPair {
 
 struct Variant {
   const char *name = "ship";
-  int kind = 0;   // 0 = ship, 1 = rows, 2 = minb
+  int kind = 0;   // 0 = ship, 1 = rows, 2 = minb, 3 = unroll, 4 = prefetch, 5 = ilp,
+                  // 6 = ship again (noise floor), 7 = landed tuning candidate
   int value = 0;
 };
 
@@ -132,14 +150,17 @@ int main(int argc, char **argv) {
   if (argc < 2) {
     std::fprintf(stderr,
                  "usage: bench-matvec-shapes-gpu <model.gguf> [--budget-mib N] [--reps N] "
-                 "[--rows a,b,c] [--minb a,b,c] [--no-ab]\n");
+                 "[--rows a,b,c] [--minb a,b,c] [--unroll 2,4] [--pf] [--ilp 1,2,4] "
+                 "[--repeat-ship] [--land] [--no-ab]\n");
     return 1;
   }
   double budget_mib = 12000.0;
   int reps = 4;
   bool do_ab = true;
   bool pf_only = false;
-  std::vector<int> row_variants, minb_variants, unroll_variants;
+  bool repeat_ship = false;
+  bool land = false;
+  std::vector<int> row_variants, minb_variants, unroll_variants, ilp_variants;
   for (int i = 2; i < argc; ++i) {
     auto list = [&](std::vector<int> &out) {
       const char *v = argv[++i];
@@ -159,9 +180,15 @@ int main(int argc, char **argv) {
       list(minb_variants);
     } else if (std::strcmp(argv[i], "--unroll") == 0 && i + 1 < argc) {
       list(unroll_variants);
+    } else if (std::strcmp(argv[i], "--ilp") == 0 && i + 1 < argc) {
+      list(ilp_variants);
     } else if (std::strcmp(argv[i], "--pf") == 0) {
       unroll_variants.push_back(1);
       pf_only = true;
+    } else if (std::strcmp(argv[i], "--repeat-ship") == 0) {
+      repeat_ship = true;
+    } else if (std::strcmp(argv[i], "--land") == 0) {
+      land = true;
     } else if (std::strcmp(argv[i], "--no-ab") == 0) {
       do_ab = false;
     } else {
@@ -174,6 +201,9 @@ int main(int argc, char **argv) {
     row_variants.clear();
     minb_variants.clear();
     unroll_variants.clear();
+    ilp_variants.clear();
+    repeat_ship = false;
+    land = false;
   }
   (void)pf_only;
 
@@ -382,9 +412,12 @@ int main(int argc, char **argv) {
   // ---------------------------------------------------------------------
   std::vector<Variant> variants;
   variants.push_back({"ship", 0, 0});
+  if (repeat_ship) variants.push_back({"ship2", 6, 0});
+  if (land) variants.push_back({"land", 7, 0});
   for (int v : row_variants) variants.push_back({"rows", 1, v});
   for (int v : minb_variants) variants.push_back({"minb", 2, v});
   for (int v : unroll_variants) variants.push_back({v == 1 ? "prefetch" : "unroll", v == 1 ? 4 : 3, v});
+  for (int v : ilp_variants) variants.push_back({"ilp", 5, v});
 
   struct Meas {
     double ship_ms = -1;
@@ -531,29 +564,55 @@ int main(int argc, char **argv) {
                   vm > 0 ? ship_ms / vm : 0.0, vm, ship_ms, 100.0 * vb / ship_bytes);
     }
 
-    // Noise floor: measuring the SHIPPING launch against the variant that equals
-    // the type's own shipping configuration is the same kernel twice, so the
-    // ratio must be 1.00. Anything else invalidates the smaller differences.
-    std::printf("\nnoise floor (same kernel measured as 'ship' and as its own configuration):\n");
-    std::printf("%-9s %12s %12s %12s %8s\n", "type", "knob=own", "ship ms", "same ms", "ratio");
+    // ------------------------------------------------------------------
+    // Per-type matrix: the tuning table of this campaign (config -> measured,
+    // per type). One row per (type, config); `ms(tok)` is the per-token cost
+    // extrapolated over ALL tensors of that type in the inventory, so the rows of
+    // one type are directly comparable and the ratios are what the tuning table
+    // in matvec.cuh is chosen from.
+    //
+    // `same kernel?` marks the rows that are the SHIPPING kernel measured a
+    // second time under a different label: those ratios are the noise floor of
+    // this bench, and nothing below that floor is a win.
+    // ------------------------------------------------------------------
+    std::printf("\nPER-TYPE MATRIX (ms/token per type, min of %d rotated passes)\n", reps);
+    std::printf("%-9s %-10s %6s %10s %10s %8s  %s\n", "type", "config", "knob", "ms(tok)",
+                "vs ship", "ratio", "same kernel?");
     for (int dt = 1; dt <= 14; ++dt) {
+      double ship_t = 0;
+      for (std::size_t i = 0; i < sel.size(); ++i)
+        if (sel[i].dt == dt && m[i].ship_ms > 0) ship_t += m[i].ship_ms;
+      if (ship_t <= 0) continue;
+      std::printf("%-9s %-10s %6s %10.3f %10s %8s  yes (baseline)\n", dt_name(dt), "ship", "-",
+                  ship_t, "-", "1.00x");
       for (std::size_t v = 1; v < variants.size(); ++v) {
-        const int own = variants[v].kind == 1 ? rdna4::matvec_default_rows(dt) : 0;
-        if (variants[v].kind == 1 && variants[v].value != own) continue;
-        if (variants[v].kind == 2 && variants[v].value != 0) continue;
-        double a = 0, b = 0;
-        int n = 0;
-        for (std::size_t i = 0; i < sel.size(); ++i) {
-          if (sel[i].dt != dt) continue;
-          if (m[i].var_ms[v] <= 0) continue;
+        const bool same = variants[v].kind == 6 ||
+                          (variants[v].kind == 1 &&
+                           variants[v].value == rdna4::matvec_default_rows(dt)) ||
+                          (variants[v].kind == 5 &&
+                           variants[v].value == rdna4::matvec_default_ilp(dt));
+        double b = 0;
+        for (std::size_t i = 0; i < sel.size(); ++i)
+          if (sel[i].dt == dt && m[i].var_ms[v] > 0) b += m[i].var_ms[v];
+        if (b <= 0) continue;
+        std::printf("%-9s %-10s %6d %10.3f %9.3fx %7.2fx  %s\n", dt_name(dt), variants[v].name,
+                    variants[v].value, b, ship_t / b, ship_t / b, same ? "yes" : "no");
+      }
+    }
+
+    // Aggregate noise floor: the shipping kernel measured twice, over the whole
+    // inventory (the per-type rows above are the same thing per type).
+    for (std::size_t v = 1; v < variants.size(); ++v) {
+      if (variants[v].kind != 6) continue;
+      double a = 0, b = 0;
+      for (std::size_t i = 0; i < sel.size(); ++i)
+        if (m[i].ship_ms > 0 && m[i].var_ms[v] > 0) {
           a += m[i].ship_ms;
           b += m[i].var_ms[v];
-          n++;
         }
-        if (n == 0) continue;
-        std::printf("%-9s %12d %12.3f %12.3f %7.2fx\n", dt_name(dt), variants[v].value, a, b,
-                    b > 0 ? a / b : 0.0);
-      }
+      std::printf("\nnoise floor (same kernel, whole inventory): ship %.3f ms vs ship2 %.3f ms = "
+                  "%.3fx\n",
+                  a, b, a / b);
     }
   }
   return 0;

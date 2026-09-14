@@ -17,6 +17,7 @@
 #include <cstdint>
 
 #include "rdna4/kv.h"
+#include "rdna4/tuning.h"
 
 namespace rdna4 {
 
@@ -79,7 +80,9 @@ inline bool rope_launch(float *d_x, int n_tokens, int n_heads, int head_dim, int
 // shuffle reduction, the accumulation is local, and the WPB slices are merged
 // through a small shared buffer at the end.
 // ---------------------------------------------------------------------------
-constexpr int kAttnWarpsPerBlock = 8;  // key slices per block (shipped value)
+// key slices per block (shipped value). O valor e o de include/rdna4/tuning.h
+// (tabela unica, medida nesta placa): nao ha uma segunda copia do numero aqui.
+constexpr int kAttnWarpsPerBlock = tuned::kAttnWarpsPerBlock;
 constexpr int kAttnMaxDimsPerLane = 16; // head_dim/32 <= 16 (head_dim <= 512)
 
 // WPB is a TEMPLATE knob (default = the shipped constant) so the bench can A/B
@@ -532,10 +535,27 @@ inline std::size_t attn_partial_bytes(int n_head, int head_dim, int n_splits) {
 // at 16K keys (7 splits) showed -1.3% with the wider CTA. Above 4 splits the
 // shipping 8 warps are therefore kept, which also means every context from 16K
 // up is byte-for-byte the code path it was before this change.
-constexpr int kAttnSplitWpbLimit = 4;
+//
+// REVISADO (task 6, docs/autotuning-gfx1201.md): a varredura de 2026-09-13 com
+// A/B intercalado mostrou que o topo da faixa e diferente do meio. Com KV f16
+// (4K-131K) 8 warps continuam ganhando em 5..15 splits, mas a partir de 16
+// splits -- o que so acontece em contexto longo, e sobretudo com KV q4_0, cuja
+// linha e 3,5x menor -- a CTA larga volta a ganhar (131K q4_0: 16 splits x
+// 16 warps = 1,050x em 12/15 rodadas; 24 splits x 8 warps = 0,954x a 64K f16).
+// Por isso a regra tem DUAS pontas; o trecho 5..15 splits, que e o que 4K/16K
+// usam, nao mudou.
+constexpr int kAttnSplitWpbLimit = tuned::kAttnSplitWpbLimit;
+// A partir de quantos splits a CTA volta a ser larga (ver tuning.h e
+// docs/autotuning-gfx1201.md §Atencao: 131K com KV q4_0, 16 splits x 16 warps
+// mediu 1,050x contra 8 warps, 12/15 rodadas de A/B intercalado).
+constexpr int kAttnSplitWpbWide = tuned::kAttnSplitWpbWide;
 
 inline int attn_split_wpb(int n_splits) {
-  return n_splits <= kAttnSplitWpbLimit ? 16 : kAttnWarpsPerBlock;
+  // Regra de duas pontas, medida (nao e monotonica): ver o comentario acima de
+  // kAttnSplitWpbLimit/kAttnSplitWpbWide e a tabela em docs/autotuning-gfx1201.md.
+  if (n_splits <= kAttnSplitWpbLimit) return 16;
+  if (n_splits >= kAttnSplitWpbWide) return 16;
+  return kAttnWarpsPerBlock;
 }
 
 inline bool attn_launch_split(const float *d_q, const void *d_k, const void *d_v, float *d_out,
