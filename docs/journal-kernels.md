@@ -305,3 +305,25 @@ virar, o ganho é seguro.
   fica no arquivo com o fallback identidade, e o comando exato está acima. É uma decisão
   explícita: **aberto, com o desenho pronto e o comando escrito**, para o coordenador ou
   para quem pegar a placa depois.
+
+## 9. Decisões do coordenador (04:25) e estado final da frente
+
+1. **A/B fim a fim**: o coordenador assumiu a corrida (mesma janela, base alternando com o
+   novo, 3 rodadas) e passa os números. Os meus dois jobs que esperavam o lock a noite
+   inteira foram perdidos (um deles por um `kill` meu com padrão que casou com o próprio
+   shell — erro meu, registrado aqui); re-enfileirei **um** job compacto com a validação
+   final do binário commitado (`/tmp/kfin.txt`).
+2. **Hoist da dequantização em lote: DESLIGADO**, e o argumento que decide é a contagem de
+   instruções (§8): ~40 ops de preparo por bloco de 110 B contra ~25 ops por token (N=16)
+   ⇒ teto ~10 %, contra a estimativa de 2-2,5x da frente de prefill. O coordenador
+   registrou no diário da noite (C8) como **gargalo real do matvec em lote não
+   identificado, com duas hipóteses medidas e nenhuma confirmada**. As duas linhas para
+   ligar e o comando de medida estão no `matvec.cuh` e no §8.
+3. **Fusão dos kernels pequenos: NÃO fazer** — o motivo (o `emit()` bloqueante do oráculo
+   por nó, §5.4) foi aceito: o oráculo é o gate mais forte do repo e a variante que
+   preserva o dump vale só 0,26 ms/token.
+4. **O que está ligado**: os três ganhos bit-exatos (§1.2 LUT em LDS, §3 `delta_rule`
+   float4, §4 normas com 4 cargas em voo). **Desligado e pronto para ligar**: o hoist em
+   lote. **Abandonados com a medida que os matou**: `rows=1` (0,973x), LUT nos `iq2_*`
+   (0,601-0,914x), `RPT>1` na `delta_rule` (0,377-0,518x), fusão dos pequenos (oráculo).
+   **Aberto sem medida**: `UNROLL=4` com a LUT em LDS (§1.3).
