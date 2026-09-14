@@ -631,14 +631,16 @@ dois motores, desvio por chunk e por posição; o critério do script é 1 % por
 | 512 (768) | 6 | 3,8231…7,7695 | 3,8160…7,7698 | **0,185 %** | 0,458 |
 | 2 048 (3 072) | 2 | 5,9218 / 8,3859 | 5,9222 / 8,3722 | **0,163 %** | 0,434 |
 | 4 096 (6 144) | 1 | 7,3900 | 7,3960 | **0,081 %** | 0,367 |
-| 8 192 (10 240) | 1 | (job B, na fila) | | | |
+| 8 192 (10 240) | 1 | 5,3284 (4 096 posições, 354,0 s = 28,93 tok/s) | (referência na fila) | | |
 | 14 336 | 1 | 3,9792 | 3,9835 | **0,108 %** | 0,929 |
 
 - **O desvio do motor NÃO cresce com o contexto**: 0,185 % (512) → 0,163 % (2K) → **0,081 %
   (4K)** → 0,108 % (14K). Se houvesse um erro de posição/limite/overflow no caminho longo, este
   número subiria com o contexto; ele fica plano e *cai* — e o pior |dNLL| de uma posição
   acompanha (0,458 → 0,434 → 0,367 até 4K).
-- (8 192: comando na fila; o valor entra aqui.)
+- (8 192: o motor rodou — PPL 5,3284 em 4 096 posições pontuadas, janela 10 240, 354,0 s =
+  28,93 tok/s; o lado da referência ficou preso na fila do lock no fim da noite, então este
+  ponto está **medido só no motor**, e não entra na comparação de desvio.)
 - A cauda de uma posição isolada fica em 0,43-0,46 nats até 2K e 0,93 a 14K.
 
 **Ponto de 14K (o mais longo que a noite alcança em PPL)**: janela única de **14 336 tokens**
@@ -688,7 +690,29 @@ janela: `mem_info_vram_used` 12,9 GB no início — o lock foi esperado dentro d
   M5 — o harness e o binário deste worktree reproduzem o baseline dígito a dígito.
 - `compare-ppl: OK` (o critério do script é 1 % por chunk).
 
-### 6.2 Posição longa de verdade: motor vs llama.cpp no MESMO ids
+### 6.2b Segunda posição longa: **25 743 tokens** (job F2)
+
+Prefill medido no motor: **25 743 tokens em 427,23 s = 60,26 tok/s** (contra 64,48 a 17 639 —
+a curva de prefill cai com o contexto, como a atenção manda). Posição 25 742, mesma métrica:
+
+| rank | motor (id, logit) | llama.cpp (id, logit) | Δlogit |
+|---|---|---|---|
+| 1 | 248044 (16,325) | 248044 (16,0648) | +0,260 |
+| 2 | 248046 (12,957) | 248046 (12,6002) | +0,357 |
+| 3 | 16 (12,216) | 16 (12,3948) | −0,179 |
+| 4 | 201 (11,494) | 201 (11,2946) | +0,199 |
+| 5 | 561 (11,258) | **733 (11,2680)** | −0,010 |
+
+- **Os quatro primeiros ids são os mesmos, na mesma ordem** (o topo é `248044` = `<|endoftext|>`
+  com 3,5 logits de vantagem — a posição é fim de artigo no wikitext, e o motor para em EOG
+  como a referência). A **quinta** posição é um **empate decidido por 0,010 logit** (561 vs 733)
+  — é o tipo de discordância que não é erro, é o empate sendo resolvido por arredondamento
+  diferente.
+- Deltas: média +0,159 (deslocamento uniforme, invariante no softmax) e espalhamento de ±0,34
+  nos quatro casados — maior que os ±0,018 medidos a 17 639 tokens (§6.2), o que é coerente com
+  o erro de matmul/atenção crescendo com o número de chaves somadas. Continua **muito abaixo**
+  dos gaps entre os candidatos do topo (3,46 / 3,26 / 0,90 / 0,20).
+
 
 **Sensibilidade do PRÓPRIO caminho da referência** (mesmo prompt, `ORACLE_NUBATCH` 512 vs 16 —
 llama.cpp não é bit-idêntico entre os dois caminhos de MUL_MAT):
