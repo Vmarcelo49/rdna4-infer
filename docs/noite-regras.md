@@ -28,8 +28,11 @@ de pesos + ~0,5 GiB de buffers: cabe, com folga pequena. **Meça antes de afirma
    O wrapper agora exporta `GPU_LOCK_HELD=1` para o filho, então os scripts que já se travam
    sozinhos (`check_golden_run.sh`, `check_attn_split.sh`, `compare_ppl.sh`,
    `compare_llama_greedy.sh`, `check_server.sh`, `check_regression.sh`) não travam duas vezes.
-2. **Sempre com `timeout`**: `timeout 900 ./scripts/gpu-lock.sh ./build/...`. Um comando que
-   pendura não pode pendurar a noite.
+2. **Sempre com `timeout`, mas DENTRO do lock**: `./scripts/gpu-lock.sh timeout 900 ./build/...`
+   — e **não** `timeout 900 ./scripts/gpu-lock.sh ...`. A segunda forma queima o orçamento
+   **esperando na fila**: a frente de contexto longo perdeu uma corrida de `compare_ppl` com
+   `RC=124` depois de 11 minutos parada no `flock`, sem nunca ter rodado nada. Com o `timeout`
+   dentro, o relógio começa quando a sua vez chega. (Medido, 03:00.)
 3. **Nunca** rode dois processos que carregam o modelo. Uma execução mapeia 11,9-15,7 GiB de
    15,9 GiB.
 4. Antes e depois de uma medição, olhe a VRAM:
