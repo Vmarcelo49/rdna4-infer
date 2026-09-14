@@ -35,3 +35,16 @@ Decode em 32K ≈ **37–38 t/s** — consistente com o tg128 do bench: o decode
 - Armadilha: sem `-st`/`--single-turn`, o `llama-cli` entra em modo interativo e trava esperando stdin (gerou log de 3.7 GB de prompts `>`). Sempre rodar bench não-interativo com redirect.
 - RADV avisa que não é implementação Vulkan conformante ("testing use only") — números valem como referência, não como verdade absoluta.
 - Próximo: build HIP (`build-hip/` configurado com `-DGGML_HIP=ON -DGPU_TARGETS=gfx1201`, parado em `hip/hip_fp16.h` não encontrado — falta include do ROCm no configure) para repetir estas medidas no backend do projeto.
+
+## Re-medição (2026-09-13, placa ociosa, mesmo binário e mesmas flags)
+
+`llama-bench -m Qwen3.8-27B-UD-IQ3_S.gguf -ngl 99 -p 64 -n 64 -r 3`:
+
+| test | agora | na tabela do M5 | leitura |
+|---|---|---|---|
+| pp64 | **575,00 ± 64,79** | 440,49 ± 76,70 | **+30 % com o mesmo comando**: `-p 64` é curto demais para medir prefill — o `±` de 65-77 t/s é 11-17 % do valor. Não citar pp64 com três dígitos |
+| tg64 | **40,03 ± 0,02** | 39,73 ± 0,45 | estável (0,8 %), o decode é o número confiável desta tabela |
+
+Referência estável de prefill: **pp512 = 1142,60 ± 29,82 t/s** (§1.1), que é 2× o pp64. O
+`tg` não depende do tamanho do prompt, o `pp` depende muito: qualquer comparação de prefill
+tem de dizer o comprimento do prompt dos dois lados.

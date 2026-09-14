@@ -176,25 +176,28 @@ errors in this budget (`docs/kv-memoria-desenho.md` §4).
 
 ## Measured numbers
 
-Every number was measured on this machine and has its exact command in the docs named below
-(the llama.cpp column is `llama-bench -p 512 -n 128 -r 3`, hot model, from
-`docs/baseline-vulkan-iq3s.md`). IQ3_S unless stated.
+Every number was measured on this machine and has its exact command in the docs named below.
+The llama.cpp column is `llama-bench -p 64 -n 64 -r 3` (Vulkan/RADV, hot model) unless
+stated — the same reference `docs/medicoes-m5.md` uses, so the prompt length is comparable
+(64 tokens). IQ3_S unless stated.
 
 | | this engine | llama.cpp Vulkan, same machine |
 |---|---|---|
-| decode, 4K `f16` | 29.3 tok/s (start of 4K) / 26.8 (end of 4K) | 39.7 tok/s |
-| decode, 16K / 64K `f16` | 24.3 / 18.9 tok/s | — |
+| decode, 4K `f16` | 29.3 tok/s (start of 4K) / 26.8 (end of 4K) | 40.0 ± 0.02 tok/s (tg64; 39.7 in M5) |
+| decode, 16K / 64K `f16` | 24.3 / 18.9 tok/s | 37-38 tok/s at 32K (`llama-cli`) |
 | decode, 128K `q4_0` | 13.0 tok/s | — |
-| prefill, batched (N≤16) | 70.2 tok/s (512-token prompt: 69.5) | 440 tok/s (batched) |
+| prefill, batched (N≤16) | 70.2 tok/s; 69.5 on a 512-token prompt; 56.7 on a 64-token prompt | 575 ± 65 tok/s (pp64, re-measured; 440 ± 77 recorded in M5 — pp64 is noisy), 1143 ± 30 (pp512) |
 | weight bandwidth (11.122 GB/token ÷ ms per token) | ~326 GB/s | ≥442 GB/s (derived) |
 | 64K `q4_0` decode | 17.9 tok/s (was 4.2 before M7) | — |
 | IQ4_XS decode, 4K `f16` | 27.0 tok/s | — |
 | perplexity (wikitext-2, 10×512 tokens, per position) | within **0.25 %** (IQ3_S) / **0.15 %** (IQ4_XS) | reference |
 | MTP (NextN) draft acceptance | 86.7 % on natural text (output identical) | 87.5 % (its own driver) |
 
-Sources: `docs/medicoes-m5.md` (both files, KV types, contexts, perplexity),
-`medicoes-m7.md` (long context), `medicoes-m8.md` (batched prefill, MTP projection),
-`medicoes-banda-e-gargalos.md` (per-phase time and the traffic budget).
+The prefill row is the honest one to look at twice: the gap is real (70 vs 440-1143) and it
+*widens* with prompt length, because a longer prompt amortizes per-call overhead while our
+per-token scaffolding does not. Sources: `docs/medicoes-m5.md` (both files, KV types,
+contexts, perplexity), `medicoes-m7.md` (long context), `medicoes-m8.md` (batched prefill,
+MTP projection), `medicoes-banda-e-gargalos.md` (per-phase time and the traffic budget).
 
 ## How it compares to llama.cpp's Vulkan backend
 
