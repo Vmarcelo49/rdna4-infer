@@ -865,9 +865,17 @@ inline bool Graph::kv_write_batch(int il, int pos0, const float *d_ksrc, const f
   const int HD = head_dim(), NKV = n_head_kv();
   const std::size_t krow_bytes = kv_row_bytes(kv_k_, HD);
   const std::size_t vrow_bytes = kv_row_bytes(kv_v_, HD);
+  // O stride POR CAMADA tem de ser o da alocacao de cada cache: d_k_ tem
+  // n_attn * kv_k_bytes e d_v_ tem n_attn * kv_v_bytes. Usar kv_bytes_ (o de K) na V
+  // enderecava a camada il fora do slot dela sempre que a linha de K fosse MAIOR que
+  // a de V -- overflow de heap silencioso, e PAGE FAULT quando a memoria logo depois
+  // de d_v_ nao estava mapeada. Medido: K=f16/V=q4_1 (86,5 MB alem do fim da
+  // alocacao) e K=q5_0/V=q4_1 (3,9 MB) davam `Memory access fault`; K=q8_0/V=q4_1
+  // (27,5 MB) passava *corrompendo* memoria de outra alocacao, que e' pior.
+  // Ver docs/estudo-prefill.md 3h.
   char *krow = (char *)d_k_ + (std::size_t)attn_slot(il) * kv_bytes_ +
                (std::size_t)pos0 * NKV * krow_bytes;
-  char *vrow = (char *)d_v_ + (std::size_t)attn_slot(il) * kv_bytes_ +
+  char *vrow = (char *)d_v_ + (std::size_t)attn_slot(il) * kv_bytes_v_ +
                (std::size_t)pos0 * NKV * vrow_bytes;
   const int width = n_tok * NKV * HD;
   if (!kv_store_row_launch(kv_k_, d_ksrc, krow, width) ||
@@ -1080,7 +1088,9 @@ inline bool Graph::forward_batch_layer(int il, int n, int pos0, std::string &err
       if (!kv_write_batch(il, pos0, d_kb_, d_vb_, n, err)) return false;
       RD_PHASE(prof_, "attention");  // RD_PHASE_PROF
       const char *kc = (const char *)d_k_ + (std::size_t)attn_slot(il) * kv_bytes_;
-      const char *vc = (const char *)d_v_ + (std::size_t)attn_slot(il) * kv_bytes_;
+      // V usa o stride da alocacao de V (ver kv_write_batch): com K maior que V o
+      // kv_bytes_ levava a leitura para fora do slot desta camada.
+      const char *vc = (const char *)d_v_ + (std::size_t)attn_slot(il) * kv_bytes_v_;
       // splits is non-decreasing in pos, so the last token's key count decides
       // whether the whole chunk can use the batched (unsplit) kernel.
       const int splits = attn_splits_for(pos0 + n);

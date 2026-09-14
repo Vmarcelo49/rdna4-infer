@@ -89,6 +89,9 @@ step "check-nn-gpu"       "$B/check-nn-gpu" "$MODEL" \
 step "check-rope-gpu"     "$B/check-rope-gpu"
 step "check-matmul-gpu"   "$B/check-matmul-gpu" "$MODEL"
 step "check-batch-gpu"    "$B/check-batch-gpu" "$MODEL"
+# Pares de KV no caminho em lote: o gate acima crava o default (f16/f16) e foi por
+# isso que o bug de stride de V sobreviveu (K=q5_0/V=q4_1 = page fault no prefill).
+step "check-kvbatch"      "$ROOT/scripts/check_kvbatch.sh" "$MODEL"
 step "check-mtp-gpu"      "$B/check-mtp-gpu" "$MODEL" 64 3
 step "golden run"         "$ROOT/scripts/check_golden_run.sh"
 step "greedy vs llama"    "$ROOT/scripts/compare_llama_greedy.sh" 32

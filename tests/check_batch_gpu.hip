@@ -13,6 +13,7 @@
 // this repo uses everywhere.
 //
 // usage: check-batch-gpu <file.gguf> [batch sizes...]   (default 2 3 4 8 16)
+//        [--kv-k T] [--kv-v T]     T in f32 f16 q8_0 q4_0 q5_0 q4_1  (default f16)
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -64,7 +65,29 @@ int main(int argc, char **argv) {
     return 2;
   }
   std::vector<int> ns;
-  for (int i = 2; i < argc; ++i) ns.push_back(std::atoi(argv[i]));
+  // Tipo de KV por flag: este gate cravava F16/F16, e foi por isso que o bug de
+  // stride de V (K>V em bytes de linha: a camada il era enderecada fora do slot e
+  // o prefill em lote fazia page fault com K=q5_0/V=q4_1) passou meses sem gate.
+  auto kv_from = [](const char *v) {
+    if (std::strcmp(v, "f32") == 0) return rdna4::KvType::F32;
+    if (std::strcmp(v, "f16") == 0) return rdna4::KvType::F16;
+    if (std::strcmp(v, "q8_0") == 0) return rdna4::KvType::Q8_0;
+    if (std::strcmp(v, "q4_0") == 0) return rdna4::KvType::Q4_0;
+    if (std::strcmp(v, "q5_0") == 0) return rdna4::KvType::Q5_0;
+    if (std::strcmp(v, "q4_1") == 0) return rdna4::KvType::Q4_1;
+    std::fprintf(stderr, "tipo de KV desconhecido: %s\n", v);
+    std::exit(2);
+  };
+  rdna4::KvType kt = rdna4::KvType::F16, vt = rdna4::KvType::F16;
+  for (int i = 2; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--kv-k") == 0 && i + 1 < argc) {
+      kt = kv_from(argv[++i]);
+    } else if (std::strcmp(argv[i], "--kv-v") == 0 && i + 1 < argc) {
+      vt = kv_from(argv[++i]);
+    } else {
+      ns.push_back(std::atoi(argv[i]));
+    }
+  }
   if (ns.empty()) ns = {2, 3, 4, 8, 16};
 
   rdna4::GgufLoader loader;
@@ -95,12 +118,13 @@ int main(int argc, char **argv) {
   // weights -- in this process.
   const int ctx_used = ctx > 1216 ? ctx : 1216;
   rdna4::Graph g(loader, cfg);
-  if (!g.init(ctx_used, rdna4::KvType::F16, rdna4::KvType::F16, err)) {
+  if (!g.init(ctx_used, kt, vt, err)) {
     std::fprintf(stderr, "graph init failed: %s\n", err.c_str());
     return 1;
   }
   g.set_want_hidden(false);
-  std::printf("prompt: %zu tokens, ctx %d\n\n", ids.size(), ctx_used);
+  std::printf("prompt: %zu tokens, ctx %d, KV K=%s V=%s\n\n", ids.size(), ctx_used,
+              rdna4::kv_type_name(kt), rdna4::kv_type_name(vt));
 
   int failures = 0;
   std::printf("%5s %12s %12s %12s %10s %10s\n", "N", "per-token ms", "batched ms", "speedup",
