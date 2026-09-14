@@ -42,6 +42,12 @@ CHUNKS="${2:-10}"
 CORPUS="${3:-$ROOT/reference/data/wikitext-2-raw/wiki.test.raw}"
 CTX="${CTX:-512}"
 STRIDE="${STRIDE:-512}"
+# KV cache types for THIS engine (frente KV). The llama.cpp reference below runs
+# its own default f16 cache, so a run with KV_K/KV_V quantized measures "our
+# quantized cache vs a clean f16 reference", which is exactly the delta the night
+# wants; the f16 run of the same command is the engine's own floor on top of it.
+KV_K="${KV_K:-f16}"
+KV_V="${KV_V:-f16}"
 ORACLE_NGL="${ORACLE_NGL:-99}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -65,8 +71,9 @@ if first is not None and first < n - 4:
     sys.exit(1)
 PY
 
-echo "== this engine: $CHUNKS chunks of ctx $CTX / stride $STRIDE"
+echo "== this engine: $CHUNKS chunks of ctx $CTX / stride $STRIDE, KV k=$KV_K v=$KV_V"
 "$BIN" ppl -m "$MODEL" -f "$CORPUS" --ctx-size "$CTX" --stride "$STRIDE" --chunks "$CHUNKS" \
+       --cache-type-k "$KV_K" --cache-type-v "$KV_V" \
        --nll-out "$TMP/ours_nll.txt" 2>"$TMP/ours.log" | tail -2
 grep -E "corpus|scored" "$TMP/ours.log" | sed 's/^/   /'
 

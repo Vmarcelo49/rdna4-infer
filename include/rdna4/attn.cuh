@@ -239,6 +239,11 @@ inline bool attn_launch_wpb(const float *d_q, const void *d_k, const void *d_v, 
   RD_ATTN_U_CASE(Q4_0, F32);
   RD_ATTN_U_CASE(Q8_0, Q4_0);
   RD_ATTN_U_CASE(Q4_0, Q8_0);
+  // The new formats, diagonal only: this entry point is the WPB A/B knob used by
+  // tests/bench_attn_gpu.hip, which benches K and V at the same type. The shipped
+  // path (attn_launch below) carries the full 6x6 product.
+  RD_ATTN_U_CASE(Q5_0, Q5_0);
+  RD_ATTN_U_CASE(Q4_1, Q4_1);
 #undef RD_ATTN_U_CASE
   return false;
 }
@@ -246,6 +251,10 @@ inline bool attn_launch_wpb(const float *d_q, const void *d_k, const void *d_v, 
 inline bool attn_launch(const float *d_q, const void *d_k, const void *d_v, float *d_out, int t,
                         int n_head, int n_head_kv, int head_dim, float scale, KvType kt,
                         KvType vt, hipStream_t stream = nullptr) {
+  // The full 6x6 product: every (K, V) pair the CLI can name is instantiated, so
+  // `--cache-type-k q5_0 --cache-type-v q4_1` cannot silently fall off the end of
+  // this dispatch and return false (the previous list was 4x4 minus f32/f32
+  // mirrors, i.e. a hand-maintained subset).
 #define RD_ATTN_CASE(K, V)                                                                        \
   if (kt == KvType::K && vt == KvType::V)                                                         \
   return attn_launch_typed<KvType::K, KvType::V>(d_q, d_k, d_v, d_out, t, n_head, n_head_kv,      \
@@ -254,18 +263,38 @@ inline bool attn_launch(const float *d_q, const void *d_k, const void *d_v, floa
   RD_ATTN_CASE(F32, F16);
   RD_ATTN_CASE(F32, Q8_0);
   RD_ATTN_CASE(F32, Q4_0);
+  RD_ATTN_CASE(F32, Q5_0);
+  RD_ATTN_CASE(F32, Q4_1);
   RD_ATTN_CASE(F16, F32);
   RD_ATTN_CASE(F16, F16);
   RD_ATTN_CASE(F16, Q8_0);
   RD_ATTN_CASE(F16, Q4_0);
+  RD_ATTN_CASE(F16, Q5_0);
+  RD_ATTN_CASE(F16, Q4_1);
   RD_ATTN_CASE(Q8_0, F32);
   RD_ATTN_CASE(Q8_0, F16);
   RD_ATTN_CASE(Q8_0, Q8_0);
   RD_ATTN_CASE(Q8_0, Q4_0);
+  RD_ATTN_CASE(Q8_0, Q5_0);
+  RD_ATTN_CASE(Q8_0, Q4_1);
   RD_ATTN_CASE(Q4_0, F32);
   RD_ATTN_CASE(Q4_0, F16);
   RD_ATTN_CASE(Q4_0, Q8_0);
   RD_ATTN_CASE(Q4_0, Q4_0);
+  RD_ATTN_CASE(Q4_0, Q5_0);
+  RD_ATTN_CASE(Q4_0, Q4_1);
+  RD_ATTN_CASE(Q5_0, F32);
+  RD_ATTN_CASE(Q5_0, F16);
+  RD_ATTN_CASE(Q5_0, Q8_0);
+  RD_ATTN_CASE(Q5_0, Q4_0);
+  RD_ATTN_CASE(Q5_0, Q5_0);
+  RD_ATTN_CASE(Q5_0, Q4_1);
+  RD_ATTN_CASE(Q4_1, F32);
+  RD_ATTN_CASE(Q4_1, F16);
+  RD_ATTN_CASE(Q4_1, Q8_0);
+  RD_ATTN_CASE(Q4_1, Q4_0);
+  RD_ATTN_CASE(Q4_1, Q5_0);
+  RD_ATTN_CASE(Q4_1, Q4_1);
 #undef RD_ATTN_CASE
   return false;
 }
@@ -500,6 +529,9 @@ inline bool attn_launch_split_wpb(const float *d_q, const void *d_k, const void 
   RD_ATTN_WPB_CASE(Q8_0, F32);
   RD_ATTN_WPB_CASE(Q4_0, F32);
   RD_ATTN_WPB_CASE(F16, F32);
+  // same reason as attn_launch_wpb above: bench-only WPB knob, diagonal entries.
+  RD_ATTN_WPB_CASE(Q5_0, Q5_0);
+  RD_ATTN_WPB_CASE(Q4_1, Q4_1);
 #undef RD_ATTN_WPB_CASE
   return false;
 }
@@ -581,21 +613,41 @@ inline bool attn_launch_split(const float *d_q, const void *d_k, const void *d_v
                                                             n_splits, stream);                      \
   }
   RD_ATTN_SPLIT_WPB(F32, F32);
-  RD_ATTN_SPLIT_WPB(F16, F16);
-  RD_ATTN_SPLIT_WPB(Q8_0, Q8_0);
-  RD_ATTN_SPLIT_WPB(Q4_0, Q4_0);
   RD_ATTN_SPLIT_WPB(F32, F16);
   RD_ATTN_SPLIT_WPB(F32, Q8_0);
   RD_ATTN_SPLIT_WPB(F32, Q4_0);
+  RD_ATTN_SPLIT_WPB(F32, Q5_0);
+  RD_ATTN_SPLIT_WPB(F32, Q4_1);
   RD_ATTN_SPLIT_WPB(F16, F32);
+  RD_ATTN_SPLIT_WPB(F16, F16);
   RD_ATTN_SPLIT_WPB(F16, Q8_0);
   RD_ATTN_SPLIT_WPB(F16, Q4_0);
+  RD_ATTN_SPLIT_WPB(F16, Q5_0);
+  RD_ATTN_SPLIT_WPB(F16, Q4_1);
   RD_ATTN_SPLIT_WPB(Q8_0, F32);
   RD_ATTN_SPLIT_WPB(Q8_0, F16);
+  RD_ATTN_SPLIT_WPB(Q8_0, Q8_0);
   RD_ATTN_SPLIT_WPB(Q8_0, Q4_0);
+  RD_ATTN_SPLIT_WPB(Q8_0, Q5_0);
+  RD_ATTN_SPLIT_WPB(Q8_0, Q4_1);
   RD_ATTN_SPLIT_WPB(Q4_0, F32);
   RD_ATTN_SPLIT_WPB(Q4_0, F16);
   RD_ATTN_SPLIT_WPB(Q4_0, Q8_0);
+  RD_ATTN_SPLIT_WPB(Q4_0, Q4_0);
+  RD_ATTN_SPLIT_WPB(Q4_0, Q5_0);
+  RD_ATTN_SPLIT_WPB(Q4_0, Q4_1);
+  RD_ATTN_SPLIT_WPB(Q5_0, F32);
+  RD_ATTN_SPLIT_WPB(Q5_0, F16);
+  RD_ATTN_SPLIT_WPB(Q5_0, Q8_0);
+  RD_ATTN_SPLIT_WPB(Q5_0, Q4_0);
+  RD_ATTN_SPLIT_WPB(Q5_0, Q5_0);
+  RD_ATTN_SPLIT_WPB(Q5_0, Q4_1);
+  RD_ATTN_SPLIT_WPB(Q4_1, F32);
+  RD_ATTN_SPLIT_WPB(Q4_1, F16);
+  RD_ATTN_SPLIT_WPB(Q4_1, Q8_0);
+  RD_ATTN_SPLIT_WPB(Q4_1, Q4_0);
+  RD_ATTN_SPLIT_WPB(Q4_1, Q5_0);
+  RD_ATTN_SPLIT_WPB(Q4_1, Q4_1);
 #undef RD_ATTN_SPLIT_WPB
   return false;
 }

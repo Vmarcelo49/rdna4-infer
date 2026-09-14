@@ -35,7 +35,7 @@ void usage_info() {
   std::fprintf(stderr,
                "usage: rdna4-infer [info] [-m model.gguf] [--ctx-size N] [--cache-type-k TYPE] "
                "[--cache-type-v TYPE] [--list-tensors]\n  cache types: f32, f16 (default), "
-               "q8_0, q4_0\n");
+               "q8_0, q4_0, q5_0, q4_1\n");
 }
 
 void usage_run() {
@@ -58,8 +58,8 @@ void usage_run() {
       "  --seed N                RNG seed (default 0)\n"
       "  --greedy                same as --temp 0\n"
       "  --ctx-size N            context (default 4096)\n"
-      "  --cache-type-k TYPE     f32, f16 (default), q8_0, q4_0\n"
-      "  --cache-type-v TYPE     f32, f16 (default), q8_0, q4_0\n"
+      "  --cache-type-k TYPE     f32, f16 (default), q8_0, q4_0, q5_0, q4_1\n"
+      "  --cache-type-v TYPE     f32, f16 (default), q8_0, q4_0, q5_0, q4_1\n"
       // ---- feat/mtp ----
       "  --mtp                   use the blk.64 NextN/MTP head for speculative decoding\n"
       "  --draft N               tokens drafted per round with the MTP head (default 3)\n"
@@ -102,21 +102,12 @@ bool parse_f32(const char *s, float *out) {
   return true;
 }
 
-// "f32" | "f16" | "q8_0" | "q4_0" -> KvType (kv.h). The names match llama.cpp's
-// --cache-type-k/-v values for the types this engine implements.
+// "f32" | "f16" | "q8_0" | "q4_0" | "q5_0" | "q4_1" -> KvType (kv.h). The names
+// match llama.cpp's --cache-type-k/-v values for the types this engine
+// implements; the parse table itself lives in kv.h so the CLI, the budget and the
+// graph cannot drift apart (there used to be three copies of this list).
 bool parse_kv_type(const char *s, rdna4::KvType *out) {
-  if (std::strcmp(s, "f32") == 0) {
-    *out = rdna4::KvType::F32;
-  } else if (std::strcmp(s, "f16") == 0) {
-    *out = rdna4::KvType::F16;
-  } else if (std::strcmp(s, "q8_0") == 0) {
-    *out = rdna4::KvType::Q8_0;
-  } else if (std::strcmp(s, "q4_0") == 0) {
-    *out = rdna4::KvType::Q4_0;
-  } else {
-    return false;
-  }
-  return true;
+  return rdna4::kv_type_parse(s, out) == nullptr;
 }
 
 // The GGUF's own sampling defaults (general.sampling.*), which SPEC.md §1.4 and
@@ -147,6 +138,8 @@ const char *kv_type_cstr(rdna4::KvType t) {
     case rdna4::KvType::F16: return "f16";
     case rdna4::KvType::Q8_0: return "q8_0";
     case rdna4::KvType::Q4_0: return "q4_0";
+    case rdna4::KvType::Q5_0: return "q5_0";
+    case rdna4::KvType::Q4_1: return "q4_1";
   }
   return "?";
 }

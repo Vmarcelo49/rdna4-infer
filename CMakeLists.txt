@@ -360,3 +360,22 @@ if(EXISTS "/opt/rocm/include")
   target_include_directories(check-regression-gpu PRIVATE /opt/rocm/include)
 endif()
 target_link_libraries(check-regression-gpu PRIVATE ${AMDHIP64})
+
+# ---------------------------------------------------------------------------
+# Frente KV (worktree rdna4-wt-noite-kv) — formatos de KV Q5_0 e Q4_1 para o alvo
+# de 131K, validados contra os quantizadores de referencia do proprio llama.cpp
+# (libggml-base exporta quantize_row_q5_0_ref / q4_1_ref e dequantize_row_q5_0 /
+# q4_1). Gate: bytes armazenados identicos ao llama.cpp e os dois caminhos de
+# load (escalar e o vetorial kv_load8) reconstruindo exatamente o que o
+# dequantizador do llama.cpp reconstroi — mais as cotas de erro medidas.
+# Appended, como as outras frentes. Com um modelo como argumento ele tambem mede
+# o erro sobre linhas K/V reais capturadas dos nos `Kcur`/`Vcur` do grafo.
+add_executable(check-kvquant-gpu tests/check_kvquant_gpu.hip
+               tests/dequant_cpu_oracle.cpp src/backend/gguf.cpp src/backend/loader.cpp
+               src/backend/model.cpp)
+target_compile_options(check-kvquant-gpu PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_link_options(check-kvquant-gpu PRIVATE --offload-arch=gfx1201)
+target_include_directories(check-kvquant-gpu PRIVATE include /opt/rocm/include
+                          ${LLAMA_CPP_SRC}/ggml/src ${LLAMA_CPP_SRC}/ggml/include)
+target_link_libraries(check-kvquant-gpu PRIVATE ${GGML_BASE_LIB} ${AMDHIP64})
+set_target_properties(check-kvquant-gpu PROPERTIES HIP_ARCHITECTURES "gfx1201")

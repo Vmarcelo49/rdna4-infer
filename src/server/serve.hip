@@ -93,19 +93,11 @@ bool parse_i64(const char *s, long long *out) {
   return true;
 }
 
+// One table for the CLI, the budget and the graph: rdna4::kv_type_parse (kv.h).
+// There used to be three copies of this list, and a type added to two of them
+// would have been accepted by the CLI and then rejected by the dispatcher.
 bool parse_kv_type(const char *s, rdna4::KvType *out) {
-  if (std::strcmp(s, "f32") == 0) {
-    *out = rdna4::KvType::F32;
-  } else if (std::strcmp(s, "f16") == 0) {
-    *out = rdna4::KvType::F16;
-  } else if (std::strcmp(s, "q8_0") == 0) {
-    *out = rdna4::KvType::Q8_0;
-  } else if (std::strcmp(s, "q4_0") == 0) {
-    *out = rdna4::KvType::Q4_0;
-  } else {
-    return false;
-  }
-  return true;
+  return rdna4::kv_type_parse(s, out) == nullptr;
 }
 
 const char *kv_type_cstr(rdna4::KvType t) {
@@ -114,6 +106,8 @@ const char *kv_type_cstr(rdna4::KvType t) {
     case rdna4::KvType::F16: return "f16";
     case rdna4::KvType::Q8_0: return "q8_0";
     case rdna4::KvType::Q4_0: return "q4_0";
+    case rdna4::KvType::Q5_0: return "q5_0";
+    case rdna4::KvType::Q4_1: return "q4_1";
   }
   return "?";
 }
@@ -126,8 +120,8 @@ void usage_serve() {
       "  --host HOST              bind address (default 127.0.0.1; 0.0.0.0 for the LAN)\n"
       "  --port N                 TCP port (default 8080; 0 = pick a free one)\n"
       "  --ctx-size N             context (default 8192)\n"
-      "  --cache-type-k TYPE      f32, f16 (default), q8_0, q4_0\n"
-      "  --cache-type-v TYPE      f32, f16 (default), q8_0, q4_0\n"
+      "  --cache-type-k TYPE      f32, f16 (default), q8_0, q4_0, q5_0, q4_1\n"
+      "  --cache-type-v TYPE      f32, f16 (default), q8_0, q4_0, q5_0, q4_1\n"
       "  --n-predict-default N    max_tokens when the request omits it (default 512; -1 = until\n"
       "                           the context is full)\n"
       "  --model-name NAME        id reported by /v1/models (default: the file name without .gguf)\n"
@@ -190,13 +184,13 @@ int parse_serve_args(int argc, char **argv, ServeArgs *a) {
     } else if (std::strcmp(v, "--cache-type-k") == 0) {
       const char *s = need("--cache-type-k");
       if (s == nullptr || !parse_kv_type(s, &a->kv_k)) {
-        std::fprintf(stderr, "rdna4-infer serve: --cache-type-k must be f32, f16, q8_0 or q4_0\n");
+        std::fprintf(stderr, "rdna4-infer serve: --cache-type-k must be f32, f16, q8_0, q4_0, q5_0 or q4_1\n");
         return 1;
       }
     } else if (std::strcmp(v, "--cache-type-v") == 0) {
       const char *s = need("--cache-type-v");
       if (s == nullptr || !parse_kv_type(s, &a->kv_v)) {
-        std::fprintf(stderr, "rdna4-infer serve: --cache-type-v must be f32, f16, q8_0 or q4_0\n");
+        std::fprintf(stderr, "rdna4-infer serve: --cache-type-v must be f32, f16, q8_0, q4_0, q5_0 or q4_1\n");
         return 1;
       }
     } else if (std::strcmp(v, "--n-predict-default") == 0) {

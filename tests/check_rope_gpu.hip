@@ -13,6 +13,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -173,8 +174,15 @@ int main() {
       hipMemcpy(d_ksrc, kc.data(), (std::size_t)kHeadKv * kHeadDim * sizeof(float),
                 hipMemcpyHostToDevice);
 
-      const rdna4::KvType types[] = {rdna4::KvType::F32, rdna4::KvType::F16, rdna4::KvType::Q8_0,
-                                     rdna4::KvType::Q4_0};
+      // Q5_0/Q4_1 are the night's KV formats (frente KV). They are in this list
+      // for the same reason the other four are: the host mirror below is written
+      // from the ggml reference (quantize_row_q5_0_ref / quantize_row_q4_1_ref and
+      // dequantize_row_q5_0 / dequantize_row_q4_1) and NOT from the kernels, and
+      // the attention check right after proves that the shipping kernel returns
+      // exactly what those bytes decode to, at every offset of the row.
+      const rdna4::KvType types[] = {rdna4::KvType::F32,  rdna4::KvType::F16,
+                                     rdna4::KvType::Q8_0, rdna4::KvType::Q4_0,
+                                     rdna4::KvType::Q5_0, rdna4::KvType::Q4_1};
       for (rdna4::KvType ty : types) {
         const std::uint64_t row = rdna4::kv_row_bytes(ty, kHeadDim);
         std::vector<std::uint8_t> kcache((std::size_t)kHeadKv * row, 0);
@@ -239,6 +247,52 @@ int main() {
                 for (int j = 0; j < 32; ++j) {
                   if (b->qs[j] != (std::int8_t)std::round(xb[j] * id)) ++bad_bytes;
                 }
+              } else if (ty == rdna4::KvType::Q5_0) {
+                // ggml-quants.c:187 quantize_row_q5_0_ref
+                float amax = 0.0f, vmax = 0.0f;
+                for (int j = 0; j < 32; ++j) {
+                  if (amax < std::fabs(xb[j])) {
+                    amax = std::fabs(xb[j]);
+                    vmax = xb[j];
+                  }
+                }
+                const float d = vmax / -16.0f;
+                const float id = d != 0.0f ? 1.0f / d : 0.0f;
+                const rdna4::block_q5_0 *b = (const rdna4::block_q5_0 *)rowp + blk;
+                if (b->d != rdna4::float_to_fp16(d)) ++bad_bytes;
+                std::uint32_t qh = 0;
+                for (int j = 0; j < 16; ++j) {
+                  const int q0 = (int)(std::int8_t)(xb[j] * id + 16.5f);
+                  const int q1 = (int)(std::int8_t)(xb[j + 16] * id + 16.5f);
+                  const std::uint8_t xi0 = (std::uint8_t)(q0 > 31 ? 31 : (q0 < 0 ? 0 : q0));
+                  const std::uint8_t xi1 = (std::uint8_t)(q1 > 31 ? 31 : (q1 < 0 ? 0 : q1));
+                  if (b->qs[j] != (std::uint8_t)((xi0 & 0x0F) | ((xi1 & 0x0F) << 4))) ++bad_bytes;
+                  qh |= (std::uint32_t)((xi0 & 0x10u) >> 4) << (j + 0);
+                  qh |= (std::uint32_t)((xi1 & 0x10u) >> 4) << (j + 16);
+                }
+                for (int i = 0; i < 4; ++i) {
+                  if (b->qh[i] != (std::uint8_t)((qh >> (8 * i)) & 0xFFu)) ++bad_bytes;
+                }
+              } else if (ty == rdna4::KvType::Q4_1) {
+                // ggml-quants.c:150 quantize_row_q4_1_ref
+                float vmin = xb[0], vmax = xb[0];
+                for (int j = 1; j < 32; ++j) {
+                  vmin = std::min(vmin, xb[j]);
+                  vmax = std::max(vmax, xb[j]);
+                }
+                const float d = (vmax - vmin) / 15.0f;
+                const float id = d != 0.0f ? 1.0f / d : 0.0f;
+                const rdna4::block_q4_1 *b = (const rdna4::block_q4_1 *)rowp + blk;
+                if (b->d != rdna4::float_to_fp16(d) || b->m != rdna4::float_to_fp16(vmin)) {
+                  ++bad_bytes;
+                }
+                for (int j = 0; j < 16; ++j) {
+                  const int q0 = (int)(std::int8_t)((xb[j] - vmin) * id + 0.5f);
+                  const int q1 = (int)(std::int8_t)((xb[j + 16] - vmin) * id + 0.5f);
+                  const std::uint8_t xi0 = (std::uint8_t)(q0 > 15 ? 15 : (q0 < 0 ? 0 : q0));
+                  const std::uint8_t xi1 = (std::uint8_t)(q1 > 15 ? 15 : (q1 < 0 ? 0 : q1));
+                  if (b->qs[j] != (std::uint8_t)(xi0 | (xi1 << 4))) ++bad_bytes;
+                }
               } else {
                 float amax = 0.0f, vmax = 0.0f;
                 for (int j = 0; j < 32; ++j) {
@@ -292,6 +346,23 @@ int main() {
               const rdna4::block_q8_0 *b =
                   (const rdna4::block_q8_0 *)(vcache.data() + (std::uint64_t)kvh * row) + (i / 32);
               exp_v = rdna4::fp16_to_float(b->d) * (float)b->qs[i & 31];
+            } else if (ty == rdna4::KvType::Q5_0) {
+              const rdna4::block_q5_0 *b = (const rdna4::block_q5_0 *)(vcache.data() +
+                                                                       (std::uint64_t)kvh * row) +
+                                           (i / 32);
+              const int j = i & 31;
+              const std::uint8_t byte = b->qs[j & 15];
+              const int nib = (j < 16) ? (byte & 0x0F) : (byte >> 4);
+              const int hi = (b->qh[j >> 3] >> (j & 7)) & 1;
+              exp_v = rdna4::fp16_to_float(b->d) * (double)((nib | (hi << 4)) - 16);
+            } else if (ty == rdna4::KvType::Q4_1) {
+              const rdna4::block_q4_1 *b = (const rdna4::block_q4_1 *)(vcache.data() +
+                                                                       (std::uint64_t)kvh * row) +
+                                           (i / 32);
+              const int j = i & 31;
+              const std::uint8_t byte = b->qs[j & 15];
+              const int qq = (j < 16) ? (byte & 0x0F) : (byte >> 4);
+              exp_v = rdna4::fp16_to_float(b->d) * (double)qq + rdna4::fp16_to_float(b->m);
             } else {
               const rdna4::block_q4_0 *b =
                   (const rdna4::block_q4_0 *)(vcache.data() + (std::uint64_t)kvh * row) + (i / 32);
