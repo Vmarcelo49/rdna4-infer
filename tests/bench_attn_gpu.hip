@@ -219,6 +219,33 @@ int main(int argc, char **argv) {
         time_ms([&] { rdna4::attn_launch(d_q, d_k, d_v, d_out, t, kHeads, kHeadsKv, kHeadDim,
                                          kScale, kt, kt, nullptr); },
                 5, 300.0);
+    // UNSPLIT kernel with a different warps-per-CTA (the "32 warps" of M7: the
+    // commit message claims kAttnWarpsPerBlock 8 -> 32, but the header still
+    // says 8, so the shipping unsplit kernel is 8 warps; this is what the
+    // measured 8/16/32 curve looks like now).
+    {
+      std::printf("  unsplit WPB sweep: ");
+      std::vector<float> ref0((std::size_t)kHeads * kHeadDim);
+      hipMemcpy(ref0.data(), d_out, ref0.size() * sizeof(float), hipMemcpyDeviceToHost);
+      for (int wpb : {8, 16, 32}) {
+        const double ms =
+            time_ms([&] {
+              (void)rdna4::attn_launch_wpb(d_q, d_k, d_v, d_out2, t, kHeads, kHeadsKv, kHeadDim,
+                                           kScale, kt, kt, wpb, nullptr);
+            }, 5, 300.0);
+        std::vector<float> got((std::size_t)kHeads * kHeadDim);
+        hipMemcpy(got.data(), d_out2, got.size() * sizeof(float), hipMemcpyDeviceToHost);
+        double num = 0, den = 0;
+        for (std::size_t i = 0; i < got.size(); ++i) {
+          const double d = (double)ref0[i] - (double)got[i];
+          num += d * d;
+          den += (double)ref0[i] * ref0[i] + (double)got[i] * got[i];
+        }
+        std::printf("wpb=%d: %.4f ms (%.2fx) rel-L2 %.1e | ", wpb, ms, ms_ship / ms,
+                    std::sqrt(num / den));
+      }
+      std::printf("\n");
+    }
     // split-KV path (M7 step 2): same inputs, so the only difference is the
     // summation order across key splits
     float *d_partial = nullptr;
@@ -252,6 +279,47 @@ int main(int argc, char **argv) {
       }
     }
     hipFree(d_partial);
+
+    // ------------------------------------------------------------------
+    // Split-count x warps-per-CTA sweep. The engine's auto policy is
+    // `keys / 2048` capped at 16, so at 4K keys it runs the UNSplit kernel with
+    // 24 CTAs on 64 CUs; the question this table answers is what that costs.
+    // WPB is a template knob (attn.cuh) and changing it changes the number of
+    // partial slices merged per CTA, i.e. it is a numeric-equivalence change.
+    // ------------------------------------------------------------------
+    {
+      std::vector<float> ref((std::size_t)kHeads * kHeadDim);
+      hipMemcpy(ref.data(), d_out, ref.size() * sizeof(float), hipMemcpyDeviceToHost);
+      float *dp = nullptr;
+      if (hipMalloc(&dp, rdna4::attn_partial_bytes(kHeads, kHeadDim, 16)) != hipSuccess) {
+        std::fprintf(stderr, "hipMalloc partial failed\n");
+        return 1;
+      }
+      std::printf("  %-10s %-10s %10s %8s %12s %10s\n", "splits", "warps/CTA", "ms", "vs unsplit",
+                  "rel-L2", "grid CTAs");
+      for (int sp : {2, 4, 8, 16}) {
+        for (int wpb : {8, 16, 32}) {
+          const double ms = time_ms(
+              [&] {
+                (void)rdna4::attn_launch_split_wpb(d_q, d_k, d_v, d_out2, dp, t, kHeads, kHeadsKv,
+                                                   kHeadDim, kScale, kt, kt, sp, wpb, nullptr);
+              },
+              5, 300.0);
+          std::vector<float> got((std::size_t)kHeads * kHeadDim);
+          hipMemcpy(got.data(), d_out2, got.size() * sizeof(float), hipMemcpyDeviceToHost);
+          double num = 0, den = 0;
+          for (std::size_t i = 0; i < got.size(); ++i) {
+            const double d = (double)ref[i] - (double)got[i];
+            num += d * d;
+            den += (double)ref[i] * ref[i] + (double)got[i] * got[i];
+          }
+          std::printf("  %-10d %-10d %10.4f %7.2fx %12.2e %10d\n", sp, wpb, ms, ms_ship / ms,
+                      std::sqrt(num / den), kHeads * sp);
+        }
+      }
+      hipFree(dp);
+    }
+
     bool gqa_ok = true;
     const double ms_gqa = time_ms(
         [&] {
