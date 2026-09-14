@@ -12,6 +12,34 @@ que esta frente teve de **implementar e depois testar**.
 
 ---
 
+## TL;DR — o que a frente KV entrega
+
+1. **`q5_0` e `q4_1` existem e estão validados contra o llama.cpp**: os bytes que o
+   motor grava são **byte a byte** os de `quantize_row_q5_0_ref`/`q4_1_ref`, e os
+   **dois** caminhos de load (escalar e o vetorial `kv_load8` que o kernel de
+   produção usa) reconstroem exatamente o que `dequantize_row_q5_0`/`q4_1`
+   reconstroem dos mesmos bytes (`max |gpu−cpu| = 0.000e+00`, igualdade bit a bit).
+   Cota de erro medida: `q5_0` ≈ **1/32** da faixa do bloco, `q4_1` ≈ **1/30** (§2).
+2. **131K com `q5_0/q4_1` roda a 13,73 tok/s usando 14,25 GiB** (1,68 GiB livres).
+   `q4_0/q4_0` 14,08, `q8_0/q4_1` 14,32, `q8_0/q8_0` 14,34 (51 MiB livres, 45 MB em
+   GTT). **`f16/f16` NÃO roda: `hipMalloc failed (kv cache)`** (§6).
+3. **A 131K o formato do KV não compra velocidade** (spread de 1,9% entre 2,25 e
+   4,25 GiB de cache, e o **maior** é o mais rápido) — o decode é limitado por
+   latência/ocupação da atenção (165-172 GB/s efetivos ≈ 27-29% do pico), não por
+   banda. A escolha tem de ser qualidade + folga (§6.1).
+4. **Qualidade por KL, não por PPL**: K `q8_0` é 16% melhor que K `q5_0`; V `q4_1` é
+   19% melhor que V `q4_0`; e a **PPL ordena os formatos ao contrário** em dois pares
+   (§7.1). Needle de 8 agulhas a 8K de contexto real: **8/8** para f16, q5_0/q4_1,
+   q4_0/q4_0 e q8_0/q8_0 (§7.2).
+5. **Orçamento de VRAM**: pesos do tronco **10,877 GiB** (não os 11,204 do ficheiro),
+   buffers **157,98 MiB**, margem **448 MiB medida** (não 1 GiB chutado). O orçamento
+   antigo **recusava `q8_0/q8_0` a 131K**, que roda (§4, §5, §6.3).
+6. Um desperdício real de **128 MiB** encontrado e corrigido (o cache de V era
+   alocado com o tamanho de K), e **3+1 portas silenciosas** do achado F6 fechadas
+   com gate (§3, §4.5).
+
+---
+
 ## 0. Baseline de VRAM da janela (para saber o que é "janela limpa")
 
 ```
@@ -686,3 +714,24 @@ antes da KL, o gate seria a needle; aqui a KL é a métrica que ordena e a needl
    única coisa que muda é o número de chaves que a atenção soma — e a sonda needle a 8K
    já mostra recuperação perfeita, mas **isso não é uma medida a 131K** e não deve ser
    reportado como tal.
+
+---
+
+## 9. Pendente (não é gate)
+
+Ficou na fila do lock e pode não rodar antes do fim da noite: `/tmp/kv-big5.sh` —
+(a) a sonda de KL com os **dois eixos completos** (K com V fixo em `q4_1`:
+`q8_0`/`q5_0`/`q4_1`/`q4_0`; V com K fixo em `q5_0`: `q8_0`/`q5_0`/`q4_1`/`q4_0`),
+e (b) a **needle a 16 384 tokens** de contexto real (o 8K saturou em 8/8 para os
+quatro formatos, então é o próximo passo honesto — não porque o resultado vá mudar,
+mas porque um teste que não distingue nada não é evidência a favor de nada).
+
+Também pendente por erro meu de script: `check-batch-gpu` (precisa do caminho do
+modelo como primeiro argumento; invoquei sem ele e o binário saiu com `usage:` e
+`exit=2`). Os gates que importam para "f16/q8_0/q4_0 não mudaram" rodaram todos (§8).
+
+E a limitação que **não** é pendência e sim o teto da sessão, repetida aqui para não
+se perder: **a 131K a qualidade não foi medida com texto real** (§7.3). A 131K tem
+custo medido (tok/s, VRAM, GTT) sobre cache **sintético**; a qualidade tem medida a
+4096 tokens (KL) e 8192 tokens (needle). Reportar os dois como se fossem a mesma
+coisa seria o erro que este diário existe para não cometer.
