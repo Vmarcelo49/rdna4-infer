@@ -327,3 +327,45 @@ virar, o ganho é seguro.
    lote. **Abandonados com a medida que os matou**: `rows=1` (0,973x), LUT nos `iq2_*`
    (0,601-0,914x), `RPT>1` na `delta_rule` (0,377-0,518x), fusão dos pequenos (oráculo).
    **Aberto sem medida**: `UNROLL=4` com a LUT em LDS (§1.3).
+
+## 10. Onde estão os "3,6x de instruções por byte" do matvec em lote? (leitura de ISA, sem GPU)
+
+Pedido do coordenador (C8). Método: `--save-temps` com duas instanciações explícitas no
+mesmo arquivo — `matvec_kernel_gen<TIQ3S_S, ROWS=8, WPR=1, ILP=1, UNROLL=2>` (o caminho
+por token que embarca) e `matvec_kernel_batch<TIQ3S_S, 8, 1, 1, N=16>` — e contagem de
+opcodes por categoria (`grep` no `.s`, por função).
+
+| | GEMV (1 token, por bloco por thread) | LOTE N=16 (por bloco por thread) | razão |
+|---|---|---|---|
+| `v_dot4_i32_iu8` | 16 | 256 | **16,0** (escala com N) |
+| cargas de ativação | 3 | 48 | **16,0** (escala com N) |
+| cargas de peso + LUT | 13 | **13** | **1,0 (amortizado)** |
+| `v_perm_b32` | 8 | **8** | **1,0 (amortizado)** |
+| demais VALU | ~83 | ~241 | 2,9 |
+| `s_wait_*`/`s_delay_alu` | ~38 | ~282 | 7,5 |
+
+Leitura (e é ela que responde o C8): **não há dequantização reexecutada N vezes.** O
+compilador já CSE-ou o `T::dot` inteiro do lado do peso: o gather da LUT, a montagem da
+máscara de sinal e o `V_PERM` aparecem **uma vez por bloco** no kernel em lote (8 perms e
+8 cargas de LUT por bloco, não 8×16). Consequências:
+
+1. O **hoist que eu implementei (§8) tem teto ~0**, não os ~10 % que a contagem de
+   instruções sugeria: o que eu ia hoistar já está hoisted. Ele fica DESLIGADO e o
+   comentário no `matvec.cuh` agora diz isso — melhor do que "desligado por falta de
+   medida": está desligado porque a ISA mostra que não vale.
+2. O que **não** pode ser amortizado é exatamente o que escala 16×: 16 `dp4a` e 3 cargas
+   de ativação por token por bloco (2 delas `global_load_b128`, resultado do merge de 4
+   `int32`, e 1 `ds`/`u16` do `ds` do `q8_1`). Isso é o mesmo trabalho por token que o
+   caminho de decodificação já faz — e é por isso que o lote ganha 3,6x por token (só o
+   lado do peso é amortizado) e ao mesmo tempo não chega perto do roofline: 6,875 ms/token
+   no lote contra 24,94 ms/token no decode, com ~0,7 GB de tráfego DRAM por token
+   (≈101 GB/s de um teto de 633).
+3. Logo, **o matvec em lote é limitado por latência, não por banda nem por instrução
+   repetida**: o IPC implícito é ~0,15 do pico de issue (25,3e6 iterações de warp × ~428
+   instr = 10,8e9 warp-instr por chunk de 11,12 GB contra 110 ms e ~640e9 warp-instr/s).
+   As cargas de ativação vêm de um working set de 320 KB (16 linhas × 20 KB, em L2) e cada
+   linha de peso do tensor re-lê a ativação inteira — a hipótese a medir na próxima sessão
+   é o **tráfego de re-leitura da ativação por linha** (para um tensor 17408×5120:
+   17408 × 16 × 20 KB ≈ 5,6 GB por tensor por chunk, saindo de L2/Infinity Cache), e as
+   duas alavancas candidatas são mais blocos independentes por thread (mais cargas em voo)
+   e staging de ativação por CTA em LDS.
