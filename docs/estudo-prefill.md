@@ -338,6 +338,54 @@ Duas conclusões que fecham o desenho do D2/D4:
    ele que decide se o caminho de dados chega perto dos 32,7 T-MAC/s do llama.cpp ou para nos
    10-13 T.
 
+## 3f. O WMMA int8 sobre os blocos reais (frente H) — e ele é BIT-EXATO
+
+Era a pergunta que a frente D deixou aberta: o pico do WMMA int8 é 4,2× o do dp4a, e o caminho int8
+*pode* ser bit-exato — mas ninguém tinha rodado WMMA int8 sobre os **blocos reais** dentro de um
+GEMM tilejado. A frente H rodou (`tests/bench_mmq_wmma_gpu.hip`, mesmo tensor da frente F:
+`blk.3.ffn_up.weight`, iq3_s, N=17408 × K=5120, ativação quantizada pelo kernel do próprio motor).
+
+**Bit-exatidão: 0 elementos diferentes em todos os tamanhos.**
+
+| comparação | elementos | diferenças |
+|---|---|---|
+| WMMA int8 × dp4a tilejado, M=16 | 278 528 | **0** |
+| M=64 | 1 114 112 | **0** |
+| M=128 | 2 228 224 | **0** |
+| **M=512 (N=17408, o tensor inteiro)** | **8 912 896** | **0** |
+| × `vec_dot_iq3_s_q8_1` do motor | 4 096 | **0** |
+| × oráculo de CPU | 256 | **0** |
+
+A ISA confirma que o motor e a bancada emitem a **mesma sequência** por bloco de 32:
+`v_mul_f32` (d_w·d_a), `v_mul_lo_u32` (**`sumi·(1+2·sc)` em inteiro**), `v_cvt_f32_i32`,
+`v_fmac_f32`. Ou seja: o caminho de matrix core **herda os gates bit-exatos que o motor já tem** —
+não precisa de gate numérico/PPL, ao contrário da rota f16 (rel-L2 2,07e-4) e ao contrário do que
+eu tinha escrito de manhã.
+
+**Velocidade: 7,5 / 16,7 / 19,7 / 22,8 T-MAC/s em M=16/64/128/512** = 3,8-11,8 % do pico remedido na
+mesma janela (198 T-MAC/s). Contra o dp4a tilejado **com o mesmo staging e a mesma correção**, na
+mesma janela: 2,82× em M=16, 1,56× em M=64, 1,68× em M=128, **1,83× em M=512**.
+
+**O ganho não é o 4,2× do pico, e o motivo tem nome e número**: a **correção de escala bit-exata
+custa 53-56 % do miolo** (miolo isolado: 84 T-MAC/s sem correção contra 37 T-MAC/s com ela). E o
+gargalo volta a ser o **staging: 50-61 % do tempo do kernel em M≥64**, a 132-275 GB/s de fonte
+contra 633 de roofline. Duplo buffer **piora 32 %** (14,46 contra 21,37 T-MAC/s em M=512) — o mesmo
+resultado negativo das frentes F e G, agora no kernel do WMMA.
+
+### A tabela que fecha o estudo (T-MAC/s, mesmo tensor real, M=512)
+
+| caminho | T-MAC/s | vs o motor (3,18) | bit-exato? |
+|---|---|---|---|
+| motor hoje (GEMV em lote, dp4a, chunk 16) | 3,18 | 1,0× | sim (é a referência) |
+| GEMM tilejado f16 + `dot2` (frente G, V6) | 14,71 | 4,6× | não (rel-L2 2,07e-4) |
+| **GEMM tilejado int8 + WMMA (frente H)** | **22,8** | **7,2×** | **SIM, 0/8 912 896** |
+| llama.cpp Vulkan (coopmat f16, `-ub 512`) | 32,7 | 10,3× | não |
+
+E os dois gargalos que sobram, medidos: **o staging (50-61 % do tempo do GEMM)** e, no caminho
+WMMA, **a correção de escala (53-56 % do miolo)**. O dobro do caminho vetorial acabou: o f16/dot2
+está a 95 % do muro de issue dele, e o WMMA int8 entrega 1,8× sobre o dp4a com a mesma precisão
+bit-exata.
+
 ## 5b. Até onde vai o caminho vetorial (o muro de issue) — e por que a saída é a unidade de matriz
 
 A frente B fechou a conta que o protótipo sugeria: os 12,74 T MAC/s do `bench-gemm-gpu` são

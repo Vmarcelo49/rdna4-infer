@@ -13,7 +13,7 @@ que o sustenta; nenhuma escolha é por preferência. O que **não** está medido
 | ~~D1~~ | chunk maior com o MESMO kernel | **MEDIDO E REPROVADO**: −18 % em N=32, −71 % em N=64 (§0.1) | **não fazer** |
 | **D2** | GEMM tilejado com staging na LDS, **M=64-512** | **12,74 T em M=128 e 14,71 em M=512 (4,0-4,6×)**, todas as variantes bit-exatas | **~331-347 tok/s** |
 | **D3** | D2 + **caminho de dados consertado** (BK=128/linha de cache cheia, ordem k-maior, mais warps) | não medido; é o que destrava os dois caminhos (hoje 58-94 % do tempo é staging, a 280 GB/s de 633) | a medir |
-| **D4** | D2/D3 + laço interno na **unidade de matriz** | teto medido: WMMA int8 **182 T-MAC/s** (364 TOPS) contra 44 do dp4a = **4,2×** | alvo llama.cpp: 32,7 T-MAC/s = **~1100 tok/s** |
+| **D4** | D2/D3 + laço interno **WMMA int8** | **MEDIDO pela frente H: 19,7 T em M=128 e 22,8 em M=512 = 6,2-7,2×, e BIT-EXATO (0/8 912 896)** | **~470 tok/s** (Amdahl §1b) |
 | referência | llama.cpp Vulkan, `-ub 512` (build **limpo**) | 32,7 T-MAC/s (74 % do pico de dp4a, 37 % do teto f16-WMMA) | **1054,3 tok/s** |
 
 Os degraus não são independentes: **D2 não rende nada sem D1** (medido: o mesmo GEMM tilejado em
@@ -106,6 +106,8 @@ sugere, porque o andaime não melhora junto:
 | hoje | 3,18 | 1,00× | 7,103 | **123,4 tok/s** | — |
 | D2 (frente G, V6) | 12,74 (M=128) | 4,0× | 1,774 | **~331 tok/s** | **2,7×** |
 | D2 em M=512 | 14,71 | 4,6× | 1,538 | **~347 tok/s** | 2,8× |
+| D4 (frente H, medido) | 22,8 | 7,2× | 0,990 | **~471 tok/s** | **3,8×** |
+| D4 + staging consertado (50-61 % do GEMM) | ~40 | 12,6× | 0,564 | **~613 tok/s** | 5,0× |
 | D4 no ritmo do llama.cpp | 32,7 | 10,3× | 0,690 | **~548 tok/s** | 4,4× |
 | D4 + andaime no ritmo deles | 32,7 | 10,3× | 0,690 | **~1050 tok/s** | 8,5× |
 
