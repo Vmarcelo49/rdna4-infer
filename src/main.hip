@@ -1249,8 +1249,13 @@ int cmd_run(int argc, char **argv) {
   // 0 branch) -- which the device can compute without shipping the 993 KB logits
   // vector to the host every token. Any other setting keeps the host path, so the
   // sampled and penalised cases are bit-for-bit what they were.
-  const bool argmax_only =
-      sp.temp <= 0.0f && (sp.repeat_penalty == 1.0f || sp.repeat_last_n <= 0);
+  // The MTP loop samples on the host from `logits`, so it keeps the host path.
+  // RD_NO_ARGMAX=1 forces the host path too: the two arms must produce the same ids,
+  // which is the differential scripts/check_golden_run.sh now checks (and the one
+  // that broke after a batched prefill until review finding R9 was fixed).
+  const bool argmax_only = getenv("RD_NO_ARGMAX") == nullptr && !mtp_on &&
+                           sp.temp <= 0.0f &&
+                           (sp.repeat_penalty == 1.0f || sp.repeat_last_n <= 0);
   graph.set_want_argmax(argmax_only);
   const double t_loaded = now_s();
 
