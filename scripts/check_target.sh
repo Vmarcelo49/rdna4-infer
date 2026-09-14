@@ -18,7 +18,9 @@ ok() { printf '  OK    %s\n' "$*"; }
 bad() { printf '  FAIL  %s\n' "$*"; fail=1; }
 skip() { printf '  SKIP  %s\n' "$*"; }
 # uma sessão de GPU por bloco, com timeout duro
-gpu() { timeout 900 "$ROOT/scripts/gpu-lock.sh" "$@"; }
+# timeout INSIDE the lock: the other order burns the budget waiting in the queue and
+# fails with RC=124 without ever running (docs/noite-regras.md 1.2, review finding R6).
+gpu() { "$ROOT/scripts/gpu-lock.sh" timeout 900 "$@"; }
 vram_mib() { cat /sys/class/drm/card*/device/mem_info_vram_used 2>/dev/null | head -1 | awk '{printf "%d", $1/1048576}'; }
 
 say "== alvo: 131K de contexto, KV q5_0/q4_1, MTP com ganho =="

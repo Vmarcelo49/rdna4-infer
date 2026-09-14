@@ -157,6 +157,16 @@ __global__ void argmax_kernel(const float *__restrict__ x, std::int64_t n, float
   const std::int64_t stride = (std::int64_t)gridDim.x * blockDim.x;
   float v = -INFINITY;
   std::int64_t vi = -1;
+  // The host scan (Sampler::filter, temp <= 0) starts with index 0 as the
+  // incumbent and only replaces it on a STRICTLY greater value -- so with
+  // logits[0] = NaN it answers 0, while a plain max-of-finite would answer the
+  // argmax of the finite entries (review finding R4). Seeding thread 0 of block 0
+  // with index 0 reproduces the host rule exactly: nothing is "greater" than NaN,
+  // and ties keep the lower index.
+  if (blockIdx.x == 0 && threadIdx.x == 0 && n > 0) {
+    v = x[0];
+    vi = 0;
+  }
   for (std::int64_t i = (std::int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
     const float xi = x[i];
     // strict > : equal values keep the lower id (and the first one seen, which is

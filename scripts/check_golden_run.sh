@@ -156,6 +156,29 @@ for combo in "f16 q8_0" "q8_0 f16" "f32 q4_0"; do
   fi
 done
 
+# ---------------------------------------------------------------------------
+# The device argmax (greedy fast path) and the host sampler must return the SAME id
+# for every prompt shape. This is not decoration: `prefill_ids` ends in a BATCH
+# chunk for most prompt lengths (7 = 4+3, 12 = 8+4), and `forward_batch` used to
+# leave the device argmax stale, so `run --greedy` emitted token 0 ("!") as its
+# first generated token. The stored golden uses a 5-token prompt (4+1) -- the one
+# shape that does not trigger it -- which is why the suite stayed green (review
+# finding R9). RD_NO_ARGMAX=1 forces the host path, so this is a differential test
+# with no stored fixture to go stale.
+for p in "The capital of France is Paris" \
+         "Explain in one sentence what a KV cache is" \
+         "one two three four five six seven eight nine ten eleven twelve"; do
+  a="$("$BIN" run -m "$MODEL" -p "$p" -n 8 --greedy --no-stats 2>/dev/null)"
+  b="$(RD_NO_ARGMAX=1 "$BIN" run -m "$MODEL" -p "$p" -n 8 --greedy --no-stats 2>/dev/null)"
+  if [ -z "$a" ] || [ -z "$b" ]; then
+    bad "argmax vs host sampler: one arm produced nothing ('$p')"
+  elif [ "$a" != "$b" ]; then
+    bad "argmax vs host sampler differ for '$p': fast='$(printf '%s' "$a" | head -c 30)' host='$(printf '%s' "$b" | head -c 30)'"
+  else
+    note "argmax == host sampler: $(printf '%s' "$p" | cut -c1-28)…"
+  fi
+done
+
 if [ "$fail" = "0" ]; then
   note "check-golden-run: OK"
 else

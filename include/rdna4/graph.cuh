@@ -108,6 +108,10 @@ class Graph {
   // maximum in id order), which is what makes the greedy ids identical.
   void set_want_argmax(bool want) { want_argmax_ = want; }
   std::int32_t last_argmax() const { return last_argmax_; }
+  // Shared by forward_run and forward_batch: both must leave last_argmax_
+  // consistent, because either can be the forward that produced the logits the
+  // caller is about to sample (review finding R9).
+  bool finish_argmax(int n_vocab, std::string &err);
   // --- RD_PHASE_PROF (diagnostico opt-in, agente de medicoes) ---------------
   // Ativa o cronometro de fases por eventos HIP (include/rdna4/phase_prof.cuh).
   // Puramente aditivo: sem profiler o caminho e identico (RD_PHASE e um no-op).
@@ -1345,6 +1349,7 @@ inline bool Graph::forward_batch(const std::vector<std::int32_t> &tokens, int st
     }
   }
   if (!proj(output_, xlast, d_logits_, n_vocab_i, E, err)) return false;
+  if (want_argmax_ && !finish_argmax(n_vocab_i, err)) return false;
   logits.resize(n_vocab_i);
   if (hipMemcpy(logits.data(), d_logits_, (std::size_t)n_vocab_i * sizeof(float),
                 hipMemcpyDeviceToHost) != hipSuccess) {
@@ -1547,6 +1552,44 @@ inline bool Graph::forward_tokens(const std::vector<std::int32_t> &tokens, int s
   return forward_run(tokens.size(), start_pos, nullptr, &tokens, hidden, logits, err);
 }
 
+// Device-side greedy argmax of the logits buffer: 64 partial candidates come back
+// (512 bytes) instead of the whole 993 KB vector. Same rule as the host scan in
+// Sampler::filter (greatest value wins, lower index on ties, index 0 when nothing
+// qualified -- every logit NaN/-inf), which is what makes the greedy ids identical.
+inline bool Graph::finish_argmax(int n_vocab, std::string &err) {
+  if (d_argmax_idx_ == nullptr) {
+    if (hipMalloc(&d_argmax_idx_, kArgmaxBlocks * sizeof(int)) != hipSuccess ||
+        hipMalloc(&d_argmax_val_, kArgmaxBlocks * sizeof(float)) != hipSuccess) {
+      err = "hipMalloc argmax scratch failed";
+      return false;
+    }
+  }
+  if (!argmax_launch(d_logits_, n_vocab, d_argmax_val_, d_argmax_idx_)) {
+    err = "argmax launch failed";
+    return false;
+  }
+  int h_idx[kArgmaxBlocks];
+  float h_val[kArgmaxBlocks];
+  if (hipMemcpy(h_idx, d_argmax_idx_, sizeof(h_idx), hipMemcpyDeviceToHost) != hipSuccess ||
+      hipMemcpy(h_val, d_argmax_val_, sizeof(h_val), hipMemcpyDeviceToHost) != hipSuccess) {
+    err = "argmax readback failed";
+    return false;
+  }
+  bool have = false;
+  float bv = -INFINITY;
+  std::int32_t best = 0;
+  for (int b = 0; b < kArgmaxBlocks; ++b) {
+    if (h_idx[b] < 0) continue;
+    if (!have || h_val[b] > bv || (h_val[b] == bv && h_idx[b] < best)) {
+      bv = h_val[b];
+      best = h_idx[b];
+      have = true;
+    }
+  }
+  last_argmax_ = best;
+  return true;
+}
+
 inline bool Graph::forward_run(std::size_t n_tokens, int start_pos, const float *host_emb,
                                const std::vector<std::int32_t> *toks, std::vector<float> &hidden,
                                std::vector<float> &logits, std::string &err) {
@@ -1644,44 +1687,9 @@ inline bool Graph::forward_run(std::size_t n_tokens, int start_pos, const float 
   emit("result_output", -1, d_logits_, n_vocab);
   RD_PHASE(prof_, "logits_copy");  // RD_PHASE_PROF
   if (want_argmax_) {
-    // 64 partial candidates come back (512 bytes) instead of the whole vector.
-    if (d_argmax_idx_ == nullptr) {
-      if (hipMalloc(&d_argmax_idx_, kArgmaxBlocks * sizeof(int)) != hipSuccess ||
-          hipMalloc(&d_argmax_val_, kArgmaxBlocks * sizeof(float)) != hipSuccess) {
-        err = "hipMalloc argmax scratch failed";
-        return false;
-      }
-    }
-    if (!argmax_launch(d_logits_, n_vocab, d_argmax_val_, d_argmax_idx_)) {
-      err = "argmax launch failed";
-      return false;
-    }
-    int h_idx[kArgmaxBlocks];
-    float h_val[kArgmaxBlocks];
-    const bool copied =
-        hipMemcpy(h_idx, d_argmax_idx_, sizeof(h_idx), hipMemcpyDeviceToHost) == hipSuccess &&
-        hipMemcpy(h_val, d_argmax_val_, sizeof(h_val), hipMemcpyDeviceToHost) == hipSuccess;
+    if (!finish_argmax(n_vocab, err)) return false;
     host_readback_ms_ +=
         std::chrono::duration<double, std::milli>(clock::now() - t_drained).count();
-    if (!copied) {
-      err = "argmax readback failed";
-      return false;
-    }
-    // Same rule as the host scan: greatest value wins, lower index on ties, and
-    // index 0 when nothing qualified (every logit NaN/-inf), which is what the
-    // host's "incumbent starts at 0" scan answers.
-    bool have = false;
-    float bv = -INFINITY;
-    std::int32_t best = 0;
-    for (int b = 0; b < kArgmaxBlocks; ++b) {
-      if (h_idx[b] < 0) continue;
-      if (!have || h_val[b] > bv || (h_val[b] == bv && h_idx[b] < best)) {
-        bv = h_val[b];
-        best = h_idx[b];
-        have = true;
-      }
-    }
-    last_argmax_ = best;
     RD_PHASE(prof_, "token_end");  // RD_PHASE_PROF
     return true;
   }

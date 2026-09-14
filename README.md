@@ -205,7 +205,7 @@ is comparable (64 tokens).
 | decode, 64K `f16` | **does not fit**: 2.1 GB spill to GTT, 2.16-7.97 tok/s | — |
 | decode, 64K `q8_0` | **19.3 tok/s** (13.75 GiB in use; the measurement front's window saw 18.28 on the same configuration) | — |
 | decode, 128K `q4_0` | **14.0 tok/s** (13.88 GiB in use) | — |
-| prefill, batched (N≤16) | **123.9 tok/s** on a 512-token prompt (73.05 at the start of the night; +69.7 % from batching the per-token scaffolding) | 575 ± 65 tok/s (pp64, re-measured; 440 ± 77 recorded in M5 — pp64 is noisy), 1143 ± 30 (pp512) |
+| prefill, batched (N≤16) | **123.9 tok/s** on a 512-token prompt (73.05 at the start of the night; +69.7 % = ~+43 % from batching the per-token scaffolding and +18.6 % from the `float4` state load in `delta_rule`, both bit-exact) | 575 ± 65 tok/s (pp64, re-measured; 440 ± 77 recorded in M5 — pp64 is noisy), 1143 ± 30 (pp512) |
 | weight bandwidth, end to end | **325 GB/s at 4K = 51 %** of the measured 633 GB/s DRAM roofline | ≥442 GB/s (derived) |
 | weight bandwidth, matvec alone | **436 GB/s = 69 %**; the LM head reaches 620 GB/s = 98 % | — |
 | IQ4_XS decode, 4K `f16` | 27.0 tok/s | — |
@@ -394,7 +394,10 @@ Ordered by how much they cost the user, with the number that justifies each. Not
 
 1. **Prefill is still the weak number: 123.9 tok/s at 512 tokens against llama.cpp's 1143 (a
    9× gap)**, so a 4K prompt costs ~33 s before the first token (was 56 s at the start of the
-   night; the batching of the per-token scaffolding bought +69.7 %). The matvec is *not* the whole
+   night). That +69.7 % decomposes as ~+43 % from batching the per-token scaffolding and
+   +18.6 % from the `delta_rule` state load — the review caught the two docs attributing the
+   whole of it to different changes, which would have made whoever inherited the lever
+   overestimate the second one by 3.7×. The matvec is *not* the whole
    story: inside `forward_batch` the weight pass is shared across the 16-token chunk, but the
    attention, the GDN recurrence, the norms and the elementwise chains still run **per token**
    (~11 ms/token of scaffolding, measured in `docs/medicoes-banda-e-gargalos.md` §1), which is
@@ -423,9 +426,27 @@ Ordered by how much they cost the user, with the number that justifies each. Not
    The spread from the smallest to the largest cache that runs is **1.9 %**: at 131K the
    decode is limited by attention latency/occupancy (165-172 GB/s effective on the weights,
    27-29 % of peak), not by KV bandwidth, so the format choice is quality plus headroom.
-   Default is `q5_0`/`q4_1` because it leaves 1.68 GiB for the MTP state planes; `q8_0`/`q4_1`
-   is the documented better-quality trade (mean KLD 0.002920 against 0.004181 for `K q5_0`,
-   measured upstream on Qwen3.5, `docs/referencias-noturnas.md`) for 0.75 GiB more.
+   Default is `q5_0`/`q4_1` because it leaves 1.68 GiB for the MTP state planes. The quality
+   question was then measured instead of assumed — mean KL over the full vocabulary at 4096
+   tokens of real text (256 probes, `docs/journal-kv.md` §7.1):
+
+   | K / V | mean KL (nats/pos) | PPL | greedy token changed |
+   |---|---|---|---|
+   | `f16`/`f16` (reference) | 0 | 5.91711 | 0/256 |
+   | `q8_0`/`q8_0` | **0.000492** | 5.92405 | 3/256 |
+   | `q8_0`/`q4_1` | 0.001443 | 5.93386 | 5/256 |
+   | **`q5_0`/`q4_1`** (default) | 0.001715 | 5.95800 | 4/256 |
+   | `q5_0`/`q4_0` | 0.002118 | 5.93234 | 7/256 |
+   | `q4_0`/`q4_0` | 0.003208 | 5.93976 | 8/256 |
+
+   Isolating each axis: **K `q8_0` is 16 % lower KL than K `q5_0`** (0.001443 vs 0.001715, with
+   V fixed) and **V `q4_1` is 19 % lower KL than V `q4_0`** (0.001715 vs 0.002118, with K
+   fixed) — the same directions llama.cpp's PR #21038 measured, now reproduced here. So the
+   night's premise holds: `q4_1` for V pays, and `q4_0` must not be used for K (worst of all,
+   0.003208). `q8_0`/`q4_1` is the better-quality option (16 % less KL for 0.75 GiB more) for
+   anyone not spending that headroom on MTP. Note that **perplexity does not order these
+   formats**: `q5_0`/`q4_0` beats `q5_0`/`q4_1` on PPL (5.932 vs 5.958) while having 23 % more
+   KL and nearly double the greedy divergence — PPL is blind to this, KL is not.
 3. **MTP (block 64) is implemented and exact but does not pay yet.** The NextN head drafts at
    86.7 % acceptance (llama.cpp's own driver: 87.5 %) and `--mtp` output is byte-identical to
    plain greedy — but every mode still runs one trunk forward per committed token, so it
@@ -438,7 +459,11 @@ Ordered by how much they cost the user, with the number that justifies each. Not
    4.295 GB of unique bytes). The attention kernel saturates ~1.35 TB/s of L2, so the L2 hides
    most of it — but a Vulkan-style grouped attention (one row loaded once for the 6 query
    heads) is a known, unclaimed win. Decode was attention-bound before M7 (4.2 tok/s at 64K);
-   `docs/medicoes-m7.md` has the fix and the curve.
+   `docs/medicoes-m7.md` has the fix and the curve. The split path is not bit-exact and its
+   deviation is now measured on real text as a ladder: **5.1989** unsplit, **5.2054** at 4
+   splits (+0.125 %), **5.2114** at 16 splits with the wide CTA (+0.240 %) — all inside the
+   0.5 % gate, but the wide end costs twice the deviation of the narrow one, which is the
+   price of the +5 % kernel speed it buys at 131K.
 5. **"Runs at 131K" is not "is good at 131K", and we say exactly which half is measured.**
    (a) *Implementation*: our RoPE was diffed against the real `ggml_rope_multi` up to position
    262 143 (`check-rope-long-gpu`) — relative L2 ≤ 1e-3 at the far end, explained by one ulp of

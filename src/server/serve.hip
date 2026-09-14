@@ -503,7 +503,12 @@ bool Engine::generate(const std::vector<std::int32_t> &prompt_ids, const GenRequ
   const double t0 = now_s();
   if (!graph_->forward_tokens(prompt_ids, 0, hidden, logits, err)) return false;
   res.prefill_s = now_s() - t0;
-  if (logits.size() != static_cast<std::size_t>(graph_->n_vocab())) {
+  // In the greedy fast path the logits deliberately never cross the bus (the token
+  // is the device argmax), so an empty vector is the expected state and not an
+  // error. Demanding it here broke every temperature-0 request -- i.e. all of
+  // tests/check_server.py -- until the second adversarial review caught it
+  // (finding R2, docs/adversarial-noite2.md).
+  if (!argmax_only_ && logits.size() != static_cast<std::size_t>(graph_->n_vocab())) {
     err = "the graph returned an unexpected number of logits";
     return false;
   }

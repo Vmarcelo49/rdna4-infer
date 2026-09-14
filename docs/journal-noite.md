@@ -107,6 +107,63 @@ pior. Repassado à frente KV.
   medição da noite ser menor do que o planejado — e por isso a limitação vai escrita no
   relatório.
 
+### C6. Economia do MTP medida pela própria frente (03:55, antes da varredura final)
+- **Referência**: `docs/mtp.md`; a projeção antiga de 2,5× e a recalibração da frente de
+  referências para 1,3-1,5× (com o `cf(N)` velho).
+- **Peças medidas** (`/tmp/mtp-gate2.log`, gates do próprio worktree): passo de rascunho
+  **2,21 ms** (6,7-6,8 % de um passo do tronco); *snapshot+restore* do estado GDN
+  **0,53 ms por par** (149,6 MiB); verificação em lote: 2 linhas 32,6 ms, 3 linhas 36,7,
+  4 linhas 43,9 ⇒ **custo marginal de uma linha extra = 7,2 ms** contra 32,7 ms de um passo
+  por token.
+- **O que isso implica**: com D=4 (verificação de 5 linhas ≈ 51 ms + 4 rascunhos ≈ 8,8 ms, mais
+  o raro restore/replay) e ~3,8 tokens aceitos por rodada, o custo por token cai para ~16 ms
+  contra 33 ms — da ordem de **~2×**, e não os 1,3-1,5× que a recalibração previa com o
+  `forward_batch` antigo. A frente está medindo.
+- **Prova de correção que já existe**: o *snapshot/restore* do estado reproduz as linhas do
+  lote de forma **bit-idêntica** (`max|d| = 0, argmax igual`) — é o que torna a rejeição de
+  rascunho segura, e era o ponto que eu tinha marcado como "a crux" no briefing.
+- **Aberta**: 1 falha no gate deles ("um passo de rascunho por proposta mais uma linha de
+  reconstrução de KV por token aceito") — é eficiência do caminho novo, não correção; a frente
+  está nisso.
+- **Veredito**: ainda em medição; o relatório da frente decide.
+
+### C7. A premissa do alvo foi testada e confirmada (frente KV, 04:00)
+- **Hipótese do enunciado**: "K `q5_0` + V `q4_1` é o ponto doce do KV".
+- **Medido** (KL média sobre o vocabulário, 4096 tokens de texto real, 256 probes, piso f16
+  rodado duas vezes, mesmo processo): `q8_0/q8_0` **0,000492** · `q8_0/q4_1` 0,001443 ·
+  **`q5_0/q4_1` 0,001715** · `q5_0/q4_0` 0,002118 · `q4_0/q4_0` 0,003208.
+- **Eixos isolados**: K `q8_0` é **16 % melhor** que K `q5_0` (V fixo em q4_1) e V `q4_1` é
+  **19 % melhor** que V `q4_0` (K fixo em q5_0). As duas direções que o PR #21038 do llama.cpp
+  mediu em Qwen3.5, reproduzidas aqui — e `q4_0` em K é o pior de todos.
+- **Needle a 8K**: 8/8 agulhas recuperadas em **todos** os formatos, inclusive `q4_0/q4_0` —
+  a sonda não discrimina nesse tamanho; a KL é que ordena.
+- **PPL não ordena** (medido, não argumentado): a ordem por PPL e a ordem por KL discordam
+  nos dois configs do meio, e `q5_0/q4_0` tem PPL *melhor* que `q5_0/q4_1` com 23 % mais KL.
+- **Veredito**: MANTIDO o padrão `q5_0/q4_1` (é o alvo, KL é o 2º melhor e sobram 1,68 GiB para
+  o MTP); `q8_0/q4_1` documentado como a opção de melhor qualidade (0,75 GiB a mais).
+
+### C8. Duas estimativas discordaram, e a mais barata de checar venceu (04:20)
+- **O que aconteceu**: a frente de prefill mediu que o matvec em lote lê 12,0 GB por chunk de 16
+  em 110 ms (**109 GB/s**) contra 446 GB/s no caminho por token, e estimou 2-2,5× de ganho ao
+  "dequantizar o bloco uma vez". A frente de kernels implementou a mudança para `iq3_s`/`iq3_xxs`
+  (com fallback identidade para os outros 12 tipos) e **contou as instruções**: ~40 operações de
+  preparo por bloco de 110 B mais ~25 por token dá um teto de **~10 %**, não 2-3×.
+- **Decisão do coordenador**: a mudança fica **desligada** (duas linhas de `RD_BATCH` prontas para
+  ligar) até existir medida. Regra da noite: mudança de kernel sem número não entra — e uma
+  estimativa que outra frente contradiz por contagem de instruções é exatamente o caso em que
+  "medir antes" paga. O gargalo real do matvec em lote segue **não identificado**: é o item
+  aberto mais valioso para a próxima sessão, e agora tem duas hipóteses concorrentes medidas
+  (banda amortizada vs issue de ALU) e nenhuma confirmada.
+- **Números que a frente de kernels trouxe e que ficam** (todos bit-exatos, memcmp): LUT dos IQ
+  em LDS `iq3_s` 7,762→7,251 ms/token e `iq3_xxs` 4,468→3,781 (**−1,20 ms/token**; nos `iq2_*`
+  a LUT é maior que o peso lido por CTA e o ganho vira perda, então uma guarda
+  peso/CTA ≥ 2× LUT decide); `delta_rule` com carga `float4` **71,70→8,42 µs por camada**
+  (8,5×, −3,0 ms/token nas 48 camadas, com a ressalva de que a cadeia de 100 reusa o mesmo estado
+  no Infinity Cache); `rms_norm` com 4 cargas em voo 1,227× (−0,26 ms/token). Abandonados com
+  medida: `rows=1` (0,973×, porque `WPR=1` faz o número de warps ser `nrows`) e a fusão dos
+  kernels pequenos (o `emit()` do grafo faz `hipMemcpy` bloqueante, então fundir 4 ops em 1 faz o
+  oráculo por nó ler um buffer já sobrescrito — a variante que preserva o dump vale 0,26 ms).
+
 ## Estado do alvo (atualizado pelo coordenador)
 
 - **131K**: ainda não medido nesta rodada. No baseline, 131K com KV `q4_0` roda a 14,0 tok/s
@@ -117,3 +174,16 @@ pior. Repassado à frente KV.
 - **MTP**: implementado, aceitação 86,7 % e saída idêntica ao greedy, mas **9-10 % mais lento**
   porque cada token aceito roda um forward do tronco (sem verificação em batch). Com o
   `Graph::forward_batch` do M8 já no lugar, a verificação em batch é o trabalho da frente MTP.
+
+### C5. Gate em texto real para a ponta larga da regra de WPB (achado F5) — FECHADO
+- **Referência**: `docs/adversarial-noite.md` F5 (a combinação embarcada ≥16 splits × 16 warps
+  não tinha gate em texto real; só um teste com cache sintético e tolerância 5e-2).
+- **Comando**: `./scripts/gpu-lock.sh timeout 1500 ./scripts/check_attn_split.sh` (o caso novo
+  roda com `RD_ATTN_SPLITS=16`, exatamente a ponta larga) em wikitext-2, ctx 1024, 2 chunks.
+- **Resultado**: PPL sem split **5,1989** · 4 splits **5,2054** (+0,125 %) · **16 splits × 16
+  warps 5,2114 (+0,240 %)** contra o sem-split. Limite do gate 0,5 %. Ou seja: a regra larga é
+  numericamente equivalente ao caminho sem split, com **o dobro** do desvio do caso de 4 splits
+  — coerente com mais reordenação da soma das chaves, e dentro da mesma classe numérica.
+- **Veredito**: MANTIDO (gate novo em `scripts/check_attn_split.sh`, `WIDE=0` pula). De quebra,
+  o número entra no README como a escada de desvio do split-KV: 0,125 % (4 splits), 0,240 %
+  (16 splits × 16 warps).
