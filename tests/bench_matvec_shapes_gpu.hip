@@ -104,6 +104,11 @@ inline bool launch_variant(int kind, int value, const Tensor &t, const block_q8_
   if (kind == 5)
     return rdna4::matvec_launch_tuned(t.dt, t.d_w, d_a, d_y, t.nrows, t.ncols, nullptr, value,
                                       /*pf=*/false);
+  if (kind == 8)  // LUT do tipo em LDS (mesma forma; ver matvec.cuh / journal §2)
+    return rdna4::matvec_launch_lut_lds(t.dt, t.d_w, d_a, d_y, t.nrows, t.ncols, nullptr);
+  if (kind == 9)  // LUT em LDS com UNROLL forcado (mede se a LDS muda o otimo de unroll)
+    return rdna4::matvec_launch_lut_lds_unroll(t.dt, t.d_w, d_a, d_y, t.nrows, t.ncols, nullptr,
+                                               value);
   if (kind == 7)
     return rdna4::matvec_default_ilp(t.dt) == 1
                ? rdna4::matvec_launch_unroll(t.dt, t.d_w, d_a, d_y, t.nrows, t.ncols, nullptr, 2,
@@ -151,7 +156,7 @@ int main(int argc, char **argv) {
     std::fprintf(stderr,
                  "usage: bench-matvec-shapes-gpu <model.gguf> [--budget-mib N] [--reps N] "
                  "[--rows a,b,c] [--minb a,b,c] [--unroll 2,4] [--pf] [--ilp 1,2,4] "
-                 "[--repeat-ship] [--land] [--no-ab]\n");
+                 "[--repeat-ship] [--land] [--lut-lds] [--lut-lds-unroll 1,2,4] [--no-ab]\n");
     return 1;
   }
   double budget_mib = 12000.0;
@@ -160,6 +165,8 @@ int main(int argc, char **argv) {
   bool pf_only = false;
   bool repeat_ship = false;
   bool land = false;
+  bool lut_lds = false;
+  std::vector<int> lut_lds_unroll;
   std::vector<int> row_variants, minb_variants, unroll_variants, ilp_variants;
   for (int i = 2; i < argc; ++i) {
     auto list = [&](std::vector<int> &out) {
@@ -189,6 +196,10 @@ int main(int argc, char **argv) {
       repeat_ship = true;
     } else if (std::strcmp(argv[i], "--land") == 0) {
       land = true;
+    } else if (std::strcmp(argv[i], "--lut-lds") == 0) {
+      lut_lds = true;
+    } else if (std::strcmp(argv[i], "--lut-lds-unroll") == 0 && i + 1 < argc) {
+      list(lut_lds_unroll);  // aceita "1,2,4" (o atoi direto leria so o 1)
     } else if (std::strcmp(argv[i], "--no-ab") == 0) {
       do_ab = false;
     } else {
@@ -204,6 +215,8 @@ int main(int argc, char **argv) {
     ilp_variants.clear();
     repeat_ship = false;
     land = false;
+    lut_lds = false;
+    lut_lds_unroll.clear();
   }
   (void)pf_only;
 
@@ -414,6 +427,8 @@ int main(int argc, char **argv) {
   variants.push_back({"ship", 0, 0});
   if (repeat_ship) variants.push_back({"ship2", 6, 0});
   if (land) variants.push_back({"land", 7, 0});
+  if (lut_lds) variants.push_back({"lut-lds", 8, 0});
+  for (int v : lut_lds_unroll) variants.push_back({"lds-unrl", 9, v});
   for (int v : row_variants) variants.push_back({"rows", 1, v});
   for (int v : minb_variants) variants.push_back({"minb", 2, v});
   for (int v : unroll_variants) variants.push_back({v == 1 ? "prefetch" : "unroll", v == 1 ? 4 : 3, v});
@@ -483,12 +498,21 @@ int main(int argc, char **argv) {
   }
   std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) { return a.ms_tok > b.ms_tok; });
 
-  std::printf("\n%-9s %9s %6s %6s %6s %10s %10s %8s\n", "type", "rows", "bpr", "n", "GB/s",
-              "ms(tok)", "ms/tens", "share");
+  // ms(tok)-fix: the same per-class extrapolation with ONE sync floor removed per
+  // tensor (`null_once` = an empty kernel timed with the same record+sync
+  // protocol). The per-tensor measurement pays that floor on every launch, which
+  // for a 261 KB q8_0 tensor is most of the number -- so the classification of
+  // "this class is slow" has to be read off this column, not off ms/tens.
+  std::printf("\n%-9s %9s %6s %6s %6s %10s %10s %10s %10s %8s\n", "type", "rows", "bpr", "n",
+              "GB/s", "ms(tok)", "ms/tens", "ms-fix", "ms(tok)-fix", "share");
   for (const Row &r : rows) {
-    std::printf("%-9s %9lld %6lld %6d %6.0f %10.3f %10.4f %7.1f%%\n", dt_name(r.c->dt),
+    const double per_fix = std::max(0.0, r.c->ms_staged / std::max(1, r.c->n_staged) - null_once);
+    const double rate_fix = per_fix > 0 ? r.c->bytes_staged / (per_fix * 1e-3) / 1e9 : 0.0;
+    const double ms_fix = rate_fix > 0 ? r.c->bytes_all / (rate_fix * 1e9) * 1e3 : 0.0;
+    std::printf("%-9s %9lld %6lld %6d %6.0f %10.3f %10.4f %10.4f %10.3f %7.1f%%\n", dt_name(r.c->dt),
                 (long long)r.c->nrows, (long long)r.c->bpr, r.c->n_staged, r.rate, r.ms_tok,
-                r.c->ms_staged / std::max(1, r.c->n_staged), 100.0 * r.ms_tok / total_ms);
+                r.c->ms_staged / std::max(1, r.c->n_staged), per_fix, ms_fix,
+                100.0 * r.ms_tok / total_ms);
   }
   std::printf("per-tensor sum: %.3f GB in %.2f ms -> %.1f tok/s (matvec only)\n",
               grand_total_bytes / 1e9, total_ms, 1000.0 / total_ms);

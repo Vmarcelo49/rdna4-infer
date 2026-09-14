@@ -872,8 +872,12 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_lin(
 // separate generation: spread the 4 sign bits into byte positions 2 of each
 // byte (one multiply by 0x00810204 masked with 0x04040404), OR in the byte
 // indices 0x03020100, and permute.
-static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_perm(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+// ..._lut: mesmo corpo, mas a tabela (((const uint32_t *)lut), 512 x 4 B = 2 KB) vem de um ponteiro do
+// chamador (LDS em matvec.cuh; docs/journal-kernels.md). Bit-exata: mesma
+// tabela, mesmos valores, mesmas operacoes, mesma ordem.
+static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_perm_lut(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx,
+    const int & iqs, const void * __restrict__ lut) {
 
     const block_iq3_s * bq3 = (const block_iq3_s *) vbq + kbx;
 
@@ -888,8 +892,8 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_perm(
     int sumi_all = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const uint32_t gx = iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)];
-        const uint32_t gy = iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)];
+        const uint32_t gx = ((const uint32_t *)lut)[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)];
+        const uint32_t gy = ((const uint32_t *)lut)[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)];
 
         const uint8_t sb = sp[l0/2];
         const uint32_t sel_x = (((uint32_t)(sb & 0x0F) * 0x00810204u) & 0x04040404u) | 0x03020100u;
@@ -913,6 +917,14 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_perm(
 
     const float d = rdna4::fp16_to_float(bq3->d) * rdna4::fp16_to_float((uint16_t)((bq8_1[iqs/2].ds) & 0xFFFFu));
     return d * sumi;
+}
+
+// Entrada de producao: mesmo corpo lendo a tabela global. Separada para um
+// bench poder A/B as duas fontes com aritmetica identica.
+static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_perm(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx,
+    const int & iqs) {
+    return vec_dot_iq3_s_q8_1_perm_lut(vbq, bq8_1, kbx, iqs, (const void *)iq3s_grid);
 }
 
 
@@ -1098,8 +1110,12 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_perm(
 // only need 4 bits per group, so compute the byte once and take a nibble:
 //   unpack_ksigns(v) = (v ^ ((popc(v)&1) << 7)) * 0x01010101, and the masks
 //   0x08040201 / 0x80402010 pick bits 0-3 / 4-7 of that byte.
-static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_perm2(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+// ..._lut: mesmo corpo, mas a tabela (((const uint32_t *)lut), 256 x 4 B = 1 KB) vem de um ponteiro do
+// chamador (LDS em matvec.cuh; docs/journal-kernels.md). Bit-exata: mesma
+// tabela, mesmos valores, mesmas operacoes, mesma ordem.
+static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_perm2_lut(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx,
+    const int & iqs, const void * __restrict__ lut) {
 
     const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vbq + kbx;
 
@@ -1112,7 +1128,7 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_perm2(
     int sumi_all = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+        const int2 grid_pos = make_int2(((const uint32_t *)lut)[q3[l0 + 0]], ((const uint32_t *)lut)[q3[l0 + 1]]);
 
         uint32_t sv = (uint32_t)(uint8_t)(aux32 >> (7*l0/2));
         sv ^= (uint32_t)(__popc(sv) & 1u) << 7;
@@ -1136,6 +1152,14 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_perm2(
     sumi = (ls*sumi + sumi/2)/2;
     const float d = rdna4::fp16_to_float(bq3->d) * rdna4::fp16_to_float((uint16_t)((bq8_1[iqs/2].ds) & 0xFFFFu));
     return d * sumi;
+}
+
+// Entrada de producao: mesmo corpo lendo a tabela global. Separada para um
+// bench poder A/B as duas fontes com aritmetica identica.
+static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_perm2(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx,
+    const int & iqs) {
+    return vec_dot_iq3_xxs_q8_1_perm2_lut(vbq, bq8_1, kbx, iqs, (const void *)iq3xxs_grid);
 }
 
 // DIAGNOSTIC (wrong on purpose) for iq3_xxs: skip the sign application.
@@ -1169,8 +1193,12 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_diag_nosign(
 // __vcmpne4 mask), and a single V_PERM_B32 per group picks the grid byte or a
 // zero byte. Same exact-integer linearity as the other perm variants.
 // ---------------------------------------------------------------------------
-static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1_perm2(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+// ..._lut: mesmo corpo, mas a tabela (((const uint64_t *)lut), 256 x 8 B = 2 KB) vem de um ponteiro do
+// chamador (LDS em matvec.cuh; docs/journal-kernels.md). Bit-exata: mesma
+// tabela, mesmos valores, mesmas operacoes, mesma ordem.
+static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1_perm2_lut(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx,
+    const int & iqs, const void * __restrict__ lut) {
 
     const block_iq2_xxs * bq2 = (const block_iq2_xxs *) vbq + kbx;
 
@@ -1182,7 +1210,7 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1_perm2(
     int sumi_all = 0;
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
-        const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[k0/2]];
+        const uint2 grid_pos = ((const uint2*)((const uint64_t *)lut))[aux8[k0/2]];
 
         uint32_t sv = (uint32_t)(uint8_t)(aux32 >> (7 * k0 / 2));
         sv ^= (uint32_t)(__popc(sv) & 1u) << 7;
@@ -1207,8 +1235,20 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1_perm2(
     return d * sumi;
 }
 
-static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1_perm2(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+// Entrada de producao: mesmo corpo lendo a tabela global. Separada para um
+// bench poder A/B as duas fontes com aritmetica identica.
+static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1_perm2(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx,
+    const int & iqs) {
+    return vec_dot_iq2_xxs_q8_1_perm2_lut(vbq, bq8_1, kbx, iqs, (const void *)iq2xxs_grid);
+}
+
+// ..._lut: mesmo corpo, mas a tabela (((const uint64_t *)lut), 512 x 8 B = 4 KB) vem de um ponteiro do
+// chamador (LDS em matvec.cuh; docs/journal-kernels.md). Bit-exata: mesma
+// tabela, mesmos valores, mesmas operacoes, mesma ordem.
+static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1_perm2_lut(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx,
+    const int & iqs, const void * __restrict__ lut) {
 
     const block_iq2_xs * bq2 = (const block_iq2_xs *) vbq + kbx;
 
@@ -1222,7 +1262,7 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1_perm2(
     int sumi1_pos = 0, sumi1_all = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const uint2 grid_pos = ((const uint2*)iq2xs_grid)[q2[l0/2] & 0x1FF];
+        const uint2 grid_pos = ((const uint2*)((const uint64_t *)lut))[q2[l0/2] & 0x1FF];
 
         uint32_t sv = (uint32_t)(uint8_t)(q2[l0/2] >> 9);
         sv ^= (uint32_t)(__popc(sv) & 1u) << 7;
@@ -1254,8 +1294,20 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1_perm2(
     return d * sumi;
 }
 
-static __device__ __forceinline__ float vec_dot_iq2_s_q8_1_perm2(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+// Entrada de producao: mesmo corpo lendo a tabela global. Separada para um
+// bench poder A/B as duas fontes com aritmetica identica.
+static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1_perm2(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx,
+    const int & iqs) {
+    return vec_dot_iq2_xs_q8_1_perm2_lut(vbq, bq8_1, kbx, iqs, (const void *)iq2xs_grid);
+}
+
+// ..._lut: mesmo corpo, mas a tabela (((const uint64_t *)lut), 1024 x 8 B = 8 KB) vem de um ponteiro do
+// chamador (LDS em matvec.cuh; docs/journal-kernels.md). Bit-exata: mesma
+// tabela, mesmos valores, mesmas operacoes, mesma ordem.
+static __device__ __forceinline__ float vec_dot_iq2_s_q8_1_perm2_lut(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx,
+    const int & iqs, const void * __restrict__ lut) {
 
     const block_iq2_s * bq2 = (const block_iq2_s *) vbq + kbx;
 
@@ -1273,7 +1325,7 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1_perm2(
     int sumi1_pos = 0, sumi1_all = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int * grid_pos = (const int *)(iq2s_grid + (qs[l0/2] | ((qh << (8-l0)) & 0x300)));
+        const int * grid_pos = (const int *)(((const uint64_t *)lut) + (qs[l0/2] | ((qh << (8-l0)) & 0x300)));
 
         const uint8_t sb = signs_packed_8[l0/2];
         const uint32_t sel0 = (((uint32_t)(sb & 0x0Fu)          * 0x00810204u) & 0x04040404u) | 0x03020100u;
@@ -1302,6 +1354,14 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1_perm2(
     const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
     const float d = rdna4::fp16_to_float(bq2->d) * rdna4::fp16_to_float((uint16_t)((bq8_1[iqs/2].ds) & 0xFFFFu));
     return d * sumi;
+}
+
+// Entrada de producao: mesmo corpo lendo a tabela global. Separada para um
+// bench poder A/B as duas fontes com aritmetica identica.
+static __device__ __forceinline__ float vec_dot_iq2_s_q8_1_perm2(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx,
+    const int & iqs) {
+    return vec_dot_iq2_s_q8_1_perm2_lut(vbq, bq8_1, kbx, iqs, (const void *)iq2s_grid);
 }
 
 
@@ -1409,6 +1469,141 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_diag_nolookup(
     }
 
     sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    const float d = rdna4::fp16_to_float(bq3->d) * rdna4::fp16_to_float((uint16_t)((bq8_1[iqs/2].ds) & 0xFFFFu));
+    return d * sumi;
+}
+
+// ---------------------------------------------------------------------------
+// Formas "prep" para o caminho em LOTE (matvec_kernel_batch): a dequantizacao do
+// peso -- gather da LUT, montagem da mascara de sinal e o V_PERM_B32 -- e' feita
+// UMA vez por bloco, e o resultado (os 4 int32 por grupo de 4 valores, na forma
+// "positivo" e "cru" que a linearidade exata usa) fica em registrador para as N
+// linhas de ativacao. So' o dp4a e' por token.
+//
+// Por que existe (medido pela frente de prefill, janela limpa): o matvec em lote
+// lia 12,0 GB por chunk de 16 tokens em 110 ms = 109 GB/s, contra 446 GB/s do
+// MESMO matvec no caminho por token -- 3,6x mais trabalho de ALU por byte,
+// porque a dequantizacao era refeita N vezes.
+//
+// Bit-exatidao: mesmas operacoes, mesma ordem. O que sai do laco por token e'
+// exatamente o que nao depende do token; a sequencia de dp4a e' identica a de
+// `vec_dot_iq3_s_q8_1_perm_lut`. Gate: `check-matmul-gpu` (lote == N GEMVs) e
+// `check-batch-gpu` (prefill em lote == caminho por token), os dois bit-exatos.
+// ---------------------------------------------------------------------------
+struct iq3s_prep_t {
+  int v[4][4];  // [l0/2] = {gx_pos, gy_pos, gx, gy}
+};
+
+static __device__ __forceinline__ iq3s_prep_t vec_prep_iq3_s_q8_1_perm(
+    const void * __restrict__ vbq, const int & kbx, const int & iqs,
+    const void * __restrict__ lut) {
+    const uint32_t * __restrict__ grid = (const uint32_t *) lut;
+    const block_iq3_s * bq3 = (const block_iq3_s *) vbq + kbx;
+
+    const int2      qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+    const int qh = bq3->qh[iqs/2];
+
+    const int       signs_packed_32 = get_int_b2(bq3->signs, iqs/2);
+    const uint8_t * sp              = (const uint8_t *) &signs_packed_32;
+
+    iq3s_prep_t out;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const uint32_t gx = grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)];
+        const uint32_t gy = grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)];
+
+        const uint8_t sb = sp[l0/2];
+        const uint32_t sel_x = (((uint32_t)(sb & 0x0F) * 0x00810204u) & 0x04040404u) | 0x03020100u;
+        const uint32_t sel_y = (((uint32_t)((sb >> 4) & 0x0F) * 0x00810204u) & 0x04040404u) | 0x03020100u;
+
+        out.v[l0/2][0] = (int)__builtin_amdgcn_perm(0u, gx, sel_x);
+        out.v[l0/2][1] = (int)__builtin_amdgcn_perm(0u, gy, sel_y);
+        out.v[l0/2][2] = (int)gx;
+        out.v[l0/2][3] = (int)gy;
+    }
+    return out;
+}
+
+static __device__ __forceinline__ float vec_dot_prep_iq3_s_q8_1_perm(
+    const iq3s_prep_t & w, const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+    const int & kbx, const int & iqs, const void * __restrict__ /*lut*/) {
+    const block_iq3_s * bq3 = (const block_iq3_s *) vbq + kbx;
+
+    int sumi_pos = 0;
+    int sumi_all = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+
+        sumi_pos = ggml_cuda_dp4a(w.v[l0/2][0], u0, sumi_pos);
+        sumi_pos = ggml_cuda_dp4a(w.v[l0/2][1], u1, sumi_pos);
+        sumi_all = ggml_cuda_dp4a(w.v[l0/2][2], u0, sumi_all);
+        sumi_all = ggml_cuda_dp4a(w.v[l0/2][3], u1, sumi_all);
+    }
+    int sumi = 2*sumi_pos - sumi_all;
+
+    sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+
+    const float d = rdna4::fp16_to_float(bq3->d) * rdna4::fp16_to_float((uint16_t)((bq8_1[iqs/2].ds) & 0xFFFFu));
+    return d * sumi;
+}
+
+struct iq3xxs_prep_t {
+  int v[4][4];  // [l0/2] = {g_l_pos, g_h_pos, grid_pos.x, grid_pos.y}
+};
+
+static __device__ __forceinline__ iq3xxs_prep_t vec_prep_iq3_xxs_q8_1_perm2(
+    const void * __restrict__ vbq, const int & kbx, const int & iqs,
+    const void * __restrict__ lut) {
+    const uint32_t * __restrict__ grid = (const uint32_t *) lut;
+    const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vbq + kbx;
+
+    const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs+1));
+    const uint8_t * q3 = (const uint8_t *) &q3_packed;
+
+    const uint32_t aux32 = get_int_b2(bq3->qs, QK_K/16 + iqs/2);
+
+    iq3xxs_prep_t out;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(grid[q3[l0 + 0]], grid[q3[l0 + 1]]);
+
+        uint32_t sv = (uint32_t)(uint8_t)(aux32 >> (7*l0/2));
+        sv ^= (uint32_t)(__popc(sv) & 1u) << 7;
+        const uint32_t sel0 = (((sv       & 0x0Fu) * 0x00810204u) & 0x04040404u) | 0x03020100u;
+        const uint32_t sel1 = ((((sv >> 4) & 0x0Fu) * 0x00810204u) & 0x04040404u) | 0x03020100u;
+
+        out.v[l0/2][0] = (int)__builtin_amdgcn_perm(0u, (uint32_t)grid_pos.x, sel0);
+        out.v[l0/2][1] = (int)__builtin_amdgcn_perm(0u, (uint32_t)grid_pos.y, sel1);
+        out.v[l0/2][2] = grid_pos.x;
+        out.v[l0/2][3] = grid_pos.y;
+    }
+    return out;
+}
+
+static __device__ __forceinline__ float vec_dot_prep_iq3_xxs_q8_1_perm2(
+    const iq3xxs_prep_t & w, const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+    const int & kbx, const int & iqs, const void * __restrict__ /*lut*/) {
+    const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vbq + kbx;
+    const uint32_t aux32 = get_int_b2(bq3->qs, QK_K/16 + iqs/2);
+
+    int sumi_pos = 0;
+    int sumi_all = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+        sumi_pos = ggml_cuda_dp4a(w.v[l0/2][0], u0, sumi_pos);
+        sumi_pos = ggml_cuda_dp4a(w.v[l0/2][1], u1, sumi_pos);
+        sumi_all = ggml_cuda_dp4a(w.v[l0/2][2], u0, sumi_all);
+        sumi_all = ggml_cuda_dp4a(w.v[l0/2][3], u1, sumi_all);
+    }
+    int sumi = 2*sumi_pos - sumi_all;
+
+    const int ls = aux32 >> 28;
+    sumi = (ls*sumi + sumi/2)/2;
     const float d = rdna4::fp16_to_float(bq3->d) * rdna4::fp16_to_float((uint16_t)((bq8_1[iqs/2].ds) & 0xFFFFu));
     return d * sumi;
 }

@@ -27,8 +27,25 @@ __global__ void rms_norm_kernel(const float *__restrict__ x, const float *__rest
   const float *xr = x + row * ncols;
   float *yr = y + row * ncols;
 
+  // A cadeia de fma tem a MESMA ordem de antes (i = tid, tid+256, tid+512, ...),
+  // mas com 4 cargas independentes em voo por iteracao: o kernel e' limitado por
+  // LATENCIA de load (docs/journal-kernels.md §4: 1 CTA de 256 threads para 5120
+  // elementos, 20 cargas por thread numa cadeia de fma). Issa nao muda nenhum
+  // valor -- mesmos fma, mesma ordem, mesma arvore de reducao -- entao e'
+  // bit-exato e nao precisa de gate numerico, so' dos gates normais.
   float acc = 0.0f;
-  for (std::int64_t i = threadIdx.x; i < ncols; i += kRmsNormThreads) {
+  std::int64_t i = threadIdx.x;
+  for (; i + 3 * kRmsNormThreads < ncols; i += 4 * kRmsNormThreads) {
+    const float v0 = xr[i];
+    const float v1 = xr[i + kRmsNormThreads];
+    const float v2 = xr[i + 2 * kRmsNormThreads];
+    const float v3 = xr[i + 3 * kRmsNormThreads];
+    acc = fmaf(v0, v0, acc);
+    acc = fmaf(v1, v1, acc);
+    acc = fmaf(v2, v2, acc);
+    acc = fmaf(v3, v3, acc);
+  }
+  for (; i < ncols; i += kRmsNormThreads) {
     const float v = xr[i];
     acc = fmaf(v, v, acc);
   }
@@ -56,8 +73,20 @@ __global__ void l2_norm_kernel(const float *__restrict__ x, float *__restrict__ 
   const float *xr = x + row * ncols;
   float *yr = y + row * ncols;
 
+  // Mesmo tratamento do rms_norm acima: 4 cargas em voo, mesma ordem de fma.
   float acc = 0.0f;
-  for (std::int64_t i = threadIdx.x; i < ncols; i += kRmsNormThreads) {
+  std::int64_t i = threadIdx.x;
+  for (; i + 3 * kRmsNormThreads < ncols; i += 4 * kRmsNormThreads) {
+    const float v0 = xr[i];
+    const float v1 = xr[i + kRmsNormThreads];
+    const float v2 = xr[i + 2 * kRmsNormThreads];
+    const float v3 = xr[i + 3 * kRmsNormThreads];
+    acc = fmaf(v0, v0, acc);
+    acc = fmaf(v1, v1, acc);
+    acc = fmaf(v2, v2, acc);
+    acc = fmaf(v3, v3, acc);
+  }
+  for (; i < ncols; i += kRmsNormThreads) {
     const float v = xr[i];
     acc = fmaf(v, v, acc);
   }
