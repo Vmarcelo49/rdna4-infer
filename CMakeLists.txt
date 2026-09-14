@@ -201,3 +201,20 @@ if(EXISTS "/opt/rocm/include")
   target_include_directories(bench-attn-gpu PRIVATE /opt/rocm/include)
 endif()
 target_link_libraries(bench-attn-gpu PRIVATE ${AMDHIP64})
+
+# ---------------------------------------------------------------------------
+# feat/mtp — the NextN / MTP draft block (blk.64): structure, drafts, the
+# acceptance rate and speculative decoding's token-for-token equivalence with
+# plain greedy decode. Appended (never inserted) so the parallel-agent merge
+# stays trivial.
+add_executable(check-mtp-gpu tests/check_mtp_gpu.hip src/backend/gguf.cpp
+               src/backend/loader.cpp src/backend/model.cpp src/backend/unicode.cpp
+               src/backend/unicode_data.cpp src/backend/tokenizer.cpp
+               src/backend/sampler.cpp)
+target_compile_options(check-mtp-gpu PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_link_options(check-mtp-gpu PRIVATE --offload-arch=gfx1201)
+target_include_directories(check-mtp-gpu PRIVATE include)
+if(EXISTS "/opt/rocm/include")
+  target_include_directories(check-mtp-gpu PRIVATE /opt/rocm/include)
+endif()
+target_link_libraries(check-mtp-gpu PRIVATE ${AMDHIP64})

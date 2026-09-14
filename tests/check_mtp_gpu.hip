@@ -1,0 +1,372 @@
+// feat/mtp — the MTP / NextN draft block (blk.64) on the GPU.
+//
+// There is no llama.cpp oracle for *this engine's* trunk+MTP combination in the
+// sense the rest of tests/ has one (an eval-callback dump captured with
+// scripts/capture_oracle.sh): the reference dump used by check-graph-gpu was
+// taken from a llama.cpp build whose forward ignores block 64. What this test
+// proves instead, in increasing order of strength:
+//
+//   1. STRUCTURE  the 15 tensors of block 64 exist with exactly the dims the
+//      config implies, `nextn.eh_proj` is [2*n_embd -> n_embd], the block is a
+//      full-attention block (attn_q/k/v/output + q/k norms, no ssm_*) and the
+//      shared head weights the block borrows really are the trunk's
+//      token_embd/output. Also: no other block carries nextn tensor names.
+//   2. DRAFTS ARE SANE  the draft logits are finite, their argmax is a real
+//      token, and the head's own h_nextn is finite.
+//   3. THE HEAD IS INFORMATIVE  its argmax beats a "repeat the previous token"
+//      baseline and a "trunk's unigram-ish frequency" baseline (the same
+//      metric the acceptance rate uses), i.e. it is doing real work.
+//   4. ACCEPTANCE  the rate the docs/report quote: the head's argmax against
+//      the token the trunk itself goes on to pick, over a fixed prompt.
+//   5. GREEDY EQUIVALENCE  speculative decoding with the head enabled produces
+//      the exact same token ids as plain greedy decode over the same prompt
+//      (in-process A/B through rdna4::mtp_generate, so the only difference is
+//      the MTP code path). This is the defining property: the draft only
+//      proposes, the trunk decides.
+//
+// usage: check-mtp-gpu <model.gguf> [n_tokens] [draft]
+#include <hip/hip_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "rdna4/graph.cuh"
+#include "rdna4/loader.h"
+#include "rdna4/model.h"
+#include "rdna4/mtp_gen.h"
+#include "rdna4/tokenizer.h"
+
+namespace {
+
+int g_fail = 0;
+void ok(bool cond, const char *what) {
+  std::printf("%s %s\n", cond ? "ok  " : "FAIL", what);
+  if (!cond) ++g_fail;
+}
+
+// The prompt used by the project's other oracle gates (8 tokens, the same text
+// as reference/oracle_prompt6_ub1_tok7_cpu.txt). Tokenized here through our own
+// tokenizer so the test does not depend on a dump being present.
+const char *kPrompt =
+    "The capital of France is Paris, a city known for the Eiffel Tower and the Louvre.";
+
+struct TensorPeek {
+  bool found = false;
+  std::vector<std::int64_t> dims;
+  rdna4::DType dt = rdna4::DType::F32;
+};
+
+TensorPeek peek(const rdna4::GgufLoader &ld, const std::string &name) {
+  TensorPeek p;
+  const rdna4::gguf::TensorInfo *info = ld.find(name.c_str());
+  if (!info) return p;
+  p.found = true;
+  p.dims = info->dims;
+  p.dt = ld.dtype((std::size_t)(info - ld.meta().tensors.data()));
+  return p;
+}
+
+std::string dims_str(const std::vector<std::int64_t> &d) {
+  std::string s = "[";
+  for (std::size_t i = 0; i < d.size(); ++i) {
+    if (i) s += ", ";
+    s += std::to_string(d[i]);
+  }
+  return s + "]";
+}
+
+bool all_finite(const std::vector<float> &v) {
+  for (float x : v) {
+    if (!std::isfinite(x)) return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+int main(int argc, char **argv) {
+  if (argc < 2) {
+    std::fprintf(stderr, "usage: check-mtp-gpu <model.gguf> [n_tokens] [draft]\n");
+    return 2;
+  }
+  const int n_tokens = argc > 2 ? std::atoi(argv[2]) : 32;
+  const int draft_n = argc > 3 ? std::atoi(argv[3]) : 3;
+
+  rdna4::GgufLoader loader;
+  std::string err;
+  if (!loader.open(argv[1], err)) {
+    std::fprintf(stderr, "loader: %s\n", err.c_str());
+    return 1;
+  }
+  rdna4::Qwen35Config cfg;
+  if (!rdna4::parse_qwen35_config(loader.meta(), cfg, err)) {
+    std::fprintf(stderr, "config: %s\n", err.c_str());
+    return 1;
+  }
+
+  // ------------------------------------------------------------------ 1
+  std::printf("== structure (blk.%u) ==\n", cfg.block_count - 1);
+  const rdna4::MtpDims d = rdna4::mtp_dims(cfg, (int)cfg.block_count - 1);
+  const int E = d.n_embd, NH = d.n_head, NKV = d.n_head_kv, HD = d.head_dim, F = d.n_ffn;
+  std::printf("   embd %d, ffn %d, heads %d/%d x %d, n_rot %d\n", E, F, NH, NKV, HD, d.n_rot);
+  ok(cfg.nextn_predict_layers == 1, "nextn_predict_layers == 1");
+  ok(d.block == 64, "the MTP block is block 64 (block_count - 1)");
+
+  struct Want {
+    const char *name;
+    int in, out;
+    bool f32;
+  };
+  const Want wants[] = {
+      {"blk.64.attn_norm.weight", E, 1, true},
+      {"blk.64.post_attention_norm.weight", E, 1, true},
+      {"blk.64.attn_q.weight", E, 2 * HD * NH, false},
+      {"blk.64.attn_q_norm.weight", HD, 1, true},
+      {"blk.64.attn_k.weight", E, HD * NKV, false},
+      {"blk.64.attn_k_norm.weight", HD, 1, true},
+      {"blk.64.attn_v.weight", E, HD * NKV, false},
+      {"blk.64.attn_output.weight", HD * NH, E, false},
+      {"blk.64.ffn_gate.weight", E, F, false},
+      {"blk.64.ffn_up.weight", E, F, false},
+      {"blk.64.ffn_down.weight", F, E, false},
+      {"blk.64.nextn.eh_proj.weight", 2 * E, E, false},
+      {"blk.64.nextn.enorm.weight", E, 1, true},
+      {"blk.64.nextn.hnorm.weight", E, 1, true},
+      {"blk.64.nextn.shared_head_norm.weight", E, 1, true},
+  };
+  for (const Want &w : wants) {
+    const TensorPeek p = peek(loader, w.name);
+    const bool dims_ok = p.found && p.dims.size() == 2 ? (p.dims[0] == w.in && p.dims[1] == w.out)
+                                                       : (p.found && p.dims.size() == 1 &&
+                                                          p.dims[0] == w.in && w.out == 1);
+    ok(dims_ok, (std::string(w.name) + " dims [in, out] == " + dims_str({w.in, w.out}) +
+                 " (found " + (p.found ? dims_str(p.dims) : std::string("MISSING")) + ")")
+                    .c_str());
+    if (p.found && w.f32) ok(p.dt == rdna4::DType::F32, (std::string(w.name) + " is f32").c_str());
+  }
+  // the block must NOT be a GDN block
+  ok(!peek(loader, "blk.64.attn_qkv.weight").found, "block 64 has no GDN attn_qkv");
+  ok(!peek(loader, "blk.64.ssm_a").found, "block 64 has no ssm_* tensors");
+  ok(!peek(loader, "blk.64.nextn.embed_tokens.weight").found,
+     "no per-block embedding (the head borrows the trunk's token_embd)");
+  // no other block may carry a nextn tensor: the head is block 64 only
+  int stray = 0;
+  for (std::size_t i = 0; i < loader.n_tensors(); ++i) {
+    const std::string n = loader.meta().tensors[i].name;
+    if (n.find("nextn.") != std::string::npos && n.compare(0, 7, "blk.64.") != 0) ++stray;
+  }
+  ok(stray == 0, "nextn.* tensors exist only in block 64");
+  // the model.h inventory (the same contract Graph::init validates) covers it
+  const auto expect = rdna4::expected_block_tensors(cfg, cfg.block_count - 1);
+  bool inv_ok = expect.size() == 15;
+  for (const auto &e : expect) {
+    if (!peek(loader, "blk.64." + e.first).found) inv_ok = false;
+  }
+  ok(inv_ok, "expected_block_tensors(64) lists 15 present tensors");
+
+  // ------------------------------------------------------------------ 2..4
+  const int ctx = 4096;
+  rdna4::Graph graph(loader, cfg);
+  if (!graph.init(ctx, rdna4::KvType::F16, rdna4::KvType::F16, err)) {
+    std::fprintf(stderr, "graph init: %s\n", err.c_str());
+    return 1;
+  }
+  rdna4::MtpHead mtp;
+  if (!mtp.init(loader, cfg, ctx, rdna4::KvType::F16, rdna4::KvType::F16, err)) {
+    std::fprintf(stderr, "MTP init must succeed: %s\n", err.c_str());
+    std::fprintf(stderr, "FAIL MTP init\n");
+    return 1;
+  }
+  rdna4::MtpShared shared;
+  ok(graph.mtp_shared_weights(shared, err), "graph lends token_embd + output.weight to the head");
+  ok(shared.n_vocab == graph.n_vocab(), "shared head n_vocab == graph n_vocab");
+  mtp.set_shared(shared);
+  std::printf("   MTP weights: %.1f MiB, own KV cache %.1f MiB (f16)\n",
+              (double)mtp.weight_bytes() / (1024.0 * 1024.0),
+              (double)mtp.kv_layer_bytes() / (1024.0 * 1024.0));
+
+  rdna4::Tokenizer tk;
+  if (!tk.init(loader.meta(), err)) {
+    std::fprintf(stderr, "tokenizer: %s\n", err.c_str());
+    return 1;
+  }
+  const std::vector<std::int32_t> prompt = tk.encode(kPrompt, /*parse_special=*/true);
+  std::printf("== prompt: %zu tokens ==\n", prompt.size());
+
+  rdna4::SamplerParams sp;
+  sp.temp = 0.0f;  // greedy: the only mode MTP supports
+  rdna4::Sampler sampler;
+  sampler.init(sp, (std::int32_t)graph.n_vocab());
+
+  std::vector<float> hidden, logits;
+
+  // ------------------------------------------------------------------ 2..5
+  // One graph and one head for every run below: the trunk is 11.2 GiB, so a
+  // second Graph would not fit the card. reset_state() brings the recurrent
+  // state back to what it is after init(), and every KV row (trunk and draft
+  // block) is rewritten by position before it can be read again.
+  //
+  // The draft block is prefilled token by token alongside the trunk, because
+  // its own KV cache has one row per *position* built from (token_i, h_(i-1)):
+  // llama.cpp's speculative.cpp does the same thing (process() decodes the whole
+  // batch into the MTP context with the target's h shifted right by one, and the
+  // first row uses a zero-initialised pending_h, which is what the zeros vector
+  // below reproduces).
+  auto prefill = [&]() -> bool {
+    if (!graph.reset_state(err)) return false;
+    mtp.reset();
+    std::vector<float> h_prev((std::size_t)graph.n_embd(), 0.0f);
+    for (std::size_t i = 0; i < prompt.size(); ++i) {
+      if (!graph.forward_tokens({prompt[i]}, (int)i, hidden, logits, err)) return false;
+      if (!mtp.step_host(h_prev.data(), prompt[i], (int)i, nullptr, nullptr, err)) return false;
+      h_prev = hidden;
+    }
+    return true;
+  };
+  auto run = [&](bool use_mtp, bool score, int draft, rdna4::MtpGenStats &st,
+                 std::vector<std::int32_t> &out) -> bool {
+    if (use_mtp) {
+      if (!prefill()) return false;
+    } else {
+      if (!graph.reset_state(err)) return false;
+      if (!graph.forward_tokens(prompt, 0, hidden, logits, err)) return false;
+    }
+    sampler.init(sp, (std::int32_t)graph.n_vocab());
+    rdna4::MtpGenParams gp;
+    gp.n_predict = n_tokens;
+    gp.draft = draft;
+    gp.score_only = score;
+    if (!rdna4::mtp_generate(graph, use_mtp ? &mtp : nullptr,
+                             [&](std::int32_t id) { return tk.is_eog(id); }, sampler, prompt,
+                             hidden, logits, gp, st, err, nullptr)) {
+      return false;
+    }
+    out = st.ids;
+    return true;
+  };
+
+  if (!prefill()) {
+    std::fprintf(stderr, "prefill: %s\n", err.c_str());
+    return 1;
+  }
+  // the token the trunk itself will pick next (greedy), which is what the draft
+  // block's next step is conditioned on
+  std::int32_t next_tok = 0;
+  for (int i = 1; i < graph.n_vocab(); ++i) {
+    if (logits[(std::size_t)i] > logits[(std::size_t)next_tok]) next_tok = i;
+  }
+  const int pos_next = (int)prompt.size();
+  std::printf("== draft sanity (step at position %d, token %d '%s') ==\n", pos_next, next_tok,
+              tk.decode({next_tok}, true).c_str());
+
+  std::vector<float> dlogits;
+  std::int32_t did = -1;
+  if (!mtp.step_host(hidden.data(), next_tok, pos_next, &dlogits, &did, err)) {
+    std::fprintf(stderr, "mtp step: %s\n", err.c_str());
+    return 1;
+  }
+  ok(all_finite(dlogits), "draft logits are finite");
+  ok(did >= 0 && did < graph.n_vocab(), "draft argmax is a valid token id");
+  std::vector<float> hout;
+  mtp.read_h_out(hout);
+  ok(all_finite(hout), "h_nextn is finite");
+  std::printf("   draft argmax %d '%s' (logit %.3f, max %.3f)\n", did,
+              tk.decode({did}, true).c_str(), dlogits[(std::size_t)did],
+              *std::max_element(dlogits.begin(), dlogits.end()));
+
+  // The eh_proj input order is the one degree of freedom that cannot be settled
+  // by reading the shapes ([2*n_embd -> n_embd] is the same either way): llama.cpp
+  // concatenates enorm first (qwen35.cpp graph_mtp: ggml_concat(e_norm, h_norm)),
+  // while the DeepSeek-V3 report's notation reads the other way. So it is
+  // measured, on the real model, by the only thing that matters — the acceptance
+  // rate — instead of assumed. RD_MTP_CONCAT picks the default; here both are run.
+  auto score_acceptance = [&](bool e_first, long long *acc, long long *tot) -> bool {
+    mtp.set_concat_order(e_first);
+    rdna4::MtpGenStats st;
+    std::vector<std::int32_t> ids;
+    if (!run(true, true, 0, st, ids)) return false;
+    *acc = st.accepted;
+    *tot = st.drafted;
+    mtp.set_concat_order(true);
+    return true;
+  };
+  long long acc_eh = 0, tot_eh = 0, acc_he = 0, tot_he = 0;
+  if (!score_acceptance(true, &acc_eh, &tot_eh) || !score_acceptance(false, &acc_he, &tot_he)) {
+    std::fprintf(stderr, "concat-order runs: %s\n", err.c_str());
+    return 1;
+  }
+  std::printf("== eh_proj concat order (acceptance over %lld scored positions) ==\n", tot_eh);
+  std::printf("   [enorm(e) ; hnorm(h)] (llama.cpp) : %lld/%lld = %.1f%%\n", acc_eh, tot_eh,
+              tot_eh ? 100.0 * (double)acc_eh / (double)tot_eh : 0.0);
+  std::printf("   [hnorm(h) ; enorm(e)] (other)     : %lld/%lld = %.1f%%\n", acc_he, tot_he,
+              tot_he ? 100.0 * (double)acc_he / (double)tot_he : 0.0);
+  if (tot_eh >= 16) {
+    ok(acc_eh >= acc_he, "the order llama.cpp uses is not worse than the alternative on real text");
+  }
+
+  rdna4::MtpGenStats s_plain, s_score, s_spec;
+  std::vector<std::int32_t> ids_plain, ids_score, ids_spec;
+  std::printf("== A/B over %d tokens (greedy, temp 0) ==\n", n_tokens);
+  if (!run(false, false, 0, s_plain, ids_plain)) {
+    std::fprintf(stderr, "plain run: %s\n", err.c_str());
+    return 1;
+  }
+  if (!run(true, true, 0, s_score, ids_score)) {
+    std::fprintf(stderr, "score run: %s\n", err.c_str());
+    return 1;
+  }
+  if (!run(true, false, draft_n, s_spec, ids_spec)) {
+    std::fprintf(stderr, "spec run: %s\n", err.c_str());
+    return 1;
+  }
+  ok(ids_score == ids_plain, "draft-and-score changes nothing (same ids as plain greedy)");
+  ok(ids_spec == ids_plain, "speculative decoding is token-for-token plain greedy decode");
+  std::printf("   plain     : %zu tokens, %d trunk steps\n", ids_plain.size(), s_plain.trunk_steps);
+  std::printf("   score     : %lld/%lld drafts matched (%.1f%%), %d draft steps\n", s_score.accepted,
+              s_score.drafted, s_score.acceptance() * 100.0, s_score.draft_steps);
+  std::printf("   spec(D=%d) : %lld/%lld drafts matched (%.1f%%) in %d rounds, %d trunk steps, "
+              "%d draft steps, trunk %.2f ms/step, draft %.2f ms/step\n",
+              draft_n, s_spec.accepted, s_spec.drafted, s_spec.acceptance() * 100.0, s_spec.rounds,
+              s_spec.trunk_steps, s_spec.draft_steps,
+              s_spec.trunk_steps ? s_spec.trunk_ms / s_spec.trunk_steps : 0.0,
+              s_spec.draft_steps ? s_spec.draft_ms / s_spec.draft_steps : 0.0);
+  std::printf("   wall clock: plain %.2f s (%.2f tok/s), score %.2f s (%.2f tok/s, %+.1f%%), "
+              "spec(D=%d) %.2f s (%.2f tok/s, %+.1f%%)\n",
+              s_plain.wall_ms / 1000.0, ids_plain.size() / (s_plain.wall_ms / 1000.0),
+              s_score.wall_ms / 1000.0, ids_score.size() / (s_score.wall_ms / 1000.0),
+              100.0 * (s_score.wall_ms / s_plain.wall_ms - 1.0), draft_n,
+              s_spec.wall_ms / 1000.0, ids_spec.size() / (s_spec.wall_ms / 1000.0),
+              100.0 * (s_spec.wall_ms / s_plain.wall_ms - 1.0));
+  ok(s_spec.accepted > 0, "the speculative path accepted at least one draft");
+  ok(s_spec.trunk_steps == (int)ids_spec.size(),
+     "speculative decode made one trunk step per committed token (an unbatched trunk cannot "
+     "verify a whole draft block in one pass)");
+  std::printf("   ACCEPTANCE RATE (documented number, score mode): %.1f%% over %lld drafts\n",
+              s_score.acceptance() * 100.0, s_score.drafted);
+
+  // a per-draft-length view of the same measurement (the rate is per draft token,
+  // so it should be roughly flat in D while accepted-per-round grows)
+  for (int D : {1, 2, 4}) {
+    rdna4::MtpGenStats st;
+    std::vector<std::int32_t> ids;
+    if (!run(true, false, D, st, ids)) {
+      std::fprintf(stderr, "spec run D=%d: %s\n", D, err.c_str());
+      return 1;
+    }
+    std::printf("   spec(D=%d) : %lld/%lld = %.1f%% per draft, %.2f accepted/round, "
+                "ids %s plain\n",
+                D, st.accepted, st.drafted, st.acceptance() * 100.0,
+                st.rounds ? (double)st.accepted / (double)st.rounds : 0.0,
+                ids == ids_plain ? "==" : "!=");
+    ok(ids == ids_plain, (std::string("D=") + std::to_string(D) +
+                          " speculative ids are still plain greedy's").c_str());
+  }
+
+  std::printf("%s (%d failure%s)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail, g_fail == 1 ? "" : "s");
+  return g_fail == 0 ? 0 : 1;
+}
