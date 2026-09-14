@@ -476,6 +476,20 @@ f16/fp32 vetorial **39-49 TOPS** (2 FMA/slot, *brief* §2); matriz (i8 ou f16) �
 Ou seja: **o teto da família int8 é 1,6-2× o da família f16 no pipe vetorial, e as duas estão ~30-50×
 abaixo do pipe de matriz.**
 
+**Checagem cruzada com o protótipo do P0** (`tests/bench_gemm_gpu.hip`, commit `4c88cad`, medido pelo
+coordenador — GEMM int8 com `sudot4` em `tests/bench_gemm_gpu.hip:42`, tile de registrador `RM×RN` em
+`:96-107`): **12,74e12 MAC/s em M=512** = 25,5 TOPS, ou `12,74e12/4/32 = 9,95e10` dp4a de warp/s. Com as
+2,5-3,0 instruções por dp4a da linha "int8 dp4a, num tile bom" acima, isso é `2,5-3,0e11` instruções de
+warp/s = **65-78 % dos 3,80e11 slots a 2,97 GHz** (o protótipo usa o clock de boost; a minha base de
+`3,07e11` é o clock medido de 2,4 GHz — as duas batem: o próprio bench calcula o pico dp4a como
+`4096 lanes × 2,97 GHz × 4 MAC = 48,7 T MACs/s = 97,3 TOPS`, exatamente 1,24× o meu 78,6 TOPS a 2,4 GHz).
+Leitura: **o protótipo já está a 2/3-3/4 do muro de issue da família dp4a** — e é por isso que ele para
+perto do fallback do Vulkan e não se aproxima dos 67 TOPS. (O "104 % do llama.cpp sem coopmat" do commit
+compara com a **fatia de matvec** do fallback — `478,38 × 30,2e9 × 0,837 = 1,21e13` MAC/s, contra os quais
+12,74e12 = 105 % — e não com o total do modelo, que seria 88 %; as duas contas fecham.) Daqui para cima as
+saídas são só duas, e as duas são o pipe de matriz: menos instruções por MAC (WMMA: 0,0103 por 4 MACs) ou
+mais MAC por instrução (4 096).
+
 ### 7.3 O que o A/B do Vulkan mede — e o que ele **não** mede
 
 Fato de código que muda a leitura das medições: **o Vulkan não tem caminho int8 para os tipos IQ.**

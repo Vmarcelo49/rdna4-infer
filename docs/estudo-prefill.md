@@ -91,15 +91,26 @@ Trunk = 497 tensores, 11,122 GB de pesos lidos por token (medido pelo nosso
 que concordam; o número 30,2e9 de uma versão anterior deste documento estava errado). 512
 tokens ⇒ **13,12 T MACs**.
 
-| | ms para 512 tokens | T MACs/s | TOPS (int8-equivalente) | % do pico dp4a |
+| | ms para 512 tokens | T MACs/s | ops/s (2 ops/MAC) | % do pico da instrução que usa |
 |---|---|---|---|---|
-| **nosso prefill** | 4139,7 | 3,19 | **6,4** | **6,6 %** |
-| llama.cpp, **coopmat desligado** | 1070,3 | 12,26 | **24,5** | 25,2 % |
-| llama.cpp, **coopmat ligado** | 427,9 | 30,66 | **61,3** | 126 % |
+| **nosso prefill** | 4139,7 | 3,18 | 6,4e12 | **3,3 %** do dp4a (97,4 T) |
+| llama.cpp, **coopmat desligado** | 1070,3 | 12,26 | 24,5e12 | 25 % do vetorial f16 (48,7 T) |
+| llama.cpp, **coopmat ligado** | 427,9 | 30,66 | 61,3e12 | 31 % do fp16-matriz (97,4 T) |
 
-Pico dp4a teórico deste cartão (`4096 lanes × 2,97 GHz × 4 MAC`): **48,7 T MACs/s = 97,3 TOPS**.
-O llama.cpp passa de 100 % desse pico quando usa matrix cores — é a prova aritmética de que eles
-não estão fazendo dp4a nesse caminho. E nós estamos a **6,6 %** do que o dp4a permite.
+Tetos deste cartão, por instrução (64 CU × 2,97 GHz; a frente A levantou e eu confirmei a
+aritmética — a minha versão anterior deste documento usava 4096 lanes e errava por 2×):
+
+| recurso | MAC/CU/clk | T MAC/s |
+|---|---|---|
+| FP32 vetorial (FMA) | 128 | 24,3 |
+| FP16 vetorial (`v_pk_fma_f16`) | 256 | 48,7 |
+| **INT8 vetorial (`v_dot4_i32_iu8`, o nosso)** | **512** | **97,4** |
+| FP16 matriz (WMMA/coopmat 16×16×16) | 512 | 97,4 |
+| INT8 matriz (WMMA iu8) | 1024 | 194,6 |
+
+Leitura: **dp4a e fp16-WMMA têm o mesmo teto de MAC neste cartão** — a vantagem do WMMA é *por
+instrução* (4096 MACs por emissão contra 128 de uma emissão wave32 de dp4a, 32× menos
+instruções por MAC), não por ciclo. E nós realizamos **3,3 %** do teto do dp4a que já usamos.
 
 ### Onde os nossos 6,6 % se perdem (ISA, já medido)
 
@@ -122,6 +133,15 @@ dequantizado **na LDS**, o que dá ~1,1-1,5 instruções por 4 MACs em vez de 3,
 (o inner loop é uma cadeia longa de dp4a com operandos na LDS).
 
 ## 4. O que nós não temos, em uma tabela (e é isto que foi "pulado")
+
+### O limiar que nós não temos: 8 colunas
+
+`mul_mat_vec_max_cols = 8` (`ggml-vulkan.cpp:404`, condição em `:10433`): **até 8 tokens o
+Vulkan usa o mesmo `mul_mat_vecq.comp` do decode; do 9º token em diante ele sai do GEMV e entra
+no `mul_mm` com tile 128×128** (frente A §1.1). O nosso motor usa o GEMV em lote **até N=16 e
+nunca sai dele** — `matvec_launch_batch` é a única porta do caminho em lote
+(`include/rdna4/matvec.cuh`), e o `batch_supported()`/`kMaxBatch = 16` fecham o teto. Não é um
+número mal ajustado: é a ausência do segundo kernel.
 
 | capacidade | llama.cpp Vulkan | nós | vale |
 |---|---|---|---|
