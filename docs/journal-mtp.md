@@ -283,6 +283,14 @@ Estado de partida (medido neste worktree, `build/` próprio, IQ3_S, f16 KV):
 - **R1 explica o 16K**: com o conserto da atenção dividida em lote a aceitação
   subiu de 54,9 % → **67,7 %** e o ganho virou **+14 %** em vez de −14 %. Sem esse
   diagnóstico eu teria reportado um negativo falso.
+- **O ótimo medido é D=2, não D=3** (e isso contraria a projeção do
+  `docs/medicoes-m8.md`, que apontava D=4): a 4K, D=2 dá 1,18× e D=3 dá 1,03×.
+  O motivo está na tabela: a aceitação por rascunho cai de 67,9 % (D=2) para
+  52,1 % (D=3) — os rascunhos encadeados acertam bem menos que o primeiro — e a
+  verificação cresce de 2,96 para 3,92 linhas por rodada, enquanto a fração de
+  rodadas com *rollback* sobe de 48 % para 68 %. Ou seja: cada rascunho a mais
+  custa 2,2 ms de rascunho + 0,83 ms de rebuild + uma linha de verify, e devolve
+  cada vez menos.
 - **Onde o tempo vai (4K, D=2, 27 rodadas para 64 tokens = 68,6 ms/rodada)**:
   o verify (1 `forward_batch_all` de ~3 linhas por rodada) mais o *replay* das 13
   rodadas com rejeição (48 %) domina; o rascunho custa ~4,4 ms/rodada (2 passos de
