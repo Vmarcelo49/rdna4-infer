@@ -292,12 +292,32 @@ prefill a 512 tokens seria **446 tok/s** contra os 123,4 nossos — **3,6× de e
 **0,4297 B/peso**), dequantizou para **f16 na LDS** e rodou o laço interno em `v_dot2_f32_f16` com
 acumulador f32:
 
-| M | T-MAC/s | vs o motor (3,18 T) |
-|---|---|---|
-| 16 | 4,45 | 1,40× |
-| 64 | 8,29 | 2,61× |
-| **128** | **9,23** (melhor tile: 9,79) | **2,90-3,08×** |
-| 512 | 11,73 | 3,69× |
+| M | frente F (1ª volta) | **frente G (V6, melhor medida)** | vs o motor (3,18 T) |
+|---|---|---|---|
+| 16 | 4,45 | — | 1,40× |
+| 64 | 8,29 | **9,84** | **3,1×** |
+| **128** | 9,23 (melhor tile 9,79) | **12,74** | **4,0×** |
+| 512 | 11,73 | **14,71** | **4,6×** |
+
+A frente G chegou nesses números com quatro mudanças de staging medidas isoladamente (V6 =
+ativação copiada em `int4` + prefetch dos campos do peso em registrador + duplo buffer **só do W** +
+ativação lida direto da global, fora da LDS), e **todas as variantes dão C bit a bit igual ao
+baseline** (`bitid = 0`, rel-L2 2,07e-4 contra o oráculo): nenhum ganho custou precisão. O staging
+caiu de 41-43 % para **18,3 %** do kernel em M=128 (0,50 → 0,164 ms) e a cópia da ativação deixou
+de existir.
+
+**Correção da frente G sobre a frente F, por ISA**: o dequant f16 custa **18,4 instruções por peso**
+(590 por sub-bloco de 32 por lane), não as ~55 estimadas — o staging é **22 % dos slots de issue,
+não 2 %**, e o "43× acima do teto" era artefato dessa subestimativa. Com a contagem certa, **o V6
+roda a 3,60e11 instruções de warp/s = 95 % do teto de issue do cartão**: **o caminho f16 nesta forma
+está no muro de emissão** — o que resta não é escalonamento, é *remover instrução*. Duas medidas
+apontam para onde: o **staging int8 é 1,31× mais rápido que o f16** (0,122 contra 0,159 ms em M=128,
+396 contra 590 instruções) e o **dp4a faz 4 MAC por instrução contra 2 do `dot2`**.
+
+**Lição de método registrada pela frente G** (e vale como regra da casa): *a mesma transformação de
+staging deu 1,33× numa forma e 0,18× na outra* — no caso ruim, o campo prefetchado ficava vivo
+através de um laço de ~2300 instruções com 64 acumuladores e a ISA mostrava **413 `scratch_*`**
+(spill) contra 0 na forma boa.
 
 | achado | número |
 |---|---|

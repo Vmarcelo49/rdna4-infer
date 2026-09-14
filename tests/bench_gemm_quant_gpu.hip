@@ -793,11 +793,9 @@ void launch_v2_one(const dim3 grid, const int th, const __half *dA, const block_
     if (mode == 0)                                                                            \
       launch_v2_one<BM, 128, 64, RM, 8, STG_, 0>(grid0, th, dA, dW, dC, N, K, regs, lds, occ); \
     else if (mode == 1)                                                                       \
-      launch_v2_one<BM, 128, 64, RM, 8, STG_, 1>(grid0, th, dA, dW, dC, N, K, nullptr, nullptr, \
-                                                 nullptr);                                    \
+      launch_v2_one<BM, 128, 64, RM, 8, STG_, 1>(grid0, th, dA, dW, dC, N, K, regs, lds, occ); \
     else if (mode == 3)                                                                       \
-      launch_v2_one<BM, 128, 64, RM, 8, STG_, 3>(grid0, th, dA, dW, dC, N, K, nullptr, nullptr, \
-                                                 nullptr);                                    \
+      launch_v2_one<BM, 128, 64, RM, 8, STG_, 3>(grid0, th, dA, dW, dC, N, K, regs, lds, occ); \
     break;
 
 template <int BM, int RM>
@@ -1155,21 +1153,26 @@ int main(int argc, char **argv) {
       const char *tag;
       int BM, RM, STG;
       bool i8;
+      int BN;
+      bool orig;  // true = o kernel ORIGINAL da frente F (comparacao direta)
     };
     static const V vs[] = {
-        {"V0  base", 128, 8, 0, false},
-        {"V1  avec", 128, 8, 1, false},
-        {"V2  avec+pf", 128, 8, 3, false},
-        {"V3  avec+pf+dbuf", 128, 8, 7, false},
-        {"V4  avec+ag", 128, 8, 9, false},
-        {"V5  avec+pf+ag", 128, 8, 11, false},
-        {"V6  avec+pf+db+ag", 128, 8, 15, false},
-        {"I8  int8 x f16 (so' W)", 128, 8, 9, true},
-        {"V0  base     BM64", 64, 4, 0, false},
-        {"V2  avec+pf  BM64", 64, 4, 3, false},
-        {"V5  avec+pf+ag BM64", 64, 4, 11, false},
-        {"V6  pf+db+ag BM64", 64, 4, 15, false},
-        {"V0  base (repete)", 128, 8, 0, false},
+        {"F   frente F (original)", 128, 8, 0, false, 128, true},
+        {"V0  base", 128, 8, 0, false, 128, false},
+        {"V1  avec", 128, 8, 1, false, 128, false},
+        {"V2  avec+pf", 128, 8, 3, false, 128, false},
+        {"V3  avec+pf+dbuf", 128, 8, 7, false, 128, false},
+        {"V4  avec+ag", 128, 8, 9, false, 128, false},
+        {"V5  avec+pf+ag", 128, 8, 11, false, 128, false},
+        {"V6  avec+pf+db+ag", 128, 8, 15, false, 128, false},
+        {"V7  V6 com BN=136", 128, 8, 15, false, 136, false},
+        {"I8  int8 x f16 (so' W)", 128, 8, 9, true, 128, false},
+        {"V0  base     BM64", 64, 4, 0, false, 128, false},
+        {"V2  avec+pf  BM64", 64, 4, 3, false, 128, false},
+        {"V5  avec+pf+ag BM64", 64, 4, 11, false, 128, false},
+        {"V6  pf+db+ag BM64", 64, 4, 15, false, 128, false},
+        {"V0  base (repete)", 128, 8, 0, false, 128, false},
+        {"F   frente F (repete)", 128, 8, 0, false, 128, true},
     };
     std::printf("\n== 5. FRENTE G: A/B do staging (mesma janela, mesmo processo) ==\n");
     std::printf(
@@ -1195,22 +1198,39 @@ int main(int argc, char **argv) {
       std::size_t g_lds = 0;
 
       auto run_v2 = [&](const V &v, const int mode) -> bool {
-        const int th = (v.BM / v.RM) * 16;  // TN = 128/8 = 16
-        const dim3 g((unsigned)(N / 128), (unsigned)((M + v.BM - 1) / v.BM), 1u);
+        const int th = (v.BM / v.RM) * (v.BN / 8);  // TN = BN/RN, RN=8
+        const dim3 g((unsigned)(N / v.BN), (unsigned)((M + v.BM - 1) / v.BM), 1u);
         int regs = 0, occ = 0;
         std::size_t lds = 0;
-        if (v.BM == 128) {
+        if (v.orig) {
+          launch_cfg<128, 128, 64, 8, 8>(mode, g, 256, dA, Wblk, dC, (int)N, (int)K);
+          if (mode == 0) {
+            hipFuncAttributes a{};
+            if (hipFuncGetAttributes(
+                    &a, (const void *)gemm_iq3s_f16_kernel<128, 128, 64, 8, 8, 0, false>) ==
+                hipSuccess) {
+              g_regs = a.numRegs;
+              g_lds = a.sharedSizeBytes;
+            }
+            int nb = 0;
+            if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &nb, gemm_iq3s_f16_kernel<128, 128, 64, 8, 8, 0, false>, 256, 0) == hipSuccess) {
+              g_occ = nb;
+            }
+          }
+          return launch_ok("gemm_iq3s_f16 (frente F)");
+        } else if (v.BN == 136) {
+          launch_v2_bn136(mode, g, dA, Wblk, dC, (int)N, (int)K, &regs, &lds, &occ);
+        } else if (v.BM == 128) {
           launch_v2<128, 8>(v.STG, mode, g, th, dA, Wblk, dC, (int)N, (int)K, &regs, &lds, &occ);
         } else if (v.BM == 64) {
           launch_v2<64, 4>(v.STG, mode, g, th, dA, Wblk, dC, (int)N, (int)K, &regs, &lds, &occ);
         } else {
           return false;
         }
-        if (mode == 0) {
-          g_regs = regs;
-          g_lds = lds;
-          g_occ = occ;
-        }
+        g_regs = regs;
+        g_lds = lds;
+        g_occ = occ;
         return launch_ok("gemm_v2");
       };
       auto timeit = [&](const V &v, const int mode) {
@@ -1253,7 +1273,7 @@ int main(int argc, char **argv) {
         const int m_tiles = (M + v.BM - 1) / v.BM;
         const double wts = (double)N * (double)K * (double)m_tiles;
         std::printf("%5d %-19s %4d %5d %9.1f %4d %10.3f %9s %9.3f %6.1f %9.1f %7.0f %8.2e\n", M,
-                    v.tag, (v.BM / v.RM) * 16, regs, (double)lds / 1024.0, occ, t0,
+                    v.tag, (v.BM / v.RM) * (v.BN / 8), regs, (double)lds / 1024.0, occ, t0,
                     v.i8 ? "   (n/a)" : std::to_string(tmacs).c_str(), t1, 100.0 * t1 / t0,
                     wts / (t1 * 1e-3) / 1e9, mx, rel_l2);
         std::fflush(stdout);

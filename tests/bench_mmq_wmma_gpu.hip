@@ -258,6 +258,15 @@ __global__ void __launch_bounds__(WMW * WNK * 32) gemm_wmma_i8_kernel(
     }
   float sink = 0.0f;
 
+  // MODE 4 = miolo isolado: o staging acontece UMA vez e a conta roda K/BK
+  // vezes sobre a MESMA LDS sem staging e sem barreira. O total de MAC e' o
+  // mesmo do GEMM (M*N*K), entao a taxa e' comparavel direto -- e' a medicao
+  // que separa "quanto custa o miolo" de "quanto custa alimentar o miolo" sem
+  // depender de subtracao entre modos.
+  if (mode == 4) {
+    stage_tile(0, 0);
+    __syncthreads();
+  }
   for (int k0 = 0, buf = 0; k0 < K; k0 += BK, buf ^= 1) {
     // ATENCAO: com DBUF=false existe UM buffer, entao o indice tem de ser 0 --
     // deixar `buf` alternar aqui escreveria fora do array de LDS (bug real
@@ -266,18 +275,18 @@ __global__ void __launch_bounds__(WMW * WNK * 32) gemm_wmma_i8_kernel(
     if constexpr (DBUF) {
       // Pipeline de software: o staging de k+BK e' emitido ANTES da conta de k,
       // e as duas barreiras por iteracao viram uma.
-      if (k0 + BK < K) stage_tile(cb ^ 1, k0 + BK);
+      if (k0 + BK < K && mode != 4) stage_tile(cb ^ 1, k0 + BK);
     }
     if (mode == 0 || mode == 1) {
       stage_tile(cb, k0);
     } else if (mode == 2) {
       stage_a_only(cb, k0);
-    } else {
+    } else if (mode == 3) {
       stage_w_only(cb, k0);
     }
     __syncthreads();
 
-    if (mode == 0) {
+    if (mode == 0 || mode == 4) {
 #pragma unroll
       for (int kk = 0; kk < BK / 16; ++kk) {
         i32x2_t af[MT], bf[NT];
@@ -361,7 +370,7 @@ __global__ void __launch_bounds__(WMW * WNK * 32) gemm_wmma_i8_kernel(
     if (!DBUF) __syncthreads();
   }
 
-  if (mode == 0) {
+  if (mode == 0 || mode == 4) {
     // C no layout do acumulador (D transposto): cada lane escreve 8 linhas de m
     // na mesma coluna n; os 16 lanes de n consecutivo escrevem 64 B contiguos.
 #pragma unroll
@@ -1117,53 +1126,76 @@ int main(int argc, char **argv) {
   // ---- 4. PICO na mesma janela -------------------------------------------
   EvPair ev;
   double peak_wmma = 0, peak_dp4a = 0;
+  int *d_i = nullptr;
   {
-    int *d_i = nullptr;
     const int threads = 256;  // 8 warps por CTA
-    const int ctas[] = {32, 64, 128, 256};
-    const std::size_t maxth = (std::size_t)256 * threads;
-    if (hipMalloc(&d_i, maxth * sizeof(int)) != hipSuccess) return 1;
-    auto cell = [&](const int which, const char *name, const double macs_per_warp_iter) {
-      double best_of_all = 0;
-      int best_ctas = 0, best_iters = 0;
-      double best_ms = 0;
-      for (int ct : ctas) {
-        auto launch = [&](const int iters) {
-          if (which == 0) peak_loop_kernel<8, 8, 0><<<ct, threads>>>(iters, d_i);
-          else peak_loop_kernel<8, 8, 1><<<ct, threads>>>(iters, d_i);
-        };
-        launch(20);
-        (void)hipDeviceSynchronize();
-        const double t1 = std::max(1e-6, ev([&] { launch(20); }) / 20.0);
-        const int iters = (int)std::max(50.0, 4.0 / t1);
-        double best = 1e9;
-        for (int r = 0; r < 5; ++r) best = std::min(best, ev([&] { launch(iters); }));
-        // `ct` CTAs x 8 warps: MAC/s = MAC por warp por iteracao x nwarps x iters / t
-        const double per_s = macs_per_warp_iter * (double)ct * 8.0 * iters / (best * 1e-3);
-        std::printf("  pico %s CTAs=%-4d (U=8, 8 cadeias, iters=%d): %.3f ms -> %.2f T-MAC/s\n",
-                    name, ct, iters, best, per_s / 1e12);
-        if (per_s > best_of_all) {
-          best_of_all = per_s;
-          best_ctas = ct;
-          best_iters = iters;
-          best_ms = best;
-        }
-      }
-      std::printf("  pico %s MELHOR: CTAs=%d, iters=%d, %.3f ms -> %.2f T-MAC/s\n", name, best_ctas,
-                  best_iters, best_ms, best_of_all / 1e12);
-      return best_of_all;
-    };
-    std::printf("\n== 2/4. pico remedido nesta janela ==\n");
-    peak_wmma = cell(0, "WMMA int8 16x16x16", 8.0 * 8.0 * 4096.0);
-    peak_dp4a = cell(1, "dp4a              ", 8.0 * 8.0 * 128.0);
-    if (!launch_ok("peak loops")) return 1;
-    std::printf("  razao pico WMMA/dp4a nesta janela: %.2fx (frente D, outra janela: 4,2x)\n",
-                peak_wmma / peak_dp4a);
-    (void)hipFree(d_i);
+    if (hipMalloc(&d_i, (std::size_t)256 * threads * sizeof(int)) != hipSuccess) return 1;
   }
+  // A DPM desta placa leva centenas de ms para subir: a frente F mediu a PRIMEIRA
+  // celula de um processo ~47 % mais lenta que as seguintes, e a primeira versao
+  // desta bancada mediu o pico em janelas de 0,3-0,6 ms logo apos a verificacao --
+  // o que da' um "pico" baixo e um "% do pico" alto demais. Agora: aquecimento
+  // longo, janela de ~4 ms e remedicao no fim (as duas no mesmo escopo, para
+  // nada capturar lambda local por referencia depois que ela morre).
+  const int kCtas[] = {32, 64, 128, 256};
+  auto peak_cell = [&](const int which, const char *name, const double macs_per_warp_iter) {
+    const int threads = 256;
+    double best_of_all = 0;
+    int best_ctas = 0, best_iters = 0;
+    double best_ms = 0;
+    for (int ct : kCtas) {
+      auto launch = [&](const int iters) {
+        if (which == 0) peak_loop_kernel<8, 8, 0><<<ct, threads>>>(iters, d_i);
+        else peak_loop_kernel<8, 8, 1><<<ct, threads>>>(iters, d_i);
+      };
+      // Calibracao iterativa: uma unica estimativa a partir de um lancamento
+      // curto erra quando a DPM ainda esta' subindo (medido: uma celula saiu com
+      // 0,065 ms de janela e 36,6 T-MAC/s, contra 49,0 T-MAC/s na mesma
+      // geometria com janela de 2,5 ms). Aqui a janela e' forcada para ~4 ms.
+      int iters = 200;
+      for (int c = 0; c < 4; ++c) {
+        launch(iters);
+        (void)hipDeviceSynchronize();
+        const double t = std::max(1e-6, ev([&] { launch(iters); }));
+        if (t > 2.0 && t < 8.0) break;
+        iters = (int)std::min(400000.0, std::max(50.0, (double)iters * 4.0 / t));
+      }
+      double w = 0;  // aquecimento na MESMA geometria que sera' medida
+      for (int i = 0; i < 400 && w < 150.0; ++i) w += ev([&] { launch(iters); });
+      double best = 1e9;
+      for (int r = 0; r < 7; ++r) best = std::min(best, ev([&] { launch(iters); }));
+      const double per_s = macs_per_warp_iter * (double)ct * 8.0 * iters / (best * 1e-3);
+      std::printf("  pico %s CTAs=%-4d (U=8, 8 cadeias, iters=%d): %.3f ms -> %.2f T-MAC/s\n", name,
+                  ct, iters, best, per_s / 1e12);
+      if (per_s > best_of_all) {
+        best_of_all = per_s;
+        best_ctas = ct;
+        best_iters = iters;
+        best_ms = best;
+      }
+    }
+    std::printf("  pico %s MELHOR: CTAs=%d, iters=%d, %.3f ms -> %.2f T-MAC/s\n", name, best_ctas,
+                best_iters, best_ms, best_of_all / 1e12);
+    return best_of_all;
+  };
+  auto peak_warm = [&] {
+    const int threads = 256;
+    double w = 0;
+    for (int i = 0; i < 400 && w < 400.0; ++i) {
+      w += ev([&] { peak_loop_kernel<8, 8, 0><<<256, threads>>>(200, d_i); });
+    }
+    return w;
+  };
+  std::printf("\n== 2/4. pico remedido nesta janela ==\n");
+  std::printf("  (aquecimento de pico: %.0f ms de GPU)\n", peak_warm());
+  peak_wmma = peak_cell(0, "WMMA int8 16x16x16", 8.0 * 8.0 * 4096.0);
+  peak_dp4a = peak_cell(1, "dp4a              ", 8.0 * 8.0 * 128.0);
+  if (!launch_ok("peak loops")) return 1;
+  std::printf("  razao pico WMMA/dp4a nesta janela: %.2fx (frente D, outra janela: 4,2x)\n",
+              peak_wmma / peak_dp4a);
   if (peak_only) {
     (void)hipFree(dW); (void)hipFree(dAf); (void)hipFree(dAQ); (void)hipFree(dC); (void)hipFree(dC2);
-    (void)hipFree(dLut);
+    (void)hipFree(dLut); (void)hipFree(d_i);
     return 0;
   }
   g_C = dC;
@@ -1262,6 +1294,8 @@ int main(int argc, char **argv) {
       const double t_gemm = t_of(0, 0);
       const double t_stage = t_of(1, 0);
       const double t_nocorr = t_of(0, 1);
+      const double t_core = t_of(4, 0);    // miolo isolado (WMMA + correcao)
+      const double t_core_nc = t_of(4, 1);  // miolo isolado sem a correcao
       g_C = dC2;
       auto fn_d = [&] { (void)launch_dp4a(kD, M, N, K, 0, 0, false); };
       fn_d();
@@ -1289,9 +1323,23 @@ int main(int argc, char **argv) {
                   t_gemm - t_stage, macs / ((t_gemm - t_stage) * 1e-3) / 1e12);
       std::printf("        correcao (t_gemm - t_nocorr) %.3f ms = %.0f%% do GEMM\n",
                   t_gemm - t_nocorr, 100.0 * (t_gemm - t_nocorr) / t_gemm);
+      std::printf("        miolo isolado (modo 4, sem staging): %.3f ms -> %.2f T-MAC/s = %.1f%% do "
+                  "pico; sem correcao %.3f ms -> %.2f T-MAC/s = %.1f%% do pico; correcao = %.0f%% "
+                  "do miolo\n",
+                  t_core, macs / (t_core * 1e-3) / 1e12, 100.0 * (macs / (t_core * 1e-3)) / peak_wmma,
+                  t_core_nc, macs / (t_core_nc * 1e-3) / 1e12,
+                  100.0 * (macs / (t_core_nc * 1e-3)) / peak_wmma,
+                  100.0 * (t_core - t_core_nc) / t_core);
     }
   }
 
+  {
+    std::printf("\n== 3b. pico remedido no FIM da corrida (deriva de DPM dentro da janela) ==\n");
+    const double p2 = peak_cell(0, "WMMA int8 (fim)   ", 8.0 * 8.0 * 4096.0);
+    std::printf("  pico WMMA: inicio %.2f T-MAC/s, fim %.2f T-MAC/s -> fim/inicio = %.2fx (o '%% do "
+                "pico' da tabela usa o do INICIO)\n",
+                peak_wmma / 1e12, p2 / 1e12, p2 / peak_wmma);
+  }
   std::printf(
       "\n== 4/4. referencias (mesma maquina; a janela de cada uma esta' no doc) ==\n"
       "  nosso prefill hoje (matvec em lote) .............. 3,0-3,2 T-MAC/s\n"
