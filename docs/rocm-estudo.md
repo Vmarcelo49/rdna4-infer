@@ -430,6 +430,7 @@ limitado por paralelismo. Medido (`bench --start-pos`, IQ3_S, f16, 32 tokens, 3 
 | 4K f16, `RD_ATTN_SPLITS` | default (1) | 2 | 4 | **8** | 16 |
 |---|---|---|---|---|---|
 | decode | 23,95 tok/s | 25,80 | 27,01 | **27,54** | 27,01 |
+| decode (re-medido no binário final) | 23,48 | — | — | **26,92 (+14,7%)** | — |
 
 e no kernel (`bench-attn-gpu f16 4096`): sem split 0,334-0,346 ms/camada contra
 0,0717 ms com 4 splits e WPB=16 (**4,7×**) — 16 camadas ⇒ 5,4 → 1,1 ms/token.
