@@ -258,267 +258,29 @@ ativação**, e são exatamente os 496 que o profiler conta. Nosso número de ma
 
 | fonte | ms por chunk de 16 | ms/token | comando |
 |---|---|---|---|
-| profiler nível 2, N=64 | **117,8** (7,362×16) | 7,362 | `bench-phases-gpu --prefill 64 --level 2` |
-| bench isolado, N=16 | **110,70** | 6,92 | `bench-matvec-shapes-gpu --batch 16 --reps 3` |
-| diferença | **+7,1 ms (+6,4 %)** | +0,44 | |
+| profiler nível 2, N=64 (corrida 1, janela ocupada) | **117,8** (7,362×16) | 7,362 | `bench-phases-gpu --prefill 64 --level 2` |
+| profiler nível 2, N=128 (corrida 2) | **113,6** (7,103×16) | 7,103 | `bench-phases-gpu --prefill 128 --level 2` |
+| bench isolado, N=16 | **110,70** | 6,92 | `bench-matvec-shapes-gpu --batch 16 --reps 3` (corrida de hoje: 111,64) |
+| diferença (corrida 2 × isolado) | **+2,9 ms (+2,6 %)** | +0,19 | |
 
-**Não há discrepância a explicar, e é isso o achado:** o matvec dentro do grafo custa 6,4 %
-mais que o mesmo inventário lançado back-to-back. O que sobra (6,4 %) é coerente com a
-diferença de staging: no grafo cada chunk intercala 305 matvecs com ~120 outros kernels, então
-a Infinity Cache (que o bench isolado aproveita ao varrer os mesmos tensores em sequência) é
-evictada entre projeções. A leitura direta das bandas: 11,133 GB / 117,8 ms = **94,5 GB/s** no
-grafo contra 11,133 GB / 110,70 ms = **100,5 GB/s** no isolado.
+**Não há discrepância a explicar, e é esse o achado:** o matvec dentro do grafo custa 2,6 % a
+6,4 % mais que o mesmo inventário lançado back-to-back, dependendo da janela. As duas corridas
+de nível 2 não concordam entre si (7,362 contra 7,103 ms/token = 3,6 %) porque a primeira
+rodou com a fila do `flock` cheia (7 waiters, VRAM de outro processo em 11,4-13,0 GB) e a
+passada limpa dela deu 115,76 tok/s contra 121,29 tok/s da segunda. **O número bom é
+7,103 ms/token** e o desvio contra o isolado cai para 2,6 %, que é o piso de ruído do
+harness. A leitura direta das bandas: 11,133 GB / 113,6 ms = **98,0 GB/s** no grafo contra
+11,133 GB / 110,70 ms = **100,5 GB/s** no isolado.
 
-**E o número que o briefing pede, o 85,6 %:** o profiler dá **83,7 %** (7,362 de 8,795 da
-instrumentada) ou **85,2 %** (7,362 de 8,638 da passada limpa do mesmo harness). O 85,6 % vinha
-de `110,70 ms × 32 chunks = 3,542 s` sobre `4,14 s`; a medição **dentro do grafo** dá
-`117,8 ms × 32 = 3,770 s` sobre `4,174 s` = **90,3 %**. As duas versões estão certas, medem
-coisas diferentes: 85,6 % é a fração do **custo mínimo** do matvec isolado; 90,3 % é a fração
-do **custo real** dele dentro do prefill. A diferença de 4,7 pontos percentuais é
-**inteiramente** o staging (+6,4 % no kernel), não andaime.
+**E o número que o briefing pede, o 85,6 %:** o profiler dá **83,7 %** nas duas corridas de
+nível 2 (7,362/8,795 e 7,103/8,486 — a razão é mais estável que os valores absolutos), ou
+**82,4 %** contra a passada limpa da mesma corrida (7,103/8,620 no N=128). O 85,6 % do
+briefing vinha de `110,70 ms × 32 chunks = 3,542 s` sobre `4,14 s`; a medição **dentro do
+grafo** dá `113,6 ms × 32 = 3,635 s` sobre `4,174 s` = **87,1 %**. As duas versões estão
+certas e medem coisas diferentes: 85,6 % é a fração do **custo do kernel isolado**; 87,1 % é a
+fração do **custo dele dentro do prefill**. **O 85,6 % está confirmado dentro do grafo, com
+1,5 ponto de diferença, e essa diferença é o staging do matvec, não andaime** — o andaime
+medido (§6) é 0,74-1,28 ms/token, e 3,635 s + 32×0,74 ms = 3,659 s ≠ 4,174 s; os 515 ms que
+sobram são o próprio matvec rodando mais devagar dentro do grafo.
 
-### 3.3 O matvec é realmente sublinear no tamanho do chunk? (destravar N > 16)
 
-`matvec_launch_batch` (`include/rdna4/matvec.cuh:1002-1013`) só instancia N ∈ {2,3,4,8,16}:
-**`kMaxBatch = 16` é um teto de compilação, não um ótimo medido**. Para transformar "vale a pena
-chunk maior?" numa medida, o kernel **idêntico** (`matvec_kernel_batch`, traits `TIQ3S_S` das
-tabelas de `include/rdna4/tuning.h`) foi instanciado para N ∈ {8,16,24,32,48,64} num binário
-scratch (`/tmp/scratch/mb_batch_n2.hip`, fora do motor), com a forma real de
-`blk.*.ffn_down.weight` (17408×5120, 5,99 GB):
-
-```
-./scripts/gpu-lock.sh timeout 900 /tmp/scratch/mb_batch_n2 3
-```
-
-<!--MB_BATCH_N2-->
-
----
-
-## 4. Despacho: quantos lançamentos, quanto custam, e quanto as fusões do Vulkan tirariam
-
-### 4.1 Contagem por camada (código)
-
-Todo helper de lançamento (`rms_norm_launch` `nn.cuh:238`, `unary_launch` `:250`,
-`mul_launch` `:257`, `add_launch` `:264`, `add_bcast_launch` `:279`, `mul_bcast_launch` `:287`,
-`l2_norm_launch` `:244`, `rope_launch` `attn.cuh:56`, `dequant_row_launch`
-`dequant_row.cuh:65-118`, `conv1d_state_batch_launch` `gdn.cuh:337`,
-`delta_rule_batch_launch` `gdn.cuh:429`, `deinterleave_q_gate_batch_launch` `gdn.cuh:463`) faz
-**exatamente 1 lançamento**. `attn_batch_launch` (`attn.cuh:423`) faz 1 (o eixo dos tokens é
-`gridDim.y`, `attn.cuh:417-419`); `attn_split_batch_launch` (`attn.cuh:887-891`) faz 2
-(kernel + merge) e só é usado quando `splits > 1`, o que a 512 tokens **não acontece**
-(`kAttnSplitMin = tuned::kAttnSplitMin = 512`, `tuning.h:101`; `attn_splits_for(512) = 512/512
-= 1`, `graph.cuh:426-428` — e o bench imprime `1 splits`).
-
-Por **chunk de 16** (`forward_batch_layer`, `graph.cuh:1032-1340`; `forward_batch`,
-`graph.cuh:1344-1425`):
-
-| bloco | lançamentos | × | total |
-|---|---|---|---|
-| embeddings (`forward_batch:1383`, 1 dequant por token) | 1 | 16 tokens | **16** |
-| camada de atenção não-recorrente: `attn_norm`, `dequant/quantize` ×2, deinterleave, rms_norm q, rms_norm k, rope q, rope k, `kv_write`, `attn_batch`, sigmoid, mul, residual, post_norm, silu, mul | 20 | 16 camadas | **320** |
-| camada GDN: `attn_norm`, 4× (quantize+matvec), 3 escalares, conv1d, l2_norm, delta_rule, ssm_norm, silu, mul, residual, post_norm, silu, mul | 12 | 48 camadas | **576** |
-| cabeça: `output_norm`, `finish_argmax` | 2 | 1 | **2** |
-| **total por chunk** | | | **914** |
-| cauda de cada chunk: `quantize_q8_1` + `matvec` do LM head (`graph.cuh:1416`), 1 × `hipMemcpy` | 2 | 1 | **2** |
-| **total real por chunk** | | | **~916** |
-
-`--count-only` confirma o andaime de marcas (42,0 marcas/token = **672 marcas por chunk**,
-`phases.log` N=512), e a conta por camada fecha exatamente: 10 marcas/camada × 64 = 640, mais
-`embed` + `out_norm` + `head` + `token_end` = 644, mais 28 de `attn_out_proj` (`:1142`/
-`:1331`; o bucket `ffn_down` a jusante absorve as marcas de `proj_batch`) = 672.
-
-### 4.2 O custo do despacho
-
-- Piso medido nesta máquina, na mesma corrida: **2,253 µs por kernel vazio enfileirado**
-  (o briefing cita 2,6-3,5 µs de `bench-matvec-shapes-gpu`; a diferença é o harness e o
-  estado de DPM).
-- 916 lançamentos × 2,253 µs = **2,06 ms por chunk**; 32 chunks × = **66 ms** para a prompt de
-  512 tokens.
-- Sobre o prefill medido de **4.174 ms** (122,66 tok/s): **1,58 %**.
-- Com o piso mais pessimista de 3,5 µs: 916 × 3,5 µs × 32 = **102,6 ms = 2,46 %**.
-
-### 4.3 Quantos lançamentos as fusões nomeadas do Vulkan tirariam do NOSSO grafo
-
-Padrões de `ggml_backend_vk_graph_compute` (`ggml-vulkan/ggml-vulkan.cpp:18149-18327`) que
-existem no nosso grafo batido com `forward_batch_layer`:
-
-| padrão Vulkan | file:line (llama.cpp) | onde no nosso grafo (file:line) | lançamentos que saem por chunk |
-|---|---|---|---|
-| `MUL_MAT_ADD` | `ggml-vulkan.cpp:18165` | residual pós-`attn_output` / pós-`ssm_out` (`graph.cuh:1316`) e pós-`ffn_down` (`graph.cuh:1334`) | 2 × 64 = **128** |
-| `SIGMOID_MUL` | `:18228-18237` | `sigmoid(attn_gate)·attn` (`graph.cuh:1137-1138`), `silu(z)·v` do GDN (`graph.cuh:1254-1255`) | 2 × 16 + 2 × 48 = **128** |
-| `SILU_MUL` | `:18228-18237` | `silu(ffn_gate)·ffn_up` (`graph.cuh:1329-1330`) | 2 × 64 = **128** |
-| `RMS_NORM_MUL` (`RMS_NORM_MUL_ADD_MUL` na versão com resíduo) | `:18203-18227` | `attn_norm`/`attn_post_norm`/`ssm_norm` (a normalização e o seu consumo) | 2 × 64 + 1 × 48 = **176** |
-| `ROPE_VIEW_SET_ROWS` | `:18251-18258` | `rope(k)` + `kv_write_batch` (`graph.cuh:1076,1080`) | **16** |
-| `RMS_NORM_MUL_ROPE_VIEW_SET_ROWS` | `:18182-18193` | `rms_norm(k)` + `rope(k)` + escrita no cache (`graph.cuh:1069,1076,1080`) | **16** |
-| `SSM_CONV_SILU` / `SSM_CONV_BIAS_SILU` | `:18238-18250` | `conv1d_state_batch` + silu (`graph.cuh:1232-1233,1254`) | **48** |
-
-**Total: 640 lançamentos por chunk sairiam**, de 916 para **276** (−70 %). Em ms:
-640 × 2,253 µs = **1,44 ms por chunk**, 46 ms por prompt de 512 = **1,1 % do prefill**.
-
-Ou seja: **a fusão nomeada do Vulkan, copiada inteira, vale 1,1 % do nosso prefill.** O
-argumento de que o Vulkan ganha por fazer menos despachos **não sobrevive à conta**: mesmo
-zerando *todos* os 916 lançamentos por chunk, o teto é 2,06 ms/chunk = 66 ms = 1,58 % do
-prefill. O que o Vulkan ganha está no **kernel** de matmul (GEMM tiled com staging em LDS e,
-para 22 % dos bytes, int8), não na orquestração.
-
----
-
-## 5. Atenção e GDN: quanto cada caminho custa no prefill
-
-Atenção = 16 camadas (`i = 3, 7, ..., 63`); GDN = 48 camadas (`is_recr`, `graph.cuh:300-302`).
-Não há bucket "atenção total": os buckets são transversais. Separação por bucket + contagem de
-camadas, com os números de nível 1 a N=64 (as marcas por token já dizem quantas camadas cada
-bucket cobre):
-
-| caminho | buckets | ms/token | % do total (8,233) |
-|---|---|---|---|
-| **atenção (16 camadas)** | `qkv_proj` 0,351 + `qk_norm_rope_kv` 0,032 + `attention` 0,031 + `attn_gate_out` 0,012 + `attn_out_proj` 0,216 | **0,642** | **7,8 %** |
-| **GDN/SSM (48 camadas)** | `gdn_proj` 1,342 + `gdn_scalars` 0,052 + `gdn_conv` 0,051 + `gdn_l2norm` 0,072 + `gdn_delta` 0,625 + `gdn_norm_silu` 0,052 + `gdn_out_proj` 0,630 | **2,824** | **34,3 %** |
-| FFN (64 camadas, dos dois tipos) | `ffn_gate_up` 2,818 + `ffn_down` 1,705 | **4,523** | **54,9 %** |
-| comum às 64 camadas | `post_norm` 0,076 + `ffn_residual` 0,164 | **0,240** | **2,9 %** |
-| | | **8,229** | 100,0 % |
-
-- **Atenção: 0,642 ms/token (7,8 %)**, dos quais 0,567 é projeção (q/k/v/out) e **0,031 ms
-  = 0,4 % é o kernel de atenção propriamente dito**. A atenção não é o problema do prefill a
-  512 tokens. (A 2048 o `count-only` mostra `splits = 4` e o custo por chunk sobe de 128,1
-  para 131,7 ms; a 4096 a atenção começa a pesar — a curva de 8,02 a 8,57 ms/token do §1.1.)
-- **GDN: 2,824 ms/token (34,3 %)**, dos quais 1,972 é projeção (`gdn_proj` + `gdn_out_proj`) e
-  **0,852 ms/token (10,3 %) é a recorrência propriamente dita** (`gdn_delta` 0,625 +
-  `gdn_l2norm` 0,072 + `gdn_conv` 0,051 + `gdn_scalars` 0,052 + `gdn_norm_silu` 0,052).
-- **Não houve ablação por `--layers`**: o `bench --layers N` existe (`src/main.hip:277`) mas é
-  um diagnóstico do caminho por token; num prefill em lote ele só trunca o número de camadas e
-  não separa tipos de camada, e o modelo não tem flag para pular as recorrentes. A separação
-  acima é **medida** pelos buckets (que somam 1,0 ao total) e pela contagem de camadas — não é
-  estimativa.
-
----
-
-## 6. O que NÃO é matvec: o custo que o lote não amortizou
-
-Tudo abaixo é **por token** (não por chunk): o lote de 16 amortiza a leitura do peso e a
-quantização de ativação, mas essas fases rodam o mesmo número de vezes por token, dentro de um
-chunk ou fora dele. Números de `--prefill 64 --level 1` (todos os buckets com marcas/token ≥ 1
-por camada), com o custo de matvec removido:
-
-| fase | ms/token | % do prefill | por que não amortiza |
-|---|---|---|---|
-| `gdn_delta` | **0,641** | 7,3 % | é a recorrência: `delta_rule_batch_rows_kernel` (`gdn.cuh:429-444`) tem o laço de tokens **dentro** do kernel, uma passada por token, dependente |
-| `act_quant` | **0,227** | 2,6 % | 190 `quantize_q8_1_batch` por chunk = 11,9 por token, cada uma sobre `n×ncols` elementos |
-| `ffn_residual` | **0,095** | 1,1 % | `add` sobre n×5120 por camada |
-| `post_norm` | **0,076** | 0,9 % | `add` + `rms_norm` sobre n×5120 por camada |
-| `gdn_l2norm` | **0,073** | 0,8 % | 2 `l2_norm` por camada GDN |
-| `gdn_norm_silu` | **0,066** | 0,8 % | `rms_norm` + `silu`·`mul` |
-| `gdn_scalars` | **0,053** | 0,6 % | `sigmoid`, `softplus`, `mul` — elementos de `nvh = 48` por token |
-| `gdn_conv` | **0,050** | 0,6 % | `conv1d_state_batch` |
-| `qk_norm_rope_kv` | **0,044** | 0,5 % | 2 `rms_norm`, 2 `rope`, escrita do KV |
-| `attention` | **0,032** | 0,4 % | 1 kernel, contexto cresce |
-| `attn_gate_out` | **0,012** | 0,1 % | `sigmoid` + `mul` |
-| **total não-matvec** | **1,369** | **16,6 %** | (a N=64; a 512 mede-se 0,79 ms/token — ver adiante) |
-
-E o total do prefill decomposto em dois pedaços, com o matvec medido **dentro do grafo**:
-
-| N | prefill total | matvec (nível 2) | % | resto | % |
-|---|---|---|---|---|---|
-| 64 | 8,638 ms/token (limpa) | 7,362 | 85,2 % | 1,276 | 14,8 % |
-| 512 | 8,104 ms/token (limpa) | 7,362 (do N=64) | 90,8 % | 0,742 | 9,2 % |
-
-O matvec do nível 2 a N=512 não pôde ser medido direto: o nível 2 com `--prefill 512` cria
-460 800 `hipEvent_t` e o próprio harness recusa (`"(passada instrumentada pulada: N=512 cria
-460800 hipEvent_t; use N<=128)"`, `bench_phases_gpu.hip:741-744`). O menor não-matvec medido
-**dentro do grafo** é 0,742 ms/token (resíduo de 8,104 − 7,362) e a soma dos buckets de nível 1
-a N=64 dá 1,276 ms/token. A diferença entre os dois é o staging do matvec: a N=64 os buckets de
-projeção incluem 0,527 ms/token de andaime de projeção (silu·mul, quantizações) que a N=512
-está contada dentro do bucket.
-
-**Os três maiores custos por token que fusão ou batching poderiam remover:**
-
-1. **`gdn_delta` — 0,641 ms/token (7,3 %)**. É 1 kernel por camada com laço de tokens dentro
-   (48 por chunk), lendo e escrevendo 3,1 MB de estado por camada; já é batido, mas é
-   sequencial por construção. Fusão não ajuda; um algoritmo de scan paralelo ajudaria.
-2. **`act_quant` — 0,227 ms/token (2,6 %)**. 190 lançamentos por chunk, cada um re-quantizando
-   blocos de 32. Candidato direto a fusão com o matvec (quantizar dentro do kernel, como o MMQ
-   faz) ou a cache por (buffer, geração).
-3. **`qk_norm_rope_kv` + `attention` + `attn_gate_out` — 0,088 ms/token (1,1 %)**, que a fusão
-   `RMS_NORM_MUL_ROPE_VIEW_SET_ROWS` + `SIGMOID_MUL` do Vulkan tocaria.
-
-Somados: **0,956 ms/token = 11,6 %** do prefill a 512 (sobre 8,104). Nenhum deles é o gap.
-
----
-
-## 7. Atribuição do gap
-
-### 7.1 O gap de 9,0× do briefing é de micro-lote, e isso está medido
-
-| configuração | tok/s | ms/token | razão contra nós |
-|---|---|---|---|
-| nós, `--prefill 512` | 123,39 | 8,104 | 1,00× |
-| llama.cpp Vulkan, `-ub 16 -b 16` | 200,25 | 4,994 | **1,62×** |
-| llama.cpp Vulkan, default (`b 2048`, `ub 512`) | 1168,49 | 0,856 | 9,47× |
-| llama.cpp Vulkan, corrida do briefing | 1113,96 | 0,898 | 9,03× |
-
-O mesmo binário, a mesma máquina, o mesmo modelo, a mesma sessão: o que muda entre a linha 2 e
-a linha 3 é `-b/-ub`. **O llama.cpp perde 5,84× ao processar 16 tokens por vez; nós não temos
-como perder, porque 16 é o nosso teto.** A pergunta certa deixa de ser "por que 9×" e passa a
-ser "por que 1,62×".
-
-### 7.2 O que resta dos 1,62× (e o que não resta)
-
-| componente | nosso (ms/token) | llama.cpp implícito (ms/token) | delta | origem de cada célula |
-|---|---|---|---|---|
-| **matvec/projeções (305 por chunk)** | **7,362** | ≤ 4,99 | ≥ **+2,37** | nosso: *medido* (nível 2, `--prefill 64`). llama: *derivado* (200,25 tok/s ⇒ 4,994 ms/token é o total dele; a projeção é parte disso) |
-| `act_quant` (190 lançamentos/chunk) | 0,227 | ≤ 0,1 | ~+0,13 | nosso: *medido*. llama: *desconhecido* (MMQ quantiza dentro do kernel; não há como medir sem profiler) |
-| `gdn_delta` + `gdn_conv` + `gdn_l2norm` + `gdn_scalars` + `gdn_norm_silu` | 0,883 | ≤ 0,3 | ~+0,58 | nosso: *medido*. llama: *desconhecido* |
-| `attention` (16 camadas, 1 split a 512) | 0,032 | *desconhecido* | — | nosso: *medido*. llama: sem número |
-| norms/resíduos (`post_norm`, `ffn_residual`) | 0,240 | *desconhecido* | — | *medido* nosso; *desconhecido* dele |
-| despacho (916 lançamentos × 2,253 µs) | 2,06 ms **por chunk** = **0,129 ms/token** | *desconhecido* (mas o teto do ganho em qualquer direção é ≤ 0,13 ms/token) | ≤ 0,13 | nosso: *medido* (piso do kernel vazio + contagem de código). dele: *desconhecido* |
-| gordura do intervalo medido (`0,79` do §6 vs `7,362`) | — | — | — | *derivado* |
-| **total** | **8,104** (*medido*) | **4,994** (*medido*) | **+3,11** | |
-
-**A atribuição em uma frase:** dos 3,11 ms/token de diferença contra um llama.cpp no mesmo
-micro-lote, **≥2,37 ms (76 %) é o matvec** e o resto (≤0,74 ms) é andaime — mas o delta do
-andaime **não é medível** do lado do llama.cpp sem profiler, e as fusões dele (a explicação
-usual) valem no máximo 1,1 % do nosso prefill por medição própria (§4.3). Do gap de 9,0×,
-**7,25 ms/token (89 %) é a diferença de tamanho de micro-lote** (512 tokens por
-`llama_decode` contra 16 por `forward_batch`), e **1,62× é o que sobra para o kernel**.
-
-### 7.3 O que a banda diz sobre o matvec (aritmética, para não confundir com medição)
-
-- 305 matvecs por chunk leem 11,133 GB de pesos (`bench-phases-gpu` imprime exatamente esse
-  número, "lidos por token 11.133 GB"). Isso é **11,133 GB por chunk de 16**, não por token.
-- No grafo: 11,133 GB / 117,8 ms = **94,5 GB/s efetivos** (dados do próprio tensor, sem contar
-  a releitura da ativação).
-- Isolado: 11,133 / 110,70 ms = **100,5 GB/s**.
-- Piso de roofline medido nesta placa: **633 GB/s** (`docs/medicoes-banda-e-gargalos.md`
-  §2.4). Ou seja, o matvec em lote usa **16 % da banda disponível** e o caminho por token usa
-  79-82 % — o lote amortiza a leitura do peso entre 16 tokens e ao mesmo tempo **multiplica por
-  16 o trabalho de ALU por byte**, ficando limitado por issue/latência e não por banda
-  (`docs/journal-lote.md` Medidas 1-4, todas refutando as alternativas).
-- **DERIVADO**: com o matvec a 100,5 GB/s e o resto do prefill igual, o teto do prefill deste
-  motor com este kernel é `11,133/(0,1005) + 0,742 ms` por chunk de 16 = 111,5 + 11,9 =
-  **123,4 ms/chunk = 129,6 tok/s**. Medimos 123,39 tok/s. **O motor está a 5 % do teto do
-  próprio kernel.**
-
----
-
-## 8. O que não foi medido, e por quê
-
-1. **A 9,0× da tabela do briefing não tem contraparte no mesmo micro-lote em nenhuma direção**:
-   o `llama-bench` não tem flag para forçar 16 tokens por `llama_decode` *e* medir o `pp512`
-   como 512 tokens lógicos — o `-ub 16` faz 32 chamadas de 16, que é o nosso caso, mas aí o
-   número dele (200,25) já é outro. Não existe um "9,0× comparável"; existe 1,62×.
-2. **O orçamento interno do lado do llama.cpp é desconhecido**: `rocprof`/`rocprofv3`/`omniperf`
-   não estão instalados nesta máquina (só `rocminfo`), e o backend Vulkan não expõe eventos HIP.
-   As colunas "llama.cpp" de §7.2 são derivadas do total, não medidas.
-3. **Nível 2 a 512 tokens não é executável**: o harness recusa por criar 460 800 `hipEvent_t`.
-   O nível 2 existe só até N=128 (§2.2), e a extrapolação para 512 usa o matvec medido a 64
-   (7,362 ms/token) — o prefill limpo medido a 512 (8,104) é o denominador.
-4. **A ablação por `--layers` para separar atenção de GDN não é possível com o que existe**: o
-   modelo não tem flag para pular as 48 camadas recorrentes, e `--layers N` corta as primeiras
-   N camadas, não um tipo. A separação de §5 é por bucket + contagem de camadas (medida, mas
-   não ablada por subtração).
-5. **`mb_batch_n` (v1) faultou** com *Memory access fault ... Page not present* por VRAM sendo
-   drenada de outro processo no instante da alocação; a v2 é autossuficiente (sem GGUF, sem
-   geometria de arquivo) e roda sob o mesmo lock.
-6. **Uma corrida de fase a 512 morreu no meio** (a tabela do N=512 do `phases.log` inicial não
-   saiu; o log mostra a corrida de 128 e depois o `--count-only`). O número de 512 que está no
-   texto é do `--count-only` e do `bench --prefill`, os dois concordando em 0,5 %.

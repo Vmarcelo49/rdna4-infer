@@ -467,7 +467,8 @@ template <int BM, int WARPS, bool F16>
 __global__ void gemm_kernel(const int8_t *__restrict__ A, const float *__restrict__ da,
                             const int8_t *__restrict__ W, const float *__restrict__ dw,
                             float *__restrict__ C, int M, int N, int K) {
-  constexpr int BN = 64, BK = 32, STRIDE = 40;
+  constexpr int BN = 64, BK = 64;          // BK = 64 = 2 blocos de quant por estagio
+  constexpr int STRIDE = F16 ? (BK + 8) : (BK + 8);  // halves p/ f16, bytes p/ int8
   constexpr int nMT = BM / 16, nNT = BN / 16;
   constexpr int warps_per_mt = WARPS / nMT;
   constexpr int nnt = nNT / warps_per_mt;
@@ -476,10 +477,13 @@ __global__ void gemm_kernel(const int8_t *__restrict__ A, const float *__restric
                 "geometria de warp invalida");
   using ST = typename std::conditional<F16, _Float16, int8_t>::type;
 
-  __shared__ __align__(16) ST sA[BM * STRIDE];
-  __shared__ __align__(16) ST sW[BN * STRIDE];
-  __shared__ float sda[BM];
-  __shared__ float sdw[BN];
+  // pintu-fase (double buffering): o staging do estagio seguinte e' emitido
+  // ANTES do compute do atual, e a barreira no topo do laco garante que o
+  // buffer que vamos reescrever ja' foi consumido por todos os warps.
+  __shared__ __align__(16) ST sA[2][BM * STRIDE];
+  __shared__ __align__(16) ST sW[2][BN * STRIDE];
+  __shared__ float sda[2][BM];
+  __shared__ float sdw[2][BN];
 
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
@@ -491,6 +495,7 @@ __global__ void gemm_kernel(const int8_t *__restrict__ A, const float *__restric
   const int mt = warp % nMT;
   const int nt0 = (warp / nMT) * nnt;
   const int nKD = K / 32;
+  const int nStage = nKD / 2;  // 2 blocos de 32 por estagio
 
   float facc[nnt][8];
 #pragma unroll
@@ -498,73 +503,78 @@ __global__ void gemm_kernel(const int8_t *__restrict__ A, const float *__restric
 #pragma unroll
     for (int j = 0; j < 8; ++j) facc[t][j] = 0.0f;
 
-  for (int kb = 0; kb < nKD; ++kb) {
-    __syncthreads();
-    // --- staging cooperativo: BM*32 B de A e 64*32 B de W ---
-    for (int idx = tid; idx < BM * 4; idx += WARPS * 32) {
-      const int m = idx >> 2, g = idx & 3;
+  auto stage = [&](int buf, int kb0) {
+    // A: BM linhas x 64 B; W: 64 linhas x 64 B; 8 B por chunk
+    for (int idx = tid; idx < BM * 8; idx += WARPS * 32) {
+      const int m = idx >> 3, g = idx & 7;
       const bool ok = (m0 + m) < M;
-      const uint2 u = ok ? *(const uint2 *)(A + (size_t)(m0 + m) * K + kb * BK + g * 8)
+      const int koff = g * 8;
+      const uint2 u = ok ? *(const uint2 *)(A + (size_t)(m0 + m) * K + kb0 * BK + koff)
                          : make_uint2(0u, 0u);
-      const float s = ok ? da[(size_t)(m0 + m) * nKD + kb] : 0.0f;
+      const float s = ok ? da[(size_t)(m0 + m) * nKD + kb0 * 2 + (koff >> 5)] : 0.0f;
       if constexpr (F16) {
-        _Float16 *dst = sA + m * STRIDE + g * 8;
+        _Float16 *dst = sA[buf] + m * STRIDE + koff;
         const int8_t *q = (const int8_t *)&u;
 #pragma unroll
         for (int e = 0; e < 8; ++e) dst[e] = (_Float16)((float)q[e] * s);
       } else {
-        *(uint2 *)(sA + m * STRIDE + g * 8) = u;
+        *(uint2 *)(sA[buf] + m * STRIDE + koff) = u;
       }
     }
-    for (int idx = tid; idx < BN * 4; idx += WARPS * 32) {
-      const int n = idx >> 2, g = idx & 3;
+    for (int idx = tid; idx < BN * 8; idx += WARPS * 32) {
+      const int n = idx >> 3, g = idx & 7;
       const bool ok = (n0 + n) < N;
-      const uint2 u = ok ? *(const uint2 *)(W + (size_t)(n0 + n) * K + kb * BK + g * 8)
+      const int koff = g * 8;
+      const uint2 u = ok ? *(const uint2 *)(W + (size_t)(n0 + n) * K + kb0 * BK + koff)
                          : make_uint2(0u, 0u);
-      const float s = ok ? dw[(size_t)(n0 + n) * nKD + kb] : 0.0f;
+      const float s = ok ? dw[(size_t)(n0 + n) * nKD + kb0 * 2 + (koff >> 5)] : 0.0f;
       if constexpr (F16) {
-        _Float16 *dst = sW + n * STRIDE + g * 8;
+        _Float16 *dst = sW[buf] + n * STRIDE + koff;
         const int8_t *q = (const int8_t *)&u;
 #pragma unroll
         for (int e = 0; e < 8; ++e) dst[e] = (_Float16)((float)q[e] * s);
       } else {
-        *(uint2 *)(sW + n * STRIDE + g * 8) = u;
+        *(uint2 *)(sW[buf] + n * STRIDE + koff) = u;
       }
     }
-    if (tid < BM) sda[tid] = (m0 + tid < M) ? da[(size_t)(m0 + tid) * nKD + kb] : 0.0f;
-    if (tid >= 128 - BN && tid < 128) {
-      const int n = tid - (128 - BN);
-      sdw[n] = (n0 + n < N) ? dw[(size_t)(n0 + n) * nKD + kb] : 0.0f;
+    for (int i = tid; i < 2 * BM; i += WARPS * 32) {
+      const int b = i / BM, m = i % BM;
+      sda[buf][m] = (m0 + m < M) ? da[(size_t)(m0 + m) * nKD + kb0 * 2 + b] : 0.0f;
     }
+    for (int i = tid; i < 2 * BN; i += WARPS * 32) {
+      const int b = i / BN, n = i % BN;
+      sdw[buf][n + b * BN] = (n0 + n < N) ? dw[(size_t)(n0 + n) * nKD + kb0 * 2 + b] : 0.0f;
+    }
+  };
+
+  stage(0, 0);
+  int cur = 0;
+  for (int st = 0; st < nStage; ++st) {
     __syncthreads();
-
-    float da8[8];
+    if (st + 1 < nStage) stage(cur ^ 1, (st + 1) * 2);
 #pragma unroll
-    for (int j = 0; j < 8; ++j) da8[j] = F16 ? 0.0f : sda[mt * 16 + 8 * hi + j];
-
-    int32_t iacc[nnt][8];
-#pragma unroll
-    for (int t = 0; t < nnt; ++t)
-#pragma unroll
-      for (int j = 0; j < 8; ++j) iacc[t][j] = 0;
-
-#pragma unroll
-    for (int h = 0; h < 2; ++h) {
-      const int k0 = h * 16;
+    for (int q = 0; q < 4; ++q) {  // 4 k16 por estagio; a correcao cai em q=1 e q=3
+      const int kb = (q >> 1);     // bloco de 32 dentro do estagio
+      const int k0 = (q & 1) * 16;
       i32x2_t af;
       f16x8_t aff;
       if constexpr (F16) {
-        aff = *reinterpret_cast<const f16x8_t *>(sA + (mt * 16 + lo) * STRIDE + k0 + 8 * hi);
+        aff = *reinterpret_cast<const f16x8_t *>(sA[cur] + (mt * 16 + lo) * STRIDE + kb * 32 + k0 + 8 * hi);
       } else {
-        const int8_t *ap = sA + (mt * 16 + lo) * STRIDE + k0 + 8 * hi;
+        const int8_t *ap = sA[cur] + (mt * 16 + lo) * STRIDE + kb * 32 + k0 + 8 * hi;
         af = pack_i32x2(i32_at(ap), i32_at(ap + 4));
       }
+      int32_t iacc[nnt][8];
+#pragma unroll
+      for (int t = 0; t < nnt; ++t)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) iacc[t][j] = 0;
 #pragma unroll
       for (int t = 0; t < nnt; ++t) {
         const int nt = nt0 + t;
         if constexpr (F16) {
-          const f16x8_t bf =
-              *reinterpret_cast<const f16x8_t *>(sW + (nt * 16 + lo) * STRIDE + k0 + 8 * hi);
+          const f16x8_t bf = *reinterpret_cast<const f16x8_t *>(
+              sW[cur] + (nt * 16 + lo) * STRIDE + kb * 32 + k0 + 8 * hi);
           f32x8_t acc;
 #pragma unroll
           for (int j = 0; j < 8; ++j) acc[j] = facc[t][j];
@@ -572,26 +582,41 @@ __global__ void gemm_kernel(const int8_t *__restrict__ A, const float *__restric
 #pragma unroll
           for (int j = 0; j < 8; ++j) facc[t][j] = acc[j];
         } else {
-          const int8_t *bp = sW + (nt * 16 + lo) * STRIDE + k0 + 8 * hi;
-          const i32x2_t bf = pack_i32x2(i32_at(bp), i32_at(bp + 4));
-          i32x8_t c;
+          // dois WMMAs por bloco de 32: o segundo acumula no int32 do primeiro
+          i32x8_t c = zero_i32x8();
+          const int8_t *bp = sW[cur] + (nt * 16 + lo) * STRIDE + kb * 32 + k0 + 8 * hi;
+          c = WMMA_I8(af, pack_i32x2(i32_at(bp), i32_at(bp + 4)), c);
+          if (q == 1 || q == 3) {
+            // segunda metade do bloco de 32
+            const int8_t *bp2 = bp + 16;
+            c = WMMA_I8(af2_for(q, sA[cur], mt, STRIDE, lo, hi, kb, k0), 
+                        pack_i32x2(i32_at(bp2), i32_at(bp2 + 4)), c);
 #pragma unroll
-          for (int j = 0; j < 8; ++j) c[j] = iacc[t][j];
-          c = WMMA_I8(af, bf, c);
+            for (int j = 0; j < 8; ++j) iacc[t][j] = c[j];
+          } else {
+            // primeira metade: guarda no iacc para o segundo k16 completar
 #pragma unroll
-          for (int j = 0; j < 8; ++j) iacc[t][j] = c[j];
+            for (int j = 0; j < 8; ++j) iacc[t][j] = c[j];
+          }
+        }
+      }
+      if constexpr (!F16) {
+        if (q == 1 || q == 3) {
+          const int b = (q >> 1);
+          float da8[8];
+#pragma unroll
+          for (int j = 0; j < 8; ++j) da8[j] = sda[cur][b * BM + mt * 16 + 8 * hi + j];
+#pragma unroll
+          for (int t = 0; t < nnt; ++t) {
+            const float wsc = sdw[cur][(nt0 + t) * 16 + lo];
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+              facc[t][j] = fmaf((float)iacc[t][j], wsc * da8[j], facc[t][j]);
+          }
         }
       }
     }
-    if constexpr (!F16) {
-#pragma unroll
-      for (int t = 0; t < nnt; ++t) {
-        const float wsc = sdw[(nt0 + t) * 16 + lo];
-#pragma unroll
-        for (int j = 0; j < 8; ++j)
-          facc[t][j] = fmaf((float)iacc[t][j], wsc * da8[j], facc[t][j]);
-      }
-    }
+    cur ^= 1;
   }
 
   // escrita: slot j do lane L -> C[m = m0 + mt*16 + 8*hi + j][n = n0 + nt*16 + lo]

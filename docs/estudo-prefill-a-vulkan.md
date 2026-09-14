@@ -225,7 +225,9 @@ Medido: **478,38 tok/s contra 1196,49** — os matrix cores valem **2,5×** nest
 | IQ3_S / IQ4_XS / IQ3_XXS / IQ2_* / IQ1_S (77,6 % dos bytes) | 512 | `{tipo, F16, f16acc=true}` tile L | `matmul_<tipo>_f16_f16acc_cm1.spv` (`mul_mm.comp` + `COOPMAT`) |
 | Q*_K (quantizado, e `mul_mmq` **é** gerado para eles) | 512 | `{tipo, Q8_1}` tile L | `matmul_q4_k_q8_1.spv` (`mul_mmq.comp`, int8 de verdade) |
 | `token_embd` (saída, 1 token) | 1 | mapa mul_mat_vec | `mul_mat_vec_q5_K_...` (`MUL_MAT_VEC` na tabela medida) |
-| F32/F16 (`ssm_a`, normas) | 512 | `{F16,F16,f16acc}` | `matmul_f16_f16acc_cm1.spv` |
+
+(Não há nenhum `MUL_MAT` de F32/F16 neste grafo: as normas e o `ssm_a` são 1-D e as projeções são
+todas quantizadas.)
 
 **O mesmo chunk mistura os dois mundos**: os k-quants vão por int8/MMQ e os LUT quants (78 % dos
 bytes deste modelo) vão por fp16/coopmat. É por isso que
@@ -316,9 +318,11 @@ store_a(col, k_pair + 1, FLOAT_TYPEV2(sign&4?-v.z:v.z, sign&8?-v.w:v.w));
 * A tabela `iq3s_grid[512]` mora **na LDS** (`types.glsl:1576`: `shared uint32_t iq3s_grid[512]`),
   copiada de `iq3s_grid_const[512]` (`types.glsl:1679-1745`) por `init_iq_shmem`
   (`types.glsl:1746-1758`, chamada em `mul_mm.comp:219-221`): **2 048 B por workgroup**,
-  amortizados por 160 iterações de K. (O `iq_shmem_init.glsl` deste checkout é um stub vazio; a
-  definição que vale é a do `types.glsl`. **INFERIDO**, confirmaria compilando o shader com
-  `glslc -DDATA_A_IQ3_S`: se houvesse redefinição, o build teria falhado.)
+  amortizados por 160 iterações de K. O `iq_shmem_init.glsl` deste checkout é um stub vazio, mas
+  ele só é incluído no caminho `MULMAT_QUANT` (`mul_mm.comp:206-208`) — nos shaders por tipo
+  (o nosso caso) quem vale é a definição do `types.glsl`. **Verificado no artefato**: o SPIR-V
+  tem `OpStore` com `MakePointerAvailable` para `%iq3s_grid` (a cópia) e `OpLoad` com
+  `MakePointerVisible` no `iq3s_grid[...]` do `mul_mm_funcs.glsl:253` (o lookup).
 * **4 pesos por lookup**: índice de 9 bits (8 de `qs` + 1 de `qh`) → um `uint32` → `unpack8` →
   `vec4`.
 * Custo por thread por tile de K: `loadstride_a = 256 × LOAD_VEC_A_EFF(4) / BK(32) = 32` ⇒ o laço
@@ -479,8 +483,10 @@ aritmética** — o tile de M, não a instrução.
 * Por tipo de peso, dentro do `MUL_MAT` (ms): **iq3_s 134,5 (127 despachos)** · iq3_xxs 78,1 (77) ·
   iq4_xs 77,4 (88) · iq2_s 23,9 (21) · q3_K 20,8 (15) · iq2_xxs 14,0 (12) · iq2_xs 13,5 (12) ·
   q4_K 7,3 (23) · q2_K 4,5 (6) · q5_K 2,6 (15) · iq1_s 2,1 (2) · q8_0 1,8 (96) · q6_K/iq4_nl 0,2.
-* GFLOPS/s por despacho: 49,1-66,5e12 para `iq3_s` (o menor é o `k=17408`, o maior o
-  `12288×512×5120`); `iq4_xs` chega a 75,9e12; `q3_K` cai a 29,9e12.
+* GFLOPS/s por despacho (2ª tabela): `iq3_s` **53,4-74,0e12** (o menor é o `k=17408`, o maior o
+  `12288×512×5120`); `iq4_xs` 52,4-74,6e12; `iq3_xxs` 57,1-73,3e12; `q4_K` 48,3-63,2e12;
+  `q3_K` 43,6-52,3e12 (é o k-quant mais lento, consistente com os 208 instruções por `vec_dot`
+  que `docs/rocm-estudo.md` §B.3 mede do nosso lado).
 
 Duas leituras que interessam para a nossa fila: **`FLASH_ATTN_EXT` custa 0,4 %** e
 `GATED_DELTA_NET` 2,8 % — todo o resto do prefill desta referência é matmul. E a taxa de peso é
