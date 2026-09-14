@@ -447,13 +447,29 @@ Ordered by how much they cost the user, with the number that justifies each. Not
    anyone not spending that headroom on MTP. Note that **perplexity does not order these
    formats**: `q5_0`/`q4_0` beats `q5_0`/`q4_1` on PPL (5.932 vs 5.958) while having 23 % more
    KL and nearly double the greedy divergence — PPL is blind to this, KL is not.
-3. **MTP (block 64) is implemented and exact but does not pay yet.** The NextN head drafts at
-   86.7 % acceptance (llama.cpp's own driver: 87.5 %) and `--mtp` output is byte-identical to
-   plain greedy — but every mode still runs one trunk forward per committed token, so it
-   measures 9-10 % *slower* than plain greedy (2.24 ms draft + a full 35 ms trunk step per
-   token). The missing piece is batched verification: one `forward_batch` over
-   `[current, d1..dk]` shares the weight pass, which is where the multiplier lives. Nightly
-   front in progress; `docs/mtp.md`, `docs/medicoes-m8.md`.
+3. **MTP (block 64) now pays: 1.71-1.75× at 4K, with the output still byte-identical to
+   greedy.** The NextN head drafts at 86.7 % acceptance (llama.cpp's own driver: 87.5 %); the
+   missing piece was **batched verification**, and it is what the night built: draft `k`
+   tokens, verify all `k+1` rows in **one** `forward_batch_all` (the weight pass is shared),
+   accept the longest prefix, and roll the recurrent state back with a device-to-device
+   snapshot when a draft is rejected.
+   Measured at 4K (IQ3_S, two interleaved repetitions, identical md5 between them):
+
+   | mode | tok/s | vs greedy |
+   |---|---|---|
+   | plain greedy | 29.33 | 1.00× |
+   | `--mtp --draft 2` | **50.15** | **1.71×** |
+   | `--mtp --draft 3` | **51.47** | **1.75×** |
+   | `--mtp --draft 3 --mtp-serial` (the old path) | 25.99 | 0.89× |
+
+   The pieces that make it work are measured too: the state snapshot/restore is bit-exact
+   (`max|d| = 0`, same argmax) and costs 0.53 ms per pair; `forward_batch_all` is bit-exact
+   against the per-token path at position 4084 (row by row, `h` and logits); an extra verified
+   row costs 7.0-7.2 ms against 32.7 ms for a whole per-token step. The contrast with the
+   serial path (0.89×) is the evidence that the win comes from batching the verification and
+   not from the draft. **At 16K the number is still open** — the first measurement (0.86×) ran
+   against the split-attention kernel *before* review finding R1 was fixed, so it is being
+   re-measured. `docs/mtp.md`, `docs/medicoes-m8.md`.
 4. **Long context works but the GQA re-read is still per query head**: with a 6:1 ratio each
    K/V row is read **6 times** per token (25.77 GB of logical KV traffic at 64K against
    4.295 GB of unique bytes). The attention kernel saturates ~1.35 TB/s of L2, so the L2 hides
