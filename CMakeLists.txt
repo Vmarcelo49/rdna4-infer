@@ -271,3 +271,16 @@ add_executable(oracle-mtp tests/oracle_mtp.cpp)
 target_include_directories(oracle-mtp PRIVATE ${LLAMA_CPP_SRC}/include ${LLAMA_CPP_SRC}/ggml/include)
 target_link_libraries(oracle-mtp PRIVATE ${LLAMA_CPP_BUILD}/bin/libllama.so ${LLAMA_CPP_BUILD}/bin/libggml.so ${LLAMA_CPP_BUILD}/bin/libggml-base.so ${AMDHIP64})
 set_target_properties(oracle-mtp PROPERTIES BUILD_RPATH "${LLAMA_CPP_BUILD}")
+
+# M8 — batched prefill: bit-exactness against the per-token path + the win.
+add_executable(check-batch-gpu tests/check_batch_gpu.hip
+               src/backend/gguf.cpp src/backend/loader.cpp src/backend/model.cpp
+               src/backend/unicode.cpp src/backend/unicode_data.cpp
+               src/backend/tokenizer.cpp)
+target_compile_options(check-batch-gpu PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_link_options(check-batch-gpu PRIVATE --offload-arch=gfx1201)
+target_include_directories(check-batch-gpu PRIVATE include)
+if(EXISTS "/opt/rocm/include")
+  target_include_directories(check-batch-gpu PRIVATE /opt/rocm/include)
+endif()
+target_link_libraries(check-batch-gpu PRIVATE ${AMDHIP64})

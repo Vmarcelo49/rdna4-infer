@@ -93,7 +93,7 @@ lengths) with the exact command for every number. Headline, IQ3_S on the RX 9070
 |---|---|---|
 | decode (IQ3_S, 4K, KV f16) | 26.8 tok/s | 39.7 tok/s |
 | decode (IQ4_XS) | 27.0 tok/s | — |
-| prefill (per-token path) | 28.8 tok/s | 440 tok/s (batched) |
+| prefill (batched, N≤16) | **70.2 tok/s** (512: 69.5) | 440 tok/s (batched) |
 | effective weight bandwidth | 336 GB/s (IQ3_S) / 364 GB/s (IQ4_XS) | — |
 | perplexity (wikitext-2, 10×512 tokens, per position) | within **0.25 %** (IQ3_S) / **0.15 %** (IQ4_XS) | reference |
 | decode 64K f16 / 131K q4_0 (IQ3_S) | 18.9 / 13.0 tok/s | — |
@@ -115,6 +115,7 @@ running after a change:
 ./scripts/compare_llama_greedy.sh 32                         # greedy == llama.cpp, token by token
 ./scripts/compare_ppl.sh <model.gguf> 10                     # perplexity vs llama.cpp, per position
 ./scripts/check_attn_split.sh                                # split-KV == unsplit on real text
+./build/check-batch-gpu  <model.gguf>                         # batched prefill == per-token (bit-exact)
 ```
 
 The oracles (`build/oracle-*`) are the only binaries that link llama.cpp; they
@@ -123,11 +124,11 @@ runtime by the engine.
 
 ## Known limitations (v1)
 
-- **Prefill is not batched**: the prompt is processed one token at a time, so a long
-  prompt costs `n_tokens × decode_time` (27.9 tok/s) instead of llama.cpp's 440 tok/s.
-  Decode is at ~70 % of the reference; prefill is the gap that matters for long
-  prompts. Measured numbers and the rejected alternatives are in
-  `docs/medicoes-m5.md`.
+- **Prefill is batched up to N=16** (M8, bit-identical to the per-token path):
+  70 tok/s against llama.cpp's 440 tok/s batched. The remaining factor is the
+  `vec_dot` inner loop (issue-bound per weight byte, measured in M6), not the
+  batching — the same limit that makes MTP speculation only 1.3-1.5× worth it
+  (`docs/medicoes-m8.md`).
 - **Long context was attention-bound; that is now fixed** (M7): decode is 23.7 tok/s
   at 4K, 24.1 at 16K, 19.0 at 64K (f16 KV) and 13.2 at 131K (`q4_0`), against
   22.1/13.7/4.2/2.3 before. Vectorized cache loads, 32 warps/CTA and splitting the

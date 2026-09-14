@@ -157,6 +157,36 @@ double now_s() {
   return std::chrono::duration<double>(clock::now() - t0).count();
 }
 
+
+// ---------------------------------------------------------------------------
+// M8: batched prefill. Splits the prompt into the chunk sizes the batched kernels
+// have instantiations for (16/8/4/3/2), with single tokens for the tail. Every
+// chunk is bit-identical to processing the tokens one at a time
+// (tests/check_batch_gpu.hip asserts exactly that, including mixed chunks).
+// ---------------------------------------------------------------------------
+bool prefill_ids(rdna4::Graph &g, const std::vector<std::int32_t> &ids, std::vector<float> &hidden,
+             std::vector<float> &logits, std::string &err) {
+  static const int kSizes[] = {16, 8, 4, 3, 2};
+  std::size_t pos = 0;
+  while (pos < ids.size()) {
+    std::size_t take = 1;
+    for (int sz : kSizes) {
+      if (ids.size() - pos >= (std::size_t)sz) {
+        take = (std::size_t)sz;
+        break;
+      }
+    }
+    if (take == 1) {
+      if (!g.forward_tokens({ids[pos]}, (int)pos, hidden, logits, err)) return false;
+    } else {
+      const std::vector<std::int32_t> chunk(ids.begin() + (long)pos, ids.begin() + (long)(pos + take));
+      if (!g.forward_batch(chunk, (int)pos, hidden, logits, err)) return false;
+    }
+    pos += take;
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // bench: M5 measurement harness. Reports the numbers SPEC.md §3 and the README
 // quote, for one (model, ctx, kv type) combination:
@@ -333,7 +363,7 @@ int cmd_bench(int argc, char **argv) {
     return 1;
   }
   const double tp0 = now_s();
-  if (!graph.forward_tokens(ids, 0, hidden, logits, err)) {
+  if (!prefill_ids(graph, ids, hidden, logits, err)) {
     std::fprintf(stderr, "rdna4-infer: prefill failed: %s\n", err.c_str());
     return 1;
   }
@@ -404,7 +434,7 @@ int cmd_bench(int argc, char **argv) {
     // rewind: the sequence length must stay in range across reps
     history.resize(ids.size());
     if (fill_cache) (void)graph.debug_fill_caches((unsigned)seed, err);
-    if (!graph.forward_tokens(ids, 0, hidden, logits, err)) {
+    if (!prefill_ids(graph, ids, hidden, logits, err)) {
       std::fprintf(stderr, "rdna4-infer: reset failed: %s\n", err.c_str());
       return 1;
     }
@@ -430,7 +460,7 @@ int cmd_bench(int argc, char **argv) {
               start_pos > 0 ? "  [synthetic keys/values: cost measurement, not quality]" : "");
   std::printf("vram in use: %.2f GiB (free %.2f of %.2f GiB)\n",
               (double)(tot_b - free_b) / gib, (double)free_b / gib, (double)tot_b / gib);
-  std::printf("prefill %zu tokens: %.3f s (%.2f tok/s, per-token path)\n", ids.size(), t_prefill,
+  std::printf("prefill %zu tokens: %.3f s (%.2f tok/s, batched N<=16)\n", ids.size(), t_prefill,
               (double)ids.size() / t_prefill);
   std::printf("decode %zu tokens x %lld reps (warmup %lld): best %.3f s (%.2f tok/s), "
               "mean %.2f tok/s\n",
@@ -1296,7 +1326,7 @@ int cmd_run(int argc, char **argv) {
   // ---- prefill -----------------------------------------------------------
   std::vector<float> hidden, logits;
   const double t_pre0 = now_s();
-  if (!graph.forward_tokens(prompt_ids, 0, hidden, logits, err)) {
+  if (!prefill_ids(graph, prompt_ids, hidden, logits, err)) {
     std::fprintf(stderr, "rdna4-infer: prefill failed: %s\n", err.c_str());
     return 1;
   }

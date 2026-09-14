@@ -138,6 +138,24 @@ class Graph {
   void debug_set_layer_limit(int n) { layer_limit_ = n < 0 ? n_layer() : n; }
   int debug_layer_limit() const { return layer_limit_ < 0 ? n_layer() : layer_limit_; }
 
+  // M8: batched prefill. Processes `tokens` (2..kMaxBatch) in ONE layer-major
+  // pass: the projections of all N tokens share one read of each weight (the
+  // bit-exact `matvec_kernel_batch`, docs/medicoes-m6.md), while the parts that
+  // are inherently sequential -- the KV writes, the attention, the GDN recurrence
+  // -- still run token by token in order. Every launch keeps the per-token
+  // arithmetic, so the result is BIT-IDENTICAL to calling forward_tokens() once
+  // per token (tests/check_batch_gpu.hip asserts exactly that).
+  // `logits` receives the logits of the LAST token (what generation needs); the
+  // LM head costs one weight read per call, not one per token.
+  bool forward_batch(const std::vector<std::int32_t> &tokens, int start_pos,
+                     std::vector<float> &hidden, std::vector<float> &logits, std::string &err);
+  static constexpr int kMaxBatch = 16;
+  // Batch sizes the matvec has instantiations for (2/3/4/8/16); anything else is
+  // split into a supported chunk plus a per-token tail.
+  static int batch_supported(int n) {
+    return n == 2 || n == 3 || n == 4 || n == 8 || n == 16;
+  }
+
   // M5: brings the graph back to the state it has after init(), for evaluating a
   // second independent sequence (perplexity chunks, chat turns). The recurrent
   // (GDN) state is zeroed — llama.cpp also starts every sequence from zeros — and
@@ -207,6 +225,14 @@ class Graph {
   bool forward_run(std::size_t n_tokens, int start_pos, const float *host_emb,
                    const std::vector<std::int32_t> *toks, std::vector<float> &hidden,
                    std::vector<float> &logits, std::string &err);
+  // Quantize the n rows at d_x (row stride ncols) and multiply by w for all n at
+  // once. `act_ready` skips the quantization when the caller already did it for
+  // the same rows (the FFN's gate/up pair shares one activation -> one launch and
+  // one pass less, bit-exactly).
+  bool proj_batch(const GpuTensor &w, const float *d_x, float *d_y, int nrows, int ncols, int n,
+                  bool act_ready, std::string &err);
+  bool quantize_batch(const float *d_x, int ncols, int n, std::string &err);
+  bool forward_batch_layer(int il, int n, int pos0, std::string &err);
   bool proj(const GpuTensor &w, const float *d_x, float *d_y, int nrows, int ncols,
             std::string &err);
   bool add_residual(float *d_src, float *d_dst, int n, std::string &err);
@@ -256,6 +282,15 @@ class Graph {
     return n;
   }
   float *d_attnout_ = nullptr, *d_attngate_ = nullptr;
+  // M8 batch buffers: [kMaxBatch][width] each, plus one N-row activation block
+  // matrix shared by every projection in the batch.
+  float *d_xb_ = nullptr, *d_xnb_ = nullptr, *d_qb_ = nullptr, *d_kb_ = nullptr, *d_vb_ = nullptr;
+  float *d_attnb_ = nullptr, *d_gateb_ = nullptr, *d_ffnab_ = nullptr, *d_ffnbb_ = nullptr;
+  float *d_projb_ = nullptr, *d_qkvb_ = nullptr, *d_zb_ = nullptr, *d_convb_ = nullptr;
+  float *d_alphab_ = nullptr, *d_betab_ = nullptr, *d_gate2b_ = nullptr;
+  block_q8_1 *d_aqb_ = nullptr;
+  std::size_t aq_blocks_per_row_ = 0;
+  int *d_posb_ = nullptr;
   // Split-KV attention scratch: [n_head][kAttnMaxSplits][2 + head_dim] (M7).
   float *d_attn_partial_ = nullptr;
   static constexpr int kAttnMaxSplits = 16;
@@ -458,6 +493,36 @@ inline bool Graph::init(int max_ctx, KvType kv_k, KvType kv_v, std::string &err)
     return false;
   }
   if (!alloc(d_kstage_, NKV * HD, err) || !alloc(d_vstage_, NKV * HD, err)) return false;
+  // M8 batch buffers. The activation block matrix is sized for the largest
+  // reduction dimension in the model (ffn_down: F elements per row).
+  const std::size_t aq_per_row = ((std::size_t)F + 31) / 32;
+  aq_blocks_per_row_ = aq_per_row;
+  {
+    const int NH_ = NH, HD_ = HD, NKV_ = NKV;
+    const auto balloc = [&](float *&p, std::size_t n) {
+      return hipMalloc(&p, (std::size_t)kMaxBatch * n * sizeof(float)) == hipSuccess;
+    };
+    if (!balloc(d_xb_, E) || !balloc(d_xnb_, E) || !balloc(d_projb_, E) ||
+        !balloc(d_qb_, (std::size_t)NH_ * 2 * HD_) || !balloc(d_kb_, (std::size_t)NKV_ * HD_) ||
+        !balloc(d_vb_, (std::size_t)NKV_ * HD_) || !balloc(d_attnb_, (std::size_t)NH_ * HD_) ||
+        !balloc(d_gateb_, (std::size_t)NH_ * HD_) || !balloc(d_ffnab_, F) ||
+        !balloc(d_ffnbb_, F) || !balloc(d_qkvb_, chan) || !balloc(d_zb_, d_inner) ||
+        !balloc(d_convb_, chan) || !balloc(d_alphab_, nvh) || !balloc(d_betab_, nvh) ||
+        !balloc(d_gate2b_, nvh)) {
+      err = "hipMalloc failed for the batch buffers";
+      return false;
+    }
+    if (hipMalloc(&d_aqb_, (std::size_t)kMaxBatch * aq_per_row * sizeof(block_q8_1)) !=
+        hipSuccess) {
+      err = "hipMalloc failed for the batch activation blocks";
+      return false;
+    }
+    if (hipMalloc(&d_posb_, (std::size_t)kMaxBatch * sizeof(int)) != hipSuccess) {
+      err = "hipMalloc failed for the batch positions";
+      return false;
+    }
+  }
+
   const std::size_t part_bytes = attn_partial_bytes(NH, HD, kAttnMaxSplits);
   if (hipMalloc(&d_attn_partial_, part_bytes) != hipSuccess) {
     err = "hipMalloc attn partial failed";
@@ -710,7 +775,289 @@ inline bool Graph::ffn(int il, std::string &err) {
   return true;
 }
 
+
 // ---------------------------------------------------------------------------
+// M8: batched prefill. See the declaration for the contract; the short version is
+// "layer-major, projections batched, everything sequential stays sequential".
+// ---------------------------------------------------------------------------
+inline bool Graph::quantize_batch(const float *d_x, int ncols, int n, std::string &err) {
+  if (ncols % QK8_1 != 0) {
+    err = "bad reduction dim for the batch q8 scratch";
+    return false;
+  }
+  const std::int64_t nb = ncols / QK8_1;
+  if ((std::size_t)nb > aq_blocks_per_row_) {
+    err = "batch q8 scratch too small";
+    return false;
+  }
+  if (!quantize_q8_1_batch_launch(d_x, d_aqb_, nb, n, ncols)) {
+    err = "batch quantize launch failed";
+    return false;
+  }
+  return true;
+}
+
+inline bool Graph::proj_batch(const GpuTensor &w, const float *d_x, float *d_y, int nrows,
+                              int ncols, int n, bool act_ready, std::string &err) {
+  if (w.dim0 != ncols || w.dim1 != nrows ||
+      w.bytes != tensor_bytes(w.dt, (std::uint64_t)nrows * (std::uint64_t)ncols)) {
+    err = "batch weight shape mismatch";
+    return false;
+  }
+  if (n < 2 || n > kMaxBatch || !batch_supported(n)) {
+    err = "unsupported batch size " + std::to_string(n);
+    return false;
+  }
+  if (!act_ready && !quantize_batch(d_x, ncols, n, err)) return false;
+  const std::int64_t act_stride = ncols / QK8_1;
+  if (!matvec_launch_batch((int)w.dt, w.ptr, d_aqb_, d_y, nrows, ncols, act_stride, n, nullptr)) {
+    err = "matvec_launch_batch failed";
+    return false;
+  }
+  return true;
+}
+
+// One layer for the whole batch. `d_xb_` holds the N token rows on entry and the
+// updated rows on exit; the KV cache and the GDN state advance in token order.
+inline bool Graph::forward_batch_layer(int il, int n, int pos0, std::string &err) {
+  const int E = n_embd();
+  const int F = (int)cfg_.feed_forward_length;
+  const int HD = head_dim(), NH = n_head(), NKV = n_head_kv();
+  const LayerW &L = w_[il];
+  const float eps = (float)cfg_.rms_norm_eps;
+  const float base = (float)cfg_.rope_freq_base;
+
+  if (!rms_norm_launch(d_xb_, (const float *)L.attn_norm.ptr, d_xnb_, n, E, eps)) {
+    err = "batch attn_norm launch failed";
+    return false;
+  }
+  emit("attn_norm", il, d_xnb_, (std::int64_t)n * E);
+
+  if (!L.recr) {
+    if (!proj_batch(L.attn_q, d_xnb_, d_qb_, NH * 2 * HD, E, n, false, err)) return false;
+    // k and v share the same activation: quantize once, reuse for both
+    if (!quantize_batch(d_xnb_, E, n, err)) return false;
+    if (!proj_batch(L.attn_k, d_xnb_, d_kb_, NKV * HD, E, n, true, err)) return false;
+    if (!proj_batch(L.attn_v, d_xnb_, d_vb_, NKV * HD, E, n, true, err)) return false;
+    // per token: split q/gate, QK-norm, RoPE, cache write, attention
+    for (int t = 0; t < n; ++t) {
+      float *q = d_qb_ + (std::size_t)t * NH * 2 * HD;
+      float *k = d_kb_ + (std::size_t)t * NKV * HD;
+      float *v = d_vb_ + (std::size_t)t * NKV * HD;
+      float *an = d_attnb_ + (std::size_t)t * NH * HD;
+      float *ag = d_gateb_ + (std::size_t)t * NH * HD;
+      const int pos = pos0 + t;
+      if (!deinterleave_q_gate_launch(q, an, ag, NH, HD)) {
+        err = "batch deinterleave launch failed";
+        return false;
+      }
+      if (!rms_norm_launch(an, (const float *)L.attn_q_norm.ptr, an, NH, HD, eps) ||
+          !rms_norm_launch(k, (const float *)L.attn_k_norm.ptr, k, NKV, HD, eps)) {
+        err = "batch qk norm launch failed";
+        return false;
+      }
+      // positions were uploaded once for the whole batch by forward_batch()
+      if (!rope_launch(an, 1, NH, HD, n_rot(), base, d_posb_ + t) ||
+          !rope_launch(k, 1, NKV, HD, n_rot(), base, d_posb_ + t)) {
+        err = "batch rope launch failed";
+        return false;
+      }
+      if (!kv_write(il, pos, k, v, err)) return false;
+      const char *kc = (const char *)d_k_ + (std::size_t)attn_slot(il) * kv_bytes_;
+      const char *vc = (const char *)d_v_ + (std::size_t)attn_slot(il) * kv_bytes_;
+      const int splits = attn_splits_for(pos + 1);
+      attn_splits_last_ = splits;
+      const float scale = 1.0f / std::sqrt((float)HD);
+      if (splits > 1) {
+        if (!attn_launch_split(an, kc, vc, an, d_attn_partial_, pos, NH, NKV, HD, scale, kv_k_,
+                               kv_v_, splits)) {
+          err = "batch attn split launch failed";
+          return false;
+        }
+      } else if (!attn_launch(an, kc, vc, an, pos, NH, NKV, HD, scale, kv_k_, kv_v_)) {
+        err = "batch attn launch failed";
+        return false;
+      }
+      if (!unary_launch(ag, ag, NH * HD, UnOp::Sigmoid) ||
+          !mul_launch(an, ag, an, NH * HD)) {
+        err = "batch attn gate launch failed";
+        return false;
+      }
+    }
+    if (!proj_batch(L.attn_output, d_attnb_, d_projb_, E, NH * HD, n, false, err)) return false;
+  } else {
+    const int S = (int)cfg_.ssm_state_size;
+    const int nkh = (int)cfg_.ssm_group_count;
+    const int nvh = (int)cfg_.ssm_time_step_rank;
+    const int d_inner = nvh * S;
+    const int key_dim = nkh * S;
+    const int chan = 2 * key_dim + d_inner;
+    const int K = (int)cfg_.ssm_conv_kernel;
+    int slot = 0;
+    for (int i = 0; i < il; ++i) slot += is_recr(i) ? 1 : 0;
+    float *state = d_state_ + (std::size_t)slot * nvh * S * S;
+    float *convst = d_convst_ + (std::size_t)slot * (K - 1) * chan;
+
+    if (!proj_batch(L.attn_qkv, d_xnb_, d_qkvb_, chan, E, n, false, err)) return false;
+    if (!quantize_batch(d_xnb_, E, n, err)) return false;
+    if (!proj_batch(L.attn_gate, d_xnb_, d_zb_, d_inner, E, n, true, err)) return false;
+    if (!proj_batch(L.ssm_beta, d_xnb_, d_betab_, nvh, E, n, true, err)) return false;
+    if (!proj_batch(L.ssm_alpha, d_xnb_, d_alphab_, nvh, E, n, true, err)) return false;
+    // The recurrence itself is sequential: token order, same kernels as the
+    // per-token path, one token's slices at a time.
+    for (int t = 0; t < n; ++t) {
+      float *qkv = d_qkvb_ + (std::size_t)t * chan;
+      float *z = d_zb_ + (std::size_t)t * d_inner;
+      float *beta = d_betab_ + (std::size_t)t * nvh;
+      float *alpha = d_alphab_ + (std::size_t)t * nvh;
+      float *conv = d_convb_ + (std::size_t)t * chan;
+      float *g = d_gate2b_ + (std::size_t)t * nvh;
+      if (!unary_launch(beta, beta, nvh, UnOp::Sigmoid)) return false;
+      if (!add_launch(alpha, (const float *)L.ssm_dt.ptr, alpha, nvh)) return false;
+      if (!unary_launch(alpha, g, nvh, UnOp::Softplus)) return false;
+      if (!mul_launch(g, (const float *)L.ssm_a.ptr, g, nvh)) return false;
+      if (!conv1d_state_launch(qkv, (const float *)L.ssm_conv1d.ptr, conv, convst, chan, K)) {
+        err = "batch conv1d launch failed";
+        return false;
+      }
+      float *q_c = conv;
+      float *k_c = conv + key_dim;
+      float *v_c = conv + 2 * key_dim;
+      if (!l2_norm_launch(q_c, q_c, nkh, S, eps) || !l2_norm_launch(k_c, k_c, nkh, S, eps)) {
+        err = "batch l2 norm launch failed";
+        return false;
+      }
+      if (!delta_rule_launch(q_c, k_c, v_c, g, beta, state, v_c, nvh, nkh, S)) {
+        err = "batch delta rule launch failed";
+        return false;
+      }
+      if (!rms_norm_launch(v_c, (const float *)L.ssm_norm.ptr, v_c, nvh, S, eps)) {
+        err = "batch ssm_norm launch failed";
+        return false;
+      }
+      if (!unary_launch(z, z, d_inner, UnOp::Silu) || !mul_launch(v_c, z, v_c, d_inner)) {
+        err = "batch gdn output launch failed";
+        return false;
+      }
+      // v_c lives inside this token's conv buffer (not contiguous across the
+      // batch), so copy it into d_zb_[t] -- free now that the gate was consumed --
+      // which is what the batched ssm_out projection reads. Same values, so the
+      // result stays bit-identical to the per-token path.
+      if (hipMemcpy(z, v_c, (std::size_t)d_inner * sizeof(float),
+                    hipMemcpyDeviceToDevice) != hipSuccess) {
+        err = "batch gdn copy failed";
+        return false;
+      }
+    }
+    if (!proj_batch(L.ssm_out, d_zb_, d_projb_, E, d_inner, n, false, err)) return false;
+  }
+
+  // residual + post-attention norm
+  if (!add_launch(d_projb_, d_xb_, d_xb_, (std::int64_t)n * E)) {
+    err = "batch residual launch failed";
+    return false;
+  }
+  if (!rms_norm_launch(d_xb_, (const float *)L.attn_post_norm.ptr, d_xnb_, n, E, eps)) {
+    err = "batch post_attn_norm launch failed";
+    return false;
+  }
+
+  // FFN (gate and up share the activation)
+  if (!proj_batch(L.ffn_gate, d_xnb_, d_ffnab_, F, E, n, false, err)) return false;
+  if (!proj_batch(L.ffn_up, d_xnb_, d_ffnbb_, F, E, n, true, err)) return false;
+  if (!unary_launch(d_ffnab_, d_ffnab_, (std::int64_t)n * F, UnOp::Silu)) return false;
+  if (!mul_launch(d_ffnab_, d_ffnbb_, d_ffnab_, (std::int64_t)n * F)) return false;
+  if (!proj_batch(L.ffn_down, d_ffnab_, d_projb_, E, F, n, false, err)) return false;
+  if (!add_launch(d_projb_, d_xb_, d_xb_, (std::int64_t)n * E)) {
+    err = "batch ffn residual launch failed";
+    return false;
+  }
+  emit("l_out", il, d_xb_, (std::int64_t)n * E);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+
+inline bool Graph::forward_batch(const std::vector<std::int32_t> &tokens, int start_pos,
+                                 std::vector<float> &hidden, std::vector<float> &logits,
+                                 std::string &err) {
+  const int E = n_embd();
+  const int n = (int)tokens.size();
+  if (n < 2 || n > kMaxBatch) {
+    err = "forward_batch needs 2.." + std::to_string(kMaxBatch) + " tokens";
+    return false;
+  }
+  if (!batch_supported(n)) {
+    err = "no batched kernel for n=" + std::to_string(n);
+    return false;
+  }
+  const std::int32_t n_vocab = (std::int32_t)tok_embd_.dim1;
+  for (std::int32_t tk : tokens) {
+    if (tk < 0 || tk >= n_vocab) {
+      err = "token id " + std::to_string(tk) + " out of range [0, " + std::to_string(n_vocab) + ")";
+      return false;
+    }
+  }
+  if (start_pos < 0 || (std::size_t)start_pos + (std::size_t)n > (std::size_t)max_ctx_) {
+    err = "positions exceed the allocated context (" + std::to_string(max_ctx_) + ")";
+    return false;
+  }
+
+  // positions for the whole batch, one upload (the per-token path does one 4-byte
+  // synchronous copy per RoPE call)
+  int pos_host[kMaxBatch];
+  for (int t = 0; t < n; ++t) pos_host[t] = start_pos + t;
+  if (hipMemcpy(d_posb_, pos_host, (std::size_t)n * sizeof(int), hipMemcpyHostToDevice) !=
+      hipSuccess) {
+    err = "batch position upload failed";
+    return false;
+  }
+
+  // embeddings: one dequantized row per token
+  const std::size_t emb_row = (std::size_t)tensor_bytes(tok_embd_.dt, (std::uint64_t)E);
+  for (int t = 0; t < n; ++t) {
+    const char *src = (const char *)tok_embd_.ptr + (std::size_t)tokens[t] * emb_row;
+    if (!dequant_row_launch(tok_embd_.dt, src, d_xb_ + (std::size_t)t * E, E)) {
+      err = "batch embedding dequant failed";
+      return false;
+    }
+  }
+
+  const int L = n_layer();
+  for (int il = 0; il < debug_layer_limit(); ++il) {
+    if (!forward_batch_layer(il, n, start_pos, err)) {
+      err = "layer " + std::to_string(il) + ": " + err;
+      return false;
+    }
+  }
+
+  // final norm + LM head for the LAST token only (that is what generation needs;
+  // the head costs one full weight read per call)
+  float *xlast = d_xb_ + (std::size_t)(n - 1) * E;
+  if (!rms_norm_launch(xlast, (const float *)output_norm_.ptr, xlast, 1, E,
+                       (float)cfg_.rms_norm_eps)) {
+    err = "batch output_norm launch failed";
+    return false;
+  }
+  readback(xlast, E, hidden);
+
+  const int n_vocab_i = output_.dim1;
+  if (d_logits_ == nullptr) {
+    if (hipMalloc(&d_logits_, (std::size_t)n_vocab_i * sizeof(float)) != hipSuccess) {
+      err = "hipMalloc logits failed";
+      return false;
+    }
+  }
+  if (!proj(output_, xlast, d_logits_, n_vocab_i, E, err)) return false;
+  logits.resize(n_vocab_i);
+  if (hipMemcpy(logits.data(), d_logits_, (std::size_t)n_vocab_i * sizeof(float),
+                hipMemcpyDeviceToHost) != hipSuccess) {
+    err = "batch logits readback failed";
+    return false;
+  }
+  return true;
+}
+
 inline bool Graph::forward(const std::vector<float> &embeddings, std::vector<float> &hidden,
                            std::vector<float> &logits, std::string &err) {
   return forward(embeddings, 0, hidden, logits, err);
@@ -915,6 +1262,19 @@ inline void Graph::release() {
   if (d_v_) (void)hipFree(d_v_);
   d_k_ = nullptr;
   d_v_ = nullptr;
+  float *batch_ptrs[] = {d_xb_,   d_xnb_,  d_qb_,    d_kb_,    d_vb_,     d_attnb_,
+                         d_gateb_, d_ffnab_, d_ffnbb_, d_projb_, d_qkvb_,   d_zb_,
+                         d_convb_, d_alphab_, d_betab_, d_gate2b_};
+  for (float *p : batch_ptrs) {
+    if (p) (void)hipFree(p);
+  }
+  d_xb_ = d_xnb_ = d_qb_ = d_kb_ = d_vb_ = d_attnb_ = d_gateb_ = nullptr;
+  d_ffnab_ = d_ffnbb_ = d_projb_ = d_qkvb_ = d_zb_ = d_convb_ = nullptr;
+  d_alphab_ = d_betab_ = d_gate2b_ = nullptr;
+  if (d_aqb_) (void)hipFree(d_aqb_);
+  if (d_posb_) (void)hipFree(d_posb_);
+  d_aqb_ = nullptr;
+  d_posb_ = nullptr;
   if (d_q8_) (void)hipFree(d_q8_);
   if (d_pos_) (void)hipFree(d_pos_);
   if (d_logits_) (void)hipFree(d_logits_);

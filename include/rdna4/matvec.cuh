@@ -60,6 +60,32 @@ __global__ void quantize_q8_1_kernel(const float *__restrict__ x, block_q8_1 *__
   quantize_q8_1_block(x + (int64_t)warp * QK8_1, y + warp);
 }
 
+// Quantize N activation rows in one launch: one warp per (row, 32-element block),
+// the same `quantize_q8_1_block` the per-row kernel uses, so the blocks are
+// bit-identical to N separate launches.
+__global__ void quantize_q8_1_batch_kernel(const float *__restrict__ x,
+                                           block_q8_1 *__restrict__ y,
+                                           std::int64_t nblocks_per_row, std::int64_t nrows,
+                                           std::int64_t row_stride) {
+  const std::int64_t warp = ((std::int64_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  if (warp >= nrows * nblocks_per_row) return;
+  const std::int64_t row = warp / nblocks_per_row;
+  const std::int64_t blk = warp % nblocks_per_row;
+  quantize_q8_1_block(x + row * row_stride + blk * QK8_1, y + warp);
+}
+
+inline bool quantize_q8_1_batch_launch(const float *d_x, block_q8_1 *d_y,
+                                       std::int64_t nblocks_per_row, std::int64_t nrows,
+                                       std::int64_t row_stride, hipStream_t stream = nullptr) {
+  const std::int64_t warps = nrows * nblocks_per_row;
+  if (warps <= 0) return false;
+  const int threads = 128;  // 4 warps per CTA
+  const unsigned grid = (unsigned)((warps + 3) / 4);
+  quantize_q8_1_batch_kernel<<<grid, threads, 0, stream>>>(d_x, d_y, nblocks_per_row, nrows,
+                                                           row_stride);
+  return hipGetLastError() == hipSuccess;
+}
+
 // ---------------------------------------------------------------------------
 // Per-type traits: block size, quants-per-int, values-per-dot, byte size,
 // and the vec_dot entry point.
@@ -562,6 +588,7 @@ inline bool matvec_launch_batch(int dt, const void *d_w, const block_q8_1 *d_a, 
                                 hipStream_t stream) {
   switch (n_tokens) {
     case 2:  return matvec_launch_batch_n<2>(dt, d_w, d_a, d_o, nrows, ncols, act_stride, stream);
+    case 3:  return matvec_launch_batch_n<3>(dt, d_w, d_a, d_o, nrows, ncols, act_stride, stream);
     case 4:  return matvec_launch_batch_n<4>(dt, d_w, d_a, d_o, nrows, ncols, act_stride, stream);
     case 8:  return matvec_launch_batch_n<8>(dt, d_w, d_a, d_o, nrows, ncols, act_stride, stream);
     case 16: return matvec_launch_batch_n<16>(dt, d_w, d_a, d_o, nrows, ncols, act_stride, stream);
