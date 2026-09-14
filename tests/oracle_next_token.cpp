@@ -148,6 +148,20 @@ int main(int argc, char **argv) {
   cparams.n_ctx = env_u32("ORACLE_NCTX", 512);
   cparams.n_batch = env_u32("ORACLE_NBATCH", cparams.n_ctx);
   cparams.n_ubatch = env_u32("ORACLE_NUBATCH", cparams.n_batch);
+  // longctx: same KV types as the engine under test (at 64K+ the f16 cache does
+  // not fit next to the weights, so the reference has to be told).
+  auto kv_type = [](const char *name, ggml_type dflt) {
+    const char *v = std::getenv(name);
+    if (!v) return dflt;
+    if (!std::strcmp(v, "f32")) return GGML_TYPE_F32;
+    if (!std::strcmp(v, "f16")) return GGML_TYPE_F16;
+    if (!std::strcmp(v, "q8_0")) return GGML_TYPE_Q8_0;
+    if (!std::strcmp(v, "q4_0")) return GGML_TYPE_Q4_0;
+    std::fprintf(stderr, "unknown %s=%s\n", name, v);
+    std::exit(2);
+  };
+  cparams.type_k = kv_type("ORACLE_CTK", GGML_TYPE_F16);
+  cparams.type_v = kv_type("ORACLE_CTV", GGML_TYPE_F16);
   cparams.no_perf = true;
   llama_context *ctx = llama_init_from_model(model, cparams);
   if (!ctx) {

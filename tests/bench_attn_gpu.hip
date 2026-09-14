@@ -201,6 +201,180 @@ bool launch_gqa(const float *q, const void *k, const void *v, float *out, int t,
   return hipGetLastError() == hipSuccess;
 }
 
+// ---------------------------------------------------------------------------
+// Prototype C (frente longctx): GQA sharing WITH the wide grid that prototype B
+// is missing. Grid = (n_head_kv, n_splits) -- the same split-over-keys structure
+// the shipping kernel uses, but one CTA serves a whole GQA group instead of one
+// query head, so a K/V row is fetched once per group instead of 6 times.
+//
+// The HG template parameter is the head-chunk: the CTA computes HG query heads of
+// its group per pass over its key slice and loops 6/HG passes. It separates the
+// two effects the M7 prototype confounded:
+//   HG = 1  -> 6 passes, same K/V traffic as the shipping kernel, but grid (4,S)
+//   HG = 3  -> 2 passes, half the traffic, same grid
+//   HG = 6  -> 1 pass,  1/6 of the traffic, same grid
+// Comparing HG=1 with HG=6 at the same grid says how much of the win is the
+// traffic and how much is the parallelism; comparing HG=6 with the shipping
+// kernel says whether the wide grid is enough to pay for the lost CTAs.
+//
+// Registers are the reason HG is a knob: q and acc are HG*8 floats per lane each
+// (head_dim 256 -> dpw 8). HG=6 costs ~110 registers per lane, HG=1 ~30.
+// dpw != 8 is refused: this is a prototype for the model's head_dim, not a
+// general kernel (the shipped one stays general).
+//
+// The partials are written into the SAME [h][s] layout the shipping split kernel
+// uses, so attn_merge_kernel combines them unchanged.
+// ---------------------------------------------------------------------------
+template <rdna4::KvType KT, rdna4::KvType VT, int HG, int WPB = rdna4::kAttnWarpsPerBlock>
+__global__ void attn_gqa_split_kernel(const float *__restrict__ q, const void *__restrict__ k,
+                                     const void *__restrict__ v, float *__restrict__ partial, int t,
+                                     int n_head, int n_head_kv, int head_dim, float dscale,
+                                     int n_splits) {
+  extern __shared__ float smem[];
+  const int kvh = blockIdx.x;
+  const int s = blockIdx.y;
+  const int w = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int grp = n_head / n_head_kv;
+  const int dpw = head_dim / 32;
+  if (dpw != 8) return;  // prototype: head_dim 256 only
+
+  const std::uint64_t krow = rdna4::kv_row_bytes(KT, head_dim);
+  const std::uint64_t vrow = rdna4::kv_row_bytes(VT, head_dim);
+  const int step = WPB * n_splits;
+  float *pm = smem + (std::int64_t)w * (2 + head_dim);
+  __shared__ float wts[WPB];
+  __shared__ float cmax;
+
+  for (int c = 0; c * HG < grp; ++c) {
+    const int h0 = kvh * grp + c * HG;
+    const int nh = (grp - c * HG < HG) ? (grp - c * HG) : HG;
+    float qv[HG][8];
+    float acc[HG][8];
+    float m[HG], l[HG];
+    for (int hh = 0; hh < nh; ++hh) {
+      const float *qp = q + (std::int64_t)(h0 + hh) * head_dim + lane * dpw;
+      for (int i = 0; i < dpw; ++i) qv[hh][i] = qp[i];
+      for (int i = 0; i < dpw; ++i) acc[hh][i] = 0.0f;
+      m[hh] = -INFINITY;
+      l[hh] = 0.0f;
+    }
+
+    for (int j = w + WPB * s; j <= t; j += step) {
+      const char *kr = (const char *)k + ((std::int64_t)j * n_head_kv + kvh) * krow;
+      const char *vr = (const char *)v + ((std::int64_t)j * n_head_kv + kvh) * vrow;
+      float kk[8], vv[8];
+      rdna4::kv_load8<KT>(kr, lane, kk);
+      rdna4::kv_load8<VT>(vr, lane, vv);
+      for (int hh = 0; hh < nh; ++hh) {
+        float dot = 0.0f;
+        for (int i = 0; i < dpw; ++i) dot = fmaf(qv[hh][i], kk[i], dot);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+          dot += __shfl_xor_sync(0xffffffffull, dot, off);
+        const float score = dot * dscale;
+        if (score > m[hh]) {
+          const float corr = (m[hh] == -INFINITY) ? 0.0f : expf(m[hh] - score);
+          l[hh] *= corr;
+          for (int i = 0; i < dpw; ++i) acc[hh][i] *= corr;
+          m[hh] = score;
+        }
+        const float p = (m[hh] == -INFINITY) ? 0.0f : expf(score - m[hh]);
+        l[hh] += p;
+        for (int i = 0; i < dpw; ++i) acc[hh][i] = fmaf(p, vv[i], acc[hh][i]);
+      }
+    }
+
+    // merge this CTA's WPB warp slices once per head, reusing the same smem slot
+    // (HG heads sequentially: HG barriers per chunk, WPB*(2+head_dim) floats).
+    for (int hh = 0; hh < nh; ++hh) {
+      __syncthreads();
+      if (lane == 0) {
+        pm[0] = m[hh];
+        pm[1] = l[hh];
+      }
+      for (int i = 0; i < dpw; ++i) pm[2 + lane * dpw + i] = acc[hh][i];
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        float mm = -INFINITY;
+        for (int i = 0; i < WPB; ++i) mm = fmaxf(mm, smem[(std::int64_t)i * (2 + head_dim)]);
+        cmax = mm;
+      }
+      __syncthreads();
+      if (threadIdx.x < WPB)
+        wts[threadIdx.x] = (cmax == -INFINITY)
+                               ? 0.0f
+                               : expf(smem[(std::int64_t)threadIdx.x * (2 + head_dim)] - cmax);
+      __syncthreads();
+      float *out = partial + ((std::int64_t)(h0 + hh) * n_splits + s) * (2 + head_dim);
+      if (threadIdx.x < 32) {
+        float lsum = 0.0f;
+        if (threadIdx.x < WPB)
+          lsum = wts[threadIdx.x] * smem[(std::int64_t)threadIdx.x * (2 + head_dim) + 1];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) lsum += __shfl_xor_sync(0xffffffffull, lsum, off);
+        if (threadIdx.x == 0) {
+          out[0] = cmax;
+          out[1] = lsum;
+        }
+      }
+      for (int d = (int)threadIdx.x; d < head_dim; d += (int)blockDim.x) {
+        float a = 0.0f;
+        for (int i = 0; i < WPB; ++i) a += smem[(std::int64_t)i * (2 + head_dim) + 2 + d] * wts[i];
+        out[2 + d] = a;
+      }
+    }
+  }
+}
+
+template <rdna4::KvType KT, rdna4::KvType VT, int HG>
+bool launch_gqa_split_hg(const float *q, const void *k, const void *v, float *out, float *partial,
+                         int t, int n_head, int n_head_kv, int head_dim, float scale, int n_splits,
+                         hipStream_t stream) {
+  if (head_dim != 256 || n_splits < 1) return false;
+  const int threads = rdna4::kAttnWarpsPerBlock * 32;
+  const std::size_t smem =
+      (std::size_t)rdna4::kAttnWarpsPerBlock * (2 + (std::size_t)head_dim) * sizeof(float);
+  dim3 grid((unsigned)n_head_kv, (unsigned)n_splits);
+  attn_gqa_split_kernel<KT, VT, HG><<<grid, threads, smem, stream>>>(
+      q, k, v, partial, t, n_head, n_head_kv, head_dim, scale, n_splits);
+  if (hipGetLastError() != hipSuccess) return false;
+  rdna4::attn_merge_kernel<<<n_head, 32, 0, stream>>>(partial, out, n_head, head_dim, n_splits);
+  return hipGetLastError() == hipSuccess;
+}
+
+template <rdna4::KvType KT, rdna4::KvType VT>
+bool launch_gqa_split(const float *q, const void *k, const void *v, float *out, float *partial, int t,
+                      int n_head, int n_head_kv, int head_dim, float scale, int n_splits, int hg,
+                      hipStream_t stream) {
+  switch (hg) {
+    case 1: return launch_gqa_split_hg<KT, VT, 1>(q, k, v, out, partial, t, n_head, n_head_kv,
+                                                  head_dim, scale, n_splits, stream);
+    case 2: return launch_gqa_split_hg<KT, VT, 2>(q, k, v, out, partial, t, n_head, n_head_kv,
+                                                  head_dim, scale, n_splits, stream);
+    case 3: return launch_gqa_split_hg<KT, VT, 3>(q, k, v, out, partial, t, n_head, n_head_kv,
+                                                  head_dim, scale, n_splits, stream);
+    case 6: return launch_gqa_split_hg<KT, VT, 6>(q, k, v, out, partial, t, n_head, n_head_kv,
+                                                  head_dim, scale, n_splits, stream);
+    default: return false;
+  }
+}
+
+// Kernel resource report: registers and spill bytes decide whether a prototype is
+// slow because of its algorithm or because of its occupancy. (The M7 prototype's
+// 8-12x was attributed to the narrow grid without this number; measure it.)
+template <typename F>
+void report_resources(const char *name, F *fn) {
+  hipFuncAttributes a{};
+  if (hipFuncGetAttributes(&a, (const void *)fn) != hipSuccess) {
+    std::printf("  %-22s (attributes unavailable)\n", name);
+    return;
+  }
+  std::printf("  %-22s regs/lane %3d  spill %4zu B  maxThreads %4d  shared %zu B\n", name,
+              a.numRegs, a.localSizeBytes, a.maxThreadsPerBlock, a.sharedSizeBytes);
+}
+
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -213,6 +387,8 @@ int main(int argc, char **argv) {
   bool no_sweep = false;
   int ab_sp = 0, ab_wpb = 0, ab_rounds = 15, ab_reps = 3;
   std::vector<std::pair<int, int>> cands;  // (splits, warps/CTA)
+  std::vector<int> gqa_hg{6, 3, 1};        // heads per pass of the GQA-split prototype
+  int gqa_splits = 0;                      // 0 = the shipping split policy for that t
   auto cell_spec = [](const char *v, int *sp, int *wpb) {
     *sp = std::atoi(v);
     while (*v && *v != ':') ++v;
@@ -242,6 +418,11 @@ int main(int argc, char **argv) {
       int sp = 0, wpb = 0;
       cell_spec(argv[++i], &sp, &wpb);
       cands.push_back({sp, wpb});
+    } else if (std::strcmp(argv[i], "--gqa-hg") == 0 && i + 1 < argc) {
+      gqa_hg.clear();
+      list(gqa_hg);
+    } else if (std::strcmp(argv[i], "--gqa-splits") == 0 && i + 1 < argc) {
+      gqa_splits = std::atoi(argv[++i]);
     } else if (std::strcmp(argv[i], "--no-sweep") == 0) {
       no_sweep = true;
     } else if (std::strcmp(argv[i], "--ab-rounds") == 0 && i + 1 < argc) {
@@ -264,6 +445,23 @@ int main(int argc, char **argv) {
   std::printf("device: %s\nkey/value cache type: %s, head_dim %d, %d heads / %d kv heads "
               "(GQA %dx)\n\n",
               prop.name, tname, kHeadDim, kHeads, kHeadsKv, kHeads / kHeadsKv);
+  // Registers/spills of every attention kernel this bench measures: at 8 warps/CTA
+  // and head_dim 256 the GQA prototypes are register-hungry, and a prototype that
+  // spills explains its own slowness without any theory about grids.
+  {
+    std::printf("kernel resources (hipFuncGetAttributes):\n");
+    report_resources("attn_kernel<f16>", rdna4::attn_kernel<rdna4::KvType::F16, rdna4::KvType::F16>);
+    report_resources("attn_split_kernel<f16>",
+                     rdna4::attn_split_kernel<rdna4::KvType::F16, rdna4::KvType::F16>);
+    report_resources("attn_gqa_kernel<f16>", attn_gqa_kernel<rdna4::KvType::F16, rdna4::KvType::F16>);
+    report_resources("gqa_split HG=6", attn_gqa_split_kernel<rdna4::KvType::F16, rdna4::KvType::F16, 6>);
+    report_resources("gqa_split HG=3", attn_gqa_split_kernel<rdna4::KvType::F16, rdna4::KvType::F16, 3>);
+    report_resources("gqa_split HG=1", attn_gqa_split_kernel<rdna4::KvType::F16, rdna4::KvType::F16, 1>);
+    report_resources("attn_merge_kernel", rdna4::attn_merge_kernel);
+    int cu = 0;
+    (void)hipDeviceGetAttribute(&cu, hipDeviceAttributeMultiprocessorCount, 0);
+    std::printf("  (device: %d CU)\n\n", cu);
+  }
 
   const int maxt = ts.empty() ? 65536 : ts.back();
   std::vector<float> qh, kh;
@@ -332,6 +530,7 @@ int main(int argc, char **argv) {
     int n_splits = keys / kPolicySplitMin;
     if (n_splits < 1) n_splits = 1;
     if (n_splits > kPolicyMaxSplits) n_splits = kPolicyMaxSplits;
+    const int gqa_splits_t = gqa_splits > 0 ? gqa_splits : n_splits;
 
     if (no_sweep) {
       // duel only: the sweep (and the GQA prototype) is skipped so a run measures
@@ -544,6 +743,82 @@ int main(int argc, char **argv) {
         split_rel = c.rel;
         split_maxd = c.maxd;
       }
+    // the three kernels must agree (they only differ in how the slices are grouped)
+    std::vector<float> a((std::size_t)kHeads * kHeadDim), b((std::size_t)kHeads * kHeadDim);
+    // BUG FIX (frente longctx): this used to read `d_out`, which NO kernel in this
+    // bench ever writes -- the "prototype vs ship" rel-L2 below was comparing
+    // against uninitialized VRAM (so the M7 prototype's numerics were never
+    // actually verified). Take the reference from an explicit run of the unsplit
+    // shipping kernel into d_out2.
+    (void)rdna4::attn_launch(d_q, d_k, d_v, d_out2, t, kHeads, kHeadsKv, kHeadDim, kScale, kt, kt,
+                             nullptr);
+    hipDeviceSynchronize();
+    hipMemcpy(a.data(), d_out2, a.size() * sizeof(float), hipMemcpyDeviceToHost);
+    // ---- frente longctx: protótipo C, GQA compartilhado com grade larga ----
+    // Mesmo grid do kernel com splits (n_head_kv, S) e o mesmo merge; o que muda é
+    // o HG (cabeças de consulta por passada sobre a fatia de chaves).
+    struct GqaS {
+      int hg;
+      double ms;
+      double rel;
+      bool ok;
+    };
+    std::vector<GqaS> gqas;
+    for (int hg : gqa_hg) {
+      gqas.push_back({hg, -1.0, 0.0, true});
+    }
+    {
+      // warm-up + timed pass, one event pair per (hg) cell
+      EvPair evg;
+      for (int r = 0; r < 3; ++r) {
+        for (auto &g : gqas) {
+          const double ms = evg([&] {
+            for (int k = 0; k < 3; ++k) {
+              switch (kt) {
+                case rdna4::KvType::F16:
+                  g.ok = launch_gqa_split<rdna4::KvType::F16, rdna4::KvType::F16>(
+                      d_q, d_k, d_v, d_out2, d_partial, t, kHeads, kHeadsKv, kHeadDim, kScale,
+                      gqa_splits_t, g.hg, nullptr);
+                  break;
+                case rdna4::KvType::Q4_0:
+                  g.ok = launch_gqa_split<rdna4::KvType::Q4_0, rdna4::KvType::Q4_0>(
+                      d_q, d_k, d_v, d_out2, d_partial, t, kHeads, kHeadsKv, kHeadDim, kScale,
+                      gqa_splits_t, g.hg, nullptr);
+                  break;
+                case rdna4::KvType::Q8_0:
+                  g.ok = launch_gqa_split<rdna4::KvType::Q8_0, rdna4::KvType::Q8_0>(
+                      d_q, d_k, d_v, d_out2, d_partial, t, kHeads, kHeadsKv, kHeadDim, kScale,
+                      gqa_splits_t, g.hg, nullptr);
+                  break;
+                default:
+                  g.ok = launch_gqa_split<rdna4::KvType::F32, rdna4::KvType::F32>(
+                      d_q, d_k, d_v, d_out2, d_partial, t, kHeads, kHeadsKv, kHeadDim, kScale,
+                      gqa_splits_t, g.hg, nullptr);
+                  break;
+              }
+            }
+          }) / 3.0;
+          if (g.ms < 0 || ms < g.ms) g.ms = ms;
+        }
+      }
+      std::printf("             gqa-split (grid %dx%d, S=%d), numerics vs unsplit:", kHeadsKv,
+                  gqa_splits_t, gqa_splits_t);
+      for (auto &g : gqas) {
+        hipDeviceSynchronize();
+        hipMemcpy(b.data(), d_out2, b.size() * sizeof(float), hipMemcpyDeviceToHost);
+        double n2 = 0, d2 = 0, md2 = 0;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+          const double d = (double)a[i] - (double)b[i];
+          n2 += d * d;
+          d2 += (double)a[i] * a[i] + (double)b[i] * b[i];
+          md2 = std::max(md2, std::fabs(d));
+        }
+        g.rel = std::sqrt(n2 / d2);
+        std::printf("  HG=%d %.4f ms (%.3fx ship) rel-L2 %.1e%s", g.hg, g.ms,
+                    ms_ship / g.ms, g.rel, g.ok ? "" : " LAUNCH_FAILED");
+      }
+      std::printf("\n");
+    }
     hipFree(d_partial);
 
     bool gqa_ok = true;
@@ -569,9 +844,7 @@ int main(int argc, char **argv) {
           }
         },
         5, 300.0);
-    // the two kernels must agree (they only differ in how the slices are grouped)
-    std::vector<float> a((std::size_t)kHeads * kHeadDim), b((std::size_t)kHeads * kHeadDim);
-    hipMemcpy(a.data(), d_out, a.size() * sizeof(float), hipMemcpyDeviceToHost);
+    // `a` already holds the unsplit reference (see above); only read the candidate.
     hipMemcpy(b.data(), d_out2, b.size() * sizeof(float), hipMemcpyDeviceToHost);
     double num = 0, den = 0, maxd = 0;
     for (std::size_t i = 0; i < a.size(); ++i) {
@@ -591,7 +864,8 @@ int main(int argc, char **argv) {
                 "prototype vs ship: rel-L2 %.1e\n",
                 split_rel, split_maxd, n_splits, rel);
     (void)grow;
-    hipFree(d_partial);
+    // d_partial was already released above (the double free was a real bug here: the
+    // second hipFree failed and polluted the error state the next iteration reads)
   }
   return 0;
 }
