@@ -255,9 +255,14 @@ int main(int argc, char **argv) {
   for (int sp : split_list) smax = std::max(smax, sp);
 
   rdna4::KvType kt = rdna4::KvType::F16;
+  // The WPB/split entry points are only instantiated for the diagonal pairs (this
+  // bench always benches K and V at the same type), so the new formats are added
+  // here as diagonal entries -- the shipping attn_launch carries the full 6x6.
   if (std::strcmp(tname, "q4_0") == 0) kt = rdna4::KvType::Q4_0;
   else if (std::strcmp(tname, "q8_0") == 0) kt = rdna4::KvType::Q8_0;
   else if (std::strcmp(tname, "f32") == 0) kt = rdna4::KvType::F32;
+  else if (std::strcmp(tname, "q5_0") == 0) kt = rdna4::KvType::Q5_0;
+  else if (std::strcmp(tname, "q4_1") == 0) kt = rdna4::KvType::Q4_1;
 
   hipDeviceProp_t prop{};
   if (hipGetDeviceProperties(&prop, 0) != hipSuccess) return 1;
