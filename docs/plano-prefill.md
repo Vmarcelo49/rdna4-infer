@@ -257,3 +257,30 @@ localizados.
    subir o chunk com o kernel atual (regressão), duplo buffer de ativação (−17 %), ampliar o tile
    em M para matar a cauda de onda (−13 %), `UNROLL` no kernel em lote (+5,6 % pior), staging LDS da
    ativação (−5 %), persistir com o caminho f16 vetorial (95 % do muro de issue dele).
+
+## 7. DECISÃO DO DONO (14/09, tarde): o contrato bit-exato do caminho em lote foi ABERTO
+
+Autorização explícita do usuário: *"pode quebrar esse contrato, os ganhos que vamos ter devem ser
+bem grandes"*. Registro aqui **com a correção de magnitude**, porque ela decide onde a autorização
+é gasta:
+
+| o que a autorização libera | ganho medido | veredito |
+|---|---|---|
+| **chunk 128 no prefill** (GEMM em vez de GEMV em lote) | **2,21× (104,86 → 231,83 tok/s a 512 tokens)** | **é aqui que se gasta** |
+| política de splits por tipo de KV (N-POL) | 1,020-1,089× na atenção f16, 15/15 A/B | junto |
+| GDN em blocos | **~5 %** (0,625 ms/token de 8,23) | atrás dos dois — não vale quebrar contrato por 5 % |
+
+**O que "abrir o contrato" significa, operacionalmente** (e o que a implementação tem de tratar):
+1. **O gate muda de caráter**: `check-batch-gpu` deixa de exigir `BIT-EXACT` no caminho em lote e
+   passa a exigir **tolerância declarada** — mas **só acima de 16 tokens**: até 16 o GEMV em lote
+   continua bit-exato, e essa parte do contrato não está sendo dada. Precedente na casa: a atenção
+   com splits já é não-bit-exata e é gated por PPL + `check-kvctx-gpu`.
+2. **Consistência entre consumidores é pré-requisito, não consequência.** O gate do `serve` falhou
+   porque o CLI cortava em chunks de 128 (GEMM) e o **servidor prefillava token a token**
+   (`serve.hip:512` chama `forward_tokens`, sem batching nenhum) — aritméticas diferentes. A
+   correção é **uma política de chunk só**, compartilhada pelos dois (e o servidor ganha o prefill
+   em lote que nunca teve).
+3. **Gates de token podem mudar de valor** (`check_golden_run`, `compare_llama_greedy`): se um token
+   mudar, o lugar e os dois textos vão para o relatório — rebaseline silencioso é proibido.
+4. **O `RD_PREFILL_CHUNK=16` continua reproduzindo o comportamento antigo** (é o A/B e a saída de
+   emergência).
