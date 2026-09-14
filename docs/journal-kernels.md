@@ -398,3 +398,14 @@ minha mudança é redundante por construção. Não reivindico esse número.
 errado (`"tok/s, mean"`, quando a linha é `... (28,66 tok/s), mean ...`) e as seis linhas
 saíram vazias — **erro meu, o mesmo tipo de erro de duas horas antes**, registrado aqui.
 Script corrigido (`/tmp/kab2.sh`) e enfileirado; o coordenador também assumiu a corrida.
+
+## 12. Bateria de gates PÓS-MERGE (05:00-05:10), no HEAD da árvore mergeada
+
+Mesma bateria, agora no binário pós-merge (`3cbbdce` + os commits seguintes), tudo com
+lock e janela verificada: `check-nn-gpu` **OK**; `GRAPH_LAST_TOKEN=1 check-graph-gpu`
+**PASS**; `check_regression.sh` **OK — 7 casos, 7 ids bit-exatos** (parede 48 s);
+`check_golden_run.sh` **OK**; `check-matvec-gpu --check-lds` **OK — 5 tipos
+BIT-IDENTICO**; `check-matmul-gpu` **OK — bit-exact em todas as configurações**, e os
+números do caminho em lote batem com os do binário pristino dentro do ruído
+(`q2_k` N=16: 1,379 vs 1,384 ms; `iq4_nl` N=16: 0,035 vs 0,035 ms). Os gates deste frente
+são, portanto, **pós-merge**.
