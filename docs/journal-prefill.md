@@ -162,6 +162,85 @@ Interruptor de A/B **no binário**: `RD_PREFILL_BATCH=0` volta ao andaime por to
 
 ### 4.1 Números
 
-(ver §4.1 na corrida `/tmp/vec-check.log`)
+- **Resultado** (janela limpa: VRAM em repouso 124 MB antes, 198 MB depois; uma única tomada de
+  lock; `bench --prefill 512 --prefill-reps 3`, duas rodadas):
+
+  | | 512 tokens | tok/s |
+  |---|---|---|
+  | antes (só §2) | 4,898 / 4,915 s | 104,5 / 104,2 |
+  | depois (float4) | **4,131 / 4,155 s** | **123,9 / 123,2** |
+
+  ⇒ **+18,6 %** (ganho muito acima do piso de ruído de 1,2 % do harness; neste caso as três
+  passadas de uma rodada concordam dentro de 0,2 %).
+- `check-batch-gpu`: **BIT-EXACT** em N = 2/3/4/8/16 e no prompt completo; o ganho do lote em
+  N=16 sobe de 3,47× para **4,11×** (32,834 → 7,980 ms/token), que é o `cf` que a frente de MTP
+  usa para escolher D:
+
+  | N | per-token ms | em lote ms/token | ganho |
+  |---|---|---|---|
+  | 2 | 39,474 | 16,373 | 2,41× |
+  | 3 | 33,062 | 12,203 | 2,71× |
+  | 4 | 33,036 | 10,752 | 3,07× |
+  | 8 | 32,958 | 9,396 | 3,51× |
+  | 16 | 32,834 | 7,980 | **4,11×** |
+
+- **Veredito**: **MANTIDO** (+18,6 % no prefill de 512 tokens, bit-exato).
+- Observação de método: a tabela de fases de §3 foi medida com o binário ANTERIOR (eu reconstruí
+  `rdna4-infer` e `check-batch-gpu`, mas não `bench-phases-gpu`, antes daquela corrida) — o bucket
+  `gdn_delta` daquela tabela (2,19 ms/token) é o valor ANTES do float4; a tabela reconstruída
+  está em §5.
 
 ---
+
+## 5. Orçamento por fase DEPOIS do float4 (binário reconstruído)
+
+- **Comando**: `./build/bench-phases-gpu IQ3_S --prefill 16 --level 2` (com `bench-phases-gpu`
+  reconstruído — a corrida de §3 usou o binário anterior e por isso mostra `gdn_delta` = 2,19).
+- **Resultado**: ver `/tmp/gates3.log` + `/tmp/speed-prefill.log` (preenchido abaixo).
+- **Veredito**: —
+
+## 6. Chunking e staging (prioridade 3 do briefing)
+
+- **`prefill_ids`**: a política 16/8/4/3/2 + cauda de 1 **continua correta e não muda** depois
+  dos kernels em lote. A razão agora é medida, não suposta: `check-batch-gpu` dá o custo de um
+  chunk de N tokens — N=16 → 7,98 ms/token, N=8 → 9,40, N=4 → 10,75, N=3 → 12,20, N=2 → 16,37
+  (o custo por token é monótono em N ⇒ maior-primeiro continua ótimo), e um chunk de 2 tokens
+  (32,7 ms no total) custa o mesmo que **um** token do caminho por token (32,8 ms): a cauda de 1
+  não é um caso patológico, é o preço de não ter instanciação para N=1.
+- **Tail de verdade** (N=500 = 31 chunks de 16 + 1 de 4): medido em §5; o esperado é um custo por
+  token ~2 % maior que em N=512, não mais que isso.
+- **GPU ociosa entre chunks?** Não, e a prova é interna ao instrumento: na passada instrumentada
+  a **soma dos buckets** (157,5 ms) coincide com o tempo de parede da passada (159,3 ms) dentro de
+  1,1 %, e o único trecho fora dos buckets é o dreno depois da última marca. Com ~1490 lançamentos
+  por chunk a 2,2 µs = 3,3 ms de fila de host contra 129 ms de GPU por chunk, o host está 40×
+  adiantado: não há starvation (o que havia antes era trabalho de kernel pequeno demais, não
+  fila vazia).
+- **Prefill vs decode trocando cache**: as passadas de prefill medidas antes e depois de um token
+  de decode (o `bench` re-prefixa na volta de cada rep) concordam dentro de 1 % (7,009/7,016 s no
+  baseline; 4,131/4,140 s depois) — não há evidência de thrashing. Medição direta de L2/DRAM
+  **não foi feita**: os contadores de hardware não existem nesta instalação
+  (`rocprof`/`omniperf` ausentes, `docs/medicoes-banda-e-gargalos.md` §0) e a frente não tinha
+  orçamento de GPU para montar um instrumento equivalente com eventos.
+
+## 7. O teto: o matvec em lote é 85 % do prefill — ENCAMINHADO, não implementado
+
+- **Referência**: `include/rdna4/matvec.cuh:302-345` (`matvec_kernel_batch`) e o orçamento por
+  fase de §3/§5.
+- **Hipótese (do briefing)**: "o matvec não é o gargalo do prefill".
+- **Medida que a mata**: o matvec em lote lê 12,0 GB por chunk de 16 tokens (11,13 GB de tronco +
+  0,87 GB de `output.weight`) em 110 ms ⇒ **109 GB/s**. O MESMO matvec no caminho por token faz
+  11,13 GB em 24,94 ms ⇒ **446 GB/s**. Não é banda: é issue de ALU — `matvec_kernel_batch` chama
+  `T::dot(rowp, abase + n*act_stride, ...)` **uma vez por token**, então a desquantização
+  (`iq3s_grid`, montagem de sinais, `__vsub4`) é reexecutada N vezes e só o *load* do peso é
+  amortizado. Com o andaime fora do caminho, esse bucket virou **70 % do prefill antes do float4
+  e ~85 % depois** (6,93 de 8,07 ms/token).
+- **O que daria**: dequantizar o bloco uma vez em registrador e fazer N `dp4a` (bit-exato, mesma
+  ordem) vale ~2-2,5× no matvec ⇒ prefill ~200 tok/s; o caminho MMQ/int8 WMMA vale os 446 GB/s
+  ⇒ ~380 tok/s (a distância para o llama.cpp está aqui, não no andaime).
+- **Por que não foi feito**: `matvec.cuh`/`vecdotq.cuh` são da frente de kernels nesta rodada
+  (regra 6.5 do `docs/noite-regras.md`); o protótipo MMQ autorizado no briefing exigiria
+  reimplementar a desquantização de 15 dtypes num arquivo novo e não caberia no resto da noite
+  sem arriscar os gates. **Encaminhado ao coordenador com a linha de código e os números.**
+- **Veredito**: **ABANDONADO nesta frente, com medida** (o ganho não é meu; o achado está
+  reportado). É o item de maior valor que sobrou.
+
