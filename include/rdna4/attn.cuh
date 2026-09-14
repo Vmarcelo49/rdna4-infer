@@ -1047,6 +1047,38 @@ inline bool attn_split_batch_launch(const float *d_q, const void *d_k, const voi
   RD_ATTN_SB_CASE(Q4_0, F16, 8);
   RD_ATTN_SB_CASE(Q4_0, Q8_0, 8);
   RD_ATTN_SB_CASE(Q4_0, Q4_0, 8);
+  // Q5_0/Q4_1 (frente KV): the list above was added by the prefill front while the KV
+  // front was adding the two formats, so the merge left it without them -- and the
+  // caller in graph.cuh treats `false` as a HARD error ("batch attn (batched) launch
+  // failed"), so with --cache-type-k q5_0 / --cache-type-v q4_1 and >=512 keys the
+  // batched prefill aborted instead of degrading. Review finding R11; the same hole was
+  // fixed for attn_batch_launch / attn_launch_split in the KV branch (a1fc8bd).
+  RD_ATTN_SB_CASE(Q5_0, Q4_1, 16);
+  RD_ATTN_SB_CASE(Q5_0, Q5_0, 16);
+  RD_ATTN_SB_CASE(Q4_1, Q4_1, 16);
+  RD_ATTN_SB_CASE(Q4_1, Q5_0, 16);
+  RD_ATTN_SB_CASE(Q5_0, F16, 16);
+  RD_ATTN_SB_CASE(Q5_0, Q8_0, 16);
+  RD_ATTN_SB_CASE(Q5_0, Q4_0, 16);
+  RD_ATTN_SB_CASE(F16, Q5_0, 16);
+  RD_ATTN_SB_CASE(F16, Q4_1, 16);
+  RD_ATTN_SB_CASE(Q8_0, Q5_0, 16);
+  RD_ATTN_SB_CASE(Q8_0, Q4_1, 16);
+  RD_ATTN_SB_CASE(Q4_0, Q5_0, 16);
+  RD_ATTN_SB_CASE(Q4_0, Q4_1, 16);
+  RD_ATTN_SB_CASE(Q5_0, Q4_1, 8);
+  RD_ATTN_SB_CASE(Q4_1, Q5_0, 8);
+  RD_ATTN_SB_CASE(Q5_0, Q5_0, 8);
+  RD_ATTN_SB_CASE(Q4_1, Q4_1, 8);
+  RD_ATTN_SB_CASE(Q5_0, F16, 8);
+  RD_ATTN_SB_CASE(Q5_0, Q8_0, 8);
+  RD_ATTN_SB_CASE(Q5_0, Q4_0, 8);
+  RD_ATTN_SB_CASE(F16, Q5_0, 8);
+  RD_ATTN_SB_CASE(F16, Q4_1, 8);
+  RD_ATTN_SB_CASE(Q8_0, Q5_0, 8);
+  RD_ATTN_SB_CASE(Q8_0, Q4_1, 8);
+  RD_ATTN_SB_CASE(Q4_0, Q5_0, 8);
+  RD_ATTN_SB_CASE(Q4_0, Q4_1, 8);
 #undef RD_ATTN_SB_CASE
   return false;
 }
