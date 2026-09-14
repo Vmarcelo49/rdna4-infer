@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/check-model.dir/link.d "CMakeFiles/check-model.dir/tests/check_model.cpp.o" "CMakeFiles/check-model.dir/src/backend/gguf.cpp.o" "CMakeFiles/check-model.dir/src/backend/loader.cpp.o" "CMakeFiles/check-model.dir/src/backend/model.cpp.o" -o check-model

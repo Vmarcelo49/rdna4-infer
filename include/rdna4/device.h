@@ -194,37 +194,46 @@ inline std::uint64_t required_bytes(std::uint64_t weights_bytes, std::uint64_t c
   return weights_bytes + buffers_bytes + kv_cache_bytes(ctx_size, kv_k, kv_v) + kOverheadBytes;
 }
 
-// Teto RUNTIME do chunk do prefill em lote. O default (16) e' o `Graph::kMaxBatch`,
-// que e' o que o GEMV em lote tem instanciado; `RD_PREFILL_CHUNK` sobe esse teto
-// para o GEMM tilejado (docs/plano-prefill.md, degrau D2). Esta funcao e' a fonte
-// unica: o alocador (graph.cuh) e o orcamento de VRAM (graph_buffer_bytes) leem
-// daqui, para nao poderem divergir.
+// Teto RUNTIME do chunk do prefill em lote. O default (128) e' o alvo medido do
+// GEMM tilejado (docs/plano-prefill.md, degrau D2); ate' 16 o chunk e' o GEMV em
+// lote de sempre, que e' bit-exato contra o caminho por token. `RD_PREFILL_CHUNK`
+// continua sendo a escotilha: `RD_PREFILL_CHUNK=16` reproduz o comportamento
+// anterior byte a byte. Esta funcao e' a fonte unica: o alocador (graph.cuh) e o
+// orcamento de VRAM (graph_buffer_bytes) leem daqui, para nao poderem divergir --
+// e agora o CLI e o servidor tambem, via `Graph::prefill()`.
 //
 // Custo medido dos buffers de lote: 0,46 MB por token (18 buffers) + 19,6 KB/token
 // de blocos q8_1 + 396 KB/token de parciais de atencao = ~0,87 MB/token, ou seja
-// ~109 MiB num chunk de 128 (7,2 MiB no default de 16).
+// ~109 MiB num chunk de 128 (7,2 MiB com 16) -- pago por graph_buffer_bytes().
 inline int prefill_chunk_cap() {
   static const int v = [] {
     const char *e = std::getenv("RD_PREFILL_CHUNK");
-    // DEFAULT 16 -- e o motivo esta' medido, nao e' conservadorismo.
+    // DEFAULT 128 desde 14/09 (frente prefill-chunk). Era 16, e o que mudou NAO foi
+    // o numero: foi o contrato em volta dele.
     //
     // O GEMM tilejado (include/rdna4/gemm.cuh) da' 104,86 -> 231,83 tok/s a 512
-    // tokens (2,21x) com chunk 128, e e' bit-exato contra o `vec_dot_*` do motor.
-    // Mas ele NAO e' bit-exato contra o `matvec_launch_batch` que embarca hoje: a
-    // particao da soma em k e' outra (bloco de 32 em int32 com fator inteiro, em vez
-    // do acumulador por lane com reducao butterfly), e a diferenca medida e'
-    // rel-L2 2,4e-7 / max|d| 3,3e-6. Como o `prefill_ids` do CLI e o loop do
-    // servidor cortam o mesmo prompt em chunks diferentes, um prefill pode MISTURAR
-    // os dois caminhos -- e ai dois consumidores do mesmo modelo divergem no ultimo
-    // bit e, as vezes, no ultimo token: foi exatamente o que o gate do `serve`
-    // pegou (118 checks, 2 falhas com chunk 128; 0 falhas com chunk 16), e o
-    // `check-batch-gpu` NAO pega porque ele so' chama chunks <= 16.
+    // tokens (2,21x) com chunk 128 e e' bit-exato contra o `vec_dot_*` do motor,
+    // mas NAO contra o `matvec_launch_batch` que embarca: a particao da soma em k e'
+    // outra (bloco de 32 em int32 com fator inteiro, em vez do acumulador por lane
+    // com reducao butterfly), rel-L2 2,4e-7 / max|d| 3,3e-6 por projecao.
     //
-    // Ou seja: o chunk maior so' pode virar default junto com o re-gate NUMERICO do
-    // caminho em lote (PPL/regressao com tolerancia declarada no lugar da
-    // bit-exatidao estrita), e com os dois consumidores cortando o prompt do MESMO
-    // jeito. Ate la', `RD_PREFILL_CHUNK=128` liga o ganho de 2,21x explicitamente.
-    int n = e ? std::atoi(e) : 16;
+    // Com chunk 16 isso nao aparecia porque TODO caminho em lote com n <= 16 e' o
+    // GEMV, que e' bit-exato contra o caminho por token. O que quebrava era MISTURAR
+    // os dois: o CLI (`prefill_ids`, chunks 16/8/4/3/2) e o servidor
+    // (`forward_tokens`, token a token) cortavam o mesmo prompt de dois jeitos, e
+    // com o GEMM ligado os dois consumidores do mesmo modelo divergiam no ultimo bit
+    // e, as vezes, no ultimo token -- 2 falhas no gate do `serve` com chunk 128, 0
+    // com 16. As tres condicoes que autorizam este default:
+    //   1. a tolerancia e' DECLARADA, nao implicita: kTolChunkRelL2/kTolChunkMaxAbs
+    //      em tests/check_batch_gpu.hip, com a medicao que as justifica;
+    //   2. todo consumidor de prefill de prompt corta o prompt do MESMO jeito:
+    //      `Graph::prefill()` e' a unica politica (CLI run/chat, bench e servidor);
+    //   3. o contrato de bit-exatidao de n <= 16 (o GEMV que embarca) NAO foi
+    //      entregue: check-batch-gpu ainda exige BIT-EXACT nessa faixa, e
+    //      `RD_PREFILL_CHUNK=16` volta ao comportamento anterior.
+    // A medicao de ponta a ponta (512/2048 tokens, decode a 4K, 131K com
+    // q5_0/q4_1) e os gates estao no relatorio da frente.
+    int n = e ? std::atoi(e) : 128;
     if (n < 16) n = 16;
     if (n > 512) n = 512;  // == Graph::kMaxChunkHost
     return n;

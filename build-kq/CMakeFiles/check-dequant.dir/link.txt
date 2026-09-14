@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/check-dequant.dir/link.d "CMakeFiles/check-dequant.dir/tests/check_dequant.cpp.o" "CMakeFiles/check-dequant.dir/src/backend/gguf.cpp.o" "CMakeFiles/check-dequant.dir/src/backend/loader.cpp.o" -o check-dequant  -Wl,-rpath,/home/marcelo/Projetos/llama.cpp/build/bin /home/marcelo/Projetos/llama.cpp/build/bin/libggml-base.so

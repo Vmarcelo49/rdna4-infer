@@ -1,0 +1,2 @@
+/usr/bin/ar qc librdna4_tokenizer.a CMakeFiles/rdna4_tokenizer.dir/src/backend/unicode.cpp.o CMakeFiles/rdna4_tokenizer.dir/src/backend/unicode_data.cpp.o CMakeFiles/rdna4_tokenizer.dir/src/backend/tokenizer.cpp.o
+/usr/bin/ranlib librdna4_tokenizer.a

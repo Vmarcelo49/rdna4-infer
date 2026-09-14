@@ -40,7 +40,7 @@ const char *kMandatory[] = {
     "matvec.q4_K",      "matvec.q5_K",      "matvec.q6_K",     "matvec.iq2_xxs",
     "matvec.iq2_xs",    "matvec.iq3_xxs",   "matvec.iq1_s",    "matvec.iq4_nl",
     "matvec.iq3_s",     "matvec.iq2_s",     "matvec.iq4_xs",   "attn.warps_per_block",
-    "attn.split_wpb_limit", "attn.split_wpb_wide", "attn.split_min", "attn.max_splits",
+    "attn.split_wpb_limit", "attn.split_wpb_wide", "attn.split_min", "attn.max_splits", "attn.split_ctas_dense",
     "batch.ns",
     "batch.cap",
 };
@@ -71,6 +71,7 @@ std::vector<std::string> report_lines() {
   out.push_back(fmt("attn.split_wpb_wide = %d", tuned::kAttnSplitWpbWide));
   out.push_back(fmt("attn.split_min = %d", tuned::kAttnSplitMin));
   out.push_back(fmt("attn.max_splits = %d", tuned::kAttnMaxSplits));
+  out.push_back(fmt("attn.split_ctas_dense = %d", tuned::kAttnSplitCtasDense));
   std::string ns;
   for (int i = 0; i < tuned::kBatchCount; ++i) {
     if (i) ns += ",";

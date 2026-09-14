@@ -116,6 +116,8 @@ uint32_t f2u(const float f) {
   return u;
 }
 
+void u2f(const uint32_t u, float &f) { std::memcpy(&f, &u, 4); }
+
 Diff diff_bits(const std::vector<float> &a, const std::vector<float> &b, const std::size_t n) {
   Diff d;
   d.n = n;
@@ -161,7 +163,13 @@ template <class Traits>
 __global__ void ref_engine_kernel(const void *__restrict__ W, const block_q8_1 *__restrict__ A,
                                   float *__restrict__ C, const int M, const int N, const int K) {
   constexpr int QK = Traits::qk;
-  constexpr int STEP = Traits::vdr;  // kqs = vdr * sub-bloco (matvec.cuh:486)
+  constexpr int STEP = Traits::vdr;  // kqs = vdr * (tid % (qi/vdr)) (matvec.cuh:486)
+  // NUMERO DE CHAMADAS por super-bloco: `qi/vdr`. Nos tipos IQ cobertos isso da'
+  // 8 (qi=16/vdr=2, qi=32/vdr=4), que e' o que o laco original fixava; nos
+  // k-quants da' 16 (q2_K, q3_K, q4_K, q5_K) e 32 (q6_K) -- com o 8 fixo o
+  // oraculo somava SO' METADE do super-bloco (bug latente, invisivel enquanto
+  // so' tipos com qi/vdr == 8 passavam por aqui).
+  constexpr int NCALL = Traits::qi / Traits::vdr;
   const std::int64_t out = (std::int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (out >= (std::int64_t)M * N) return;
   const int m = (int)(out / N);
@@ -173,7 +181,7 @@ __global__ void ref_engine_kernel(const void *__restrict__ W, const block_q8_1 *
   float acc = 0.0f;
   for (int ib = 0; ib < bpr; ++ib) {
 #pragma unroll
-    for (int s = 0; s < 8; ++s) acc += Traits::dot((const void *)row, q + ib * 8, ib, STEP * s);
+    for (int s = 0; s < NCALL; ++s) acc += Traits::dot((const void *)row, q + ib * 8, ib, STEP * s);
   }
   C[out] = acc;
 }
@@ -253,6 +261,241 @@ float cpu_oracle_iq3s(const unsigned char *wraw, const std::int64_t bpr, const u
 }
 
 // ---------------------------------------------------------------------------
+// 2b. k-quants: oracle de CPU
+// ---------------------------------------------------------------------------
+// (i) `cpu_dequant_*`: transcricao LITERAL de `include/rdna4/dequant.cuh`, com
+//     `tid` virando o indice do laco. E' a decodificacao CANONICA do bloco
+//     (llama.cpp) e usa uma parametrizacao DIFERENTE da do vec_dot, entao ela e'
+//     um oraculo independente do indexamento que o kernel usa.
+// (ii) `cpu_stage_*`: a mesma algebra do `Solver*::store()` do gemm.cuh (quant
+//     cru + escalas) -- e' o que o oraculo de GEMM usa para reproduzir o kernel
+//     em CPU bit a bit.
+struct KqCpu {
+  int q[32];        // quant cru por elemento do bloco de 32 (ja' com o offset do tipo)
+  float dw, dmn;    // d (ou dm.d) e dmin
+  int s0, s1;       // escalas empacotadas como no `KqScal`
+};
+
+static inline uint16_t rd16(const unsigned char *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static inline float rdf16(const unsigned char *p) { return rdna4::fp16_to_float(rd16(p)); }
+
+// ---- dequant canonico -----------------------------------------------------
+void cpu_dequant_q2k(const unsigned char *b, float *yy) {
+  const unsigned char *sc = b, *qs = b + 16;
+  const float d = rdf16(b + 80), dmin = rdf16(b + 82);
+  for (int tid = 0; tid < 64; ++tid) {
+    const int n = tid / 32, l = tid - 32 * n, is = 8 * n + l / 16;
+    const int q = qs[32 * n + l];
+    float *y = yy + 128 * n;
+    y[l + 0] = d * (sc[is + 0] & 0xF) * ((q >> 0) & 3) - dmin * (sc[is + 0] >> 4);
+    y[l + 32] = d * (sc[is + 2] & 0xF) * ((q >> 2) & 3) - dmin * (sc[is + 2] >> 4);
+    y[l + 64] = d * (sc[is + 4] & 0xF) * ((q >> 4) & 3) - dmin * (sc[is + 4] >> 4);
+    y[l + 96] = d * (sc[is + 6] & 0xF) * ((q >> 6) & 3) - dmin * (sc[is + 6] >> 4);
+  }
+}
+void cpu_dequant_q3k(const unsigned char *b, float *yy) {
+  const unsigned char *hm = b, *qs = b + 32, *sc = b + 96;
+  const float d = rdf16(b + 108);
+  for (int tid = 0; tid < 64; ++tid) {
+    const int r = tid / 4, t = r / 2, is0 = r % 2, l0 = 16 * is0 + 4 * (tid % 4);
+    const int n = t / 4, j = t - 4 * n;
+    const unsigned char m = (unsigned char)(1 << (4 * n + j));
+    const int is = 8 * n + 2 * j + is0, shift = 2 * j;
+    int us;
+    if (is < 4) us = (sc[is] & 0xF) | (((sc[is + 8] >> 0) & 3) << 4);
+    else if (is < 8) us = (sc[is] & 0xF) | (((sc[is + 4] >> 2) & 3) << 4);
+    else if (is < 12) us = (sc[is - 8] >> 4) | (((sc[is + 0] >> 4) & 3) << 4);
+    else us = (sc[is - 8] >> 4) | (((sc[is - 4] >> 6) & 3) << 4);
+    const float dl = d * (float)(us - 32);
+    float *y = yy + 128 * n + 32 * j;
+    // ATENCAO: `q` e' `x->qs + 32*n` no dequant.cuh -- sem o `32*n` o oraculo le'
+    // o super-bloco errado quando n = 1 (metade dos blocos) e reprova um staging
+    // CORRETO: foi o que aconteceu na primeira corrida desta bancada (751 de 2048
+    // "errados" no q3_K, com o kernel certo).
+    for (int l = l0; l < l0 + 4; ++l)
+      y[l] = dl * (float)((int8_t)((qs[32 * n + l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
+  }
+}
+void cpu_get_scale_min_k4(int j, const unsigned char *q, int &dd, int &mm) {
+  if (j < 4) {
+    dd = q[j] & 63;
+    mm = q[j + 4] & 63;
+  } else {
+    dd = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+    mm = (q[j + 4] >> 4) | ((q[j + 0] >> 6) << 4);
+  }
+}
+void cpu_dequant_q4k(const unsigned char *b, float *yy) {
+  const unsigned char *sc = b + 4, *qs = b + 16;
+  const float d = rdf16(b + 0), dmin = rdf16(b + 2);
+  for (int tid = 0; tid < 32; ++tid) {
+    const int il = tid / 8, ir = tid % 8, is = 2 * il;
+    float *y = yy + 64 * il + 4 * ir;
+    const unsigned char *q = qs + 32 * il + 4 * ir;
+    int s1, m1, s2, m2;
+    cpu_get_scale_min_k4(is + 0, sc, s1, m1);
+    cpu_get_scale_min_k4(is + 1, sc, s2, m2);
+    for (int l = 0; l < 4; ++l) {
+      y[l + 0] = d * s1 * (q[l] & 0xF) - dmin * m1;
+      y[l + 32] = d * s2 * (q[l] >> 4) - dmin * m2;
+    }
+  }
+}
+void cpu_dequant_q5k(const unsigned char *b, float *yy) {
+  const unsigned char *sc = b + 4, *qh = b + 16, *qs = b + 48;
+  const float d = rdf16(b + 0), dmin = rdf16(b + 2);
+  for (int tid = 0; tid < 64; ++tid) {
+    const int il = tid / 16, ir = tid % 16, is = 2 * il;
+    float *y = yy + 64 * il + 2 * ir;
+    const unsigned char *ql = qs + 32 * il + 2 * ir;
+    const unsigned char *h = qh + 2 * ir;
+    int s1, m1, s2, m2;
+    cpu_get_scale_min_k4(is + 0, sc, s1, m1);
+    cpu_get_scale_min_k4(is + 1, sc, s2, m2);
+    unsigned char hm = (unsigned char)(1 << (2 * il));
+    y[0] = d * s1 * ((ql[0] & 0xF) + ((h[0] & hm) ? 16 : 0)) - dmin * m1;
+    y[1] = d * s1 * ((ql[1] & 0xF) + ((h[1] & hm) ? 16 : 0)) - dmin * m1;
+    hm = (unsigned char)(hm << 1);
+    y[32] = d * s2 * ((ql[0] >> 4) + ((h[0] & hm) ? 16 : 0)) - dmin * m2;
+    y[33] = d * s2 * ((ql[1] >> 4) + ((h[1] & hm) ? 16 : 0)) - dmin * m2;
+  }
+}
+void cpu_dequant_q6k(const unsigned char *b, float *yy) {
+  const unsigned char *ql = b, *qh = b + 128;
+  const int8_t *sc = (const int8_t *)(const void *)(b + 192);
+  const float d = rdf16(b + 208);
+  for (int tid = 0; tid < 64; ++tid) {
+    const int ip = tid / 32, il = tid - 32 * ip, is = 8 * ip + il / 16;
+    float *y = yy + 128 * ip + il;
+    const unsigned char *q = ql + 64 * ip + il;
+    const unsigned char h = qh[32 * ip + il];
+    const int8_t *s = sc + is;
+    y[0] = d * s[0] * (float)((int8_t)((q[0] & 0xF) | (((h >> 0) & 3) << 4)) - 32);
+    y[32] = d * s[2] * (float)((int8_t)((q[32] & 0xF) | (((h >> 2) & 3) << 4)) - 32);
+    y[64] = d * s[4] * (float)((int8_t)((q[0] >> 4) | (((h >> 4) & 3) << 4)) - 32);
+    y[96] = d * s[6] * (float)((int8_t)((q[32] >> 4) | (((h >> 6) & 3) << 4)) - 32);
+  }
+}
+
+// ---- staging (a algebra do gemm.cuh) --------------------------------------
+void cpu_stage_q2k(const unsigned char *b, const int sub, KqCpu &o) {
+  const unsigned char *sc = b, *qs = b + 16;
+  o.dw = rdf16(b + 80);
+  o.dmn = rdf16(b + 82);
+  const int g0 = sc[2 * sub], g1 = sc[2 * sub + 1];
+  o.s0 = (g0 & 0xF) | ((g0 >> 4) << 16);
+  o.s1 = (g1 & 0xF) | ((g1 >> 4) << 16);
+  for (int e = 0; e < 32; ++e) o.q[e] = (qs[32 * (sub >> 2) + e] >> (2 * (sub & 3))) & 3;
+}
+void cpu_stage_q3k(const unsigned char *b, const int sub, KqCpu &o) {
+  const unsigned char *hm = b, *qs = b + 32, *sc = b + 96;
+  o.dw = rdf16(b + 108);
+  o.dmn = 0.0f;
+  const int is = 2 * sub, quad = is >> 2, sh2 = 2 * quad;
+  const unsigned lo = rd16(sc + (is < 8 ? is : is - 8));
+  const unsigned hi = rd16(sc + 8 + (is & 3));
+  const int l0 = (is < 8) ? (int)(lo & 0x0Fu) : (int)((lo >> 4) & 0x0Fu);
+  const int l1 = (is < 8) ? (int)((lo >> 8) & 0x0Fu) : (int)((lo >> 12) & 0x0Fu);
+  o.s0 = (l0 | (((int)(hi >> sh2) & 3) << 4)) - 32;
+  o.s1 = (l1 | (((int)(hi >> (sh2 + 8)) & 3) << 4)) - 32;
+  for (int e = 0; e < 32; ++e) {
+    const int q2 = (qs[32 * (sub >> 2) + e] >> (2 * (sub & 3))) & 3;
+    o.q[e] = q2 - ((hm[e] >> sub) & 1 ? 0 : 4);
+  }
+}
+void cpu_stage_q45k(const int is5, const unsigned char *b, const int sub, KqCpu &o) {
+  const unsigned char *sc = b + 4;
+  const unsigned char *qs = b + (is5 ? 48 : 16);
+  const unsigned char *qh = is5 ? (b + 16) : nullptr;
+  o.dw = rdf16(b + 0);
+  o.dmn = rdf16(b + 2);
+  int s6, m6;
+  cpu_get_scale_min_k4(sub, sc, s6, m6);
+  o.s0 = s6 | (m6 << 16);
+  o.s1 = 0;
+  for (int e = 0; e < 32; ++e) {
+    int v = (qs[32 * (sub >> 1) + e] >> (4 * (sub & 1))) & 0xF;
+    if (is5) v |= ((qh[e] >> sub) & 1) << 4;
+    o.q[e] = v;
+  }
+}
+void cpu_stage_q6k(const unsigned char *b, const int sub, KqCpu &o) {
+  const unsigned char *ql = b, *qh = b + 128;
+  const int8_t *sc = (const int8_t *)(const void *)(b + 192);
+  const int n = sub >> 2, q = sub & 1, i2 = (sub >> 1) & 1;
+  o.dw = rdf16(b + 208);
+  o.dmn = 0.0f;
+  const int g = 8 * n + 2 * q + 4 * i2;
+  o.s0 = sc[g];
+  o.s1 = sc[g + 1];
+  for (int e = 0; e < 32; ++e) {
+    const int v = ((ql[64 * n + 32 * q + e] >> (4 * i2)) & 0xF) |
+                  (((qh[32 * n + e] >> (2 * (sub & 3))) & 3) << 4);
+    o.q[e] = v - 32;
+  }
+}
+// desempacota o record (o mesmo `scm()` do gemm.cuh) -> (escala, minimo) do grupo
+void cpu_scm(const int dt, const KqCpu &s, int grp, int &sc, int &mm) {
+  switch (dt) {
+    case 2:
+      sc = (grp ? s.s1 : s.s0) & 0xFFFF;
+      mm = ((grp ? s.s1 : s.s0) >> 16) & 0xFFFF;
+      break;
+    case 3: sc = grp ? s.s1 : s.s0; mm = 0; break;
+    case 4:
+    case 5: sc = s.s0 & 0xFFFF; mm = (s.s0 >> 16) & 0xFFFF; break;
+    case 6: sc = grp ? s.s1 : s.s0; mm = 0; break;
+    default: sc = 0; mm = 0; break;
+  }
+}
+// oraculo do GEMM na MESMA formulacao do kernel (inteiro exato + fma na ordem
+// do motor): o gate aqui e' BIT-EXATIDAO, porque e' a mesma sequencia.
+float cpu_oracle_kq(const int dt, const unsigned char *wraw, const std::int64_t bpr,
+                    const block_q8_1 *q8, const int m, const int n, const std::int64_t K,
+                    const std::size_t bb) {
+  const unsigned char *row = wraw + (std::size_t)n * (std::size_t)bpr * bb;
+  const block_q8_1 *qrow = q8 + (std::size_t)m * (std::size_t)(K / kQ8);
+  const bool two = (dt == 2 || dt == 3 || dt == 6);
+  const bool has_min = (dt == 2 || dt == 4 || dt == 5);
+  float acc = 0.0f;
+  for (std::int64_t ib = 0; ib < bpr; ++ib) {
+    const unsigned char *blk = row + (std::size_t)ib * bb;
+    for (int sub = 0; sub < 8; ++sub) {
+      KqCpu s{};
+      switch (dt) {
+        case 2: cpu_stage_q2k(blk, sub, s); break;
+        case 3: cpu_stage_q3k(blk, sub, s); break;
+        case 4: cpu_stage_q45k(0, blk, sub, s); break;
+        case 5: cpu_stage_q45k(1, blk, sub, s); break;
+        default: cpu_stage_q6k(blk, sub, s); break;
+      }
+      const block_q8_1 *qa = qrow + ib * 8 + sub;
+      const float da = rdna4::fp16_to_float((uint16_t)(qa->ds & 0xFFFFu));
+      int I0 = 0, I1 = 0, S0 = 0, S1 = 0;
+      for (int e = 0; e < 32; ++e) {
+        const int a = (int)qa->qs[e];
+        if (two && e >= 16) I1 += s.q[e] * a;
+        else I0 += s.q[e] * a;
+        if (has_min) {
+          if (two && e >= 16) S1 += a;
+          else S0 += a;
+        }
+      }
+      int sc0, m0, sc1, m1;
+      cpu_scm(dt, s, 0, sc0, m0);
+      cpu_scm(dt, s, 1, sc1, m1);
+      const int X = two ? (I0 * sc0 + I1 * sc1) : (I0 * sc0);
+      acc = std::fma(s.dw, da * (float)X, acc);  // std::fma(float,float,float) = fmaf
+      if (has_min) {
+        const int Y = two ? (S0 * m0 + S1 * m1) : (S0 * m0);
+        acc = std::fma(-s.dmn, da * (float)Y, acc);
+      }
+    }
+  }
+  return acc;
+}
+
+// ---------------------------------------------------------------------------
 // 3. Despacho por tipo
 // ---------------------------------------------------------------------------
 struct TypeDesc {
@@ -274,16 +517,99 @@ void ref_iq4xs(const void *w, const block_q8_1 *a, float *c, int M, int N, int K
   ref_engine_kernel<rdna4::TIQ4XS>
       <<<(unsigned)(((std::int64_t)M * N + 127) / 128), 128>>>(w, a, c, M, N, K);
 }
+void ref_q2k(const void *w, const block_q8_1 *a, float *c, int M, int N, int K) {
+  ref_engine_kernel<rdna4::TQ2K>
+      <<<(unsigned)(((std::int64_t)M * N + 127) / 128), 128>>>(w, a, c, M, N, K);
+}
+void ref_q3k(const void *w, const block_q8_1 *a, float *c, int M, int N, int K) {
+  ref_engine_kernel<rdna4::TQ3K>
+      <<<(unsigned)(((std::int64_t)M * N + 127) / 128), 128>>>(w, a, c, M, N, K);
+}
+void ref_q4k(const void *w, const block_q8_1 *a, float *c, int M, int N, int K) {
+  ref_engine_kernel<rdna4::TQ4K>
+      <<<(unsigned)(((std::int64_t)M * N + 127) / 128), 128>>>(w, a, c, M, N, K);
+}
+void ref_q5k(const void *w, const block_q8_1 *a, float *c, int M, int N, int K) {
+  ref_engine_kernel<rdna4::TQ5K>
+      <<<(unsigned)(((std::int64_t)M * N + 127) / 128), 128>>>(w, a, c, M, N, K);
+}
+void ref_q6k(const void *w, const block_q8_1 *a, float *c, int M, int N, int K) {
+  ref_engine_kernel<rdna4::TQ6K>
+      <<<(unsigned)(((std::int64_t)M * N + 127) / 128), 128>>>(w, a, c, M, N, K);
+}
+
+// ---- k-quants (D2/kq): ref do motor + oraculos de CPU ----------------------
+constexpr int kQ2K = 2, kQ3K = 3, kQ4K = 4, kQ5K = 5, kQ6K = 6;
+
+void deq_q2k(const unsigned char *b, float *y) { cpu_dequant_q2k(b, y); }
+void deq_q3k(const unsigned char *b, float *y) { cpu_dequant_q3k(b, y); }
+void deq_q4k(const unsigned char *b, float *y) { cpu_dequant_q4k(b, y); }
+void deq_q5k(const unsigned char *b, float *y) { cpu_dequant_q5k(b, y); }
+void deq_q6k(const unsigned char *b, float *y) { cpu_dequant_q6k(b, y); }
 
 const TypeDesc *type_of(const int dt) {
   static const TypeDesc kTypes[] = {
       {"iq3_s", kIq3S, ref_iq3s, sizeof(rdna4::block_iq3_s)},
       {"iq3_xxs", kIq3XXS, ref_iq3xxs, sizeof(rdna4::block_iq3_xxs)},
       {"iq4_xs", kIq4XS, ref_iq4xs, sizeof(rdna4::block_iq4_xs)},
+      {"q2_K", kQ2K, ref_q2k, sizeof(rdna4::block_q2_K)},
+      {"q3_K", kQ3K, ref_q3k, sizeof(rdna4::block_q3_K)},
+      {"q4_K", kQ4K, ref_q4k, sizeof(rdna4::block_q4_K)},
+      {"q5_K", kQ5K, ref_q5k, sizeof(rdna4::block_q5_K)},
+      {"q6_K", kQ6K, ref_q6k, sizeof(rdna4::block_q6_K)},
   };
   for (const TypeDesc &t : kTypes)
     if (t.dt == dt) return &t;
   return nullptr;
+}
+
+// Dequant canonico do tipo (nullptr se nao ha' oraculo de CPU).
+void (*dequant_of(const int dt))(const unsigned char *, float *) {
+  switch (dt) {
+    case kQ2K: return deq_q2k;
+    case kQ3K: return deq_q3k;
+    case kQ4K: return deq_q4k;
+    case kQ5K: return deq_q5k;
+    case kQ6K: return deq_q6k;
+    default: return nullptr;
+  }
+}
+
+// Dump do staging de um k-quant: 8 palavras int8 (a ordem de k) + o record.
+template <class Traits>
+__global__ void dump_stage_kq_kernel(const char *__restrict__ W, int *__restrict__ out,
+                                     const int nrow, const int bpr, const int nsub) {
+  const int t = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (t >= nsub) return;
+  const int s = t % 8;
+  const char *blk = W + ((std::int64_t)nrow * bpr + (t / 8)) * Traits::block_bytes;
+  const typename Traits::Pf pf = Traits::load(blk, s);
+  int tmp[8];
+  rdna4::KqScal k;
+  Traits::store(pf, s, tmp, k);
+  int *o = out + (std::size_t)t * 12;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) o[i] = tmp[i];
+  o[8] = __float_as_int(k.dw);
+  o[9] = __float_as_int(k.dmn);
+  o[10] = k.s0;
+  o[11] = k.s1;
+}
+
+template <class Traits>
+void dump_stage_kq(const char *dW, int *dOut, const int nrow, const int bpr, const int nsub) {
+  dump_stage_kq_kernel<Traits><<<(nsub + 63) / 64, 64>>>(dW, dOut, nrow, bpr, nsub);
+}
+
+void dump_stage_kq_dt(const int dt, const char *dW, int *dOut, const int nrow, const int bpr,
+                      const int nsub) {
+  switch (dt) {
+    case kQ2K: dump_stage_kq<rdna4::SolverQ2K>(dW, dOut, nrow, bpr, nsub); break;
+    case kQ3K: dump_stage_kq<rdna4::SolverQ3K>(dW, dOut, nrow, bpr, nsub); break;
+    case kQ4K: dump_stage_kq<rdna4::SolverQ4K>(dW, dOut, nrow, bpr, nsub); break;
+    case kQ5K: dump_stage_kq<rdna4::SolverQ5K>(dW, dOut, nrow, bpr, nsub); break;
+    default: dump_stage_kq<rdna4::SolverQ6K>(dW, dOut, nrow, bpr, nsub); break;
+  }
 }
 
 const char *type_name(const int dt) {
@@ -430,6 +756,7 @@ int main(int argc, char **argv) {
   int reps = 5;
   std::int64_t n_ovr = -1, k_ovr = -1;
   bool verify = true, quick = false, list_only = false, types_only = false;
+  bool kq_auto = false;
   std::string tensor_name;
   const char *model = nullptr;
   for (int i = 1; i < argc; ++i) {
@@ -464,6 +791,11 @@ int main(int argc, char **argv) {
       list_only = true;
     } else if (!std::strcmp(argv[i], "--types")) {
       types_only = true;
+    } else if (!std::strcmp(argv[i], "--kq")) {
+      // SELECAO POR TIPO, nao por nome: o mesmo nome de projecao e' um dtype
+      // diferente em camadas diferentes neste modelo, entao a bancada escolhe o
+      // MAIOR tensor de cada tipo k-quant (menos token_embd, que e' gather).
+      kq_auto = true;
     } else if (argv[i][0] != '-') {
       model = argv[i];
     }
@@ -548,6 +880,27 @@ int main(int argc, char **argv) {
   std::vector<std::string> names;
   if (!tensor_name.empty()) {
     names.push_back(tensor_name);
+  } else if (kq_auto) {
+    // Um tensor REAL por tipo k-quant, escolhido pelo DTYPE (nao pelo nome).
+    for (int dt : {kQ2K, kQ3K, kQ4K, kQ5K, kQ6K}) {
+      std::uint64_t best_bytes = 0;
+      std::string best;
+      for (std::size_t i = 0; i < ld.n_tensors(); ++i) {
+        const auto &t = ld.meta().tensors[i];
+        if ((int)ld.dtype(i) != dt) continue;
+        if (t.name.find("token_embd") != std::string::npos) continue;  // gather, nao GEMM
+        if ((std::int64_t)t.dims[0] % 256 != 0 || (std::int64_t)t.dims[1] % 128 != 0) continue;
+        if (ld.tensor_bytes(i) > best_bytes) {
+          best_bytes = ld.tensor_bytes(i);
+          best = t.name;
+        }
+      }
+      if (!best.empty()) {
+        std::printf("[--kq] %-9s -> %s (%.1f MB)\n", type_name(dt), best.c_str(),
+                    (double)best_bytes / 1e6);
+        names.push_back(best);
+      }
+    }
   } else {
     // Os tres shapes que importam + os tres tipos cobertos: K grande
     // (ffn_down, 17408), N grande (ffn_up, 17408), a projecao de atencao
@@ -694,6 +1047,68 @@ int main(int argc, char **argv) {
         }
       }
 
+      // (a2) staging dos k-quants: o quant cru + o record contra o DEQUANT
+      //      CANONICO (`dequant.cuh`, parametrizacao de threads do llama.cpp).
+      //      Reconstroi w_e = dw*sc_g*q_e - dmn*m_g a partir do que o kernel
+      //      depositou e compara com o dequant do MESMO bloco: uma troca de
+      //      nibble/bit/sinal (o defeito do `.x/.y` do iq4_xs, 4096 de 4096
+      //      errados) aparece aqui como erro de ordem 1.
+      {
+        void (*deq)(const unsigned char *, float *) = dequant_of(dt);
+        if (deq) {
+          const int nsub = 64;  // 8 super-blocos = 2048 pesos da linha 0
+          int *dStage = nullptr;
+          if (hipMalloc(&dStage, (std::size_t)nsub * 12 * sizeof(int)) != hipSuccess) continue;
+          dump_stage_kq_dt(dt, (const char *)dW, dStage, 0, (int)(K / kQK), nsub);
+          if (!launch_ok("dump_stage_kq")) continue;
+          (void)hipDeviceSynchronize();
+          std::vector<int> staged((std::size_t)nsub * 12);
+          (void)hipMemcpy(staged.data(), dStage, staged.size() * sizeof(int),
+                          hipMemcpyDeviceToHost);
+          (void)hipFree(dStage);
+          const bool two = (dt == kQ2K || dt == kQ3K || dt == kQ6K);
+          int bad = 0, first_bad = -1;
+          double maxrel = 0;
+          for (int t = 0; t < nsub; ++t) {
+            const int sb = t / 8, sub = t % 8;
+            float yy[256];
+            deq(w_raw.data() + (std::size_t)sb * td->block_bytes, yy);
+            KqCpu s{};
+            u2f(staged[(std::size_t)t * 12 + 8], s.dw);
+            u2f(staged[(std::size_t)t * 12 + 9], s.dmn);
+            s.s0 = staged[(std::size_t)t * 12 + 10];
+            s.s1 = staged[(std::size_t)t * 12 + 11];
+            for (int e = 0; e < 32; ++e)
+              s.q[e] = (int8_t)((unsigned)staged[(std::size_t)t * 12 + e / 4] >>
+                                (8 * (e % 4)));  // byte e/4, posicao e%4
+            for (int e = 0; e < 32; ++e) {
+              int sc, mm;
+              cpu_scm(dt, s, (two && e >= 16) ? 1 : 0, sc, mm);
+              const float got = (s.dw * (float)sc) * (float)s.q[e] - s.dmn * (float)mm;
+              const float want = yy[32 * sub + e];
+              const double err = std::fabs((double)got - (double)want);
+              const double ref = std::fabs((double)want) + 1e-30;
+              if (err > 1e-5 * ref + 1e-30) {
+                ++bad;
+                if (first_bad < 0) first_bad = 32 * sub + e;
+                maxrel = std::max(maxrel, err / ref);
+              }
+            }
+          }
+          std::printf(
+              "  staging k-quant: pesos reconstruidos do staging diferentes do dequant\n"
+              "    canonico: %d de 2048%s%s (recon: dw*sc*q - dmin*m; tolerancia rel 1e-5,\n"
+              "    que so' cobre ordem de arredondamento -- um nibble/bit trocado da' erro ~1)\n",
+              bad, bad ? "" : " (ok)",
+              first_bad >= 0 ? "  <-- PRIMEIRO PESO ERRADO" : "");
+          (void)maxrel;
+          if (bad) {
+            std::printf("  REPROVADO: o staging nao reproduz o dequant canonico\n");
+            continue;
+          }
+        }
+      }
+
       // (b) caso pequeno: nao-finitos, zeros, e oraculo de CPU (iq3_s)
       {
         const int Mc = 4, Nc = 64;
@@ -748,6 +1163,32 @@ int main(int argc, char **argv) {
               "    exato, `*(1+2*sc)` inteiro, d_w*d_a em fp32, acumulador fp32 com std::fma):\n"
               "    max|ref| %.6g ; max|gpu-cpu| %.3g ; max rel %.3g ; BITS diferentes %zu de %d%s\n",
               Mc, Nc, (long long)K, (long long)(K / 32), mref, mx, mrel, ndiff, Mc * Nc,
+              ndiff ? "" : "  (bit-exato)");
+        }
+        // oraculo de CPU dos k-quants: a MESMA formulacao do kernel (produto
+        // int32 exato por metade, escala/minimo inteiros, dw*da e dmn*da em
+        // fp32, std::fma na ordem do motor) -> tem de ser BIT-EXATO
+        if (dequant_of(dt)) {
+          std::size_t ndiff = 0;
+          double mx = 0, mrel = 0, mref = 0;
+          for (int m = 0; m < Mc; ++m) {
+            for (int n = 0; n < Nc; ++n) {
+              const float wantv = cpu_oracle_kq(dt, w_raw.data(), K / kQK, hAQ, m, n, (int)K,
+                                                td->block_bytes);
+              const float g = got[(std::size_t)m * Nc + n];
+              if (f2u(wantv) != f2u(g)) ++ndiff;
+              const double d = std::fabs((double)g - (double)wantv);
+              mx = std::max(mx, d);
+              mref = std::max(mref, std::fabs((double)wantv));
+              if (std::fabs((double)wantv) > 0) mrel = std::max(mrel, d / std::fabs((double)wantv));
+            }
+          }
+          std::printf(
+              "  oraculo de CPU (mesma formulacao do kernel: int32 exato por metade, escala e\n"
+              "    minimo INTEIROS, dw*da e dmn*da em fp32, std::fma na ordem do motor):\n"
+              "    M=%d N=%d K=%lld -> max|ref| %.6g ; max|gpu-cpu| %.3g ; max rel %.3g ;\n"
+              "    BITS diferentes %zu de %d%s\n",
+              Mc, Nc, (long long)K, mref, mx, mrel, ndiff, Mc * Nc,
               ndiff ? "" : "  (bit-exato)");
         }
       }

@@ -205,6 +205,42 @@ inline bool split_batch_enabled() {
     return n >= 2 && n <= batch_max_ && (n <= 16 ? batch_supported(n) != 0 : true);
   }
 
+  // ---------------------------------------------------------------------------
+  // POLITICA UNICA DE CHUNK DO PREFILL (frente prefill-chunk, 14/09).
+  //
+  // Ate' hoje CADA consumidor cortava o prompt por conta propria: o CLI em
+  // `src/main.hip::prefill_ids` (chunks de 16/8/4/3/2) e o servidor com
+  // `forward_tokens(prompt, 0, ...)` -- ou seja, TOKEN A TOKEN, sem lote nenhum.
+  // Dois consumidores do mesmo modelo com duas aritmeticas diferentes: com o chunk
+  // em 16 a diferenca era invisivel (o GEMV em lote e' bit-exato contra o caminho
+  // por token), mas com o GEMM tilejado ligado (`RD_PREFILL_CHUNK`, D2 do
+  // docs/plano-prefill.md) o CLI passava a usar o GEMM em parte das projecoes e o
+  // servidor continuava no caminho por token -- e ai os dois divergiam no ultimo
+  // bit e, as vezes, no ultimo token (gate do `serve`: 2 falhas com chunk 128, 0
+  // com 16). Alem disso o servidor nao tinha prefill em lote nenhum: ele
+  // prefillava a ~28 tok/s enquanto o CLI ja' fazia ~230.
+  //
+  // Agora existe UMA funcao, esta, e os dois a chamam. Todo consumidor de prefill
+  // de prompt (CLI `run`/`chat`, `bench`, servidor) corta o prompt identicamente
+  // por construcao, porque a lista de tamanhos vem de `prefill_chunk_sizes()`, que
+  // e' a mesma para todos.
+  //
+  // Contrato numerico (declarado, nao implicito):
+  //   - todo chunk de n <= 16 e' o GEMV em lote e continua BIT-EXATO contra o
+  //     caminho por token (contrato do M8, inegociavel; tests/check_batch_gpu.hip
+  //     exige bit-exatidao nessa faixa);
+  //   - chunks com n > 16 usam o GEMM tilejado, que e' bit-exato contra o
+  //     `vec_dot_*` do motor mas NAO contra o `matvec_launch_batch` (particao de k
+  //     diferente): tolerancia declarada em tests/check_batch_gpu.hip
+  //     (kTolChunkRelL2 / kTolChunkMaxAbs), com a medicao que a justifica.
+  // `hidden`/`logits` sao os do ULTIMO token do prompt.
+  bool prefill(const std::vector<std::int32_t> &ids, int start_pos, std::vector<float> &hidden,
+               std::vector<float> &logits, std::string &err);
+  // A lista de tamanhos que `prefill()` tenta, do maior para o menor. Exposta
+  // porque e' a POLITICA (e o gate a imprime): qualquer consumidor que queira
+  // cortar o prompt "do mesmo jeito" tem de chamar `prefill()`, nao recopiar isto.
+  std::vector<int> prefill_chunk_sizes() const;
+
   // feat/noite-prefill: `RD_PREFILL_BATCH=0` runs forward_batch with the
   // per-token scaffolding the M8 path shipped (the attention and the GDN
   // recurrence launched once per token) instead of the batched kernels. It is the
@@ -441,6 +477,23 @@ inline bool split_batch_enabled() {
       return attn_splits_env_ > kAttnMaxSplits ? kAttnMaxSplits : attn_splits_env_;
     }
     if (keys < kAttnSplitMin) return 1;
+    // N-POL (medido, docs/autotuning-gfx1201.md §Atencao): com KV SEM dequant no
+    // laco interno (f16/f32) o otimo e um numero FIXO de CTAs, nao uma fracao das
+    // chaves. A politica antiga (`keys/kAttnSplitMin`, teto 16) dobrava a grade com
+    // o contexto e chegava a 384 CTAs a 16K, onde a celula medida e 4 splits x 16
+    // warps = 96 CTAs (kAttnSplitCtasDense/n_head): 1,047x a 4K, 1,089x a 8K,
+    // 1,030x a 16K, 1,023x a 32K, 1,020x a 64K -- A/B intercalado de 15 rodadas
+    // contra a celula antiga, 15/15 rodadas, piso de ruido 1,001-1,005x. Com KV
+    // quantizado o mesmo A/B mede o oposto (4 splits perde 6-13%, 0/15), entao a
+    // regra por chaves fica exatamente para ele: o que separa os dois casos e o
+    // dequant, nao o numero de chaves.
+    if ((kv_k_ == KvType::F16 || kv_k_ == KvType::F32) &&
+        (kv_v_ == KvType::F16 || kv_v_ == KvType::F32)) {
+      const int nh = n_head();
+      int sp = nh > 0 ? (tuned::kAttnSplitCtasDense + nh - 1) / nh : 1;
+      if (sp < 1) sp = 1;
+      return sp > kAttnMaxSplits ? kAttnMaxSplits : sp;
+    }
     const int sp = keys / kAttnSplitMin;
     return sp > kAttnMaxSplits ? kAttnMaxSplits : sp;
   }
@@ -1491,6 +1544,76 @@ inline bool Graph::forward_batch(const std::vector<std::int32_t> &tokens, int st
                 hipMemcpyDeviceToHost) != hipSuccess) {
     err = "batch logits readback failed";
     return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// A POLITICA UNICA DE CHUNK DO PREFILL -- ver a declaracao, no topo da classe,
+// para o porque' (CLI e servidor cortavam o prompt de dois jeitos diferentes).
+//
+// Esta funcao e' a extracao LITERAL do `prefill_ids` que vivia em
+// `src/main.hip:162-195`: a mesma lista de tamanhos, a mesma escolha do maior que
+// cabe (`for (int sz : sizes) if (resta >= sz) { take = sz; break; }`) e a mesma
+// cauda. Com `RD_PREFILL_CHUNK=16` a lista e' exatamente {16,8,4,3,2} e o
+// comportamento e' byte a byte o que embarcava (era o unico caminho, entao os
+// numeros de 104,86 tok/s e o golden atual foram medidos com ele).
+//
+// Detalhe da cauda, preservado de proposito: com cap > 16 a lista desce
+// {cap, cap/2, ..., 2} e so' DEPOIS recebe os tamanhos que faltam de {16,8,4,3,2},
+// entao o 3 cai no fim da lista e uma cauda de 3 tokens sai como 2 + 1 token (com
+// cap = 16, onde a lista e' {16,8,4,3,2}, ela sai como um chunk de 3). Nos dois
+// casos a aritmetica e' a mesma -- todo caminho com n <= 16 e' bit-exato contra o
+// caminho por token, e um chunk de 1 token E' o caminho por token -- mas manter a
+// ordem e' o que faz o chunk 128 medido (231,83 tok/s a 512 tokens) ser o mesmo
+// chunk 128 que roda agora.
+// ---------------------------------------------------------------------------
+inline std::vector<int> Graph::prefill_chunk_sizes() const {
+  const int cap = batch_max_;
+  std::vector<int> sizes;
+  for (int sz = cap; sz >= 2; sz >>= 1) sizes.push_back(sz);
+  if (cap > 16) {
+    for (int sz : {16, 8, 4, 3, 2}) {
+      bool tem = false;
+      for (int x : sizes) tem = tem || x == sz;
+      if (!tem) sizes.push_back(sz);
+    }
+  } else {
+    sizes = {16, 8, 4, 3, 2};
+  }
+  return sizes;
+}
+
+inline bool Graph::prefill(const std::vector<std::int32_t> &ids, int start_pos,
+                           std::vector<float> &hidden, std::vector<float> &logits,
+                           std::string &err) {
+  if (ids.empty()) {
+    err = "the prompt must not be empty";
+    return false;
+  }
+  const std::vector<int> sizes = prefill_chunk_sizes();
+  std::size_t pos = 0;
+  while (pos < ids.size()) {
+    std::size_t take = 1;
+    for (int sz : sizes) {
+      if (ids.size() - pos >= (std::size_t)sz) {
+        take = (std::size_t)sz;
+        break;
+      }
+    }
+    const int p = start_pos + (int)pos;
+    if (take == 1) {
+      // Cauda de 1 token: o caminho por token. O em lote nao tem instanciacao
+      // para n = 1 e este caminho e' o proprio caminho por token, entao nao ha'
+      // nada a tolerar aqui.
+      const std::vector<std::int32_t> one{ids[pos]};
+      if (!forward_tokens(one, p, hidden, logits, err)) return false;
+    } else {
+      const std::vector<std::int32_t> chunk(ids.begin() + (long)pos,
+                                            ids.begin() + (long)(pos + take));
+      if (!forward_batch(chunk, p, hidden, logits, err)) return false;
+    }
+    pos += take;
   }
   return true;
 }

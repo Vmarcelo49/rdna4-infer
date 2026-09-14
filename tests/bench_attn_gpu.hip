@@ -19,9 +19,11 @@
 //
 // AUTOTUNING (task 6, docs/autotuning-gfx1201.md): the split-count x warps-per-CTA
 // table is the search space of the attention kernel, and the engine's policy is
-// `attn_splits_for(keys)` (graph.cuh: keys/kAttnSplitMin, capped at kAttnMaxSplits)
-// plus `attn_split_wpb(splits)` (attn.cuh: 16 warps up to kAttnSplitWpbLimit
-// splits, 8 above). --smax raises the split cap so the sweep can ask whether the
+// `attn_splits_for(keys)` (graph.cuh: a fixed kAttnSplitCtasDense/n_head CTAs when
+// the KV has no dequant -- f16/f32 -- and keys/kAttnSplitMin capped at
+// kAttnMaxSplits for the quantized types) plus `attn_split_wpb(splits)` (attn.cuh:
+// 16 warps up to kAttnSplitWpbLimit splits, 8 in between, 16 again from
+// kAttnSplitWpbWide). --smax raises the split cap so the sweep can ask whether the
 // shipped kAttnMaxSplits=16 is still the optimum at long context, and every `t`
 // row prints the best cell, the cell the shipping policy would pick, and the
 // same-kernel-twice noise floor that makes the comparison meaningful.
@@ -434,6 +436,12 @@ int main(int argc, char **argv) {
   if (ts.empty()) ts = {4096, 16384, 65536};
   if (smax < 1) smax = 1;
   for (int sp : split_list) smax = std::max(smax, sp);
+  // The duel runs (`--ab`/`--cand`) also need their split counts in the partial
+  // buffer's size: a candidate above smax writes past d_partial. Measured the hard
+  // way -- `--cand 24:16` without `--splits 24` left smax at 16 and every duel in
+  // a 9-run battery died with "Memory access fault ... Page not present", which
+  // looks like a broken card instead of an under-sized buffer.
+  for (const auto &c : cands) smax = std::max(smax, c.first);
 
   rdna4::KvType kt = rdna4::KvType::F16;
   // The WPB/split entry points are only instantiated for the diagonal pairs (this
@@ -522,8 +530,6 @@ int main(int argc, char **argv) {
     // change, not a bit-exact one. The shipping policy picks the warps
     // (attn_split_wpb: 16 warps for n_splits <= kAttnSplitWpbLimit, 8 above).
     // ------------------------------------------------------------------
-    constexpr int kPolicySplitMin = 512;
-    constexpr int kPolicyMaxSplits = 16;
     constexpr int kReps = 5;
     constexpr int kRounds = 3;
     float *d_partial = nullptr;
@@ -532,9 +538,26 @@ int main(int argc, char **argv) {
       return 1;
     }
     const int keys = t + 1;
-    int n_splits = keys / kPolicySplitMin;
+    // The cell the SHIPPING policy picks, mirrored from Graph::attn_splits_for
+    // (graph.cuh) -- it is the reference every table below is judged against, so it
+    // has to be that function and not a paraphrase of it. Two bugs lived here: the
+    // WPB came from a stale copy of attn_split_wpb (16 warps only for splits <=
+    // kAttnSplitWpbLimit, which missed kAttnSplitWpbWide and so labelled 16:8 -- a
+    // cell the engine never runs -- as "ship policy" for every keys >= 8192), and
+    // the split count ignored the KV-type split of the rule (f16/f32 want a fixed
+    // CTA count, quantized KV keeps keys/kAttnSplitMin).
+    const bool kv_dense = (kt == rdna4::KvType::F16 || kt == rdna4::KvType::F32);
+    int n_splits;
+    if (keys < rdna4::tuned::kAttnSplitMin) {
+      n_splits = 1;
+    } else if (kv_dense) {
+      n_splits = (rdna4::tuned::kAttnSplitCtasDense + kHeads - 1) / kHeads;
+    } else {
+      n_splits = keys / rdna4::tuned::kAttnSplitMin;
+    }
     if (n_splits < 1) n_splits = 1;
-    if (n_splits > kPolicyMaxSplits) n_splits = kPolicyMaxSplits;
+    if (n_splits > rdna4::tuned::kAttnMaxSplits) n_splits = rdna4::tuned::kAttnMaxSplits;
+    const int n_splits_wpb = rdna4::attn_split_wpb(n_splits);
     const int gqa_splits_t = gqa_splits > 0 ? gqa_splits : n_splits;
 
     if (no_sweep) {
@@ -716,10 +739,7 @@ int main(int argc, char **argv) {
     int best_sp = 0, best_wpb = 0, policy_sp = 1, policy_wpb = 0;
     for (const Cell &c : cells) {
       if (c.sp <= 0) continue;
-      const bool is_policy = (c.sp == n_splits) &&
-                             (c.wpb == (c.sp <= rdna4::kAttnSplitWpbLimit
-                                            ? 16
-                                            : rdna4::kAttnWarpsPerBlock));
+      const bool is_policy = (c.sp == n_splits) && (c.wpb == n_splits_wpb);
       if (is_policy) {
         policy_ms = c.ms;
         policy_sp = c.sp;

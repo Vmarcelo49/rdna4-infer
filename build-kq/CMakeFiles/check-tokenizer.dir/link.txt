@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/check-tokenizer.dir/link.d "CMakeFiles/check-tokenizer.dir/tests/check_tokenizer.cpp.o" "CMakeFiles/check-tokenizer.dir/src/backend/gguf.cpp.o" "CMakeFiles/check-tokenizer.dir/src/backend/loader.cpp.o" -o check-tokenizer  librdna4_tokenizer.a

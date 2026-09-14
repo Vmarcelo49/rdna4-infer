@@ -509,7 +509,21 @@ bool Engine::generate(const std::vector<std::int32_t> &prompt_ids, const GenRequ
 
   std::vector<float> hidden, logits;
   const double t0 = now_s();
-  if (!graph_->forward_tokens(prompt_ids, 0, hidden, logits, err)) return false;
+  // PREFILL EM LOTE, com a MESMA politica de chunk do CLI (frente prefill-chunk,
+  // 14/09). Aqui havia `graph_->forward_tokens(prompt_ids, 0, ...)`: o caminho por
+  // token, token a token, sem lote nenhum -- duas consequencias, as duas medidas:
+  //   (a) o servidor prefillava a ~28 tok/s enquanto o CLI ja' fazia ~230 no mesmo
+  //       prompt (o gate do `serve` agora mede os dois);
+  //   (b) os dois consumidores do mesmo modelo usavam aritmeticas diferentes. Com
+  //       chunk 16 a diferenca era invisivel (GEMV em lote bit-exato contra o
+  //       caminho por token), mas com o GEMM tilejado ligado (`RD_PREFILL_CHUNK`,
+  //       D2 do docs/plano-prefill.md) o CLI passava a usar o GEMM e o servidor
+  //       continuava no caminho por token: 2 falhas de token no gate com chunk
+  //       128, 0 com 16. Uma politica so', em Graph::prefill(), e' o que impede
+  //       isso de voltar -- nao ha' mais duas listas de tamanhos para divergirem.
+  // A tolerancia que essa troca custou esta' DECLARADA em tests/check_batch_gpu.hip
+  // (kTolChunkRelL2 / kTolChunkMaxAbs, com a medicao que a justifica).
+  if (!graph_->prefill(prompt_ids, 0, hidden, logits, err)) return false;
   res.prefill_s = now_s() - t0;
   // In the greedy fast path the logits deliberately never cross the bus (the token
   // is the device argmax), so an empty vector is the expected state and not an

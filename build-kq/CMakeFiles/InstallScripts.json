@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/marcelo/Projetos/rdna4-infer/build-kq/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/check-dtype.dir/link.d "CMakeFiles/check-dtype.dir/tests/check_dtype.cpp.o" "CMakeFiles/check-dtype.dir/src/backend/gguf.cpp.o" -o check-dtype

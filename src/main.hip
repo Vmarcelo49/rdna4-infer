@@ -154,46 +154,19 @@ double now_s() {
 
 
 // ---------------------------------------------------------------------------
-// M8: batched prefill. Splits the prompt into the chunk sizes the batched kernels
-// have instantiations for (16/8/4/3/2), with single tokens for the tail. Every
-// chunk is bit-identical to processing the tokens one at a time
-// (tests/check_batch_gpu.hip asserts exactly that, including mixed chunks).
+// M8: batched prefill. A POLITICA DE CHUNK saiu daqui em 14/09 (frente
+// prefill-chunk): agora ela e' UMA so' para todos os consumidores e vive em
+// `Graph::prefill()` (include/rdna4/graph.cuh). O motivo e' medido: o servidor
+// cortava o mesmo prompt de outro jeito (`forward_tokens`, token a token, sem lote
+// nenhum) e, com o GEMM tilejado ligado por `RD_PREFILL_CHUNK`, os dois
+// consumidores do mesmo modelo divergiam -- no ultimo bit e, as vezes, no ultimo
+// token (o gate do `serve` pegou 2 falhas com chunk 128 e 0 com 16). Este arquivo
+// e' agora apenas mais um chamador: nenhuma lista de tamanhos, nenhuma cauda,
+// nenhuma decisao de chunk aqui.
 // ---------------------------------------------------------------------------
 bool prefill_ids(rdna4::Graph &g, const std::vector<std::int32_t> &ids, std::vector<float> &hidden,
              std::vector<float> &logits, std::string &err) {
-  // O maior chunk que o caminho em lote aceita: 16 (kMaxBatch, o GEMV) por padrao,
-  // ou o teto de `RD_PREFILL_CHUNK` quando o GEMM tilejado esta' em uso (D2 do
-  // plano do prefill). A lista de tamanhos desce dele para a cauda.
-  const int cap = g.batch_cap();
-  std::vector<int> sizes;
-  for (int sz = cap; sz >= 2; sz >>= 1) sizes.push_back(sz);
-  if (cap > 16) {
-    for (int sz : {16, 8, 4, 3, 2}) {
-      bool tem = false;
-      for (int x : sizes) tem = tem || x == sz;
-      if (!tem) sizes.push_back(sz);
-    }
-  } else {
-    sizes = {16, 8, 4, 3, 2};
-  }
-  std::size_t pos = 0;
-  while (pos < ids.size()) {
-    std::size_t take = 1;
-    for (int sz : sizes) {
-      if (ids.size() - pos >= (std::size_t)sz) {
-        take = (std::size_t)sz;
-        break;
-      }
-    }
-    if (take == 1) {
-      if (!g.forward_tokens({ids[pos]}, (int)pos, hidden, logits, err)) return false;
-    } else {
-      const std::vector<std::int32_t> chunk(ids.begin() + (long)pos, ids.begin() + (long)(pos + take));
-      if (!g.forward_batch(chunk, (int)pos, hidden, logits, err)) return false;
-    }
-    pos += take;
-  }
-  return true;
+  return g.prefill(ids, 0, hidden, logits, err);
 }
 
 // ---------------------------------------------------------------------------

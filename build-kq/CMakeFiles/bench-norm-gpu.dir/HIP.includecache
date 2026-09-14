@@ -1,0 +1,46 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/marcelo/Projetos/rdna4-infer/include/rdna4/fp16.h
+hip/hip_runtime.h
+-
+hip/hip_fp16.h
+-
+stdint.h
+-
+
+/home/marcelo/Projetos/rdna4-infer/include/rdna4/nn.cuh
+hip/hip_runtime.h
+-
+cstdint
+-
+rdna4/fp16.h
+/home/marcelo/Projetos/rdna4-infer/include/rdna4/rdna4/fp16.h
+
+/home/marcelo/Projetos/rdna4-infer/tests/bench_norm_gpu.hip
+hip/hip_runtime.h
+-
+algorithm
+-
+chrono
+-
+cmath
+-
+cstdio
+-
+cstdlib
+-
+cstring
+-
+functional
+-
+vector
+-
+rdna4/nn.cuh
+/home/marcelo/Projetos/rdna4-infer/tests/rdna4/nn.cuh
+

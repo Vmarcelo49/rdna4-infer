@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/check-eog.dir/link.d "CMakeFiles/check-eog.dir/tests/check_eog.cpp.o" "CMakeFiles/check-eog.dir/src/backend/gguf.cpp.o" "CMakeFiles/check-eog.dir/src/backend/loader.cpp.o" -o check-eog  librdna4_tokenizer.a

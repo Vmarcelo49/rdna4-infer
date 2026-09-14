@@ -23,5 +23,6 @@ attn.split_wpb_limit = 4
 attn.split_wpb_wide = 16
 attn.split_min = 512
 attn.max_splits = 16
+attn.split_ctas_dense = 96
 batch.ns = 2,3,4,8,16
 batch.cap = 16

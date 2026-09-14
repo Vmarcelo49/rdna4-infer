@@ -88,6 +88,59 @@
 // API publica: `gemm_launch`, espelhando `matvec_launch_batch` para o grafo
 // poder trocar um pelo outro. `false` = nao suportado (o chamador decide); nunca
 // ha' queda silenciosa para outro caminho.
+//
+// ===========================================================================
+// COBERTURA k-QUANT (q2_K, q3_K, q4_K, q5_K, q6_K = 21,8 % dos bytes do modelo)
+// ===========================================================================
+// MEDIDO em 14/09 (a janela esta' em `bench-gemm-engine-gpu --kq`, min de 5 reps,
+// piso de ruido 1,000x, DPM aquecido, `hipGetLastError` depois de todo lancamento,
+// UM tensor REAL por tipo escolhido pelo DTYPE -- o mesmo nome de projecao e' um
+// tipo diferente em camadas diferentes). T-MAC/s contra o GEMV em lote que embarca
+// (sub-lote 64, o caminho do grafo hoje em n>16 era sub-lote 16):
+//
+//   tipo  tensor (K x N)             M=16   M=64   M=128  M=512  |  x GEMV64 (16/64/128/512)
+//   q2_K  blk.3.attn_q  5120x12288    6,33   9,09   9,41  10,05  |  2,11 3,51 3,63 3,85
+//   q3_K  blk.7.ffn_down 17408x5120   3,35   6,96   9,59  11,97  |  1,11 2,54 3,45 4,38
+//   q4_K  blk.63.ffn_down 17408x5120  4,26   7,49  10,39  12,81  |  2,00 2,97 4,12 6,39
+//   q5_K  output.weight 5120x248320   6,87  11,41  11,44  11,51  |  2,70 3,66 3,69 3,73
+//   q6_K  blk.64.ffn_down 17408x5120  3,60   7,46  10,25  12,49  |  1,49 3,33 4,62 5,62
+//
+// O GEMV em lote nesses tipos e' MAIS LENTO do que nos tipos IQ (2,0-3,1 T-MAC/s
+// contra 5-6), entao a razao e' maior do que a que o plano estimou. Em M=16 o
+// GEMM so' ganha com folga nos tipos de 32 bits por peso (q4_K/q5_K); o grafo nao
+// usa essa geometria para n <= 16 (vai de GEMV em lote), mas usa para n = 17..63.
+//
+// TOLERANCIA DECLARADA (o que substitui a bit-exatidao dos tipos IQ):
+//   contra o `vec_dot_*_q8_1` DO MOTOR, M=16 N=256 (4096 elementos), mesma janela:
+//     q2_K rel-L2 4,51e-07 max|d| 5,72e-06 | q3_K 7,39e-07 / 1,34e-05
+//     q4_K rel-L2 8,44e-07 max|d| 1,53e-05 | q5_K 4,69e-07 / 5,48e-06
+//     q6_K rel-L2 9,23e-07 max|d| 1,53e-05
+//     (todos os 4096 elementos divergem em bits, como esperado: a divergencia e'
+//      de ARREDONDAMENTO, nao de valor)
+//   contra o `matvec_launch_batch` que embarca, nos tensores INTEIROS das tabelas
+//   acima, M=16..512: rel-L2 3,38e-07..6,15e-07, max|d| 7,6e-06..3,05e-05.
+//   (os tipos IQ sao 0 bits e max ulp 0 contra o vec_dot; contra o GEMV em lote a
+//    diferenca documentada e' 2,4e-07 / 3,3e-06 por projecao -- os k-quants ficam
+//    na MESMA ordem, ~1,5x em rel-L2 e ate ~3x em max|d|.)
+//
+// Por que nao da' para ser bit-exato aqui: ver a secao 1b (o motor arredonda por
+// termo de 4 elementos nas DUAS cadeias; o acumulador inteiro colapsa o bloco).
+//
+// Custo: VGPR 189/236/203/229/219 (q2/q3/q4/q5/q6, BM=64) contra 157 do iq3_s,
+// LDS 28 672 B (16 B de record por (linha, bloco de k) contra 8 B) e ZERO spill em
+// todos os cinco (`hipFuncGetAttributes` e a ISA, mesma janela).
+//
+// O QUE FALHOU NO CAMINHO (registrado porque cada um custou uma corrida):
+//   1. `ref_engine_kernel` da bancada somava 8 chamadas por super-bloco, o que so'
+//      esta' certo para qi/vdr == 8 (os tres tipos IQ); nos k-quants qi/vdr = 16
+//      (q2_K..q5_K) e 32 (q6_K), entao o oraculo somava METADE do super-bloco.
+//   2. A transcricao do `dequantize_q3_K` na bancada perdeu o `32*n` do ponteiro
+//      `qs`: reprovou 751 de 2048 pesos de um staging CORRETO.
+//   3. O bit alto do q6_K e' o par de bits (2*(sub%4)) do byte de `qh`, nao
+//      (2*(sub%2)): 735 de 2048 pesos errados de verdade. Achei reproduzindo o
+//      layout em CPU com bytes ALEATORIOS (sem GPU), que e' o jeito barato de
+//      iterar nisso.
+// ===========================================================================
 #pragma once
 #include <hip/hip_runtime.h>
 
@@ -136,6 +189,7 @@ __device__ __forceinline__ int gemm_sign_mask4(const unsigned bits) {
 struct SolverIq3S {
   static constexpr int qk = QK_K;  // 256
   static constexpr int block_bytes = (int)sizeof(block_iq3_s);
+  static constexpr bool is_kq = false;  // cadeia unica: caminho de producao antigo
   struct Pf {
     int qs0, qs1;      // qs[8*sub .. 8*sub+8)  (8 indices de grid = 32 pesos)
     unsigned qh;       // qh[sub]                (bit alto do indice)
@@ -215,6 +269,7 @@ struct SolverIq3S {
 struct SolverIq3XXS {
   static constexpr int qk = QK_K;
   static constexpr int block_bytes = (int)sizeof(block_iq3_xxs);
+  static constexpr bool is_kq = false;
   struct Pf {
     int qs0, qs1;  // qs[8*sub .. 8*sub+8)
     unsigned aux;  // qs[64 + 4*sub .. +4): 8 bits de sinal por 8 pesos + ls no topo
@@ -284,6 +339,7 @@ struct SolverIq3XXS {
 struct SolverIq4XS {
   static constexpr int qk = QK_K;
   static constexpr int block_bytes = (int)sizeof(block_iq4_xs);
+  static constexpr bool is_kq = false;
   struct Pf {
     int q0, q1, q2, q3;  // qs[16*sub .. 16*sub+16)  (32 nibbles = 32 pesos)
     unsigned dsl;        // d (fp16) | scales_l[sub/2] << 16
@@ -360,6 +416,339 @@ struct SolverIq4XS {
 };
 
 // ===========================================================================
+// 1b. k-quants (q2_K..q6_K): QUANT CRU na LDS + escala/minimo no record
+// ===========================================================================
+// Diferenca estrutural em relacao aos tipos IQ ja' cobertos: o peso do motor
+// NAO e' `d_w * q` com um unico fator inteiro por bloco de 32. Sao tres formas
+//
+//   q2_K, q4_K, q5_K:  w_e = d*q_e*sc_g - dmin*m_g          (DUAS cadeias fp32)
+//   q3_K:              w_e = d*(us_g - 32)*(q_e + (hmask ? 0 : -4))
+//   q6_K:              w_e = d*sc_g*(q_e - 32)
+//
+// com escala por 16 elementos (q2_K, q3_K, q6_K: duas por bloco de 32 -> dois
+// acumuladores int, `ngrp = 2`) ou por 32 (q4_K, q5_K: uma, `ngrp = 1`).
+//
+// O que a LDS guarda, portanto, e' o QUANT CRU na ordem de k (1 int8 por peso,
+// 8 palavras por bloco de 32, exatamente o layout do caminho IQ -- o `ws` da
+// LDS e' o MESMO) e o record `KqScal` guarda (d, dmin, escala(s)). A correcao
+// continua INTEIRA sobre o acumulador do bloco de 32:
+//
+//   X = I0*s0 + I1*s1   (produto de inteiros EXATO, |X| < 2^24 nos 5 tipos)
+//   Y = S0*m0 + S1*m1   (idem; S = soma da ATIVACAO do bloco, por TOKEN)
+//   F = fma(dw*da, X, F) ; F = fma(-(dmin*da), Y, F)
+//
+// O termo do minimo precisa de `S = sum a_e`, que e' por token e nao por coluna:
+// custa RM*8 dp4a por bloco contra RM*RN*8 do produto (+12,5 % com RM=4/RN=8).
+//
+// ---------------------------------- BIT-EXATIDAO ---------------------------
+// NAO e' bit-exato e nao da' para ser, com o acumulador inteiro: o motor soma,
+// por chamada de `vec_dot`, o termo `d8*(dp4a(4 pesos)*sc)` -- 8 arredondamentos
+// fp32 por bloco de 32 em `sumf_d` (mais 8 em `sumf_m`) -- enquanto o acumulador
+// inteiro colapsa o bloco inteiro num produto exato com UM arredondamento por
+// escala. Reproduzir a sequencia exigiria os 8 `dot_m` de 4 elementos SEPARADOS
+// (`vec_dot_q4_K_q8_1_impl_vmmq` deixa o dot por par de palavras: 8 valores int
+// por elemento de saida por bloco) + ~2x16 fma/4 pesos, i.e. 2x os acumuladores
+// fp32 e ~4x a correcao. Medido (bancada, M=16 N=256): a divergencia fica em
+// ulps de fp32 -- ver `bench-gemm-engine-gpu`, secao de tolerancia.
+// ---------------------------------------------------------------------------
+//
+// Alinhamento: os blocos q3_K (110 B) e q6_K (210 B) NAO sao multiplos de 4, o
+// que faz o stride de linha sair 4-alinhado apenas quando `bpr` e' par. As cargas
+// do staging sao de 32 bits (o mesmo que o caminho iq3_s, cujo bloco tambem tem
+// 110 B e cujo staging e' validado byte a byte); cargas vetoriais de 16 B ficam
+// de fora porque o bloco nao garante 16 B de alinhamento.
+struct KqScal {
+  float dw;    // d (ou dm.d)
+  float dmn;   // dmin (0.0f nos tipos de cadeia unica)
+  int s0, s1;  // escala(s) do bloco de 32: s0 -> elementos 0..15, s1 -> 16..31
+};
+
+// Carga de N palavras de 32 bits sem prometer alinhamento: os blocos q3_K (110 B)
+// e q6_K (210 B) NAO sao multiplos de 4, entao um `(const int *)` mentiria sobre
+// o alinhamento (o caminho iq3_s, de bloco 110 B, ja' faz essa leitura de 32 bits
+// e o staging dele e' validado byte a byte). Larga de 16 B fica de fora: o bloco
+// nao garante 16 B de alinhamento.
+template <int N>
+static __device__ __forceinline__ void kq_ld8(const void *p, int *dst) {
+  const unsigned char *b = (const unsigned char *)p;
+#pragma unroll
+  for (int i = 0; i < N; ++i) {
+    unsigned w;
+    __builtin_memcpy(&w, b + 4 * i, 4);
+    dst[i] = (int)w;
+  }
+}
+
+// ---- q2_K (84 B / 256 pesos, 0,97 % dos bytes deste modelo) ---------------
+// 16 sub-blocos de 16 pesos, escala E minimo de 4 bits: w = d*sc*q - dmin*m.
+// Bloco de 32 t: elementos e = 0..31 em qs[32*(t/4) + e], campo (t%4) de 2 bits;
+// grupo g = 2t + e/16 (o low/high nibble de scales[g]).
+struct SolverQ2K {
+  static constexpr int qk = QK_K;
+  static constexpr int block_bytes = (int)sizeof(block_q2_K);
+  static constexpr bool is_kq = true;
+  static constexpr int ngrp = 2;
+  static constexpr bool has_min = true;
+  static constexpr int raw_words = 4;  // so' para o constexpr RSTR do kernel
+  struct Pf {
+    int q[8];     // qs[32*(sub/4) .. +32)
+    unsigned dms; // half2 {d, dmin}
+    unsigned sc2; // scales[2*sub] | scales[2*sub+1] << 8
+  };
+  static __device__ __forceinline__ Pf load(const char *blk, const int sub) {
+    const block_q2_K *b = (const block_q2_K *)blk;
+    Pf p;
+    kq_ld8<8>((const void *)(b->qs + 32 * (sub >> 2)), p.q);
+    p.dms = *(const unsigned *)(const void *)&b->dm;
+    p.sc2 = (unsigned)((const uint16_t *)(const void *)b->scales)[sub];
+    return p;
+  }
+  static __device__ __forceinline__ void store(const Pf &p, const int sub, int *dst, KqScal &k) {
+    const int sh = 2 * (sub & 3);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) dst[i] = (p.q[i] >> sh) & 0x03030303;
+    k.dw = fp16_to_float((uint16_t)(p.dms & 0xFFFFu));
+    k.dmn = fp16_to_float((uint16_t)(p.dms >> 16));
+    const int g0 = (int)(p.sc2 & 0xFFu), g1 = (int)((p.sc2 >> 8) & 0xFFu);
+    k.s0 = (g0 & 0x0F) | ((g0 >> 4) << 16);
+    k.s1 = (g1 & 0x0F) | ((g1 >> 4) << 16);
+  }
+  static __device__ __forceinline__ void scm(const KqScal &k, int &s0, int &m0, int &s1,
+                                             int &m1) {
+    s0 = k.s0 & 0xFFFF;
+    m0 = (k.s0 >> 16) & 0xFFFF;
+    s1 = k.s1 & 0xFFFF;
+    m1 = (k.s1 >> 16) & 0xFFFF;
+  }
+};
+
+// ---- q3_K (110 B / 256, 7,87 %): 6 bits de escala por 16 pesos, SEM minimo ---
+// w = d*(us-32)*(q + (hmask ? 0 : -4)), q de 2 bits.
+// Bloco t: qs[32*(t/4) + e] campo (t%4) de 2 bits; hmask[e] bit t; grupo 2t+e/16.
+// As 16 escalas de 6 bits moram em scales[12]: nibble baixo de scales[0..7] =
+// 4 bits baixos das escalas 0..7, nibble alto das MESMAS = escalas 8..15, e
+// bytes 8..11 = 2 bits altos das escalas {k, k+4, k+8, k+12} (k = indice%4).
+struct SolverQ3K {
+  static constexpr int qk = QK_K;
+  static constexpr int block_bytes = (int)sizeof(block_q3_K);
+  static constexpr bool is_kq = true;
+  static constexpr int ngrp = 2;
+  static constexpr bool has_min = false;
+  static constexpr int raw_words = 4;
+  struct Pf {
+    int q[8];    // qs[32*(sub/4) .. +32)
+    int hm[8];   // hmask[0..32)
+    unsigned d;  // d (fp16) do super-bloco
+    unsigned sc2;  // uint16 das escalas baixas | uint16 dos 2 bits altos << 16
+  };
+  static __device__ __forceinline__ Pf load(const char *blk, const int sub) {
+    const block_q3_K *b = (const block_q3_K *)blk;
+    Pf p;
+    kq_ld8<8>((const void *)(b->qs + 32 * (sub >> 2)), p.q);
+    kq_ld8<8>((const void *)b->hmask, p.hm);
+    p.d = b->d;
+    const int is = 2 * sub;
+    const uint8_t *sc = b->scales;
+    const unsigned lo =
+        (unsigned)((const uint16_t *)(const void *)(sc + (is < 8 ? is : is - 8)))[0];
+    const unsigned hi = (unsigned)((const uint16_t *)(const void *)(sc + 8 + (is & 3)))[0];
+    p.sc2 = lo | (hi << 16);
+    return p;
+  }
+  static __device__ __forceinline__ void store(const Pf &p, const int sub, int *dst, KqScal &k) {
+    const int sh = 2 * (sub & 3);
+    const int bit = sub;  // o bit do hmask deste bloco de 32
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int q2 = (p.q[i] >> sh) & 0x03030303;
+      const int m1 = (p.hm[i] >> bit) & 0x01010101;  // 1 onde o bit do hmask e' 1
+      const int s4 = (~m1 & 0x01010101) << 2;        // 4 onde ele e' 0
+      dst[i] = __vsubss4(q2, s4);
+    }
+    k.dw = fp16_to_float((uint16_t)p.d);
+    k.dmn = 0.0f;
+    const int is = 2 * sub, quad = is >> 2, sh2 = 2 * quad;
+    const unsigned lo = p.sc2 & 0xFFFFu, hi = p.sc2 >> 16;
+    const int l0 = (is < 8) ? (int)(lo & 0x0Fu) : (int)((lo >> 4) & 0x0Fu);
+    const int l1 = (is < 8) ? (int)((lo >> 8) & 0x0Fu) : (int)((lo >> 12) & 0x0Fu);
+    k.s0 = (l0 | (((int)(hi >> sh2) & 3) << 4)) - 32;
+    k.s1 = (l1 | (((int)(hi >> (sh2 + 8)) & 3) << 4)) - 32;
+  }
+  static __device__ __forceinline__ void scm(const KqScal &k, int &s0, int &m0, int &s1,
+                                             int &m1) {
+    s0 = k.s0;
+    m0 = 0;
+    s1 = k.s1;
+    m1 = 0;
+  }
+};
+
+// ---- q4_K (144 B / 256, 1,94 %): 8 sub-blocos de 32, escala e minimo de 6 bits
+// (get_scale_min_k4, o empacotamento de K_SCALE_SIZE=12 bytes). Duas cadeias.
+// Bloco t: elementos e em qs[32*(t/2) + e], nibble (t%2); grupo = t.
+struct SolverQ4K {
+  static constexpr int qk = QK_K;
+  static constexpr int block_bytes = (int)sizeof(block_q4_K);
+  static constexpr bool is_kq = true;
+  static constexpr int ngrp = 1;
+  static constexpr bool has_min = true;
+  static constexpr int raw_words = 4;
+  struct Pf {
+    int q[8];    // qs[32*(sub/2) .. +32)
+    int sc[3];   // scales[0..12)
+    unsigned dms;
+  };
+  static __device__ __forceinline__ Pf load(const char *blk, const int sub) {
+    const block_q4_K *b = (const block_q4_K *)blk;
+    Pf p;
+    kq_ld8<8>((const void *)(b->qs + 32 * (sub >> 1)), p.q);
+    kq_ld8<3>((const void *)b->scales, p.sc);
+    p.dms = *(const unsigned *)(const void *)&b->dm;
+    return p;
+  }
+  static __device__ __forceinline__ void store(const Pf &p, const int sub, int *dst, KqScal &k) {
+    const int sh = 4 * (sub & 1);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) dst[i] = (p.q[i] >> sh) & 0x0F0F0F0F;
+    k.dw = fp16_to_float((uint16_t)(p.dms & 0xFFFFu));
+    k.dmn = fp16_to_float((uint16_t)(p.dms >> 16));
+    // `get_scale_min_k4` (dequant.cuh:91): j = sub
+    const int j = sub;
+    const uint32_t w0 = (uint32_t)p.sc[0], w1 = (uint32_t)p.sc[1], w2 = (uint32_t)p.sc[2];
+    const int shl = (j & 3) * 8;
+    uint32_t wj = (j < 4) ? w0 : w1;  // byte j
+    const uint32_t wj4 = (j < 4) ? w1 : w2;  // byte j+4
+    const uint32_t wjm4 = w0;                // byte j-4 (so' para j >= 4)
+    const int bj = (int)((wj >> shl) & 0xFFu);
+    const int bj4 = (int)((wj4 >> shl) & 0xFFu);
+    const int bjm4 = (int)((wjm4 >> shl) & 0xFFu);
+    const int sc6 = (j < 4) ? (bj & 63) : ((bj4 & 0x0F) | ((bjm4 >> 6) << 4));
+    const int m6 = (j < 4) ? (bj4 & 63) : ((bj4 >> 4) | ((bj >> 6) << 4));
+    k.s0 = sc6 | (m6 << 16);
+    k.s1 = 0;
+  }
+  static __device__ __forceinline__ void scm(const KqScal &k, int &s0, int &m0, int &s1,
+                                             int &m1) {
+    s0 = k.s0 & 0xFFFF;
+    m0 = (k.s0 >> 16) & 0xFFFF;
+    s1 = 0;
+    m1 = 0;
+  }
+};
+
+// ---- q5_K (176 B / 256, 8,19 %): como q4_K + o 5o bit em qh[e], bit t -------
+struct SolverQ5K {
+  static constexpr int qk = QK_K;
+  static constexpr int block_bytes = (int)sizeof(block_q5_K);
+  static constexpr bool is_kq = true;
+  static constexpr int ngrp = 1;
+  static constexpr bool has_min = true;
+  static constexpr int raw_words = 4;
+  struct Pf {
+    int qs[8];  // qs[32*(sub/2) .. +32)
+    int qh[8];  // qh[0..32)
+    int sc[3];
+    unsigned dms;
+  };
+  static __device__ __forceinline__ Pf load(const char *blk, const int sub) {
+    const block_q5_K *b = (const block_q5_K *)blk;
+    Pf p;
+    kq_ld8<8>((const void *)(b->qs + 32 * (sub >> 1)), p.qs);
+    kq_ld8<8>((const void *)b->qh, p.qh);
+    kq_ld8<3>((const void *)b->scales, p.sc);
+    p.dms = *(const unsigned *)(const void *)&b->dm;
+    return p;
+  }
+  static __device__ __forceinline__ void store(const Pf &p, const int sub, int *dst, KqScal &k) {
+    const int sh = 4 * (sub & 1);
+    const int bit = sub;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int v = (p.qs[i] >> sh) & 0x0F0F0F0F;
+      const int hb = (p.qh[i] >> bit) & 0x01010101;
+      dst[i] = v | (hb << 4);
+    }
+    k.dw = fp16_to_float((uint16_t)(p.dms & 0xFFFFu));
+    k.dmn = fp16_to_float((uint16_t)(p.dms >> 16));
+    const int j = sub;
+    const uint32_t w0 = (uint32_t)p.sc[0], w1 = (uint32_t)p.sc[1], w2 = (uint32_t)p.sc[2];
+    const int shl = (j & 3) * 8;
+    const uint32_t wj = (j < 4) ? w0 : w1;
+    const uint32_t wj4 = (j < 4) ? w1 : w2;
+    const int bj = (int)((wj >> shl) & 0xFFu);
+    const int bj4 = (int)((wj4 >> shl) & 0xFFu);
+    const int bjm4 = (int)((w0 >> shl) & 0xFFu);
+    const int sc6 = (j < 4) ? (bj & 63) : ((bj4 & 0x0F) | ((bjm4 >> 6) << 4));
+    const int m6 = (j < 4) ? (bj4 & 63) : ((bj4 >> 4) | ((bj >> 6) << 4));
+    k.s0 = sc6 | (m6 << 16);
+    k.s1 = 0;
+  }
+  static __device__ __forceinline__ void scm(const KqScal &k, int &s0, int &m0, int &s1,
+                                             int &m1) {
+    s0 = k.s0 & 0xFFFF;
+    m0 = (k.s0 >> 16) & 0xFFFF;
+    s1 = 0;
+    m1 = 0;
+  }
+};
+
+// ---- q6_K (210 B / 256, 2,86 %): escala int8 por 16 pesos, quant de 6 bits
+// COM sinal deslocado: w = d*sc*(q-32). Bloco t: n = t/4, q = t%2, i2 = (t/2)%2
+//   ql[64*n + 32*q + e], nibble i2; qh[32*n + e] bits (2q, 2q+1);
+//   grupo 8n + 2q + 4*i2 + e/16 (dois por bloco de 32).
+struct SolverQ6K {
+  static constexpr int qk = QK_K;
+  static constexpr int block_bytes = (int)sizeof(block_q6_K);
+  static constexpr bool is_kq = true;
+  static constexpr int ngrp = 2;
+  static constexpr bool has_min = false;
+  static constexpr int raw_words = 4;
+  struct Pf {
+    int ql[8];
+    int qh[8];
+    unsigned d;
+    unsigned sc2;  // scales[g], scales[g+1] (int8 cada)
+  };
+  static __device__ __forceinline__ Pf load(const char *blk, const int sub) {
+    const block_q6_K *b = (const block_q6_K *)blk;
+    Pf p;
+    const int n = sub >> 2, q = sub & 1, i2 = (sub >> 1) & 1;
+    kq_ld8<8>((const void *)(b->ql + 64 * n + 32 * q), p.ql);
+    kq_ld8<8>((const void *)(b->qh + 32 * n), p.qh);
+    p.d = b->d;
+    const int g = 8 * n + 2 * q + 4 * i2;
+    p.sc2 = (unsigned)((const uint16_t *)(const void *)(b->scales + g))[0];
+    return p;
+  }
+  static __device__ __forceinline__ void store(const Pf &p, const int sub, int *dst, KqScal &k) {
+    const int i2 = (sub >> 1) & 1, q = sub & 1;
+    const int sh = 4 * i2;
+    // Os 2 bits altos do quant sao os bits (2*(sub%4)) do byte qh[e] do bloco --
+    // NAO (2*(sub%2)): o par de bits anda de 2 em 2 com o indice do bloco DENTRO
+    // do grupo de 4 (o `vh_shift`/`4*i` do `vec_dot_q6_K_q8_1` e o `{0,2,4,6}[j]`
+    // do `dequantize_q6_K` sao a mesma coisa). Trocar isso deixa 36 % dos pesos
+    // errados -- foi o que a bancada pegou (735 de 2048).
+    const int hsh = 2 * (sub & 3);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int v = ((p.ql[i] >> sh) & 0x0F0F0F0F) | (((p.qh[i] >> hsh) & 0x03030303) << 4);
+      dst[i] = __vsubss4(v, 0x20202020);  // q - 32, sem saturacao (0..63 -> -32..31)
+    }
+    k.dw = fp16_to_float((uint16_t)p.d);
+    k.dmn = 0.0f;
+    k.s0 = (int)(int8_t)(p.sc2 & 0xFFu);
+    k.s1 = (int)(int8_t)((p.sc2 >> 8) & 0xFFu);
+  }
+  static __device__ __forceinline__ void scm(const KqScal &k, int &s0, int &m0, int &s1,
+                                             int &m1) {
+    s0 = k.s0;
+    m0 = 0;
+    s1 = k.s1;
+    m1 = 0;
+  }
+};
+
+// ===========================================================================
 // 2. O GEMM tilejado
 // ===========================================================================
 // Grade: x -> N (BN colunas de W = linhas de saida), y -> M (BM tokens por CTA).
@@ -404,7 +793,8 @@ __global__ void __launch_bounds__((BM / RM) * (BN / RN), MINB) gemm_i8_kernel(
   static_assert(!RAW || WHOLD, "o caminho raw decodifica para o bloco de registradores (WHOLD)");
 
   __shared__ __align__(16) unsigned char s_w[RAW ? 16 : NBUF * BN * WSB];
-  __shared__ __align__(16) int2 s_dwsc[RAW ? 1 : NBUF * NKB * BN];
+  __shared__ __align__(16) int2 s_dwsc[TR::is_kq ? 1 : (RAW ? 1 : NBUF * NKB * BN)];
+  __shared__ __align__(16) KqScal s_kq[TR::is_kq ? NBUF * NKB * BN : 1];
   __shared__ __align__(16) int s_wr[RAW ? NBUF * BN * RSTR : 4];
 
   const int tid = threadIdx.x;
@@ -446,6 +836,13 @@ __global__ void __launch_bounds__((BM / RM) * (BN / RN), MINB) gemm_i8_kernel(
         int *dst = s_wr + buf * (BN * RSTR) + row * RSTR + kb * RSLOT;
         *(int4 *)(void *)dst = make_int4(rec[0], rec[1], rec[2], rec[3]);
         if constexpr (RWW > 4) *(int2 *)(void *)(dst + 4) = make_int2(rec[4], rec[5]);
+      } else if constexpr (TR::is_kq) {
+        // k-quant: o quant CRU vai para a LDS (mesmo layout de 8 palavras do
+        // caminho IQ) e (d, dmin, escalas) para o record `KqScal`.
+        KqScal k;
+        TR::store(pf[i], (kk >> 5) & 7,
+                  (int *)(void *)(s_w + buf * (BN * WSB) + row * WSB + kb * 32), k);
+        s_kq[buf * (NKB * BN) + kb * BN + row] = k;
       } else {
         float dw;
         int scf;
@@ -529,6 +926,101 @@ __global__ void __launch_bounds__((BM / RM) * (BN / RN), MINB) gemm_i8_kernel(
                               : (const int *)(const void *)(s_w + cb * (BN * WSB));
 #pragma unroll
         for (int i = 0; i < 4; ++i) sink += (float)base[(tid * 7 + i * 29) % NW];
+      } else if constexpr (TR::is_kq) {
+        // ---- k-quants: quant CRU na LDS + correcao INTEIRA com escala/minimo --
+        // Dois acumuladores int quando a escala muda no meio do bloco de 32
+        // (q2_K, q3_K, q6_K: `ngrp = 2`; palavras 0..3 = elementos 0..15) e um so'
+        // quando ela e' constante no bloco (q4_K, q5_K). O termo do minimo usa a
+        // SOMA DA ATIVACAO do bloco -- `S` e' por TOKEN, nao por coluna, entao
+        // custa RM*8 dp4a contra RM*RN*8 do produto. `S` e' exatamente o
+        // `dp4a(0x01010101, u)` que o `*_impl_vmmq` do motor usa.
+        int I0[RM][RN], I1[RM][RN];
+        int Sq0[RM], Sq1[RM];
+#pragma unroll
+        for (int r = 0; r < RM; ++r) {
+          Sq0[r] = 0;
+          Sq1[r] = 0;
+#pragma unroll
+          for (int c = 0; c < RN; ++c) {
+            I0[r][c] = 0;
+            I1[r][c] = 0;
+          }
+        }
+        int ww[RN][8];
+#pragma unroll
+        for (int c = 0; c < RN; ++c) {
+          const int *wp =
+              (const int *)(const void *)(s_w + cb * (BN * WSB) + (nloc + c * TN) * WSB + kb * 32);
+#pragma unroll
+          for (int g = 0; g < 8; ++g) ww[c][g] = wp[g];
+        }
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+          int ar[RM];
+#pragma unroll
+          for (int r = 0; r < RM; ++r) {
+            const block_q8_1 *q = A + (std::int64_t)mrow[r] * act_stride + ka;
+            ar[r] = ((const int *)(const void *)q->qs)[g];
+          }
+          if constexpr (TR::ngrp == 2) {
+            // o `g` esta' desenrolado, entao `g < 4` e' constante de compilacao
+            if (g < 4) {
+#pragma unroll
+              for (int r = 0; r < RM; ++r)
+#pragma unroll
+                for (int c = 0; c < RN; ++c)
+                  I0[r][c] = ggml_cuda_dp4a(ww[c][g], ar[r], I0[r][c]);
+            } else {
+#pragma unroll
+              for (int r = 0; r < RM; ++r)
+#pragma unroll
+                for (int c = 0; c < RN; ++c)
+                  I1[r][c] = ggml_cuda_dp4a(ww[c][g], ar[r], I1[r][c]);
+            }
+          } else {
+#pragma unroll
+            for (int r = 0; r < RM; ++r)
+#pragma unroll
+              for (int c = 0; c < RN; ++c)
+                I0[r][c] = ggml_cuda_dp4a(ww[c][g], ar[r], I0[r][c]);
+          }
+          if constexpr (TR::has_min) {
+#pragma unroll
+            for (int r = 0; r < RM; ++r) {
+              if (TR::ngrp == 2 && g >= 4) Sq1[r] = ggml_cuda_dp4a(0x01010101, ar[r], Sq1[r]);
+              else                         Sq0[r] = ggml_cuda_dp4a(0x01010101, ar[r], Sq0[r]);
+            }
+          }
+        }
+        float da[RM];
+#pragma unroll
+        for (int r = 0; r < RM; ++r) {
+          const block_q8_1 *q = A + (std::int64_t)mrow[r] * act_stride + ka;
+          da[r] = fp16_to_float((uint16_t)(q->ds & 0xFFFFu));
+        }
+        const KqScal *ks = s_kq + cb * (NKB * BN) + kb * BN;
+#pragma unroll
+        for (int c = 0; c < RN; ++c) {
+          const KqScal k = ks[nloc + c * TN];
+          int s0, m0, s1, m1;
+          TR::scm(k, s0, m0, s1, m1);
+          const float nm = -k.dmn;
+#pragma unroll
+          for (int r = 0; r < RM; ++r) {
+            // X/Y sao produtos de inteiros EXATOS (|X| < 2^24 nos 5 tipos), e a
+            // ORDEM e' a do motor: a escala entra antes do `d` do super-bloco
+            // (`dm.x*sumf_d` no fim do vec_dot) e o `da` esta' dentro da soma.
+            int X, Y = 0;
+            if constexpr (TR::ngrp == 2) X = I0[r][c] * s0 + I1[r][c] * s1;
+            else                         X = I0[r][c] * s0;
+            F[r][c] = __fmaf_rn(k.dw, da[r] * (float)X, F[r][c]);
+            if constexpr (TR::has_min) {
+              if constexpr (TR::ngrp == 2) Y = Sq0[r] * m0 + Sq1[r] * m1;
+              else                         Y = Sq0[r] * m0;
+              F[r][c] = __fmaf_rn(nm, da[r] * (float)Y, F[r][c]);
+            }
+          }
+        }
       } else if constexpr (RAW) {
         // ---- decodificacao DENTRO do laco de consumo -----------------------
         // 1 ds_load_b128 por coluna traz os campos crus; a LUT, a mascara de
@@ -635,7 +1127,7 @@ __global__ void __launch_bounds__((BM / RM) * (BN / RN), MINB) gemm_i8_kernel(
       // ---- correcao (a sequencia do motor: inteiro -> (float) -> fma) ----
       // (o caminho RAW faz a sua dentro do ramo acima: la' o `dw`/`scf` esta'
       //  no record cru e nao no `s_dwsc`)
-      if constexpr (!RAW && !STAGE_ONLY) {
+      if constexpr (!RAW && !STAGE_ONLY && !TR::is_kq) {
         float da[RM];
 #pragma unroll
         for (int r = 0; r < RM; ++r) {
@@ -711,6 +1203,8 @@ inline bool gemm_attrs_t(hipFuncAttributes &attr, int &lds_bytes) {
   constexpr int RSTR = NKB * ((TR::raw_words + 3) & ~3);
   if constexpr (RAW) {
     lds_bytes = (DBUF ? 2 : 1) * (BN * RSTR * (int)sizeof(int));
+  } else if constexpr (TR::is_kq) {
+    lds_bytes = (DBUF ? 2 : 1) * (BN * WSB + NKB * BN * (int)sizeof(KqScal));
   } else {
     lds_bytes = (DBUF ? 2 : 1) * (BN * WSB + NKB * BN * 8);
   }
@@ -749,6 +1243,11 @@ inline bool gemm_launch(int dt, const void *d_w, const block_q8_1 *d_a, float *d
     RD_GEMM(SolverIq3S, 12, 256)
     RD_GEMM(SolverIq3XXS, 9, 256)
     RD_GEMM(SolverIq4XS, 14, 256)
+    RD_GEMM(SolverQ2K, 2, 256)
+    RD_GEMM(SolverQ3K, 3, 256)
+    RD_GEMM(SolverQ4K, 4, 256)
+    RD_GEMM(SolverQ5K, 5, 256)
+    RD_GEMM(SolverQ6K, 6, 256)
     default:
       return false;  // sem kernel: o chamador decide (SPEC 1.3)
   }
@@ -765,6 +1264,11 @@ inline bool gemm_attrs(int dt, int n_tokens, hipFuncAttributes &attr, int &lds_b
     RD_ATTR(SolverIq3S, 12)
     RD_ATTR(SolverIq3XXS, 9)
     RD_ATTR(SolverIq4XS, 14)
+    RD_ATTR(SolverQ2K, 2)
+    RD_ATTR(SolverQ3K, 3)
+    RD_ATTR(SolverQ4K, 4)
+    RD_ATTR(SolverQ5K, 5)
+    RD_ATTR(SolverQ6K, 6)
     default:
       return false;
   }

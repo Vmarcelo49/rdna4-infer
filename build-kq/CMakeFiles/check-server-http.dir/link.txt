@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/check-server-http.dir/link.d "CMakeFiles/check-server-http.dir/tests/check_server_http.cpp.o" "CMakeFiles/check-server-http.dir/src/server/http.cpp.o" "CMakeFiles/check-server-http.dir/src/server/json.cpp.o" -o check-server-http

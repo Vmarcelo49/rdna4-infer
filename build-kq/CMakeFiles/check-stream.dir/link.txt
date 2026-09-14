@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/check-stream.dir/link.d "CMakeFiles/check-stream.dir/tests/check_stream.cpp.o" -o check-stream

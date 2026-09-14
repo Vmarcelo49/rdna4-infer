@@ -1,0 +1,30 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/marcelo/Projetos/rdna4-infer/tests/bench_wmma_gpu.hip
+hip/hip_runtime.h
+-
+algorithm
+-
+chrono
+-
+cmath
+-
+cstdint
+-
+cstdio
+-
+cstdlib
+-
+cstring
+-
+functional
+-
+vector
+-
+

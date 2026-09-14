@@ -1,0 +1,26 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/marcelo/Projetos/rdna4-infer/tests/bench_gemm_gpu.hip
+hip/hip_runtime.h
+-
+algorithm
+-
+cmath
+-
+cstdio
+-
+cstdlib
+-
+cstring
+-
+functional
+-
+vector
+-
+

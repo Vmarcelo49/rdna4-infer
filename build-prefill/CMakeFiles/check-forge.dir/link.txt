@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/check-forge.dir/link.d "CMakeFiles/check-forge.dir/tests/check_forge.cpp.o" "CMakeFiles/check-forge.dir/src/backend/gguf.cpp.o" "CMakeFiles/check-forge.dir/src/backend/loader.cpp.o" -o check-forge

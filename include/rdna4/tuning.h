@@ -80,14 +80,31 @@ static_assert(mt_tables_valid(),
 // kAttnWarpsPerBlock   warps por CTA no kernel sem split (8/16/32 instanciados)
 // kAttnSplitWpbLimit   ate este numero de splits por cabeca o kernel COM split
 //                      usa 16 warps; acima disso usa kAttnWarpsPerBlock
-// kAttnSplitMin        chave por split: splits = keys/kAttnSplitMin
+// kAttnSplitMin        chave por split: splits = keys/kAttnSplitMin (so para o KV
+//                      COM dequant -- ver kAttnSplitCtasDense)
 // kAttnMaxSplits       teto de splits por cabeca (o buffer de parciais e
 //                      dimensionado por este valor)
+// kAttnSplitCtasDense  alvo de CTAs (n_head x splits) quando o KV NAO precisa de
+//                      desquantizacao no laco interno (f16/f32): o otimo medido e
+//                      um numero FIXO de CTAs, nao uma fracao das chaves
 //
 // Medido em f16 (head_dim 256, 24 cabecas / 4 kv, 1 token de query) a 4K/16K/64K
 // e q4_0 a 131K: a politica que esta aqui e a melhor celula medida ou esta dentro
 // do piso de ruido dela (ver docs/autotuning-gfx1201.md §Atencao). Nao foi
 // trocada por um "ganho" de 4% que o proprio bench mostrou ser ordem de medicao.
+//
+// N-POL (2026-09-14): a varredura de splits x contexto derrubou a parte "dentro do
+// piso de ruido" para o KV sem dequant. f16, celula 4 splits x 16 warps = 96 CTAs:
+// e a MELHOR celula medida em 512, 1K, 2K, 4K, 8K, 16K, 32K, 64K e 131K chaves, e
+// o A/B intercalado de 15 rodadas contra a politica antiga (chaves/512, teto 16 =
+// ate 384 CTAs) da 1,047x a 4K (15/15), 1,089x a 8K (15/15), 1,030x a 16K (15/15),
+// 1,023x a 32K (15/15), 1,020x a 64K (15/15) e 1,004x a 131K (13/15, no piso) --
+// piso de ruido medido 1,001-1,005x com 4-11/15 de sinal. f32 (mesma familia, sem
+// dequant) confirma: 1,076x a 16K e 1,021x a 64K (15/15).
+// O KV quantizado mediu o OPOSTO, e por isso NAO entra nesta regra: com q4_0/q8_0
+// a politica antiga (16 splits) e a melhor celula a 16K/64K/131K e 4 splits perde
+// 6-13% (0/15 rodadas). O que separa os dois casos e o dequant estar ou nao no
+// laco interno -- e nao o numero de chaves.
 // ---------------------------------------------------------------------------
 // kAttnSplitWpbWide    a partir deste numero de splits por cabeca a CTA volta a
 //                      ser larga (16 warps). A regra medida NAO e monotonica:
@@ -95,6 +112,13 @@ static_assert(mt_tables_valid(),
 //                      warp), splits medios (5..15) -> CTA estreita (o merge por
 //                      LDS domina), muitos splits -> CTA larga de novo (com o KV
 //                      q4_0 a caminhada fica curta e o que falta e paralelismo).
+// kAttnSplitCtasDense: 4 splits x 24 cabecas = 96 CTAs medidos como melhor celula
+// de 512 a 131072 chaves com KV f16 (e 4K/16K/64K com f32). Com 24 cabecas da 4
+// splits por cabeca, que e <= kAttnSplitWpbLimit, entao a CTA e a larga (16 warps)
+// -- a celula 4x16 medida. Para um modelo com outro n_head a regra escala pelo
+// numero de CTAs, nao pelo numero de splits (e cai em kAttnMaxSplits se preciso).
+inline constexpr int kAttnSplitCtasDense = 96;
+
 inline constexpr int kAttnWarpsPerBlock = 8;
 inline constexpr int kAttnSplitWpbLimit = 4;
 inline constexpr int kAttnSplitWpbWide = 16;
