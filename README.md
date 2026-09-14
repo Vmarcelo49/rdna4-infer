@@ -376,11 +376,26 @@ Ordered by how much they cost the user, with the number that justifies each. Not
    near 145 tok/s. Two honest routes: batch the scaffolding (the prefill front's work) or
    replace the `vec_dot` with a tiled MMQ-style int8 kernel (weights in LDS, WMMA int8 —
    possible on this card, but it gives up bit-exactness and needs numeric gating).
-2. **The KV cache has a cliff, not a curve.** IQ3_S + `f16` KV fits to 48K; at 64K it spills
-   ~2.1 GB into GTT and decode collapses from ~18 to **2.16-7.97 tok/s** with no error
-   message. Above ~56K the supported configuration is `q8_0` (or `q5_0`/`q4_1` once the KV
-   front lands); `q4_0` is only for when 128K must fit. `f16` at 128K needs 8 GiB of KV and
-   cannot fit at all.
+2. **The KV cache has a cliff, not a curve — and at 131K the format buys quality, not
+   speed.** IQ3_S + `f16` KV fits to 48K; at 64K it spills ~2.1 GB into GTT and decode
+   collapses from ~18 to **2.16-7.97 tok/s** with no error message, and `f16` at 131K does
+   not even allocate (`hipMalloc failed` — 8 GiB of KV). Measured at 131K (16 decode tokens,
+   clean window):
+
+   | K / V | decode | VRAM in use | free | GTT |
+   |---|---|---|---|---|
+   | `q5_0`/`q4_1` (**default**) | 13.73 tok/s | 14.25 GiB | 1.68 GiB | 30 MB |
+   | `q8_0`/`q4_1` (best quality) | 14.32 tok/s | 15.00 GiB | 0.93 GiB | 30 MB |
+   | `q8_0`/`q8_0` | 14.34 tok/s | 15.87 GiB | **0.05 GiB** | 75 MB |
+   | `q4_0`/`q4_0` | 14.08 tok/s | 13.87 GiB | 2.05 GiB | 75 MB |
+   | `f16`/`f16` | — | — | — | does not allocate |
+
+   The spread from the smallest to the largest cache that runs is **1.9 %**: at 131K the
+   decode is limited by attention latency/occupancy (165-172 GB/s effective on the weights,
+   27-29 % of peak), not by KV bandwidth, so the format choice is quality plus headroom.
+   Default is `q5_0`/`q4_1` because it leaves 1.68 GiB for the MTP state planes; `q8_0`/`q4_1`
+   is the documented better-quality trade (mean KLD 0.002920 against 0.004181 for `K q5_0`,
+   measured upstream on Qwen3.5, `docs/referencias-noturnas.md`) for 0.75 GiB more.
 3. **MTP (block 64) is implemented and exact but does not pay yet.** The NextN head drafts at
    86.7 % acceptance (llama.cpp's own driver: 87.5 %) and `--mtp` output is byte-identical to
    plain greedy — but every mode still runs one trunk forward per committed token, so it
@@ -394,11 +409,17 @@ Ordered by how much they cost the user, with the number that justifies each. Not
    most of it — but a Vulkan-style grouped attention (one row loaded once for the 6 query
    heads) is a known, unclaimed win. Decode was attention-bound before M7 (4.2 tok/s at 64K);
    `docs/medicoes-m7.md` has the fix and the curve.
-5. **Quality at long context is the model's, not ours — but we have not proven it beyond
-   wikitext-2.** Per-chunk perplexity deltas against llama.cpp are ≤ 0.25 % at 512-token
-   windows; longer windows and the RoPE-scaling question are being measured (long-context
-   front). Do not read "131K runs" as "131K is good": the RoPE/quality check is what makes
-   that claim, and it has to be done in the reference too.
+5. **"Runs at 131K" is not "is good at 131K", and we say exactly which half is measured.**
+   (a) *Implementation*: our RoPE was diffed against the real `ggml_rope_multi` up to position
+   262 143 (`check-rope-long-gpu`) — relative L2 ≤ 1e-3 at the far end, explained by one ulp of
+   theta, against a sensitivity control showing that a misconfigured YaRN would be 24-42 %
+   off. No rope scaling is applied by the GGUFs or by llama.cpp for this model, and ours
+   matches. (b) *Cost*: the 131K numbers above use a **synthetic seeded cache**
+   (`bench --start-pos --fill-cache`), so they measure the cost of decoding at that position.
+   (c) *Quality*: measured with real text only up to **16-24K**, because a real 131K prefill
+   at the current 74.9 tok/s takes ~29 minutes per run. Per-chunk perplexity against llama.cpp
+   is ≤ 0.25 % at 512-token windows. A 131K quality claim beyond that is not supported by
+   tonight's data, and the report says so.
 6. **The attention kernel's *unsplit* variant ignores its `WPB` template parameter**
    (`include/rdna4/attn.cuh`), so any warp-per-CTA sweep done through it measured redundant
    warps. It affects diagnostics, not the shipped split path (which uses the parameter), and
