@@ -19,11 +19,13 @@ As duas coisas foram escritas em frentes diferentes e nunca foram confrontadas.
 1. **Não cobre o kernel deles.** O nosso parâmetro `HG` varia *quantas cabeças a CTA serve*;
    nunca varia **qual eixo as warps dividem**. O ninfer divide as **linhas** (T·GroupSize ≤ 48,
    `ninfer src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh:33,52`) com o K/V
-   estagiado **uma vez** na LDS (`.../small_t_k8v4.cuh:294-341`) e o Q relido da LDS a cada bloco
-   de chaves (`:359-364`); o protótipo C mantém `qv[6][8]+acc[6][8]+m[6]+l[6] = 108 f32` **por
-   lane** com um laço serial de 6 cabeças dentro do laço de chaves
+   estagiado **uma vez** na LDS (`.../small_t_k8v4.cuh:294-341`) e o estado das linhas
+   **particionado** pelos warps (o Q é relido da LDS a cada bloco de chaves, `:359-364`); o
+   protótipo C mantém `qv[6][8]+acc[6][8]+m[6]+l[6] = 108 f32` **por lane, replicado em cada uma
+   das 8 warps**, com um laço serial de 6 cabeças dentro do laço de chaves
    (`nosso tests/bench_attn_gpu.hip:249-285`). Os 68 VGPR + **400 B/lane de derrame** do HG=6 são
-   da nossa organização, não da fusão.
+   da nossa organização, não da fusão — e o default deles (bf16-K/f16-V, **1024 B/chave**, §5a) é
+   a mesma linha em que a fusão nos custou 1,25-1,82×, não uma linha estreita.
 2. **Mas a parte da refutação que decide o valor já está medida**: no mesmo grid e **sem
    derrame** (HG=3 = 2 passadas, 125 VGPR, 0 B), cortar as leituras 3× vale **+5,0 % a 4K**
    (0,1358 → 0,1293 ms) e **0 % a 16K** (0,2652 → 0,2657 ms) — `nosso docs/journal-longctx.md`
@@ -58,9 +60,9 @@ As duas coisas foram escritas em frentes diferentes e nunca foram confrontadas.
 | linhas de consulta por CTA | `TokenTile·GroupSize` = **6 … 48** (`small_t_k8v4.cuh:33,52`) | **1** (`attn.cuh:100`) |
 | threads/CTA, LDS/CTA | 256, 28 KiB dinâmico (`small_t_k8v4.cu:21,24,51`) + ~7 KiB estático DERIVADO de `small_t_k8v4.cuh:58-72` | 256-512, 8,2 KiB (`nosso attn.cuh:192`) |
 | unidade de cálculo | `mma` m16n8k16 / m16n8k32 (`ninfer src/ops/common/mma.cuh:36,45,53,62`) | `fma` fp32 + **5 `shfl_xor` por (chave, cabeça)** (`attn.cuh:131-133`) |
-| estado por lane no T=1 | `acc[4][4]` = **16 f32**, + `score[4][4]` na warp produtora (`small_t_k8v4.cuh:283-288,353-356`) | `qv[8]+acc[8]+m+l` = 18 f32 **por cabeça** (`attn.cuh:113-119`); HG=6 = **108 f32** → spill medido |
+| estado por lane no T=1 | **particionado**: `acc[4][4]` = 16 f32 no k8v4 (`small_t_k8v4.cuh:283-288`) ou 128+64+16 f32 no bf16, por warp e por tile de linhas (`small_t_bf16.cuh:196,199-214,265`) | **replicado**: `qv[8]+acc[8]+m+l` = 18 f32 **por cabeça, em cada warp** (`attn.cuh:113-119`); HG=6 = 108 f32/lane → spill medido |
 | tráfego de K/V | **1× os bytes únicos**, por construção (`ninfer small_t_k8v4.cuh:3-4,294-341`) | **6×** (uma vez por cabeça de consulta, `nosso README.md:510-511`) |
-| bytes por chave (K+V) | ~**402 B** (fp8 1 B/elem + escala por linha D256; V nvfp4, grupo 16 → 0,5 B/elem + 16 escalas) (`ninfer kv_cache/fp8_e4m3_row_codec.cuh:3,45-58`, `nvfp4_group16_codec.cuh:17-18`) — DERIVADO das constantes | f16 **1024 B**; q4_0 **288 B** (`nosso kv.h:144`: 18/32 B por elemento × 2 linhas) |
+| bytes por chave (K+V) | ~**402 B** no k8v4 (fp8 1 B/elem + escala por linha D256; V nvfp4, grupo 16 → 0,5 B/elem + 16 escalas; `ninfer kv_cache/fp8_e4m3_row_codec.cuh:3,45-58`, `nvfp4_group16_codec.cuh:17-18`), mas **1024 B no default bf16** (§5a) — DERIVADO das constantes | f16 **1024 B**; q4_0 **288 B** (`nosso kv.h:144`: 18/32 B por elemento × 2 linhas) |
 
 `GroupSize` é 6 na geometria que interessa (`CausalD256H24Kv4`, `ninfer geometry.cuh:15` +
 `head_mapping.cuh:12-14`) — **a nossa mesma razão 24/4**. O `GroupSize` é 8 na outra geometria que
@@ -83,12 +85,17 @@ construção, o ideal de 1× — ela não pode falsear a afirmação do comentá
 `Br = 16` (`:35`), `Warps = 8` (`small_t_k8v4.cu:21`). O mapeamento linha→(cabeça, token) é
 `q_head = kv_head·GroupSize + local_q` (`ninfer .../small_t.cuh:157-163`).
 
-**(b) O que fica residente por lane é só o acumulador de um slice de d, não a cabeça.** Cada warp
-guarda `acc[PVNtPerWarp][4]` = 16 f32 (`small_t_k8v4.cuh:283-288`), porque o PV é distribuído
-pelas 8 warps em d (`ConsumerWarpsPerTile = Wc/RowTiles = 8`, `PVNtPerWarp = D/(8·8) = 4`,
-`:43-44`; consumo em `:495-527`). O **Q não fica residente**: o fragmento `af[4]` é relido da LDS
-por bloco de chaves, dentro do laço (`:359-364`), e o K idem (`:366-373`). O estado da linha
-(m, l) são 4 escalares por warp (`:289-292`), não 6 vetores.
+**(b) ninfer — o estado das linhas é *particionado* pelos warps, não replicado.** No k8v4 do T=1,
+`RowTiles = 1`, `Wc = 8` e `ConsumerWarpsPerTile = Wc/RowTiles = 8`, então o PV é dividido por
+**d**: `PVNtPerWarp = D/(8·8) = 4` e cada warp guarda só `acc[4][4]` = **16 f32**
+(`ninfer .../small_t_k8v4.cuh:43-44,283-288`; consumo em `:495-527`). O **Q nem fica residente**: o
+fragmento `af[4]` é relido da LDS por bloco de chaves, dentro do laço (`:359-364`), e o K idem
+(`:366-373`). O estado da linha (m, l) são 4 escalares por warp (`:289-292`), não 6 vetores.
+
+No caminho **bf16** (o default do CLI, ver §5a) o estado é maior, mas continua **particionado por
+linha**: cada warp é dono de 16 linhas (`warp_row0 = warp*16`, `small_t_bf16.cuh:196`) e guarda
+`acc[PVNt][4]` com `PVNt = D/8 = 32` → 128 f32, mais `af_q[QKKs][4]` = 64 f32 de Q residente
+(`:36-37,199-214`) e `score[4][4]` = 16 f32 (`:265`). Nada disso é replicado entre warps.
 
 **(c) nosso protótipo C — as 6 cabeças são estado por lane, dentro do laço de chaves.**
 `float qv[HG][8]; float acc[HG][8]; float m[HG], l[HG];` carregados **antes** do laço
@@ -99,12 +106,15 @@ q and acc are HG·8 floats per lane each (head_dim 256 -> dpw 8). HG=6 costs ~11
 lane"* (`tests/bench_attn_gpu.hip:220-221`) — e foi o que a medição achou: **68 VGPR + 400 B de
 derrame no HG=6 contra 56 VGPR e 0 B no HG=1** (`nosso docs/journal-longctx.md:379-382`).
 
-**(d) A diferença, então, não é "6 cabeças por CTA" (os dois têm), é *onde* elas cabem:** nas
-linhas de um tile que se reconstrói da LDS a cada bloco (deles) ou no registrador de cada lane
-através do laço inteiro (nosso). O derrame que matou o HG=6 **não pode ocorrer** na forma deles
-no T=1, porque 6 cabeças são 6 de 16 linhas de um mma e o único estado residente é 16 f32 de
-acumulador — 3,4× a 6,8× menos que os 108 f32 do HG=6. [D] quanto à estrutura; o número de VGPR
-deles é INFERIDO (ver §7).
+**(d) A diferença, então, não é "6 cabeças por CTA" (os dois têm): é *partição contra
+replicação*.** Na forma deles as 6 linhas ocupam **um** tile de 16 linhas, com o acumulador
+particionado pelas 8 warps em d e o Q relido da LDS a cada bloco (16 f32/lane no total,
+`:283-288`); na nossa, **cada uma das 8 warps carrega o estado das 6 cabeças**, porque cada warp
+anda por uma fatia de chaves diferente e precisa da linha inteira para si: `108 f32/lane × 8 warps
+× 32 lanes ≈ 27,6 mil f32` de estado de linha por CTA para 6 linhas de 256 d (1 536 f32 de carga
+útil) — **18× de replicação** — e o resultado medido foi 68 VGPR + 400 B de derrame
+(`nosso docs/journal-longctx.md:379-382`). O derrame que matou o HG=6 **não tem onde ocorrer** na
+forma deles. [D] quanto à estrutura; o número de VGPR deles é INFERIDO (ver §7).
 
 **Consequência para a refutação: o item 1 dela ("servir 6 cabeças por CTA custa mais que os
 bytes economizados") é um resultado sobre a *nossa* forma. Ele não se transporta.**
@@ -139,6 +149,14 @@ nossos (8 splits × 24 cabeças), 256 deles (64 splits × 4 KV). A 16K: 384 noss
 contagens de CTA são *da mesma ordem* — o que não é da mesma ordem é a contagem de CTA **do
 protótipo C** (32 a 4K, 64 a 16K com S=8/16, `journal-longctx.md:366,418-423`).
 
+**Ressalva de porte, DERIVADO**: a política de splits deles é dimensionada para *uma onda* de uma
+placa de **170 SMs** com 2 CTAs por SM: o comentário do launcher diz "manter a grade completa em
+uma ou duas ondas de 170 SMs" (`ninfer small_t.cu:229-235`) e o kernel bf16 declara
+`__launch_bounds__(128, 2)` (`small_t_bf16.cuh:21`), isto é 160-320 CTAs alvo. A nossa placa tem
+**32 WGP = 64 CU** (`nosso docs/rdna4-gfx1201-hardware-brief.md:9`, medido em
+`journal-longctx.md:372-373`). "Mesma contagem de CTA" entre os dois desenhos **não é mesma
+ocupação**; é mais um motivo para a célula de E0 ser medida, e não deduzida.
+
 ## 3. O regime de T (e o teto de 48 linhas)
 
 **(a) A fusão de GQA e o tile de tokens competem pelo mesmo orçamento de linhas.** O
@@ -165,6 +183,13 @@ quando `RowTiles = 3` e `KeyBlock = 64` para T ≥ 2 (`small_t_k8v4.cu:21-22`).
 verify do MTP é T=2..4 e usa `attn_batch_kernel` com **grade `(n_head, n_tok)`**
 (`nosso attn.cuh:416`), isto é, **uma CTA por (cabeça, token) — zero compartilhamento de linha de
 K/V**. A 16K isso é `24 × 4 = 96` CTAs relendo o mesmo KV 96 vezes por camada. [D]
+
+**(e) Um detalhe que confirma a leitura de que o default deles mira T ≥ 2.** No caminho bf16 o
+`WarpsPerCta` do T=1 é **2** (`ninfer small_t.cu:298`), o que dá `Br = 2·16 = 32` linhas para
+`row_count = 6` (`small_t_bf16.cuh:31,65,109-110`): a warp 1 (linhas 16-31) é **inteiramente
+preenchimento** e as linhas 6-15 da warp 0 também. O caminho otimizado para T=1 é o k8v4, cujo
+`RowTiles` acompanha `RowCount` (`small_t_k8v4.cuh:34,350`, um tile só, 6 linhas reais de 16).
+[D]
 
 **Consequência: parte do que o `docs/estudo-ninfer.md` §3.5 atribui à fusão de GQA é, no repo
 deles, amortização por T — e é a parte que o nosso motor poderia usar hoje (MTP roda com 4 linhas,
@@ -195,23 +220,30 @@ quem reduz com `shfl` de 32 lanes e guarda o estado na lane.
 
 ## 5. Precisão e formato
 
-**(a) Formato de K/V.** O caminho que embarca no decode deles é fp8-E4M3 para K (1 B/elemento,
-escala por linha de 256) e NVFP4 grupo-16 para V (0,5 B/elemento + 16 escalas)
-(`ninfer kv_cache/fp8_e4m3_row_codec.cuh:3,45-58`, `ninfer kv_cache/nvfp4_group16_codec.cuh:17-18`):
-~402 B por chave (K+V) — DERIVADO das constantes do codec, contra **1024 B** nossos com f16 e
-**288 B** com q4_0. A linha deles é **estreita**, e a nossa própria medição diz que é com linha
-estreita que agrupar compensa: com q4_0 (144 B de K por chave) o `HG=3` ganha 9,5-11,8 % a
-64K/131K, com f16 (512 B) perde 7 % (`nosso docs/journal-longctx.md:484-491`).
+**(a) O default deles tem a *nossa* linha, não uma linha estreita.** O CLI deles usa
+`KvCacheStorage::BFloat16` por default (`ninfer apps/cli/options.h:27`; as opções são
+bf16/int8/fp8/nvfp4/k8v4, `apps/cli/options.cpp:56-60`) e esse caminho guarda **K em bf16 e V em
+f16** (`ninfer small_t_bf16.cuh:3`; "K is copied exactly and V is rounded once to FP16", `:150,164-166`):
+512 B + 512 B = **1024 B por chave** com head_dim 256 — **exatamente o nosso f16**
+(`nosso kv.h:142`). O caminho fp8-K/NVFP4-V (`k8v4`) é *opção*, e aí sim a linha é estreita:
+fp8-E4M3 (1 B/elemento + escala por linha de 256) para K e NVFP4 grupo-16 (0,5 B/elemento + 16
+escalas) para V (`ninfer kv_cache/fp8_e4m3_row_codec.cuh:3,45-58`,
+`ninfer kv_cache/nvfp4_group16_codec.cuh:17-18`) → ~402 B por chave (K+V), DERIVADO das
+constantes.
 
-**(b) Precisão do score.** Os scores deles nascem de um mma fp8/bf16 com correção de escala em
-fp32 (`small_t_k8v4.cuh:377-388`); os nossos são dot fp32 SIMT com `expf` fp32. Um port fiel não
-pode trocar a nossa aritmética de score sem trocar o gate numérico: a tolerância do
+**(b) A consequência para a pergunta é o contrário do que se poderia esperar.** A fusão não é um
+truque que só paga com KV quantizado: o caminho default deles funde GQA **com a mesma linha de
+1024 B que nós medimos como o caso onde a fusão perde 1,25-1,82×** (`nosso docs/journal-longctx.md`
+§4.1: 0,1358 → 0,1694 a 4K e 0,2652 → 0,4834 a 16K). A nossa medição com q4_0 (144 B de K por
+chave, ganho de 9,5-11,8 % a 64K/131K, `journal-longctx.md:484-491`) mostra *outro* regime, com
+linha estreita — não é o regime do default deles. Ou seja: **o formato não explica a diferença de
+desenho entre os dois kernels; a organização explica.**
+
+**(c) Precisão do score.** Os scores deles nascem de um mma bf16/fp8 com correção de escala em
+fp32 (`ninfer small_t_k8v4.cuh:377-388`); os nossos são dot fp32 SIMT com `expf` fp32. Um port
+fiel não pode trocar a nossa aritmética de score sem trocar o gate numérico: a tolerância do
 `check_attn_split.sh` é de 0,5 % de PPL em texto real (`nosso scripts/check_attn_split.sh`,
 escada medida 5,1989 → 5,2054 → 5,2114, `nosso README.md:516-518`).
-
-**(c) O que isso quer dizer para a pergunta**: o formato deles é *mais um* fator que reduz o
-tráfego (402 B contra 1024 B), empilhado com a fusão. Não é a fusão. E é justamente onde a nossa
-medição **já achou** o ganho: KV quantizado a 64K+.
 
 ## 6. O contraste do prefill deles (evidência sobre quando a fusão paga)
 

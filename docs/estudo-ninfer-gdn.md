@@ -19,8 +19,9 @@ Sem GPU. Tudo abaixo é leitura de código e aritmética; onde eu medi, eu digo 
 
 1. **A forma em blocos é EXATA, não é aproximação.** Protótipo em `float64` (aritmética exata
    para os fins desta pergunta), nossa recorrência sequencial contra a forma em blocos transcrita
-   termo a termo: desvio relativo máximo **1,0e-15 … 1,7e-15** na saída e **4,4e-16 … 1,7e-15** no
-   estado, para $B \in \{8,16,32,64\}$ e $T \in \{64,256,1024,2048,8192\}$. Só há reordenação de
+   termo a termo: desvio relativo máximo **1,0e-15 … 1,7e-15** (máximo sobre saída **e** estado),
+   para $B \in \{8,16,32,64\}$ e $T \in \{64,256,1024,2048,8192\}$; em $T=128$ com 5 sementes, a
+   saída fica em 1,5e-16 … 2,9e-16 e o estado em 4,4e-16 … 1,6e-15. Só há reordenação de
    somas e arredondamento de `float`.
 2. **Em `float32` puro (nosso caminho, sem BF16 em nada)** o desvio medido foi **5,0e-7 (T=64) …
    1,0e-6 (T=8192)** — a mesma ordem do erro que o **nosso próprio** caminho sequencial já tem
@@ -44,8 +45,8 @@ Sem GPU. Tudo abaixo é leitura de código e aritmética; onde eu medi, eu digo 
 7. **Alvo**: `gdn_delta` = 0,625 ms/token e a recorrência inteira 0,852 ms/token
    (`nosso docs/estudo-prefill-c-nosso.md:501-503`), medidos a N=64 com chunk 16. Hoje isso é
    `0,625/48 = 13,0 µs` por camada por token = **208 µs por camada por chamada de 16 tokens** para
-   25,2 M fma — ~1,5 % do pico de fma da placa. O ganho tem que vir de ILP/ocupação, não de bytes
-   (3,1 MB por camada por chamada = 5 µs de piso de memória).
+   37,7 M fma — ~1,1 % do pico de fma da placa, e 20× acima do piso de memória (6,3 MB de tráfego
+   de estado por camada por chamada ≈ 10 µs a 633 GB/s). O ganho tem que vir de ILP/ocupação.
 
 ---
 
@@ -259,22 +260,22 @@ $$
 Mesmo esquema no llama.cpp: máscara `LOWER_DIAG` (diagonal dentro)
 (`llama.cpp .../delta-net-base.cpp:143-147`), termo intra $A v_{new}$ ($:251$), termo do estado
 $e^{g_t}(q_t\cdot S)$ ($:255,259$), escala $1/\sqrt{S_k}$ aplicada em $q$ uma única vez
-($:45-47`) — a diferença de *onde* a escala entra (deles em $q$, a nossa e a do ninfer na saída) é
+($:45-47`) — a diferença de *onde* a escala entra (deles em $q$; a nossa e a do ninfer, na saída) é
 equivalente em aritmética exata e diferente em arredondamento.
 
 ### 2.6 Shapes e onde cada tensor vive
 
 | tensor | shape lógico | quem é | dtype ninfer | nosso candidato |
 |---|---|---|---|---|
-| $g$ (log-gate) | $[T][H_v]$ | por token × value head | FP32 entrada | **cópia exata** do nosso `d_gate2b_` (`nosso graph.cuh:419`) |
+| $g$ (log-gate) | $[T][H_v]$ | por token × value head | FP32 entrada | **cópia exata** do nosso `d_gate2b_` (`nosso include/rdna4/graph.cuh:419`) |
 | $\beta$ | $[T][H_v]$ | por token × value head | FP32 entrada (pós-sigmoid fora) | **cópia exata** do nosso `d_betab_` |
-| $K, Q, V$ | $[T][H_{qk}\text{ ou }H_v][S]$ | por token × head × dim | BF16 | nosso é FP32 (`nosso graph.cuh:416,671`) |
+| $K, Q, V$ | $[T][H_{qk}\text{ ou }H_v][S]$ | por token × head × dim | BF16 | nosso é FP32 (`nosso include/rdna4/graph.cuh:416,671`) |
 | $g\_cumsum$ | $[H_v][T]$ | por head × token, **local ao bloco** | FP32 | FP32 |
 | $T$ | $[B][B]$ por (bloco, head) | intra-bloco | FP32, **só em smem** | FP32, smem (1 KB com $B{=}16$) |
 | $W, U$ | $[B][H_v][S]$ | por bloco × head × dim | workspace **BF16** | **FP32** (§5.1) |
 | `v_new` | $[B][H_v][S]$ | idem | workspace **BF16** | **FP32** |
 | `h_chunk` | $[N_T][H_v][S][S]$ | por bloco × head, estado na **entrada** do bloco | workspace **BF16** | **FP32** (ou eliminado, §6.4) |
-| `ssm_state` | $[S][S][H_v]$ fp32 | por head, persistente | **FP32** | `nosso d_state_` (`nosso graph.cuh:695`) |
+| `ssm_state` | $[S][S][H_v]$ fp32 | por head, persistente | **FP32** | `nosso d_state_` (`nosso include/rdna4/graph.cuh:695`) |
 
 Layout do workspace no ninfer: `ninfer .../chunked/launch.h:32-46`
 (`g_cumsum` FP32 `{H_v, T}`, `W/U/v_new` BF16 `{S, H_v, T}`, `h_chunk` BF16 `{S, S, H_v, N_T}`).
@@ -369,7 +370,7 @@ Desvio relativo da forma em blocos contra o nosso sequencial quando uma convenç
 | cumsum **exclusivo** em vez de inclusivo | **0,275** |
 | máscara da saída **estrita** ($s<t$) em vez de inclusiva ($s\le t$) | **0,824** |
 | $T=(I + L\,\mathrm{diag}(\beta))^{-1}$ em vez de $(I+\mathrm{diag}(\beta)L)^{-1}$ ($\beta$ na coluna) | **1,1e-2 … 2,6e-2** |
-| as duas primeiras juntas | 0,848 |
+| as duas primeiras linhas juntas | 0,848 |
 
 Não são erros que um gate de PPL pegue com folga — são erros de ordem 1. Cada um vira uma
 verificação no teste de §6.3 (o teste de $T$ contra $I$ é o mais barato: $T\cdot(I-A) = I$ a 1e-6).
@@ -426,7 +427,7 @@ agregado medido é 5e-7 … 1e-6 (§3.3).
 
 ### 4.3 O contrato que este port quebra (a decisão que é do dono do repo)
 
-Hoje o caminho em lote **é bit-identico** ao caminho por token, e isso é contrato explícito:
+Hoje o caminho em lote **é bit-idêntico** ao caminho por token, e isso é contrato explícito:
 `nosso include/rdna4/gdn.cuh:295-308` ("every token keeps the arithmetic it has in the per-token
 path, so the result is BIT-IDENTICAL") e o teste exige exatamente isso
 (`nosso tests/check_batch_gpu.hip:163-169` falha se `!exact`, e `:203-204` idem para o caso
@@ -478,7 +479,7 @@ números medidos.
   (`nosso include/rdna4/graph.cuh:1338-1381`); o ninfer simplesmente recusa $T$ não múltiplo de 64.
 - **O snapshot/restore do estado para o MTP** (`nosso include/rdna4/graph.cuh:1592-1654`) e o
   nó de grafo `new_state-*` (`nosso tests/check_graph_gpu.hip:396-398` com limiar 1e-3): o caminho
-  em blocos tem de escrever **o mesmo buffer, no mesmo layout, no mesmo dtype** — escreve, e é por
+  em blocos tem de escrever **o mesmo buffer, no mesmo layout, no mesmo dtype** — e escreve; é por
   isso que o layout `[valor][chave]` fp32 importa (§2.6).
 - **A escala e o ssm_norm+silu** fora do kernel (`nosso include/rdna4/graph.cuh:1321-1327`): o
   ninfer tem `build_norm_gated` no grafo do modelo. Mantemos como está.
@@ -525,13 +526,15 @@ documento resolver.
 O port não precisa de 64. Medido: a igualdade vale para qualquer $B$ (§3.2), e o custo por token é
 
 $$
-\text{fma/token/head} \;=\; \underbrace{3S^2}_{\text{estado}} \;+\; \underbrace{\approx 4{,}5\,B\,S}_{\text{intra-bloco}}
+\text{fma/token/head} \;=\; \underbrace{3S^2}_{\text{estado}} \;+\; \underbrace{\approx 4\,B\,S}_{\text{intra-bloco}}
 $$
 
-contra $2S^2 = 32\,768$ do sequencial. Com $S=128$: $B=16 \to 41\,984$ (1,28×);
-$B=64 \to 69\,632$ (2,13×). $B$ menor é mais barato em fma e troca mais vezes o estado entre blocos
-(tráfego de estado: $\propto 1/B$). Além disso, $T = B\times B$ fp32 vive em smem: $B=16 \to 1$ KB,
-$B=64 \to 16$ KB, $B=128 \to 64$ KB (o CU inteiro).
+A parcela de estado é **igual** à do sequencial (que também gasta $3S^2$: um fma por elemento no
+passe do `sum`, dois no passe de atualização+saída, `nosso include/rdna4/gdn.cuh:75-85`); o que se
+paga a mais é só o intra-bloco. Com $S=128$: $B=16 \to 57\,344$ fma/token/head (1,17× o
+sequencial de 49 152); $B=64 \to 81\,920$ (1,67×). $B$ menor é mais barato em fma e troca mais
+vezes o estado entre blocos (tráfego de estado $\propto 1/B$). Além disso, $T = B\times B$ fp32 vive
+em smem: $B=16 \to 1$ KB, $B=64 \to 16$ KB, $B=128 \to 64$ KB (o CU inteiro).
 
 **Proposta**: $B = 16$ fixo, casando com o chunk de produção (`RD_PREFILL_CHUNK` default 16), com
 preenchimento de zeros no último grupo — o mesmo truque do llama.cpp
@@ -559,8 +562,8 @@ IQ3_S (o espelho tem de usar `s.max_batch`/`prefill_chunk_cap()`, como
 `nosso include/rdna4/device.h:255`).
 
 A variante de 3 estágios (a do ninfer, mais fácil de depurar) materializa também `v_new` e
-`h_chunk` em FP32: +$B\cdot S$ e +$S^2$ floats por (bloco, head) =
-**+3,15 MB por bloco** ($S^2\cdot4\cdot48$), o que com `RD_PREFILL_CHUNK=512` dá 63,0 MB no total.
+`h_chunk` em FP32: +$B\cdot S$ floats por (bloco, head) = **+0,39 MB** e +$S^2$ floats =
+**+3,15 MB por bloco**, o que com `RD_PREFILL_CHUNK=512` (32 blocos) dá 63,0 MB no total.
 É por isso que a fusão da saída no estágio de estado é a recomendação: ela elimina o $h_{\text{chunk}}$
 inteiro (e o seu tráfego), porque o termo $e^{G_r}(q_r\cdot H_{\text{in}})$ é independente por
 faixa de dim de valor, que é exatamente como o CTA do estado já está fatiado.
@@ -595,7 +598,7 @@ faixa de dim de valor, que é exatamente como o CTA do estado já está fatiado.
 ### 6.5 Switch e ordem de implementação
 
 Switch: **`RD_GDN_CHUNKED`**, lido uma vez, no padrão da casa
-(`nosso include/rdna4/graph.cuh:166-172`). Regra do plano (`nosso docs/plano-ninfer.md:88-89`):
+(`nosso include/rdna4/graph.cuh:166-172`). Regra do plano (`nosso docs/plano-ninfer.md:53-54`):
 `RD_GDN_CHUNKED=0` mantém o caminho antigo. Entrada em produção em duas etapas — enquanto os gates
 de §4.2/§4.3 não fecharem, o default é **desligado** (ou seja, temporariamente `RD_GDN_CHUNKED=1`
 liga), e só depois de a decisão de §4.3 estar tomada o default vira ligado com `=0` como escape.
@@ -629,12 +632,12 @@ binário.
 
 O que ler, e o que decide:
 
-| medida | hoje (`nosso docs/estudo-prefill-c-nosso.md:154,159,162,494`) | barra para manter |
+| medida | hoje (`nosso docs/estudo-prefill-c-nosso.md:154,159,162,166,494,501-503`) | barra para manter |
 |---|---|---|
 | `gdn_delta` | **0,625 ms/token** | **≤ 0,30** (corta ≥ 50 % do item) |
 | recorrência inteira (delta+conv+l2+scalars+norm_silu) | **0,852 ms/token** | **≤ 0,45** |
-| prefill total | 8,233 ms/token (§5) / 8,244 a N=128 | ganho visível fora do ruído do harness |
-| tok/s do `bench --prefill 512` | `nosso docs/estudo-prefill-c-nosso.md:510-513` | ≥ 2 % |
+| prefill total | 8,233 ms/token (N=64) / 8,244 a N=128 | ganho visível fora do ruído do harness |
+| tok/s a 512 tokens | 123,39 tok/s (`bench-phases-gpu` count-only, `nosso docs/estudo-prefill-c-nosso.md:603`) | ≥ 2 % |
 
 Complementos, na mesma sessão de GPU:
 
@@ -650,13 +653,15 @@ Complementos, na mesma sessão de GPU:
    mesmo estado e mede cache, não DRAM (`nosso docs/journal-kernels.md:157-161`).
 
 Aritmética do que é razoável esperar (para calibrar a barra, não para prometer): os 208 µs por
-camada por chamada de 16 tokens correspondem a 25,2 M fma = ~121 G-fma/s, ~1,5 % do pico de fma da
-placa. Mesmo com 1,5-2× mais fma (§6.2) e chegando a 10-30 % do pico, o item cai para
-0,01-0,07 ms/token — ou seja, a barra de 0,30 é conservadora e o que pode frustrá-la é
-**ocupação de grade**: 48 heads × 4 faixas = 192 CTAs é o mesmo teto de hoje, e o que muda é o
-trabalho por CTA. Se a medição mostrar que o gargalo virou outra coisa, o item 5 da tabela do §0.1
-de `nosso docs/plano-prefill.md:97-120` (Amdahl: 0,852 é 29 % do que sobra no melhor caso, ~52 % no
-D4) é quem diz se vale continuar.
+camada por chamada de 16 tokens correspondem a 37,7 M fma (48 heads × 16 tokens × $3S^2$) =
+~181 G-fma/s, **~1,1 % do pico de fma da placa** (~16,4 T-fma/s a 64 CU × 128 lanes × 2 GHz), e
+20× acima do piso de memória (lê+escreve os 3,1 MB de estado da camada = 6,3 MB ≈ 10 µs a
+633 GB/s, `nosso docs/estudo-prefill-c-nosso.md:580-581`). Mesmo com 1,2-1,7× mais fma (§6.2) e
+chegando a 10-30 % do pico, o item cai para 0,01-0,07 ms/token — ou seja, a barra de 0,30 é
+conservadora e o que pode frustrá-la é **ocupação de grade**: 48 heads × 4 faixas = 192 CTAs é o
+mesmo teto de hoje, e o que muda é o trabalho por CTA. Se a medição mostrar que o gargalo virou
+outra coisa, o item 5 da tabela do §0.1 de `nosso docs/plano-prefill.md:97-120` (Amdahl: 0,852 é
+29 % do que sobra no melhor caso, ~52 % no D4) é quem diz se vale continuar.
 
 ---
 
