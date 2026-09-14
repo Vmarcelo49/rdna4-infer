@@ -165,7 +165,7 @@ The cache is contiguous per layer, addressed directly, with no paging and no ind
 | context (IQ3_S) | weights | KV read (DRAM) | KV read (logical/L2) | GDN state | total DRAM |
 |---|---|---|---|---|---|
 | 4K, `f16` | 11.133 GB | 0.268 GB | 1.611 GB | 0.302 GB | 11.71 GB |
-| 64K, `f16` | 11.133 GB | 4.295 GB | 25.770 GB | 0.302 GB | 15.74 GB |
+| 64K, `f16` | 11.133 GB | 4.295 GB | 25.770 GB | 0.302 GB | 15.74 GB — **does not fit: see below** |
 | 128K, `q4_0` | 11.133 GB | 2.416 GB | 14.496 GB | 0.302 GB | 13.87 GB |
 
 Two facts drive the design: the GQA ratio is 6:1, so with one CTA per query head each KV row
@@ -173,6 +173,17 @@ is read **6 times** (the difference between the two KV columns), and the GDN rec
 is 302 MB per token of pure round-trip traffic. The split-KV attention trades exactness for
 parallelism and is gated numerically; the split partials and the logits copy are rounding
 errors in this budget (`docs/kv-memoria-desenho.md` §4).
+
+**The KV budget is not a table entry, it is a cliff** (measured, `docs/medicoes-banda-e-gargalos.md`
+§2.4). IQ3_S + `f16` KV fits up to **48K** (1.30 GiB free); at **64K it is over the limit** —
+0.30 GiB free, ~2.1 GB spill to GTT (`gtt_used` 2557 MB against 466-472 MB when it fits) and
+decode collapses from ~18 to **2.16 and 7.97 tok/s** in two identical runs, with the lock held
+and `/dev/kfd` empty. Phases that read a lot fail together (attention 13.3×, matvecs 6-23×)
+while the cheap ones do not move: the signature of traffic over the system bus, not of
+contention. Above ~56K the supported configuration is **KV `q8_0`**, which is also *faster*
+than `q4_0` at 64K (18.28 vs 18.10-18.17 tok/s; attention 19.87 vs 21.03 ms) and leaves
+2.18 GiB free — attention there is issue-bound in the dequantization, not bandwidth-bound, so
+paying for the extra precision costs nothing.
 
 ## Measured numbers
 
@@ -184,11 +195,13 @@ stated — the same reference `docs/medicoes-m5.md` uses, so the prompt length i
 | | this engine | llama.cpp Vulkan, same machine |
 |---|---|---|
 | decode, 4K `f16` | 29.3 tok/s (start of 4K) / 26.8 (end of 4K) | 40.0 ± 0.02 tok/s (tg64; 39.7 in M5) |
-| decode, 16K / 64K `f16` | 24.3 / 18.9 tok/s | 37-38 tok/s at 32K (`llama-cli`) |
+| decode, 16K `f16` | 24.3 tok/s (39.7 ms/token) | 37-38 tok/s at 32K (`llama-cli`) |
+| decode, 64K `f16` | **does not fit**: 2.1 GB spill to GTT, 2.16-7.97 tok/s | — |
+| decode, 64K `q8_0` / `q4_0` | 18.28 / 18.10-18.17 tok/s | — |
 | decode, 128K `q4_0` | 13.0 tok/s | — |
 | prefill, batched (N≤16) | 70.2 tok/s; 69.5 on a 512-token prompt; 56.7 on a 64-token prompt | 575 ± 65 tok/s (pp64, re-measured; 440 ± 77 recorded in M5 — pp64 is noisy), 1143 ± 30 (pp512) |
-| weight bandwidth (11.122 GB/token ÷ ms per token) | ~326 GB/s | ≥442 GB/s (derived) |
-| 64K `q4_0` decode | 17.9 tok/s (was 4.2 before M7) | — |
+| weight bandwidth, end to end (12.02 GB/token inventory) | **331 GB/s = 52 %** of the measured DRAM roofline | ≥442 GB/s (derived) |
+| weight bandwidth, matvec alone | **436 GB/s = 69 %**; the LM head reaches 620 GB/s = 98 % | — |
 | IQ4_XS decode, 4K `f16` | 27.0 tok/s | — |
 | perplexity (wikitext-2, 10×512 tokens, per position) | within **0.25 %** (IQ3_S) / **0.15 %** (IQ4_XS) | reference |
 | MTP (NextN) draft acceptance | 86.7 % on natural text (output identical) | 87.5 % (its own driver) |
@@ -198,6 +211,50 @@ The prefill row is the honest one to look at twice: the gap is real (70 vs 440-1
 per-token scaffolding does not. Sources: `docs/medicoes-m5.md` (both files, KV types,
 contexts, perplexity), `medicoes-m7.md` (long context), `medicoes-m8.md` (batched prefill,
 MTP projection), `medicoes-banda-e-gargalos.md` (per-phase time and the traffic budget).
+
+## Where a token goes
+
+Measured with HIP events inside the real graph (`bench-phases-gpu`), context 4K, `f16` KV,
+best pass on a quiet window, minus the measured cost of each event mark (1479 marks × 4.03 µs
+= 5.95 ms, i.e. level-2 instrumentation inflates a token by 16 % if you do not subtract it).
+Full detail in `docs/medicoes-banda-e-gargalos.md` §1.
+
+| phase | ms/token | share | lever measured |
+|---|---|---|---|
+| weight matvec (496 launches + LM head) | 24.94 | 69.3 % | issue-bound at 436 GB/s: 5.9 ms recoverable in the `vec_dot` bodies |
+| GDN recurrence (`delta_rule` 3.97 + conv + scalars + norms) | 5.63 | 15.6 % | 48 CTAs = 9 % occupancy; a 4-threads-per-row rewrite is worth up to ~3 ms |
+| norms / rope / elementwise | 2.96 | 8.2 % | fusing `rms_norm`+`quantize`, the GDN scalars and `kv_write` 8→1 ≈ 1.1 ms |
+| LM head + logits copy + sampler | 2.08 | 5.8 % | the LM head is at 98 % of the read roofline (874 MB/token, unavoidable) |
+| attention (16 layers, split) | 1.38 | 3.8 % | memory-latency bound here; at 64K it becomes issue-bound in the KV dequant |
+| activation quantization | 0.88 | 2.4 % | the q8_1 activation is also the entire numerical error of the matvec (see below) |
+| **total** | **36.0** | | cross-checked against `bench` (36.29 ms) at the same position |
+
+The 1 940 launches per token cost ~4.0 ms (11 %) at the measured 2.2-3.5 µs dispatch floor —
+but measure before believing it: replaying the same launch sequence as a HIP graph bought only
+1.06× (1.4 ms), because most of those launches overlap with real kernels. The irreducible part
+is the ~1 440 *small* kernels, which are at the floor (2.77-3.16 µs against 2.20 µs for an
+empty kernel).
+
+## Numerical accuracy of the quantization
+
+`docs/quants-precisao.md` measures each format against an fp64 dot over dequantized weights,
+and separates the two error sources. The result is counter-intuitive and useful:
+
+- **The matvec arithmetic is not the error.** For all 14 formats the total error of one
+  projection is the error of the `q8_1` activation quantization: **3.6e-3 to 4.0e-3**. The
+  kernel arithmetic itself is 6.4e-8 to 1.0e-7 for the nine exact formats, and the worst
+  truncating format is `iq1_s` at 4.4e-4.
+- **Between formats, weight distance** (294 tensors, IQ3_S vs IQ4_XS): `iq3_s`↔`iq4_xs`
+  1.19e-1, `iq4_xs`↔`q5_k` 6.5e-2, `q4_k`↔`q5_k` 6.4e-2 — i.e. IQ4_XS represents these
+  tensors with about half the error of IQ3_S.
+- **End to end** (perplexity on wikitext-2, per chunk, against llama.cpp): IQ3_S
+  0.185/0.105/0.008/0.018 %, IQ4_XS 0.053/0.015/0.099/0.116 %. "IQ4_XS is consistently
+  better" does **not** hold: it wins on two chunks and loses on two, and its worst absolute
+  NLL delta (0.873) is larger than IQ3_S's (0.458). What the extra 1.2 GiB of IQ4_XS buys is
+  a smaller weight error that the activation error then hides.
+- Measured recommendation: **IQ3_S + `f16` KV up to 48K**, **IQ3_S + `q8_0` KV above ~56K**.
+  IQ4_XS does not even initialize at 48K with `q4_0` KV or 32K with `f16` (`hipMalloc`
+  measured), so it is not the file to use for long context on this card.
 
 ## How it compares to llama.cpp's Vulkan backend
 
@@ -290,8 +347,9 @@ those are queued with the attention changes rather than silenced with a flag.
 - **Long context**: decode used to be attention-bound (4.2 tok/s at 64K with `q4_0` KV); see
   `docs/medicoes-m7.md` for the fix (vectorized cache loads, more warps per CTA, split-KV)
   and the numbers. The GQA re-read is still per-query-head, which is the next known win.
-- Prefer `f16` KV where it fits: it is measurably faster than `q4_0` at the same context,
-  and `q4_0` exists to make 128K fit, not to be fast.
+- KV type by context, measured: `f16` up to 48K (fits with 1.30 GiB free), **`q8_0` above
+  ~56K** (18.28 tok/s at 64K, 2.18 GiB free, and *faster* than `q4_0`), `q4_0` only when
+  128K must fit. `f16` at 64K overflows into GTT and collapses to 2-8 tok/s.
 - **MTP (block 64) works but does not pay**: `--mtp` drafts with the NextN head at 86.7 %
   acceptance and reproduces plain greedy output exactly, but every mode still runs one trunk
   forward per committed token, so it is 9-10 % *slower* than plain greedy. With batched
@@ -321,6 +379,9 @@ those are queued with the attention changes rather than silenced with a flag.
   ranking. `docs/autotuning-gfx1201.md` — the tuning space, what shipped, what was rejected.
 - `docs/build-repro.md` — pinned versions, a clean build, and the traps.
 - `docs/medicoes-m5.md`, `medicoes-m6.md`, `medicoes-m7.md`, `medicoes-m8.md`,
-  `medicoes-banda-e-gargalos.md` — every measured number, per milestone.
+  `medicoes-banda-e-gargalos.md` — every measured number, per milestone, plus the per-phase
+  token budget, the measured DRAM roofline and the GTT cliff.
+- `docs/quants-precisao.md` — per-format accuracy, activation error vs kernel error, and
+  format-to-format weight distance.
 - `docs/mtp.md`, `docs/servidor-openai.md`, `docs/gpu-queue.md`, `docs/agentes-paralelos.md`
   — the MTP study, the server surface, and the rules for running several agents on one GPU.
