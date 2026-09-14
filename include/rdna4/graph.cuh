@@ -34,6 +34,7 @@
 #include "rdna4/model.h"
 #include "rdna4/mtp.cuh"
 #include "rdna4/nn.cuh"
+#include "rdna4/phase_prof.cuh"  // RD_PHASE_PROF: diagnostico opt-in (agente de medicoes)
 
 namespace rdna4 {
 
@@ -99,6 +100,17 @@ class Graph {
   // copy removes one device sync per token (it would otherwise be merged into
   // forward_run's logits copy). Default true: the oracle tests compare `hidden`.
   void set_want_hidden(bool want) { want_hidden_ = want; }
+  // --- RD_PHASE_PROF (diagnostico opt-in, agente de medicoes) ---------------
+  // Ativa o cronometro de fases por eventos HIP (include/rdna4/phase_prof.cuh).
+  // Puramente aditivo: sem profiler o caminho e identico (RD_PHASE e um no-op).
+  // Nao altera numeros: os eventos so marcam a fila, nenhum buffer e tocado.
+  void set_phase_prof(PhaseProf *p) { prof_ = p; }
+  // splits usados na ultima atencao (para o relatorio de trafego de KV)
+  int debug_attn_splits() const { return attn_splits_last_; }
+  PhaseProf *phase_prof() const { return prof_; }
+  // nivel 2 (separar act_quant de matvec dentro de cada proj)
+  PhaseProf *pfine() { return (prof_ != nullptr && prof_->fine()) ? prof_ : nullptr; }
+  // --- fim RD_PHASE_PROF ---------------------------------------------------
   // Force a split count (0 = automatic). tests/check_kvctx_gpu.hip compares the
   // split-KV path against the unsplit one at the same context through this.
   void set_attn_splits(int n) {
@@ -335,6 +347,8 @@ class Graph {
   int cur_token_ = 0;
   int *d_pos_ = nullptr;
   int max_ctx_ = 0;
+  // RD_PHASE_PROF: nullptr = desligado (comportamento de producao).
+  PhaseProf *prof_ = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -577,11 +591,13 @@ inline bool Graph::proj(const GpuTensor &w, const float *d_x, float *d_y, int nr
     err = "bad reduction dim for q8 scratch";
     return false;
   }
+  RD_PHASE(pfine(), "act_quant");  // RD_PHASE_PROF
   quantize_q8_1_kernel<<<(nb + 3) / 4, 128>>>(d_x, (block_q8_1 *)d_q8_, nb);
   if (hipGetLastError() != hipSuccess) {
     err = "quantize_q8_1 launch failed";
     return false;
   }
+  RD_PHASE(pfine(), "matvec");  // RD_PHASE_PROF
   if (!matvec_launch((int)w.dt, w.ptr, (const block_q8_1 *)d_q8_, d_y, nrows, ncols, nullptr)) {
     err = "matvec_launch failed";
     return false;
@@ -601,6 +617,7 @@ inline bool Graph::proj_qq(const GpuTensor &w, float *d_y, int nrows, int ncols,
     err = "bad reduction dim for q8 scratch (proj_qq)";
     return false;
   }
+  RD_PHASE(pfine(), "matvec");  // RD_PHASE_PROF
   if (!matvec_launch((int)w.dt, w.ptr, (const block_q8_1 *)d_q8_, d_y, nrows, ncols, nullptr)) {
     err = "matvec_launch failed (proj_qq)";
     return false;
@@ -625,12 +642,14 @@ inline bool Graph::add_residual(float *d_src, float *d_dst, int n, std::string &
 inline bool Graph::full_attn(int il, int t, int pos, std::string &err) {
   const int E = n_embd(), HD = head_dim(), NH = n_head(), NKV = n_head_kv();
   const LayerW &L = w_[il];
+  RD_PHASE(prof_, "attn_norm");  // RD_PHASE_PROF
   if (!rms_norm_launch(d_x_, (const float *)L.attn_norm.ptr, d_xn_, 1, E,
                        (float)cfg_.rms_norm_eps)) {
     err = "attn_norm launch failed";
     return false;
   }
   emit("attn_norm", il, d_xn_, E);
+  RD_PHASE(prof_, "qkv_proj");  // RD_PHASE_PROF
   if (!proj(L.attn_q, d_xn_, d_proj_, NH * 2 * HD, E, err)) return false;
   // k and v read the same activation as q: reuse its q8_1 blocks
   if (!proj_qq(L.attn_k, d_kstage_, NKV * HD, E, err)) return false;
@@ -638,6 +657,7 @@ inline bool Graph::full_attn(int il, int t, int pos, std::string &err) {
   emit("Qcur_full", il, d_proj_, (std::int64_t)NH * 2 * HD);
   emit("Vcur", il, d_vstage_, (std::int64_t)NKV * HD);
 
+  RD_PHASE(prof_, "qk_norm_rope_kv");  // RD_PHASE_PROF
   if (!deinterleave_q_gate_launch(d_proj_, d_attnout_, d_attngate_, NH, HD)) {
     err = "deinterleave launch failed";
     return false;
@@ -674,6 +694,7 @@ inline bool Graph::full_attn(int il, int t, int pos, std::string &err) {
   const int n_keys = pos + 1;
   const int splits = attn_splits_for(n_keys);
   attn_splits_last_ = splits;
+  RD_PHASE(prof_, "attention");  // RD_PHASE_PROF
   if (splits > 1) {
     if (!attn_launch_split(d_attnout_, kc, vc, d_attnout_, d_attn_partial_, pos, NH, NKV, HD,
                            scale, kv_k_, kv_v_, splits)) {
@@ -685,6 +706,7 @@ inline bool Graph::full_attn(int il, int t, int pos, std::string &err) {
     return false;
   }
   emit("attn_pregate", il, d_attnout_, (std::int64_t)NH * HD);
+  RD_PHASE(prof_, "attn_gate_out");  // RD_PHASE_PROF
   if (!unary_launch(d_attngate_, d_attngate_, NH * HD, UnOp::Sigmoid)) return false;
   emit("gate_sigmoid", il, d_attngate_, (std::int64_t)NH * HD);
   if (!mul_launch(d_attnout_, d_attngate_, d_attnout_, NH * HD)) return false;
@@ -733,12 +755,14 @@ inline bool Graph::gdn_layer(int il, int t, std::string &err) {
   float *state = d_state_ + (std::size_t)slot * nvh * S * S;
   float *convst = d_convst_ + (std::size_t)slot * (K - 1) * chan;
 
+  RD_PHASE(prof_, "attn_norm");  // RD_PHASE_PROF
   if (!rms_norm_launch(d_x_, (const float *)L.attn_norm.ptr, d_xn_, 1, E,
                        (float)cfg_.rms_norm_eps)) {
     err = "attn_norm launch failed";
     return false;
   }
   emit("attn_norm", il, d_xn_, E);
+  RD_PHASE(prof_, "gdn_proj");  // RD_PHASE_PROF
   if (!proj(L.attn_qkv, d_xn_, d_qkv_, chan, E, err)) return false;
   // all four GDN projections read d_xn_ unchanged: one quantization serves all
   if (!proj_qq(L.attn_gate, d_z_, d_inner, E, err)) return false;
@@ -749,6 +773,7 @@ inline bool Graph::gdn_layer(int il, int t, std::string &err) {
   emit("beta", il, d_beta_, nvh);
   emit("alpha", il, d_alpha_, nvh);
 
+  RD_PHASE(prof_, "gdn_scalars");  // RD_PHASE_PROF
   if (!unary_launch(d_beta_, d_beta_, nvh, UnOp::Sigmoid)) return false;
   emit("beta_sigmoid", il, d_beta_, nvh);
   if (!add_launch(d_alpha_, (const float *)L.ssm_dt.ptr, d_alpha_, nvh)) return false;
@@ -757,6 +782,7 @@ inline bool Graph::gdn_layer(int il, int t, std::string &err) {
   if (!mul_launch(d_gate_, (const float *)L.ssm_a.ptr, d_gate_, nvh)) return false;
   emit("gate", il, d_gate_, nvh);
 
+  RD_PHASE(prof_, "gdn_conv");  // RD_PHASE_PROF
   if (!conv1d_state_launch(d_qkv_, (const float *)L.ssm_conv1d.ptr, d_conv_, convst, chan, K)) {
     err = "conv1d launch failed";
     return false;
@@ -770,15 +796,18 @@ inline bool Graph::gdn_layer(int il, int t, std::string &err) {
   // the eval callback registers the same tensor under both names and keeps the
   // last one, so the dump only has `v_conv_predelta`
   emit("v_conv_predelta", il, v_c, d_inner);
+  RD_PHASE(prof_, "gdn_l2norm");  // RD_PHASE_PROF
   if (!l2_norm_launch(q_c, q_c, nkh, S, (float)cfg_.rms_norm_eps)) return false;
   if (!l2_norm_launch(k_c, k_c, nkh, S, (float)cfg_.rms_norm_eps)) return false;
 
   if (cb_) emit("state_predelta", il, state, (std::int64_t)nvh * S * S);
+  RD_PHASE(prof_, "gdn_delta");  // RD_PHASE_PROF
   if (!delta_rule_launch(q_c, k_c, v_c, d_gate_, d_beta_, state, v_c, nvh, nkh, S)) {
     err = "delta_rule launch failed";
     return false;
   }
   if (cb_) emit("new_state", il, state, (std::int64_t)nvh * S * S);
+  RD_PHASE(prof_, "gdn_norm_silu");  // RD_PHASE_PROF
   if (!rms_norm_launch(v_c, (const float *)L.ssm_norm.ptr, v_c, nvh, S,
                        (float)cfg_.rms_norm_eps)) {
     err = "ssm_norm launch failed";
@@ -788,6 +817,7 @@ inline bool Graph::gdn_layer(int il, int t, std::string &err) {
   if (!mul_launch(v_c, d_z_, v_c, d_inner)) return false;
   emit("final_output", il, v_c, d_inner);
 
+  RD_PHASE(prof_, "gdn_out_proj");  // RD_PHASE_PROF
   if (!proj(L.ssm_out, v_c, d_ffnout_, E, d_inner, err)) return false;
   emit("linear_attn_out", il, d_ffnout_, E);
   if (!add_residual(d_ffnout_, d_x_, E, err)) return false;
@@ -800,11 +830,13 @@ inline bool Graph::ffn(int il, std::string &err) {
   const int E = n_embd();
   const int F = (int)cfg_.feed_forward_length;
   const LayerW &L = w_[il];
+  RD_PHASE(prof_, "ffn_gate_up");  // RD_PHASE_PROF
   if (!proj(L.ffn_gate, d_xn_, d_ffn_a_, F, E, err)) return false;  // d_xn_ holds attn_post_norm
   if (!unary_launch(d_ffn_a_, d_ffn_a_, F, UnOp::Silu)) return false;
   // up reads the same activation as gate (silu only touched the output)
   if (!proj_qq(L.ffn_up, d_ffn_b_, F, E, err)) return false;
   if (!mul_launch(d_ffn_a_, d_ffn_b_, d_ffn_a_, F)) return false;
+  RD_PHASE(prof_, "ffn_down");  // RD_PHASE_PROF
   if (!proj(L.ffn_down, d_ffn_a_, d_ffnout_, E, F, err)) return false;
   emit("ffn_out", il, d_ffnout_, E);
   if (!add_residual(d_ffnout_, d_x_, E, err)) return false;
@@ -1149,6 +1181,7 @@ inline bool Graph::forward_run(std::size_t n_tokens, int start_pos, const float 
   const clock::time_point t_queue0 = clock::now();
   for (std::size_t t = 0; t < n_tokens; ++t) {
     cur_token_ = (int)t;
+    RD_PHASE(prof_, "embed");  // RD_PHASE_PROF
     if (toks != nullptr) {
       const char *src = (const char *)tok_embd_.ptr + (std::size_t)(*toks)[t] * emb_row;
       if (!dequant_row_launch(tok_embd_.dt, src, d_x_, E)) {
@@ -1171,12 +1204,14 @@ inline bool Graph::forward_run(std::size_t n_tokens, int start_pos, const float 
         return false;
       }
       emit("attn_residual", il, d_x_, E);
+      RD_PHASE(prof_, "post_norm");  // RD_PHASE_PROF
       if (!rms_norm_launch(d_x_, (const float *)w_[il].attn_post_norm.ptr, d_xn_, 1, E,
                            (float)cfg_.rms_norm_eps)) {
         err = "attn_post_norm launch failed";
         return false;
       }
       emit("attn_post_norm", il, d_xn_, E);
+      RD_PHASE(prof_, "ffn");  // RD_PHASE_PROF
       if (!ffn(il, err)) {
         err = "layer " + std::to_string(il) + ": " + err;
         return false;
@@ -1189,6 +1224,7 @@ inline bool Graph::forward_run(std::size_t n_tokens, int start_pos, const float 
   // the RMS norm divides out, so a too-large value here compresses every
   // downstream logit)
   emit("diag.hidden_pre_norm", -1, d_x_, E);
+  RD_PHASE(prof_, "out_norm");  // RD_PHASE_PROF
   if (!rms_norm_launch(d_x_, (const float *)output_norm_.ptr, d_x_, 1, E,
                        (float)cfg_.rms_norm_eps)) {
     err = "output_norm launch failed";
@@ -1214,11 +1250,15 @@ inline bool Graph::forward_run(std::size_t n_tokens, int start_pos, const float 
       return false;
     }
   }
+  if (prof_ != nullptr) prof_->set_tag("head:");  // RD_PHASE_PROF
+  RD_PHASE(prof_, "head");                        // RD_PHASE_PROF
   if (!proj(output_, d_x_, d_logits_, n_vocab, E, err)) {
     return false;
   }
+  if (prof_ != nullptr) prof_->set_tag("");       // RD_PHASE_PROF
   emit("result_output", -1, d_logits_, n_vocab);
   logits.resize(n_vocab);
+  RD_PHASE(prof_, "logits_copy");  // RD_PHASE_PROF
   const bool copied = hipMemcpy(logits.data(), d_logits_, (std::size_t)n_vocab * sizeof(float),
                                hipMemcpyDeviceToHost) == hipSuccess;
   host_readback_ms_ += std::chrono::duration<double, std::milli>(clock::now() - t_drained).count();
@@ -1226,6 +1266,7 @@ inline bool Graph::forward_run(std::size_t n_tokens, int start_pos, const float 
     err = "logits readback failed";
     return false;
   }
+  RD_PHASE(prof_, "token_end");  // RD_PHASE_PROF (fecha a ultima fase do token)
   return true;
 }
 
