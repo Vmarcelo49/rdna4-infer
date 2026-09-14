@@ -155,3 +155,70 @@ Estado de partida (medido neste worktree, `build/` próprio, IQ3_S, f16 KV):
   contagem, não regressão de qualidade: a sequência commitada é a mesma.
 - **Veredito**: MANTIDO. O gate de exatidão passa bit a bit; os gates numéricos
   pré-existentes continuam verdes.
+
+## 5. Merge da frente de prefill (`main` → `feat/noite-mtp`): o verify ficou barato
+
+- **Referência**: aviso do coordenador (commit `264044e`, `feat/noite-prefill`
+  mergeado na `main`): `forward_batch` agora batela *todo* o andaime por token
+  (atenção com máscara causal, recorrência GDN, conv1d, normas, `kv_write`),
+  bit-exato, com `RD_PREFILL_BATCH=0` para A/B.
+- **Hipótese**: meu `forward_batch_all` chama `forward_batch_layer`, então herda
+  os kernels novos sem mudar uma linha — e é o andaime por token que definia o
+  custo do verify (a medição antiga dava ~11 ms de custo marginal por linha, ou
+  seja `~1/3` de um token). Se o lote novo entregar os ~8-16 ms/token medidos
+  pelo `check-batch-gpu`, o verify de `D+1` linhas cai de ~63 ms para ~43 ms a 4K
+  e o teto do ganho sobe.
+- **Comando**: `git merge main` (sem conflito — as mudanças do MTP são funções
+  novas em `graph.cuh` e blocos delimitados em `main.hip`), recompilação completa,
+  e a bateria da fase A: `check-batch-gpu`, `check-graph-gpu`,
+  `check-mtp-gpu 64 3`, `check_golden_run.sh`, `check_regression.sh` e a matriz de
+  4K — tudo sob uma tomada de lock (`scripts/gpu-lock.sh timeout 2400 bash
+  /tmp/mtp-phaseA.sh`).
+- **Resultado**: ver §6.
+- **Veredito**: (ver §6)
+
+## 6. Matriz medida a 4K e 16K (e um bug de exatidão que ela pegou)
+
+- **Referência**: briefing do coordenador (alvo ≥ 1,5×, `--mtp` byte-idêntico ao
+  ganancioso) + `docs/noite-regras.md` §3 (piso de ruído, janela limpa).
+- **Comando** (uma tomada de lock por fase; janela limpa: VRAM 119,9 MB antes,
+  120,6 MB depois, nenhum outro processo do modelo):
+  `scripts/gpu-lock.sh timeout 2400 bash /tmp/mtp-phaseA.sh` (= gates +
+  `/tmp/mtp-matrix.sh 4096 64 2 plain: b2:--mtp\ --draft\ 2 b3:--mtp\ --draft\ 3
+  s3:--mtp\ --draft\ 3\ --mtp-serial`) e `... /tmp/mtp-phaseB.sh` (o mesmo a 16384).
+  Prompt: parágrafo do `wiki.test.raw` repetido até encher o contexto (3 996
+  tokens a 4K, 16 282 a 16K), terminando numa frase completa + "In the following
+  years, the" (um prompt de wiki cru faz o modelo emitir EOS no primeiro token —
+  medido na primeira tentativa, com 0 tokens gerados).
+- **Resultado (IQ3_S, f16 KV, greedy, 64 tokens, 2 repetições intercaladas)**:
+
+  | ctx | modo | tok/s (rep1 / rep2) | ganho | tokens/rodada | aceitação/rascunho | rollbacks |
+  |---|---|---|---|---|---|---|
+  | 4K | ganancioso | 29,33 / 29,33 | 1,00× | — | — | — |
+  | 4K | `--mtp --draft 2` (batelado) | 50,15 / 50,14 | **1,71×** | 2,78 | 88,9 % | 3/23 |
+  | 4K | `--mtp --draft 3` (batelado) | 51,47 / 51,46 | **1,75×** | 3,56 | 84,9 % | 3/18 |
+  | 4K | `--mtp --draft 3 --mtp-serial` (pré-existente) | 25,99 / 25,99 | 0,89× | 3,76 | 89,8 % | 0/17 |
+  | 16K | ganancioso | 26,81 / 26,88 | 1,00× | — | — | — |
+  | 16K | `--mtp --draft 3` (batelado) | 23,14 / 23,14 | 0,86× | 2,67 | **54,9 %** | **19/24** |
+  | 16K | `--mtp --draft 2` (batelado) | 19,74 / 19,75 | 0,74× | 1,73 | **35,6 %** | 25/37 |
+
+  O piso de ruído deste harness é **zero na prática**: as duas repetições de cada
+  configuração dão o mesmo tok/s (2 casas) e o mesmo md5 de stdout.
+- **BUG DE EXATIDÃO (achado pela própria matriz)**: a 4K a saída do `--mtp` **não**
+  era a do ganancioso — o primeiro token já divergia (" actor actor actor …" contra
+  "! Boulter starred in two films…"), e **b2, b3 e s3 davam exatamente o mesmo
+  md5 entre si**, ou seja, a divergência era comum aos três e vinha de antes do
+  laço especulativo. O único componente comum aos três e **não coberto** pelo
+  gate em processo (`check-mtp-gpu`, que pré-preenche token a token) era o
+  pré-preenchimento batelado do bloco MTP (`mtp_prefill_batched`, que usa
+  `forward_batch_all` em blocos de 16). A 20 posições o gate é bit-exato; a 4K
+  não era.
+- **Correção (MANTIDA)**: o default do pré-preenchimento MTP volta a ser o laço
+  por token (o caminho que o gate valida desde a feat/mtp); o batelado fica atrás
+  de `RD_MTP_PREFILL=batched`, com o motivo escrito no código. Custo: ~5 s a mais
+  de prefill a 4K. O gate novo `RD_MTP_XALL_POS=4096` do `check-mtp_gpu` compara
+  `forward_batch_all` com o caminho por token **em contexto longo**, linha a linha
+  (h e logits) — é o teste que faltava e que teria pegado isso.
+- **16K, aceitação 54,9 %**: com o pré-preenchimento por token o número foi
+  re-medido (§7); a hipótese era que o mesmo bug também estivesse degradando o
+  estado do bloco de rascunho em contexto longo.

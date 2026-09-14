@@ -669,6 +669,74 @@ int main(int argc, char **argv) {
     }
   }
 
+  // ------------------------------------- forward_batch_all at a LONG context
+  // The batched verify and the (optional) batched MTP prefill both consume every
+  // row of forward_batch_all, and the gate above only exercises it at ~20
+  // positions where the trunk attention is the unsplit kernel. At a long context
+  // the trunk switches to the split-KV path, so every row has to be re-checked
+  // there: row j of a batched call must be bit-identical to a forward_tokens() of
+  // that same token at that same position, h and logits alike. RD_MTP_XALL_POS
+  // picks the position (default 4096); the fill uses batched chunks, then the
+  // snapshot/restore pair rewinds the state so both ways start from the same one.
+  if (const char *pe = std::getenv("RD_MTP_XALL_POS")) {
+    const int want = std::atoi(pe);
+    const int p0 = (int)prompt.size();
+    if (want > p0 + 64) {
+      if (!prefill()) {
+        std::fprintf(stderr, "xall prefill: %s\n", err.c_str());
+        return 1;
+      }
+      std::printf("== forward_batch_all vs per-token at position %d ==\n", want);
+      std::vector<std::int32_t> chunk(16);
+      std::vector<float> hh, ll;
+      int p = p0;
+      const double t0 = now_s();
+      while (p + 16 <= want) {
+        for (int i = 0; i < 16; ++i) {
+          chunk[(std::size_t)i] = prompt[(std::size_t)((p + i) % (int)prompt.size())];
+        }
+        if (!graph.forward_batch_all(chunk, p, hh, ll, err)) {
+          std::fprintf(stderr, "xall fill: %s\n", err.c_str());
+          return 1;
+        }
+        p += 16;
+      }
+      std::printf("   filled to %d in %.1f s\n", p, now_s() - t0);
+      for (int N : {2, 4, 16}) {
+        std::vector<std::int32_t> tk;
+        for (int i = 0; i < N; ++i) {
+          tk.push_back(prompt[(std::size_t)((p + i) % (int)prompt.size())]);
+        }
+        std::vector<float> hb, lb, hr, lr;
+        if (!graph.state_snapshot(err)) return 1;
+        if (!graph.forward_batch_all(tk, p, hb, lb, err)) {
+          std::fprintf(stderr, "xall N=%d: %s\n", N, err.c_str());
+          return 1;
+        }
+        if (!graph.state_restore(err)) return 1;
+        hr.clear();
+        lr.clear();
+        for (int j = 0; j < N; ++j) {
+          std::vector<float> hj, lj;
+          if (!graph.forward_tokens({tk[(std::size_t)j]}, p + j, hj, lj, err)) return 1;
+          hr.insert(hr.end(), hj.begin(), hj.end());
+          lr.insert(lr.end(), lj.begin(), lj.end());
+        }
+        double maxh = 0.0, maxl = 0.0;
+        for (std::size_t i = 0; i < hr.size() && i < hb.size(); ++i) {
+          maxh = std::max(maxh, (double)std::fabs(hr[i] - hb[i]));
+        }
+        for (std::size_t i = 0; i < lr.size() && i < lb.size(); ++i) {
+          maxl = std::max(maxl, (double)std::fabs(lr[i] - lb[i]));
+        }
+        std::printf("   N=%2d at pos %d: max|d| h %.3e, logits %.3e\n", N, p, maxh, maxl);
+        ok(maxh == 0.0 && maxl == 0.0,
+           (std::string("forward_batch_all N=") + std::to_string(N) +
+            " is bit-identical to the per-token path at a long context").c_str());
+      }
+    }
+  }
+
   // ------------------------------------------------- the rollback, isolated
   // Snapshot, advance four positions with ONE batched call, restore, then re-run
   // only the first three: their last row must come back bit-identical (the state
