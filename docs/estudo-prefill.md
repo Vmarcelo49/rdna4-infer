@@ -231,6 +231,22 @@ não é banda, é *forma*.
 
 ## 4. O que nós não temos, em uma tabela (e é isto que foi "pulado")
 
+### Atenção e KV no prefill (frente J, código a código)
+
+- **Atenção não é alavanca por si**: 2,1 % do nosso prefill (87,7 ms de 4174 ms); zerá-la levaria
+  122,66 → 125,30 tok/s. Do lado deles o kernel de atenção é **1,76 ms por chunk de 512** = 0,39 %
+  do prefill. Por MAC emitido, a flash attention deles é **99×** a nossa — mas o volume é pequeno.
+- **O que importa é a *forma***: `Br=16` linhas de consulta por workgroup é o pré-requisito para o
+  micro-lote grande (o fator 2,50×), porque sem tile de consultas não há chunk de 128/512 na
+  atenção. O port nº 1 da frente J é exatamente isso.
+- **KV `f16` não passa por LDS no caminho deles**: o `coopMatLoad` lê K e V **direto da global**
+  para o fragmento (`flash_attn_cm1.comp:269-303`). **KV quantizado, sim** — desquantiza no shader e
+  é obrigado a estagiar na LDS, e `q8_0` tem um caminho próprio que copia **o cache inteiro** para um
+  rascunho f16 (`dequant_q8_0_transpose`, `ggml-vulkan.cpp:11230-11244`).
+- **O prefill deles paga 2× de trabalho causal enquanto KV < 1024**: a máscara é um tensor
+  `f16 [KV, N]` com `-inf` e o atalho de bloco só liga com `nem0 >= Bc*16 = 1024`
+  (`ggml-vulkan.cpp:11309-11310`).
+
 ### O limiar que nós não temos: 8 colunas
 
 `mul_mat_vec_max_cols = 8` (`ggml-vulkan.cpp:404`, condição em `:10433`): **até 8 tokens o
@@ -247,7 +263,8 @@ número mal ajustado: é a ausência do segundo kernel.
 | **matrix cores** | `coopmat` 16×16×16 f16→f32 | **zero** WMMA/MFMA em todo o motor | **2,50×** |
 | **f16 empacotado no caminho vetorial** | `dot2`/`pk_fma_f16` (1,5× o FMA fp32 neste cartão) | zero no motor (só fp32 escalar) | não medido |
 | **fusão de cadeias** | 7 padrões nomeados (`ggml-vulkan.cpp:18149-18327`) | nenhuma; ~2200 kernels/token | ~640 lançamentos/token ≈ **2,2 ms** |
-| **atenção com grupo GQA** | 1 workgroup por grupo kv, N=6 cabeças, `split_k=32` | 6 leituras redundantes de K/V por token | já medido: +9,0-11,8 % a 64K/131K |
+| ~~atenção com grupo GQA~~ | ~~1 workgroup por grupo kv, N=6 cabeças~~ | — | **CORRIGIDO pela frente J: não é lacuna no prefill.** A fusão GQA do Vulkan só vale com `N <= 8` (`ggml-vulkan.cpp:11251-11259`), ou seja **é recurso de decode**; no prefill eles têm as **mesmas 6 leituras redundantes de K/V que nós** |
+| **atenção com tile de 16 consultas** | `Br=16 × Bc=64`, coopmat f16→f32, `flash_attn_f32_f16_aligned_cm1`, K/V lidos **direto da global** para o fragmento | a nossa é 1 consulta por CTA e nunca materializa a P | a nossa atenção é **2,1 %** do prefill (87,7 ms de 4174 ms); a deles é **0,39 %**. **Mas o tile de 16 consultas é o pré-requisito do micro-lote grande** — é o ganho *habilitado*, não o próprio |
 
 ## 5. O plano que sai disto (ordem por ganho medido, não por gosto)
 
