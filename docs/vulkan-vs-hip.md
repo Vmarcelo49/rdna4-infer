@@ -774,3 +774,43 @@ nenhuma, mas os números ficam certos):
   quantizações, e o total por token é **1 940** lançamentos.
 - O assunto do commit `aa15eea` fala em "384 lançamentos a menos"; pelo código a mudança
   (`proj_qq`) remove **um** lançamento de quantização por chamada reusada, ou seja **240**.
+
+---
+
+## 8. Verificação (coordenador, com a placa livre)
+
+A §6 listava como incerteza número 1 "qual caminho coopmat/`dot2` este build usa
+nesta máquina". Fechado com **um** comando, o que a própria §6 propôs:
+
+```bash
+scripts/gpu-lock.sh env LD_LIBRARY_PATH=.../llama.cpp/build/bin \
+  .../llama-bench -m Qwen3.8-27B-UD-IQ3_S.gguf -ngl 99 -p 32 -n 8 -r 1
+```
+
+Saída (llama.cpp b10902, RADV, RX 9070 XT):
+
+```
+ggml_vulkan: 0 = AMD Radeon RX 9070 XT (RADV GFX1201) (radv) | uma: 0 | fp16: dot2 |
+  bf16: 1 | fp4: 0 | warp size: 64 | shared memory: 65536 | int dot: 1 | matrix cores: KHR_coopmat
+| qwen35 27B IQ3_S - 3.4375 bpw | 11.20 GiB | 27.32 B | Vulkan | 99 | pp32 | 207.77 ± 0.00 |
+| qwen35 27B IQ3_S - 3.4375 bpw | 11.20 GiB | 27.32 B | Vulkan | 99 |  tg8 |  26.03 ± 0.00 |
+```
+
+O que isso resolve:
+
+1. **`matrix cores: KHR_coopmat`** — o gate de vendor (`ggml-vulkan.cpp:20087-20102`)
+   **não** rebaixa coopmat1 no RADV: coopmat1 está ligado nesta máquina, como a §1.4
+   suspeitava. Ou seja, o backend *pode* despachar GEMM por matriz cooperativa.
+2. **`fp16: dot2`** — `v_dot2_f32_f16` existe e está habilitado (2 MACs por instrução
+   para f16), e **`int dot: 1`** — `v_dot4_i32_iu8` também (o caminho `_q8_1`/MMQ).
+3. Mas isso **não** muda a descoberta 1: para `iq3_s`/`iq4_xs`/`iq2_*` não existe shader
+   `*_q8_1` nem coopmat (a lista de `.spv` do build é a prova), e `coopmat` de inteiros
+   no caminho GEMV de decode só existe onde existe shader. Para 77,7 % dos bytes deste
+   modelo o decode do Vulkan continua sendo **FMA fp32 sobre ativação fp32**.
+
+Ressalva de método: os `tok/s` acima **não** são o baseline deste repositório. O baseline
+de `docs/baseline-vulkan-iq3s.md` usa `-p 512 -n 128 -r 3` (modelo quente), e um `pp32` de
+1 repetição mede majoritariamente sobrecarga de lançamento, não vazão — foi por isso que
+o `tg8` deu 26,0 contra os 39,7 tok/s do baseline. A linha de capacidades é que é o
+resultado deste comando; os `tok/s` do baseline devem ser re-medidos com as mesmas flags,
+o que o `README.md` faz na seção de comparação.

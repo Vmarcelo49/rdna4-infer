@@ -561,3 +561,66 @@ vazão de lançamento — a primeira execução do M6 enfileirou ~20 minutos de 
   precisa de rodada própria de validação numérica; trabalho de milestão separado.
 - **2d. Tiling da atenção** (262 ms/token em 64K hoje): mudança contida, ganho visível
   em contexto longo — provavelmente o melhor ganho por hora se contexto longo importa.
+
+## M7 — Atenção de contexto longo ✅ concluído em 2026-09-13
+
+O `bench --start-pos` (corrigido no M5) mostrou que contexto longo era **limitado pela
+atenção**, não pelos pesos: 45 ms por passo a 4K, 174 ms a 64K (KV f16) e 441 ms a 131K,
+contra ~36 ms de fluxo de pesos constante. O diagnóstico
+(`tests/bench_attn_gpu.hip`) apontou **latência de memória**, não softmax nem banda:
+o tempo por camada não segue os bytes do cache (7,0-9,4 ms para 36/128/256 MiB), a banda
+alcançada a 64K era 27 GB/s de ~600 GB/s, e a mesma quantidade de trabalho ia de 9,42 ms
+(8 warps) para 3,69 ms (32 warps). Ou seja: o problema era **requisições em voo**.
+
+Correções, cada uma medida: cargas vetorizadas do cache (`kv_load8<CT>()`, 1 acesso por
+lane em vez de 8 escalares), mais warps por CTA, e split-KV (a faixa de chaves dividida
+entre CTAs com merge de softmax online). Resultado final (decode, IQ3_S):
+
+| contexto / KV | M5 | agora | ganho |
+|---|---|---|---|
+| 4 096 f16 | 22,13 | **26,82** | 1,21× |
+| 16 384 f16 | 13,72 | **24,29** | 1,77× |
+| 65 536 f16 | — | **18,91** | — |
+| 65 536 q4_0 | 4,18 | **17,88** | 4,3× |
+| 131 072 q4_0 | 2,27 | **12,99** | 5,7× |
+
+Split-KV **não** é bit-exato (a soma das chaves muda de ordem) e por isso tem gate próprio:
+`scripts/check_attn_split.sh` compara em texto real (PPL 5,1989 contra 5,1917, 0,14 %) e o
+`check-kvctx-gpu` compara logits a contexto fixo (rel-L2 ~1e-6). `docs/medicoes-m7.md` traz
+o detalhamento, inclusive a correção do registro "32 warps": o valor **embarcado** sempre
+foi 8, e o `a830570` dizia 32.
+
+## M8 — prefill em batch, `proj_qq` e política de splits ✅ concluído em 2026-09-13
+
+- **Prefill em batch** (`Graph::forward_batch`, 2..16 tokens, layer-major): projeções,
+  quantização da ativação, norms e elementwise em uma passada; KV, atenção e recorrência
+  GDN continuam por token porque são sequenciais. **Bit-idêntico** ao caminho por token
+  (`check-batch-gpu`, rel-L2 0 em N=2/3/4/8/16) e **28,6 → 70,2 tok/s** (2,45-2,62×).
+- **`proj_qq`**: a projeção reusa a ativação já quantizada em q8_1 (384 lançamentos e uma
+  passagem de leitura a menos por token, +1,3 %, bit-exato).
+- **Política de splits** 2048 → 512 chaves: +14,7 % a 4K (`docs/rocm-estudo.md`).
+- **MTP: decidido não fazer.** O rascunho do NextN tem 86,7 % de aceitação (o driver do
+  llama.cpp, 87,5 %) e o greedy sai idêntico, mas cada modo ainda roda um forward do tronco
+  por token aceito: `--mtp` é 9-10 % **mais lento**. Com verificação em batch a projeção
+  medida dá 1,3-1,5×, não os 2,5× que a razão passo-rascunho/passo-tronco sugere. Fica
+  documentado em `docs/medicoes-m8.md` e `docs/mtp.md` em vez de embarcado.
+
+## Frente paralela — 9 tarefas, 6 agentes, 6 worktrees ✅ concluída em 2026-09-13
+
+Trabalho independente em worktrees separados (um agente por worktree, uma placa de GPU
+serializada por `scripts/gpu-lock.sh`, ver `docs/gpu-queue.md`), mergeado em série pelo
+coordenador:
+
+| # | frente | entrega |
+|---|---|---|
+| 1 | auditoria de qualidade | `docs/auditoria-qualidade.md` (4 CRÍTICOS, 19 IMPORTANTES); os 4 CRÍTICOS e 3 IMPORTANTES foram corrigidos na `main` com prova antes/depois (§7 do doc, `scripts/check_hardening.sh`) |
+| 2 | kernels do Qwen e matrix cores | `docs/qwen-kernels.md` |
+| 3 | Vulkan (llama.cpp) vs HIP, código a código | `docs/vulkan-vs-hip.md` |
+| 4 | inventário de quantizações | `docs/quants-inventario.md` |
+| 5 | desenho do cache KV e orçamento de tráfego | `docs/kv-memoria-desenho.md` |
+| 6-7 | autotuning e regressão | `docs/autotuning-gfx1201.md`, `include/rdna4/tuning.h` |
+| 8 | build reprodutível | `docs/build-repro.md` |
+| 9 | README com os números reais | `README.md` |
+
+Regras do lote: cada agente só commita na sua branch; o merge é em série; GPU só com o
+lock; agente que não precisa de GPU não usa GPU.
