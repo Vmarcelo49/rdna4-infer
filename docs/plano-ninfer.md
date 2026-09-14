@@ -18,7 +18,7 @@ gate antes de cronometrar, e número medido no lugar de adjetivo.
 | **4. GDN em blocos de 64 com três estágios** | **VIVO, e é o segundo maior** | ataca 0,852 ms/token de recorrência (`docs/estudo-prefill-c-nosso.md` §5) — o maior custo de andaime que sobra depois do matvec. A matemática (block-WY) **não foi validada termo a termo** pela frente do ninfer → vira pesquisa antes de virar código (§1 N2). |
 | **5. Launcher por T exato com K dividido entre warps** | **VIVO, e é o item do MTP** | ataca o coeficiente `6,04 ms/token` de `pass_ms ≈ 13,9 + 6,04·N` e o custo marginal da verificação. |
 | **honra: ReplaySSM** (registrar entradas e reexecutar em vez de snapshot+restore) | **VIVO, barato de medir** | contra os nossos **0,54 ms** por par snapshot+restore; a razão de tráfego de estado deles é 86,1×. |
-| **honra: PDL** (28 sítios) | **ESTUDO primeiro** | contra os nossos ~1.940 lançamentos/token (~4 ms/token de despacho). **Não há equivalente HIP verificado** — é a primeira coisa a checar. |
+| **honra: PDL** (28 sítios) | **FECHADO: não portável** | sonda de compilação: as três peças não existem no ROCm 7.2.4 e a ISA do gfx1201 rejeita as instruções; e o custo que ele ataca (rampa de GPU) não é o nosso (enfileiramento de CPU). `docs/estudo-pdl-hip.md` |
 | **honra: política de split em degraus, teto 85** | **VIVO, mas subordinado** | a nossa atenção a 64K custa 19,0 ms/token e o teto é 16 splits; a frente J mediu que a atenção é ≤2 % do prefill, então isto é **contexto longo**, não prefill. |
 | **§3.13 drafter em bloco (DFlash2)** | **enquadramento, não port** | bloqueio de **artefato** (pesos que o GGUF não tem). O que passa a valer é a medição F0: *ms por draft proposto hoje* contra `1/K` de um forward. |
 
@@ -78,11 +78,25 @@ Padrão do ninfer `q4_small_t_mma`: `kKWarps=8`, `kTileKPerWarp=64`, `kRowsPerCt
 LDS, instanciado para T=2/3 (a nossa janela de verificação do MTP). Alvo: o coeficiente
 6,04 ms/token na parte que é do T pequeno.
 
-### N6 — Estudo: existe equivalente HIP do PDL? (sem GPU, meia hora)
-Checar `/opt/rocm/include` e a documentação do ROCm por algo como
-`cudaGridDependencySynchronize`/`griddepcontrol` (PTX `griddepcontrol.wait/launch_dependents`).
-Se existir, dimensionar o ganho contra ~4 ms/token de despacho; se não existir, **fechar** o item
-com a evidência (e registrar como "não portável", não como "a fazer").
+### N6 — FECHADO: PDL **não é portável** (medido por sonda de compilação)
+`docs/estudo-pdl-hip.md`: ROCm 7.2.4 **não tem** nenhuma das três peças do PDL do CUDA — o
+disparo, a espera e o atributo de lançamento **falham os três em compilar**
+(`hipTriggerProgrammaticLaunchCompletion`, `hipGridDependencySynchronize`,
+`hipLaunchAttributeProgrammaticStreamSerialization`), a enum de atributos
+(`hip_runtime_api.h:1570-1577`) tem 6 IDs sem esse, o caminho por grafo é inalcançável
+(`hipStreamBeginCaptureToGraph` recebe edge data como `nullptr` por contrato, `:7941`), o
+`libamdhip64.so` não define nada com "programmatic", e a **ISA do gfx1201 rejeita**
+`s_griddepcontrol`/`s_launch_dependents` (as strings que existem no toolchain são do alvo
+**NVPTX**, que o mesmo LLVM carrega). **Item fechado como não portável, com evidência** — não
+fica "a fazer".
+
+**E ele nem atacaria o nosso gargalo**: PDL esconde a rampa de cauda/cabeça *do lado da GPU*;
+o nosso custo de despacho é **enfileiramento do lado da CPU** (1.940 lançamentos × 2,253 µs), e o
+que o remove é **graph replay** — que já está medido aqui: **1,38 ms/token** no estudo ROCm e
+**0,81 ms/token** na sequência completa (`docs/rocm-estudo.md:291,356`, `README.md:259-260`).
+Além disso a frente C fechou a conta: **0,129 ms/token = 1,58 %** do prefill. Ou seja, o teto
+realista desta linha é ~1 %, e é por isso que ela **não** vira frente de implementação
+(a correção do "~4 ms/token" que eu tinha escrito aqui está no §4).
 
 ### N7 — Implementação: política de split em degraus (contexto longo, depois de N4)
 `attn_splits_for` (`include/rdna4/graph.cuh:432-445`) hoje é `keys/kAttnSplitMin` com teto 16;
@@ -99,10 +113,9 @@ agora      N1 (pesquisa, sem GPU)  ─┬─ decide se o GQA volta a ser trabalh
            N4 (medição, GPU)       ─┴─ decide o MTP e o ReplaySSM
 depois     N5 (impl small-T) ← depende de N4
            N7 (impl splits)  ← independente, contexto longo
-meia hora  N6 (estudo PDL)  ← decide se vale um protótipo
 ```
 
-N1/N2/N6 não tocam a GPU nem o código (só criam os docs deles) → rodam livres. N3/N4 disputam a
+N1/N2 não tocam a GPU nem o código (só criam os docs deles) → rodam livres. N6 já fechou. N3/N4 disputam a
 GPU pelo lock (serializam, cada um com `timeout` dentro).
 
 ## 3. O que este plano se recusa a fazer
@@ -115,3 +128,15 @@ GPU pelo lock (serializam, cada um com `timeout` dentro).
   o nosso é 0,54 ms por par e é isso que N4 mede.
 - **Trocar bit-exatidão por velocidade sem declarar**: N3 mantém o gate bit-exato; N2 e N7 não são
   bit-exatos e por isso entram com PPL/regressão e com o caminho antigo atrás de `RD_*`.
+
+## 4. Correções de premissa que este plano incorpora (e uma que ele mesmo gerou)
+
+1. **"~4 ms/token de despacho" estava errado como justificativa.** Os ~4,0 ms/token são
+   **enfileiramento do lado da CPU** (1.940 lançamentos × 2,253 µs), não rampa de GPU — e a frente
+   C mediu que o despacho custa **0,129 ms/token = 1,58 %** do prefill. Qualquer item desta linha
+   tem teto de ~1 %, e é o `graph replay` que o captura (1,38 / 0,81 ms/token medidos), não o PDL.
+2. **O número "0,76 ms/token de graph replay" não está no repo.** Ele saiu de uma *impressão do
+   bench* numa janela; os valores documentados são **1,38 ms/token** (`docs/rocm-estudo.md`) e
+   **0,81 ms/token** (`README.md`). Quem for decidir com base nele deve usar um desses dois.
+3. **O item nº 1 do ninfer (GQA fundido) já estava refutado aqui** — foi o filtro do §0 que pegou,
+   e é a razão de o plano começar por pesquisa (N1) em vez de implementação.
