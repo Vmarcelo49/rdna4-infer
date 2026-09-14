@@ -161,11 +161,25 @@ double now_s() {
 // ---------------------------------------------------------------------------
 bool prefill_ids(rdna4::Graph &g, const std::vector<std::int32_t> &ids, std::vector<float> &hidden,
              std::vector<float> &logits, std::string &err) {
-  static const int kSizes[] = {16, 8, 4, 3, 2};
+  // O maior chunk que o caminho em lote aceita: 16 (kMaxBatch, o GEMV) por padrao,
+  // ou o teto de `RD_PREFILL_CHUNK` quando o GEMM tilejado esta' em uso (D2 do
+  // plano do prefill). A lista de tamanhos desce dele para a cauda.
+  const int cap = g.batch_cap();
+  std::vector<int> sizes;
+  for (int sz = cap; sz >= 2; sz >>= 1) sizes.push_back(sz);
+  if (cap > 16) {
+    for (int sz : {16, 8, 4, 3, 2}) {
+      bool tem = false;
+      for (int x : sizes) tem = tem || x == sz;
+      if (!tem) sizes.push_back(sz);
+    }
+  } else {
+    sizes = {16, 8, 4, 3, 2};
+  }
   std::size_t pos = 0;
   while (pos < ids.size()) {
     std::size_t take = 1;
-    for (int sz : kSizes) {
+    for (int sz : sizes) {
       if (ids.size() - pos >= (std::size_t)sz) {
         take = (std::size_t)sz;
         break;
@@ -521,8 +535,8 @@ int cmd_bench(int argc, char **argv) {
   } else {
     std::printf("vram in use: unavailable (hipMemGetInfo failed)\n");
   }
-  std::printf("prefill %zu tokens: %.3f s (%.2f tok/s, batched N<=16)\n", ids.size(), t_prefill,
-              (double)ids.size() / t_prefill);
+  std::printf("prefill %zu tokens: %.3f s (%.2f tok/s, chunk cap %d)\n", ids.size(), t_prefill,
+              (double)ids.size() / t_prefill, graph.batch_cap());
   std::printf("decode %zu tokens x %lld reps (warmup %lld): best %.3f s (%.2f tok/s), "
               "mean %.2f tok/s\n",
               best_n, reps, warmup, best_ms / 1000.0, tok_s,

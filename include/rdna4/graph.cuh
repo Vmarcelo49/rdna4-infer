@@ -27,8 +27,10 @@
 
 #include "rdna4/attn.cuh"
 #include "rdna4/dequant_row.cuh"
+#include "rdna4/device.h"  // prefill_chunk_cap(): dependencia explicita, nao transitiva
 #include "rdna4/dtype.h"
 #include "rdna4/gdn.cuh"
+#include "rdna4/gemm.cuh"
 #include "rdna4/loader.h"
 #include "rdna4/matvec.cuh"
 #include "rdna4/model.h"
@@ -187,10 +189,20 @@ inline bool split_batch_enabled() {
   bool forward_batch(const std::vector<std::int32_t> &tokens, int start_pos,
                      std::vector<float> &hidden, std::vector<float> &logits, std::string &err);
   static constexpr int kMaxBatch = 16;
+  // Teto HOST do chunk: os arrays de pilha do caminho em lote (posicoes) sao deste
+  // tamanho. Tem de acompanhar `prefill_chunk_cap()`.
+  static constexpr int kMaxChunkHost = 512;
   // Batch sizes the matvec has instantiations for (2/3/4/8/16); anything else is
   // split into a supported chunk plus a per-token tail.
   static int batch_supported(int n) {
     return n == 2 || n == 3 || n == 4 || n == 8 || n == 16;
+  }
+  // Tamanho de chunk ACEITO pelo caminho em lote. Ate 16 e' o GEMV (com as
+  // instanciacoes acima); acima disso quem decide e' o despacho do `proj_batch`:
+  // GEMM tilejado onde ele cobre o tipo, GEMV em sub-lotes de 16 onde nao cobre.
+  // O teto e' `batch_max_` (RD_PREFILL_CHUNK).
+  bool chunk_ok(int n) const {
+    return n >= 2 && n <= batch_max_ && (n <= 16 ? batch_supported(n) != 0 : true);
   }
 
   // feat/noite-prefill: `RD_PREFILL_BATCH=0` runs forward_batch with the
@@ -1027,16 +1039,60 @@ inline bool Graph::proj_batch(const GpuTensor &w, const float *d_x, float *d_y, 
     err = "batch weight shape mismatch";
     return false;
   }
-  if (n < 2 || n > batch_max_ || !batch_supported(n)) {
+  if (n < 2 || n > batch_max_) {
     err = "unsupported batch size " + std::to_string(n);
     return false;
   }
   if (!act_ready && !quantize_batch(d_x, ncols, n, err)) return false;
   const std::int64_t act_stride = ncols / QK8_1;
   RD_PHASE(pfine(), "matvec");  // RD_PHASE_PROF (frente prefill: caminho em lote)
-  if (!matvec_launch_batch((int)w.dt, w.ptr, d_aqb_, d_y, nrows, ncols, act_stride, n, nullptr)) {
-    err = "matvec_launch_batch failed";
-    return false;
+
+  // ---------------------------------------------------------------------
+  // Despacho GEMV x GEMM (D2 do plano do prefill, docs/plano-prefill.md).
+  //
+  // Ate 16 tokens o GEMV em lote e' o caminho certo -- medido: o GEMM tilejado
+  // rende 0,96x ali, porque o tile nao amortiza o staging da dequantizacao. Acima
+  // disso o GEMV regride (0,82x em N=32, 0,29x em N=64, em iq3_s) e o GEMM e' o
+  // unico caminho: 2,31x em M=64, 2,69x em M=128 e 3,42x em M=512 contra o chunk
+  // de 16 (bench-gemm-engine-gpu, min de 5, medido antes de cronometrar).
+  //
+  // `gemm_launch` reproduz a aritmetica do `vec_dot_*` do motor bit a bit (0 de
+  // 4096 elementos, max ulp 0, nos tres tipos) e devolve false para tudo o que nao
+  // cobre (68,0 % dos bytes deste modelo: iq3_s, iq3_xxs, iq4_xs). Para os tipos
+  // fora da cobertura, com n > 16, o caminho e' o GEMV em SUB-LOTES de 16: o kernel
+  // escreve `d_o[n*nrows + row]` e le `d_a + n*act_stride`, entao deslocar os dois
+  // por t0 resolve -- e' GEMV puro, sem kernel novo, e mantem o resto do chunk
+  // correto ainda que mais lento.
+  // ---------------------------------------------------------------------
+  if (n <= 16 && batch_supported(n)) {
+    if (!matvec_launch_batch((int)w.dt, w.ptr, d_aqb_, d_y, nrows, ncols, act_stride, n, nullptr)) {
+      err = "matvec_launch_batch failed";
+      return false;
+    }
+    return true;
+  }
+  if (rdna4::gemm_launch((int)w.dt, w.ptr, d_aqb_, d_y, nrows, ncols, act_stride, n, nullptr)) {
+    return true;
+  }
+  for (int t0 = 0; t0 < n; t0 += 16) {
+    const int nb = n - t0 < 16 ? n - t0 : 16;
+    if (nb < 2) {
+      // Cauda de 1 token: o GEMV POR TOKEN (o caminho do decode) e' a resposta --
+      // o em lote nao tem instanciacao para n=1. Achado com chunk 17 (RD_PREFILL_CHUNK=17
+      // em camada cujo tipo nao esta' coberto pelo GEMM, ex.: blk.0.ffn_up e' iq1_s).
+      if (!matvec_launch((int)w.dt, w.ptr, d_aqb_ + (std::size_t)t0 * act_stride,
+                         d_y + (std::size_t)t0 * nrows, nrows, ncols, nullptr)) {
+        err = "matvec_launch (single-token tail) failed";
+        return false;
+      }
+      continue;
+    }
+    if (!matvec_launch_batch((int)w.dt, w.ptr, d_aqb_ + (std::size_t)t0 * act_stride,
+                             d_y + (std::size_t)t0 * nrows, nrows, ncols, act_stride, nb,
+                             nullptr)) {
+      err = "matvec_launch_batch (sub-batch) failed";
+      return false;
+    }
   }
   return true;
 }
@@ -1362,12 +1418,8 @@ inline bool Graph::forward_batch(const std::vector<std::int32_t> &tokens, int st
                                  std::string &err) {
   const int E = n_embd();
   const int n = (int)tokens.size();
-  if (n < 2 || n > batch_max_) {
+  if (!chunk_ok(n)) {
     err = "forward_batch needs 2.." + std::to_string(batch_max_) + " tokens";
-    return false;
-  }
-  if (!batch_supported(n)) {
-    err = "no batched kernel for n=" + std::to_string(n);
     return false;
   }
   const std::int32_t n_vocab = (std::int32_t)tok_embd_.dim1;
@@ -1384,7 +1436,10 @@ inline bool Graph::forward_batch(const std::vector<std::int32_t> &tokens, int st
 
   // positions for the whole batch, one upload (the per-token path does one 4-byte
   // synchronous copy per RoPE call)
-  int pos_host[kMaxBatch];
+  // kMaxChunkHost, nao kMaxBatch: este array era de 16 ints e recebia `n` posicoes,
+  // entao com o chunk elevado (RD_PREFILL_CHUNK=64) ele corrompia a PILHA -- o
+  // sintoma aparecia depois, como SIGSEGV no readback do fim do forward_batch.
+  int pos_host[kMaxChunkHost];
   for (int t = 0; t < n; ++t) pos_host[t] = start_pos + t;
   if (hipMemcpy(d_posb_, pos_host, (std::size_t)n * sizeof(int), hipMemcpyHostToDevice) !=
       hipSuccess) {
@@ -1449,12 +1504,8 @@ inline bool Graph::forward_batch_all(const std::vector<std::int32_t> &tokens, in
                                      std::string &err) {
   const int E = n_embd();
   const int n = (int)tokens.size();
-  if (n < 2 || n > kMaxBatch) {
-    err = "forward_batch_all needs 2.." + std::to_string(kMaxBatch) + " tokens";
-    return false;
-  }
-  if (!batch_supported(n)) {
-    err = "no batched kernel for n=" + std::to_string(n);
+  if (!chunk_ok(n)) {
+    err = "forward_batch_all needs 2.." + std::to_string(batch_max_) + " tokens";
     return false;
   }
   const std::int32_t n_vocab_in = (std::int32_t)tok_embd_.dim1;
@@ -1470,7 +1521,10 @@ inline bool Graph::forward_batch_all(const std::vector<std::int32_t> &tokens, in
     return false;
   }
 
-  int pos_host[kMaxBatch];
+  // kMaxChunkHost, nao kMaxBatch: este array era de 16 ints e recebia `n` posicoes,
+  // entao com o chunk elevado (RD_PREFILL_CHUNK=64) ele corrompia a PILHA -- o
+  // sintoma aparecia depois, como SIGSEGV no readback do fim do forward_batch.
+  int pos_host[kMaxChunkHost];
   for (int t = 0; t < n; ++t) pos_host[t] = start_pos + t;
   if (hipMemcpy(d_posb_, pos_host, (std::size_t)n * sizeof(int), hipMemcpyHostToDevice) !=
       hipSuccess) {

@@ -206,9 +206,16 @@ inline std::uint64_t required_bytes(std::uint64_t weights_bytes, std::uint64_t c
 inline int prefill_chunk_cap() {
   static const int v = [] {
     const char *e = std::getenv("RD_PREFILL_CHUNK");
-    int n = e ? std::atoi(e) : 16;
+    // Default 128 desde 14/09: o GEMM tilejado (include/rdna4/gemm.cuh) cobre os
+    // tipos IQ que sao 68 % dos bytes deste modelo e e' BIT-EXATO contra o
+    // `vec_dot_*` do motor, entao o `check-batch-gpu` continua passando (medido:
+    // identico ao caminho por token nos chunks 16/64/128). Medido a 512 tokens:
+    // chunk 16 = 104,86 tok/s, chunk 64 = 189,40, chunk 128 = 210,25.
+    // Custo de VRAM: +93 MiB (257,32 contra 164,28 MiB); no alvo de 131K com
+    // q5_0/q4_1 o `need` vai de 14,10 para 14,19 GiB e cabe.
+    int n = e ? std::atoi(e) : 128;
     if (n < 16) n = 16;
-    if (n > 512) n = 512;
+    if (n > 512) n = 512;  // == Graph::kMaxChunkHost
     return n;
   }();
   return v;
