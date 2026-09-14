@@ -88,6 +88,16 @@ Legenda: **[medido]** = número desta sessão · **[estimativa]** = derivado de 
 | LM head | 1 | 1 | 0 |
 | **total** | **305** | | **16·3 + 48·3 = 192** |
 
+**Correção de registro (medida em `docs/vulkan-vs-hip.md` §2.2, contagem no código que
+roda):** os números desta seção foram contados antes do M8 e ficaram **subestimados**. O
+`proj_qq` do M8 tirou uma quantização por projeção do FFN, e o código atual faz **497
+matvec** e **257 `quantize_q8_1`** por token, não 305/192 — o total por token é **1 940
+lançamentos** (497 + 257 + 1 186 das norms, ops escalares, `kv_write` e atenção). A
+conclusão da seção não muda (a quantização redundante é removível com aritmética idêntica,
+e o M8 já removeu a maior parte dela: `act_ready` no caminho em batch), mas o teto de
+economia é maior do que o 63% calculado aqui, porque as 240 quantizações repetidas do
+código pré-M8 valiam mais que 192.
+
 Custo: o M5 mediu o teto *pulando todos* os `quantize_q8_1` em **1,36-1,5 ms (4,1%)**;
 192 de 305 são 63% disso ⇒ **~0,85 ms/token (2,4%)** de trabalho, mais os 192 gaps de
 lançamento correspondentes (§B.5) ⇒ ~1,2-1,5 ms no total. **Removível com aritmética idêntica**: os 192 blocos
@@ -283,7 +293,9 @@ bench-matvec-shapes-gpu:
 
 O motor faz **~2200 lançamentos por token** (contados em `graph.cuh`: 305 projeções ×2,
 130 norms, 192 ops escalares do GDN, 128 `kv_write`, 16 pares split+merge de atenção,
-rope, deinterleave, silt, residuals...). O trabalho real dos kernels pequenos é
+rope, deinterleave, silt, residuals...). **[Correção, ver §A.2.1: a contagem medida no
+código pós-M8 é 1 940 — 497 matvec + 257 quantizações + 1 186 do resto; as 305 projeções
+desta linha são 497 porque o FFN tem 3 projeções por camada, não 2 × 1,5.]** O trabalho real dos kernels pequenos é
 desprezível; o que custa é o **gap de despacho** (3,5 µs medidos com kernel vazio
 enfileirado). Duas medidas delimitam o quanto disso é evitável:
 
