@@ -369,6 +369,10 @@ bool load_embedding(const rdna4::GgufLoader &ld, const rdna4::Qwen35Config &cfg,
 }  // namespace
 
 int main(int argc, char **argv) {
+  // Line-buffered: this test prints one line per format, and an abort or a hang
+  // must not swallow the rows that already passed (the first version of this file
+  // aborted in the per-pattern loop and the log came back empty).
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);
   int failures = 0;
   const std::string model = argc >= 2 ? argv[1] : std::string();
 
@@ -378,40 +382,66 @@ int main(int argc, char **argv) {
   std::vector<float> synth;
   std::vector<int> pattern;
   make_patterns(synth, pattern);
-  // Per-format tolerance on the round-trip error, in units of the format's own
-  // step. q5_0: 32 levels, so <= 0.5 step; q4_1: 16 levels, <= 0.5 step. f16 is
-  // the exact baseline (its error is a relative 2^-11, not a step).
+  // Tolerance on the round-trip error, in units of the format's own step. The
+  // values are the geometry, not a guess, and they are NOT all 0.5:
+  //
+  //   Q5_0/Q4_0  d is taken from the SIGNED max (`d = vmax/-16` resp. `/-8`), so
+  //              the grid is the ASYMMETRIC [-16,15] (resp. [-8,7]). The extreme
+  //              value at the signed max lands exactly, but the opposite extreme
+  //              is a full step away: measured err/step 0.930-1.000, so <= 1.0.
+  //              Relative to a block's (max-min) range that is ~1/32.
+  //   Q4_1       affine grid [min, max] with both ends exact, so half a step:
+  //              measured 0.491-0.496, i.e. ~1/30 of the range.
+  //   Q8_0       roundf on a symmetric grid -> half a step, but `d` is stored as
+  //              fp16, which adds a 2^-11 relative term: measured 0.520, so the
+  //              bound needs that headroom.
+  //   F16        no step grid at all: a relative 2^-11, checked separately with
+  //              the same 5e-4 bound tests/check_rope_gpu.hip uses.
   auto step_tol = [](rdna4::KvType t) -> double {
     switch (t) {
-      case rdna4::KvType::Q5_0: return 0.5 + 1e-6;
-      case rdna4::KvType::Q4_0: return 0.5 + 1e-6;
-      case rdna4::KvType::Q4_1: return 0.5 + 1e-6;
-      case rdna4::KvType::Q8_0: return 0.5 + 1e-6;
-      case rdna4::KvType::F16: return 0.0;  // not a step-based grid
+      case rdna4::KvType::Q5_0: return 1.02;
+      case rdna4::KvType::Q4_0: return 1.02;
+      case rdna4::KvType::Q4_1: return 0.52;
+      case rdna4::KvType::Q8_0: return 0.55;
+      case rdna4::KvType::F16: return 0.0;  // relative bound below, not a step bound
       case rdna4::KvType::F32: return 0.0;
     }
     return 0.0;
   };
+  // f16 stores a relative 2^-11 = 4.88e-4; 5e-4 is the same bound check-rope-gpu
+  // uses. f32 must be exact (scored below as err == 0).
+  auto relative_tol = [](rdna4::KvType t) -> double {
+    return t == rdna4::KvType::F16 ? 5e-4 : 0.0;
+  };
+  auto err_ok = [&](rdna4::KvType t, const RowResult &r) {
+    if (t == rdna4::KvType::F32) return r.max_abs_err == 0.0;
+    if (t == rdna4::KvType::F16) return r.max_abs_err <= relative_tol(t) * r.max_abs_x + 1e-9;
+    return r.max_abs_err <= step_tol(t) * r.max_step + 1e-6;
+  };
 
-  std::printf("== synthetic (no model): %d rows x %d elems per pattern, %d rows/type\n", kRows,
-              kHeadDim, kRows * kHeadKv);
-  std::printf("%-6s %-8s %-10s %-10s %-12s %-10s %s\n", "type", "bytes", "step_tol", "max_err",
-              "err/step", "err/|x|", "check");
+  std::printf("== synthetic (no model): %d rows x %d elems, 8 patterns x %d reps\n", kRows,
+              kHeadDim, kRows / 8);
+  std::printf("%-6s %-8s %-10s %-10s %-12s %-12s %-10s %s\n", "type", "bytes", "step_tol",
+              "max_err", "err/step", "err/range", "err/|x|", "check");
   for (rdna4::KvType ty : kTypes) {
     std::string bytes_report, load_report;
-    const RowResult r = check_type(ty, synth, kRows * kHeadKv, kHeadDim, bytes_report, load_report,
-                                   false);
+    // make_patterns() already produced kRows independent rows of kHeadDim floats,
+    // so the row count is kRows (not kRows * kHeadKv -- that mis-count is what
+    // overran the buffer in the first version of this test).
+    const RowResult r = check_type(ty, synth, kRows, kHeadDim, bytes_report, load_report, false);
     const bool bytes_ok = bytes_report.find(": 0") != std::string::npos;
+    // "exact", not "close": both load paths are compared against llama.cpp's own
+    // dequantizer on the bytes the engine actually stored, and the difference must
+    // be zero. A tolerance here would hide exactly the offset bugs this checks.
     const bool load_ok = load_report.find("scalar load 0.000e+00") != std::string::npos &&
                          load_report.find("load8 0.000e+00") != std::string::npos;
-    const bool err_ok = (ty == rdna4::KvType::F16 || ty == rdna4::KvType::F32)
-                            ? true
-                            : (r.max_abs_err <= step_tol(ty) * r.max_step + 1e-9);
-    const bool ok = bytes_ok && load_ok && err_ok;
+    const bool e_ok = err_ok(ty, r);
+    const bool ok = bytes_ok && load_ok && e_ok;
     if (!ok) ++failures;
-    std::printf("%-6s %-8s %-10.4f %-10.6f %-12.4f %-10.6f %s\n", rdna4::kv_type_name(ty),
+    std::printf("%-6s %-8s %-10.4f %-10.6f %-12.4f %-12.5f %-10.6f %s\n", rdna4::kv_type_name(ty),
                 bytes_ok ? "exact" : "DIFFER", step_tol(ty), r.max_abs_err,
                 r.max_step > 0 ? r.max_abs_err / r.max_step : 0.0,
+                r.block_range > 0 ? r.max_abs_err / r.block_range : 0.0,
                 r.max_abs_x > 0 ? r.max_abs_err / r.max_abs_x : 0.0, ok ? "OK" : "FAIL");
     std::printf("       %s | %s\n", bytes_report.c_str(), load_report.c_str());
     if (!ok && (ty == rdna4::KvType::Q5_0 || ty == rdna4::KvType::Q4_1)) {
@@ -425,19 +455,25 @@ int main(int argc, char **argv) {
   std::printf("\n-- per-pattern, only the patterns that stress the format --\n");
   for (rdna4::KvType ty : {rdna4::KvType::Q5_0, rdna4::KvType::Q4_1}) {
     for (int p = 0; p < 8; ++p) {
-      std::vector<float> sub((std::size_t)kHeadKv * kHeadDim);
       int n = 0;
       for (int r = 0; r < kRows; ++r) {
-        if (pattern[r] != p) continue;
-        std::memcpy(sub.data() + (std::size_t)n * kHeadDim, synth.data() + (std::size_t)r * kHeadDim,
-                    (std::size_t)kHeadDim * sizeof(float));
-        ++n;
+        if (pattern[r] == p) ++n;
       }
       if (n == 0) continue;
+      std::vector<float> sub((std::size_t)n * kHeadDim);  // n matching rows, sized first
+      int w = 0;
+      for (int r = 0; r < kRows; ++r) {
+        if (pattern[r] != p) continue;
+        std::memcpy(sub.data() + (std::size_t)w * kHeadDim, synth.data() + (std::size_t)r * kHeadDim,
+                    (std::size_t)kHeadDim * sizeof(float));
+        ++w;
+      }
       std::string br, lr;
-      const RowResult r = check_type(ty, sub, kHeadKv, kHeadDim, br, lr, false);
-      std::printf("   %-5s pattern %d: max_err %.6f  err/step %.4f  (%s)\n", rdna4::kv_type_name(ty),
-                  p, r.max_abs_err, r.max_step > 0 ? r.max_abs_err / r.max_step : 0.0, br.c_str());
+      const RowResult r = check_type(ty, sub, n, kHeadDim, br, lr, false);
+      std::printf("   %-5s pattern %d: max_err %.6f  err/step %.4f  err/range %.5f  (%s)\n",
+                  rdna4::kv_type_name(ty), p, r.max_abs_err,
+                  r.max_step > 0 ? r.max_abs_err / r.max_step : 0.0,
+                  r.block_range > 0 ? r.max_abs_err / r.block_range : 0.0, br.c_str());
     }
   }
 
@@ -516,16 +552,15 @@ int main(int argc, char **argv) {
           const bool bytes_ok = br.find(": 0") != std::string::npos;
           const bool load_ok = lr.find("scalar load 0.000e+00") != std::string::npos &&
                                lr.find("load8 0.000e+00") != std::string::npos;
-          const bool err_ok = (ty == rdna4::KvType::F16 || ty == rdna4::KvType::F32)
-                                  ? true
-                                  : (r.max_abs_err <= step_tol(ty) * r.max_step + 1e-9);
-          if (!(bytes_ok && load_ok && err_ok)) ++failures;
-          std::printf("   %-5s bytes %-6s %s | max_err %.6f  err/step %.4f  err/|x|max %.5f  %s\n",
-                      rdna4::kv_type_name(ty), bytes_ok ? "exact" : "DIFFER",
-                      lr.c_str(), r.max_abs_err,
-                      r.max_step > 0 ? r.max_abs_err / r.max_step : 0.0,
+          const bool e_ok = err_ok(ty, r);
+          if (!(bytes_ok && load_ok && e_ok)) ++failures;
+          std::printf("   %-5s bytes %-6s %s | max_err %.6f  err/step %.4f  err/range %.5f  "
+                      "err/|x|max %.5f  %s\n",
+                      rdna4::kv_type_name(ty), bytes_ok ? "exact" : "DIFFER", lr.c_str(),
+                      r.max_abs_err, r.max_step > 0 ? r.max_abs_err / r.max_step : 0.0,
+                      r.block_range > 0 ? r.max_abs_err / r.block_range : 0.0,
                       r.max_abs_x > 0 ? r.max_abs_err / r.max_abs_x : 0.0,
-                      (bytes_ok && load_ok && err_ok) ? "OK" : "FAIL");
+                      (bytes_ok && load_ok && e_ok) ? "OK" : "FAIL");
         }
       }
     }

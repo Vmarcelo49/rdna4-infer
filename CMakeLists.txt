@@ -379,3 +379,19 @@ target_include_directories(check-kvquant-gpu PRIVATE include /opt/rocm/include
                           ${LLAMA_CPP_SRC}/ggml/src ${LLAMA_CPP_SRC}/ggml/include)
 target_link_libraries(check-kvquant-gpu PRIVATE ${GGML_BASE_LIB} ${AMDHIP64})
 set_target_properties(check-kvquant-gpu PROPERTIES HIP_ARCHITECTURES "gfx1201")
+
+# Frente KV — porta fechada do achado F6 (docs/adversarial-noite.md): as tres
+# tabelas de include/rdna4/kv.h nao podem mais responder "nao sei" com um 0
+# silencioso (kv_row_bytes -> passo de linha 0; kv_bytes_per_elem -> orcamento sem
+# KV) nem cair no corpo do q4_0 por fallthrough. O teste forka um filho, entrega
+# KvType(99) e EXIGE SIGABRT; roda em microssegundos, sem GPU e sem modelo, por
+# isso pode entrar em qualquer gate. Appended, como as outras frentes.
+add_executable(check-kvtype tests/check_kvtype.hip)
+target_compile_options(check-kvtype PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_link_options(check-kvtype PRIVATE --offload-arch=gfx1201)
+target_include_directories(check-kvtype PRIVATE include)
+if(EXISTS "/opt/rocm/include")
+  target_include_directories(check-kvtype PRIVATE /opt/rocm/include)
+endif()
+target_link_libraries(check-kvtype PRIVATE ${AMDHIP64})
+set_target_properties(check-kvtype PROPERTIES HIP_ARCHITECTURES "gfx1201")

@@ -12,6 +12,8 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "rdna4/fp16.h"
@@ -33,6 +35,38 @@
 #endif
 
 namespace rdna4 {
+
+// ---------------------------------------------------------------------------
+// Adversarial-review finding F6 (docs/adversarial-noite.md): the KV tables used
+// to answer "I do not know this type" with a *silent* 0 -- `kv_row_bytes`
+// returned 0 bytes per row, so every row of a cache landed on the same address
+// and the engine ran, wrote, and returned wrong numbers without a word;
+// `kv_store_row_kernel`/`kv_fill_kernel` fell through to their q4_0 body for any
+// type that was not F32/F16/Q8_0 (the trailing branch was an implicit `else`);
+// and `kv_bytes_per_elem` returned 0.0, which made `info`/`serve` approve a
+// configuration with NO KV bytes counted.
+//
+// The fix has two halves, and both are needed:
+//   * every switch stays EXHAUSTIVE WITH NO `default:` so `-Wswitch` still fires
+//     the moment a type is added (a `default:` would silence the compiler, which
+//     is how this class of bug survives);
+//   * the code after each switch is kv_unreachable(), which aborts on the host
+//     and traps on the device instead of degrading into a plausible answer.
+// tests/check_kvtype.hip is the regression gate: it forks a child, feeds it
+// KvType(99), and requires it to die on SIGABRT for each of those three tables.
+// ---------------------------------------------------------------------------
+__host__ __device__ __forceinline__ void kv_unreachable(const char *what) {
+#if defined(__HIP_DEVICE_COMPILE__)
+  (void)what;
+  __builtin_trap();
+#else
+  std::fprintf(stderr,
+               "rdna4: %s: unknown KvType -- the value is outside the enum and the KV "
+               "path refuses to guess (see include/rdna4/kv.h)\n",
+               what);
+  std::abort();
+#endif
+}
 
 // llama.cpp layout (ggml-common.h): the 5th bit plane `qh` lives *between* the
 // scale and the nibbles, so the struct is not 4-byte aligned and a 32-bit read
@@ -72,7 +106,9 @@ inline const char *kv_type_name(KvType t) {
     case KvType::Q5_0: return "q5_0";
     case KvType::Q4_1: return "q4_1";
   }
-  return "?";
+  // Not an abort: this one only feeds printed output, and dying while trying to
+  // report a bad type is worse than printing a visibly wrong name.
+  return "<unknown-kv-type>";
 }
 
 // nullptr for an unknown name (the caller reports the error).
@@ -100,7 +136,10 @@ inline double kv_bytes_per_elem(KvType t) {
     case KvType::Q5_0: return 22.0 / 32.0;  // 0.6875 B/elem
     case KvType::Q4_1: return 20.0 / 32.0;  // 0.625  B/elem
   }
-  return 0.0;
+  // A silent 0.0 here is what let `info`/`serve` approve a context with no KV
+  // counted at all (F6).
+  kv_unreachable("kv_bytes_per_elem");
+  return 0.0;  // not reached: kv_unreachable() aborts/traps
 }
 
 // Bytes of one row (head_dim elements).
@@ -114,7 +153,10 @@ __host__ __device__ __forceinline__ std::uint64_t kv_row_bytes(KvType t, int hea
     case KvType::Q5_0: return blocks * sizeof(block_q5_0);
     case KvType::Q4_1: return blocks * sizeof(block_q4_1);
   }
-  return 0;
+  // A silent 0 here is the worst of the three: the row stride becomes 0 and the
+  // whole cache collapses onto one address (F6).
+  kv_unreachable("kv_row_bytes");
+  return 0;  // not reached: kv_unreachable() aborts/traps
 }
 
 // ---------------------------------------------------------------------------
@@ -384,6 +426,11 @@ __global__ void kv_store_row_kernel(const float *__restrict__ src, void *__restr
   // is built from the *signed* value with the largest magnitude,
   // `d = max / -8`, so the grid is [-8, 8] with d carrying the sign. (An
   // amax/7 symmetric grid looks equivalent but stores different bytes.)
+  //
+  // This used to be the *implicit* tail of the if-chain, so any CT that matched
+  // none of the branches above would silently be stored as q4_0 (F6). It is an
+  // explicit branch now and the chain ends in kv_unreachable().
+  if (CT == KvType::Q4_0) {
   block_q4_0 *y = (block_q4_0 *)dst + blk;
   float amax = 0.0f, vmax = 0.0f;
   for (int j = 0; j < 32; ++j) {
@@ -405,6 +452,9 @@ __global__ void kv_store_row_kernel(const float *__restrict__ src, void *__restr
     const std::uint8_t xi1 = (std::uint8_t)(q1 > 15 ? 15 : (q1 < 0 ? 0 : q1));
     y->qs[j] = (std::uint8_t)(xi0 | (xi1 << 4));
   }
+  return;
+  }
+  kv_unreachable("kv_store_row_kernel");
 }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +559,9 @@ __global__ void kv_fill_kernel(void *__restrict__ cache, std::int64_t n_rows, in
     }
     return;
   }
+  // Explicit q4_0 branch, and the chain ends in kv_unreachable(): this used to be
+  // the implicit tail, i.e. any unknown type was filled as q4_0 (F6).
+  if (CT == KvType::Q4_0) {
   block_q4_0 *b = (block_q4_0 *)dst + blk;
   if (lane >= 16) return;  // one thread per byte: both nibbles are computed
                            // together, so there is no read-modify-write race
@@ -528,6 +581,9 @@ __global__ void kv_fill_kernel(void *__restrict__ cache, std::int64_t n_rows, in
   const std::uint8_t xi0 = (std::uint8_t)(q0 > 15 ? 15 : (q0 < 0 ? 0 : q0));
   const std::uint8_t xi1 = (std::uint8_t)(q1 > 15 ? 15 : (q1 < 0 ? 0 : q1));
   b->qs[lane] = (std::uint8_t)(xi0 | (xi1 << 4));
+  return;
+  }
+  kv_unreachable("kv_fill_kernel");
 }
 
 inline bool kv_fill_launch(KvType t, void *d_cache, std::int64_t n_rows, int head_dim,
@@ -536,33 +592,39 @@ inline bool kv_fill_launch(KvType t, void *d_cache, std::int64_t n_rows, int hea
   const std::int64_t blocks_per_row = (head_dim + 31) / 32;
   const std::int64_t total_warps = n_rows * blocks_per_row;
   const unsigned blocks = (unsigned)((total_warps + warps_per_block - 1) / warps_per_block);
+  // Each case returns its OWN launch status, and an unknown type falls out of the
+  // switch to `return false`. The tail used to be a single
+  // `return hipGetLastError() == hipSuccess;` AFTER the switch, which reported the
+  // status of whatever ran last -- for an unmatched type that is "no error", i.e.
+  // the dispatcher said "filled OK" for a cache it never touched (found by
+  // tests/check-kvtype.hip, the same F6 shape as the tables above).
   switch (t) {
     case KvType::F32:
       kv_fill_kernel<KvType::F32><<<blocks, warps_per_block * 32, 0, stream>>>(d_cache, n_rows,
                                                                               head_dim, seed);
-      break;
+      return hipGetLastError() == hipSuccess;
     case KvType::F16:
       kv_fill_kernel<KvType::F16><<<blocks, warps_per_block * 32, 0, stream>>>(d_cache, n_rows,
                                                                               head_dim, seed);
-      break;
+      return hipGetLastError() == hipSuccess;
     case KvType::Q8_0:
       kv_fill_kernel<KvType::Q8_0><<<blocks, warps_per_block * 32, 0, stream>>>(d_cache, n_rows,
                                                                                head_dim, seed);
-      break;
+      return hipGetLastError() == hipSuccess;
     case KvType::Q4_0:
       kv_fill_kernel<KvType::Q4_0><<<blocks, warps_per_block * 32, 0, stream>>>(d_cache, n_rows,
                                                                                head_dim, seed);
-      break;
+      return hipGetLastError() == hipSuccess;
     case KvType::Q5_0:
       kv_fill_kernel<KvType::Q5_0><<<blocks, warps_per_block * 32, 0, stream>>>(d_cache, n_rows,
                                                                                head_dim, seed);
-      break;
+      return hipGetLastError() == hipSuccess;
     case KvType::Q4_1:
       kv_fill_kernel<KvType::Q4_1><<<blocks, warps_per_block * 32, 0, stream>>>(d_cache, n_rows,
                                                                                head_dim, seed);
-      break;
+      return hipGetLastError() == hipSuccess;
   }
-  return hipGetLastError() == hipSuccess;
+  return false;  // unknown type: refuse, do not report the previous launch's status
 }
 
 template <KvType CT>
