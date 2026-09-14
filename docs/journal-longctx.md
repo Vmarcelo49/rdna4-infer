@@ -794,8 +794,14 @@ Medido até agora (o motor):
 - `check-rope-gpu` e `compare_ppl.sh` rodaram também na forma que já existia (inalterada).
 
 **Ficou na fila quando a noite acabou** (com o motivo, para a manhã):
-- Pontos de PPL a 4 096 e 8 192 e a sondagem a 25 742 tokens: comandos prontos, esperando a
-  placa (a fila do lock teve blocos de 30-50 min de outras frentes; ver §5.3, §5.5).
+- O **lado da referência** do ponto de PPL a 8 192 (o motor rodou: PPL 5,3284, §6.1) e a
+  corrida de sensibilidade `ORACLE_NUBATCH=16` da sondagem de 25 742 tokens: ficaram presos na
+  fila do lock (blocos de 30-50 min de outras frentes, ver §5.3, §5.5) e a manhã chegou antes.
+  Comandos exatos para repetir (cada um é 1 comando de ~10 min):
+  `./scripts/gpu-lock.sh timeout 900 env ORACLE_NGL=99 ORACLE_NLL_OUT=/tmp/lc-ref-nll8k.txt
+  ./build/oracle-next-token <modelo> $(cat /tmp/lc-win8k.ids)` e
+  `./scripts/gpu-lock.sh timeout 900 env ORACLE_NGL=99 ORACLE_NCTX=26240 ORACLE_NBATCH=26240
+  ORACLE_NUBATCH=16 ./build/oracle-next-token <modelo> $(cat /tmp/lc-ids5-24k.txt)`.
 - `check_all.sh --quick` no meu worktree: os meus commits são `tests/` + `docs/` +
   `CMakeLists.txt` e os gates afetados por eles foram rodados individualmente (acima); a
   bateria completa fica para o coordenador no merge.
