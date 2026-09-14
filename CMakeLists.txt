@@ -201,3 +201,17 @@ if(EXISTS "/opt/rocm/include")
   target_include_directories(bench-attn-gpu PRIVATE /opt/rocm/include)
 endif()
 target_link_libraries(bench-attn-gpu PRIVATE ${AMDHIP64})
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible server (branch feat/openai-server, docs/servidor-openai.md).
+#
+# Appended by the server workstream: no line above this one was modified
+# (docs/agentes-paralelos.md rule 2, "CMakeLists.txt: só append").
+#
+# src/server/http.cpp + src/server/json.cpp are plain C++ (blocking sockets,
+# request parsing, router, JSON codec) with no HIP at all — that split is what
+# lets this CPU-only target exercise the routing and the codec without a GPU.
+# ---------------------------------------------------------------------------
+add_executable(check-server-http tests/check_server_http.cpp src/server/http.cpp
+                                 src/server/json.cpp)
+target_include_directories(check-server-http PRIVATE include)
