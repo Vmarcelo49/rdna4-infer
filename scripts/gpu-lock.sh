@@ -35,4 +35,26 @@ fi
 # the timeout and then fails. Setting it here makes that impossible instead of
 # relying on every caller to export it (measured the hard way: an ad-hoc wrapper
 # without it hung check_golden_run.sh for 18 minutes).
-exec flock -w "$WAIT" "$LOCK" env GPU_LOCK_HELD=1 "$@"
+# The lock serialises *runs*, but a process that just died (SIGTERM, timeout, a kill)
+# keeps its VRAM for a few seconds while the driver drains it -- and a model load
+# that starts inside that window dies with "hipMalloc failed for blk.N...", which
+# looks like a broken engine. Measured four times tonight (twice as false-red gates).
+# So: after taking the lock, wait for the card to go quiet before handing over.
+exec flock -w "$WAIT" "$LOCK" env GPU_LOCK_HELD=1 bash -c '
+  # 1 GiB: the desktop and a fresh context sit far below it; a draining model is
+  # several GiB above it.
+  f=$(ls /sys/class/drm/card*/device/mem_info_vram_used 2>/dev/null | head -1)
+  if [ -n "$f" ]; then
+    t0=$SECONDS
+    while [ $((SECONDS - t0)) -lt "${GPU_LOCK_DRAIN_WAIT:-90}" ]; do
+      used=$(cat "$f" 2>/dev/null || echo 0)
+      [ "${used:-0}" -lt $((1 << 30)) ] && break
+      sleep 2
+    done
+    used=$(cat "$f" 2>/dev/null || echo 0)
+    if [ "${used:-0}" -ge $((1 << 30)) ]; then
+      echo "gpu-lock: aviso: VRAM ainda em $((used / 1048576)) MiB apos a espera; seguindo" >&2
+    fi
+  fi
+  exec "$@"
+' -- "$@"
