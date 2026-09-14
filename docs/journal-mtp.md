@@ -249,3 +249,51 @@ Estado de partida (medido neste worktree, `build/` próprio, IQ3_S, f16 KV):
   `/tmp/mtp-matrix.sh 4096 64 1 plain: b2:… b3:… s3:…` e
   `/tmp/mtp-matrix.sh 16384 64 1 plain: b3:… b2:…`.
 - **Resultado**: §8.
+
+## 8. Números finais (R1 + R9 + R11 mergeados, baseline correto)
+
+- **Comando**: `/tmp/mtp-now.sh` sob uma tomada de lock (janela limpa: VRAM
+  275 MB antes / 1,31 GB depois, nenhum outro processo do modelo):
+  `RD_MTP_XALL_POS=4096 ./build/check-mtp-gpu <IQ3_S> 32 3`,
+  `/tmp/mtp-matrix.sh 4096 64 1 plain: b2:--mtp\ --draft\ 2 b3:--mtp\ --draft\ 3
+  s3:--mtp\ --draft\ 3\ --mtp-serial`,
+  `/tmp/mtp-matrix.sh 16384 64 1 plain: b3:--mtp\ --draft\ 3 b2:--mtp\ --draft\ 2`.
+- **Resultado**:
+
+  | ctx | modo | tok/s | ganho | aceitação/rascunho | linhas/rodada | rollbacks | md5 stdout |
+  |---|---|---|---|---|---|---|---|
+  | 4K (3 996 tok) | ganancioso puro | 29,37 | 1,00× | — | — | — | `84099989b3dca42c` |
+  | 4K | `--mtp --draft 2` (batelado) | **34,56** | **1,18×** | 67,9 % | 2,96 | 13/27 | `84099989b3dca42c` |
+  | 4K | `--mtp --draft 3` (batelado) | 30,11 | 1,03× | 52,1 % | 3,92 | 17/25 | `84099989b3dca42c` |
+  | 4K | `--mtp --draft 3 --mtp-serial` | 25,85 | 0,88× | 58,2 % | — | 0/19 | `84099989b3dca42c` |
+  | 16K (16 282 tok) | ganancioso puro | 26,81 | 1,00× | — | — | — | `e5ac04e772dd553f` |
+  | 16K | `--mtp --draft 3` (batelado) | **30,53** | **1,14×** | 67,7 % | 3,95 | 10/21 | `e5ac04e772dd553f` |
+
+  **A saída é byte-idêntica ao ganancioso puro nas duas pontas, em todas as
+  variantes de `--mtp`** — é a propriedade que torna a especulação segura, e é o
+  que o `check_regression.sh` (7 prompts, ids bit-exatos, rel-L2 ≤ 1e-5) também
+  cobre do lado do motor.
+- **Correção honesta de um número anterior**: os 1,71-1,75× da §6 foram medidos
+  contra o baseline **quebrado pelo R9**, que gerava o token 0 como primeiro token
+  e caía em texto degenerado ("actor actor actor…"). Texto degenerado infla a
+  aceitação do rascunho (88,9 % → **67,9 %** com texto coerente), e é daí que
+  vinha quase todo o ganho aparente. O contraste que sobrevive — e que é a tese da
+  frente — é **0,88× (verify serial) → 1,18× (verify batelado)**, mesma janela,
+  mesma saída byte a byte.
+- **R1 explica o 16K**: com o conserto da atenção dividida em lote a aceitação
+  subiu de 54,9 % → **67,7 %** e o ganho virou **+14 %** em vez de −14 %. Sem esse
+  diagnóstico eu teria reportado um negativo falso.
+- **Onde o tempo vai (4K, D=2, 27 rodadas para 64 tokens = 68,6 ms/rodada)**:
+  o verify (1 `forward_batch_all` de ~3 linhas por rodada) mais o *replay* das 13
+  rodadas com rejeição (48 %) domina; o rascunho custa ~4,4 ms/rodada (2 passos de
+  2,2 ms, cada um 63 % LM head compartilhada) e o *rebuild* da KV ~1,1 ms/rodada
+  (1,37 linhas aceitas a 0,83 ms, sem a head). Custos unitários medidos:
+  passo de trunk por token 34,0 ms; `forward_batch_all` bit-exato contra o caminho
+  por token em posição 4084 (h e logits, max|d| 0,0) para N=2 e N=4; snapshot +
+  restore do estado recorrente 0,54 ms por par (149,6 MiB).
+- **D=4 não foi entregue, e o motivo é estrutural**: `matvec_launch_batch` só tem
+  instanciações N = 2/3/4/8/16 e o verify de `k` rascunhos precisa de `k+1` linhas
+  (D=4 → 5 linhas). Fazer isso exige uma instanciação N=5 em `matvec.cuh` (arquivo
+  de outra frente); com o ganho de D=3 já abaixo do de D=2 (a aceitação marginal
+  cai e o replay sobe), o custo não se justifica — o coordenador confirmou a
+  decisão de não gastar a janela nisso.
