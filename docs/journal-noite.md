@@ -142,6 +142,28 @@ pior. Repassado à frente KV.
 - **Veredito**: MANTIDO o padrão `q5_0/q4_1` (é o alvo, KL é o 2º melhor e sobram 1,68 GiB para
   o MTP); `q8_0/q4_1` documentado como a opção de melhor qualidade (0,75 GiB a mais).
 
+### C8. Duas estimativas discordaram, e a mais barata de checar venceu (04:20)
+- **O que aconteceu**: a frente de prefill mediu que o matvec em lote lê 12,0 GB por chunk de 16
+  em 110 ms (**109 GB/s**) contra 446 GB/s no caminho por token, e estimou 2-2,5× de ganho ao
+  "dequantizar o bloco uma vez". A frente de kernels implementou a mudança para `iq3_s`/`iq3_xxs`
+  (com fallback identidade para os outros 12 tipos) e **contou as instruções**: ~40 operações de
+  preparo por bloco de 110 B mais ~25 por token dá um teto de **~10 %**, não 2-3×.
+- **Decisão do coordenador**: a mudança fica **desligada** (duas linhas de `RD_BATCH` prontas para
+  ligar) até existir medida. Regra da noite: mudança de kernel sem número não entra — e uma
+  estimativa que outra frente contradiz por contagem de instruções é exatamente o caso em que
+  "medir antes" paga. O gargalo real do matvec em lote segue **não identificado**: é o item
+  aberto mais valioso para a próxima sessão, e agora tem duas hipóteses concorrentes medidas
+  (banda amortizada vs issue de ALU) e nenhuma confirmada.
+- **Números que a frente de kernels trouxe e que ficam** (todos bit-exatos, memcmp): LUT dos IQ
+  em LDS `iq3_s` 7,762→7,251 ms/token e `iq3_xxs` 4,468→3,781 (**−1,20 ms/token**; nos `iq2_*`
+  a LUT é maior que o peso lido por CTA e o ganho vira perda, então uma guarda
+  peso/CTA ≥ 2× LUT decide); `delta_rule` com carga `float4` **71,70→8,42 µs por camada**
+  (8,5×, −3,0 ms/token nas 48 camadas, com a ressalva de que a cadeia de 100 reusa o mesmo estado
+  no Infinity Cache); `rms_norm` com 4 cargas em voo 1,227× (−0,26 ms/token). Abandonados com
+  medida: `rows=1` (0,973×, porque `WPR=1` faz o número de warps ser `nrows`) e a fusão dos
+  kernels pequenos (o `emit()` do grafo faz `hipMemcpy` bloqueante, então fundir 4 ops em 1 faz o
+  oráculo por nó ler um buffer já sobrescrito — a variante que preserva o dump vale 0,26 ms).
+
 ## Estado do alvo (atualizado pelo coordenador)
 
 - **131K**: ainda não medido nesta rodada. No baseline, 131K com KV `q4_0` roda a 14,0 tok/s
