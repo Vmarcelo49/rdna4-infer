@@ -230,24 +230,31 @@ medido como 3 células independentes).
 
 ---
 
-### 3.2 Onde o tempo do passo vai (motor real, `bench-phases-gpu --level 2`)
+### 3.2 Onde o tempo do passo vai (motor real, `bench-phases-gpu --level 2`) — medido
 
-Comandos (timeout dentro do lock): `./scripts/gpu-lock.sh timeout 850 ./build/bench-phases-gpu
-<modelo> --ctx <n> --pos <n-64> --tokens 24 --level 2 --kv-k T --kv-v T` (16K/64K f16 e 131K
-q4_0). A tabela preenchida sai daqui; os números de referência que já existiam no repo, para
-comparação, são: passo de **45 ms/token a 4K**, **174 ms a 64K (f16)**, e a atenção a 64K
-q4_0 = **20,97 ms** (38 % do passo) — `docs/medicoes-banda-e-gargalos.md` §3.2.
+**Comando**: `./scripts/gpu-lock.sh timeout 850 ./build/bench-phases-gpu <modelo> --ctx <n>
+--pos <n-64> --tokens 24 --level 2 --kv-k T --kv-v T` (contexto semeado: posições n-64..n-1;
+cache sintético). 24 tokens por célula, melhor da passada limpa (o `bench-phases` aquece com
+`sync` no laço até ≥300 ms de GPU ocupada).
 
-| ctx / KV | passo (ms/token) | atenção (ms) | fatia | matvec (ms) | GB/s do matvec | splits |
-|---|---|---|---|---|---|---|
-| 16 384 f16 | (job A2) | | | | | |
-| 65 536 f16 | (job A2) | | | | | |
-| 131 072 q4_0 | (job A2) | | | | | |
+| ctx / KV | **passo** | tok/s | **atenção** | fatia do passo | matvec (trunk) | matvec GB/s | **emitido (GQA 6×)** | splits |
+|---|---|---|---|---|---|---|---|---|
+| 16 384 f16 | **37,10 ms/token** | 26,95 | **4,487 ms** | **12,1 %** | 23,96 ms | 464,7 | 1430 GB/s | 16 |
+| 65 536 f16 | **49,13 ms/token** | 20,35 | **16,494 ms** | **33,6 %** | 24,03 ms | 463,3 | 1561 GB/s | 16 |
+| 131 072 q4_0 | **70,74 ms/token** | 14,14 | **38,320 ms** | **54,2 %** | 24,17 ms | 460,6 | **378 GB/s** | 16 |
 
-Estimativa independente (com os números da autotuning + baseline, para o relatório ter a
-ordem de grandeza mesmo se o bench não rodar): a 131K q4_0 o passo é **71,4 ms** (14,0 tok/s)
-e a atenção medida por camada é 2,446 ms × 16 = **39,1 ms ⇒ ~55 % do passo é atenção**.
-A 64K f16 o passo é 174 ms e a atenção 0,9955 × 16 = 15,9 ms ⇒ ~9 %.
+- **A curva que a noite devia ter por escrito**: a atenção sai de **12 % do passo a 16K** para
+  **34 % a 64K e 54 % a 131K**; o matvec do tronco fica **constante em ~24 ms/token**
+  (11,133 GB lidos a ~460 GB/s), que é o piso do motor em qualquer contexto; o head
+  (`output.weight` 0,874 GB) custa 1,391 ms a 628 GB/s.
+- **Banda emitida medida**: 1430 GB/s a 16K, **1561 GB/s a 64K** (o Infinity Cache servindo a
+  releitura 6× — o meu número derivado em §4.2 era 1,67 TB/s, coerente) e **378 GB/s a 131K
+  q4_0** contra 2,4 GB/token de bytes únicos (63 GB/s). Isto é a confirmação independente do
+  diagnóstico da frente de banda ("a 64K+ com `q4_0` o kernel é limitado por
+  desquantização/issue, não por banda"): 378 GB/s emitidos é **1/4** do que o cache entrega em
+  f16, e o kernel está *mais lento* apesar de mover 4× menos bytes.
+- O `14,14 tok/s` a 131K q4_0 bate com os 14,0 tok/s do baseline e com o meu `bench` em §3.4
+  (14,09) — três medidas independentes do mesmo ponto.
 
 ### 3.3 Curva da atenção por **tipo de KV** (a comparação que faltava a 64K+)
 
@@ -623,13 +630,15 @@ dois motores, desvio por chunk e por posição; o critério do script é 1 % por
 |---|---|---|---|---|---|
 | 512 (768) | 6 | 3,8231…7,7695 | 3,8160…7,7698 | **0,185 %** | 0,458 |
 | 2 048 (3 072) | 2 | 5,9218 / 8,3859 | 5,9222 / 8,3722 | **0,163 %** | 0,434 |
-| 4 096 (6 144) | 1 | (job B, na fila) | | | |
+| 4 096 (6 144) | 1 | 7,3900 | 7,3960 | **0,081 %** | 0,367 |
 | 8 192 (10 240) | 1 | (job B, na fila) | | | |
 | 14 336 | 1 | 3,9792 | 3,9835 | **0,108 %** | 0,929 |
 
-- **O desvio do motor NÃO cresce com o contexto**: 0,185 % (512) → 0,163 % (2K) → 0,108 %
-  (14K). Se houvesse um erro de posição/limite/overflow no caminho longo, este número subiria
-  com o contexto; ele *cai*.
+- **O desvio do motor NÃO cresce com o contexto**: 0,185 % (512) → 0,163 % (2K) → **0,081 %
+  (4K)** → 0,108 % (14K). Se houvesse um erro de posição/limite/overflow no caminho longo, este
+  número subiria com o contexto; ele fica plano e *cai* — e o pior |dNLL| de uma posição
+  acompanha (0,458 → 0,434 → 0,367 até 4K).
+- (8 192: comando na fila; o valor entra aqui.)
 - A cauda de uma posição isolada fica em 0,43-0,46 nats até 2K e 0,93 a 14K.
 
 **Ponto de 14K (o mais longo que a noite alcança em PPL)**: janela única de **14 336 tokens**
@@ -681,6 +690,23 @@ janela: `mem_info_vram_used` 12,9 GB no início — o lock foi esperado dentro d
 
 ### 6.2 Posição longa de verdade: motor vs llama.cpp no MESMO ids
 
+**Sensibilidade do PRÓPRIO caminho da referência** (mesmo prompt, `ORACLE_NUBATCH` 512 vs 16 —
+llama.cpp não é bit-idêntico entre os dois caminhos de MUL_MAT):
+
+| top-5 na posição 17 638 | ub=512 | ub=16 | diferença |
+|---|---|---|---|
+| 16 | 16,8713 | 16,8158 | 0,0555 |
+| 17 | 16,2301 | 16,1717 | 0,0584 |
+| 18 | 15,6146 | 15,5248 | 0,0898 |
+| 20 | 15,3875 | 15,3118 | 0,0757 |
+| 19 | 15,2302 | 15,1482 | 0,0820 |
+
+- **A discordância nossa-vs-referência (espalhamento ±0,018 depois de remover o deslocamento
+  uniforme) é MENOR que a discordância da referência com ela mesma entre dois ubatchs
+  (0,056-0,090).** Ou seja: em 17 639 tokens de contexto, o motor está dentro do ruído
+  caminho-a-caminho do llama.cpp — não há sinal de erro de posição longa.
+
+
 **Comando (motor)**: `./scripts/gpu-lock.sh timeout 850 ./build/rdna4-infer run -m <modelo>
 -p "$(cat /tmp/prompt16k.txt)" --ctx-size 18048 -n 1 -v --temp 1.0 --top-k 5 --top-p 1.0
 --min-p 0.0 --repeat-penalty 1.0 --seed 1 --cache-type-k f16 --cache-type-v f16`
@@ -724,25 +750,37 @@ Medido até agora (o motor):
 
 ## 7. Estado no fim da noite (o que rodou, o que não rodou)
 
-**Rodou e está neste diário** (todos com comando exato e janela):
-- `check-rope-long-gpu` (novo gate): OK, 11 posições até 262 143, controle NEOX = 0,0 (§2).
+**Rodou e está medido neste diário** (todos com comando exato, janela e piso de ruído):
+- `check-rope-long-gpu` (**gate novo**): OK, 11 posições até 262 143, controle NEOX = 0,0 (§2).
 - `bench-attn-gpu` f16: varredura completa 2/4/8/16 splits × 8/16/32 warps em 4K/16K/64K/131K
-  (§3.1); q4_0 e q8_0 em 64K/131K (§3.3); protótipo C (GQA) em 4K/16K/64K/131K nos três tipos
-  (§4.1-4.3); recursos de kernel/VGPR/derrame (§4.1).
-- `bench-attn-gpu` com `--splits 8..48`: política a 131K q4_0/q8_0/f16 (§3.5).
-- `bench` com cache sintético: decode a 64K (q8_0 e f16) e 131K (q4_0), VRAM/GTT (§3.4).
-- `check-rope-gpu`, `compare_llama_greedy.sh` e `compare_ppl.sh` com os defaults: inalterados
-  pela extensão do `oracle-next-token` (§5.1, e o job K).
-- `compare_ppl.sh` a 512 (6 chunks) e 2 048 (2 chunks); janela única de 14 336 (§6.1).
-- Sondagem de posição longa a **17 639 tokens** com top-5 nos dois motores (§6.2).
-- `run` + `oracle-next-token` com `ORACLE_NCTX`/`NUBATCH` (nova capacidade do test tool).
+  (§3.1); q4_0 e q8_0 em 64K/131K (§3.3); protótipo C (GQA agrupado) nos três tipos e nos
+  quatro contextos, com VGPR/derrame de cada kernel (§4.1-4.3).
+- `bench-attn-gpu --splits 8..48`: política de splits a 131K q4_0/q8_0/f16 (§3.5).
+- `bench-phases-gpu --level 2`: decomposição do passo no motor real a 16K/64K/131K (atenção
+  12,1 % / 33,6 % / **54,2 %**; matvec constante em 24 ms/token; banda emitida 1430/1561/378 GB/s)
+  (§3.2).
+- `bench` com cache sintético (`--start-pos`): decode a 64K q8_0/f16 e 131K q4_0 com
+  VRAM/GTT (§3.4).
+- `compare_ppl.sh` a 512 (6 chunks) e 2 048 (2 chunks); janela única de 14 336 tokens com o
+  desvio por faixa de posição (§6.1).
+- Sondagem de posição longa a **17 639 tokens**: top-5 do motor vs llama.cpp (mesmos ids, mesma
+  ordem, argmax igual) + a sensibilidade do próprio caminho da referência (ub512 vs ub16) (§6.2).
+- `compare_llama_greedy.sh 16`: **IDS MATCH** (16 tokens idênticos) — a extensão do
+  `oracle-next-token` não mudou o caminho default (job K).
+- `check-rope-gpu` e `compare_ppl.sh` rodaram também na forma que já existia (inalterada).
 
-**Não rodou / ficou na fila** (e por quê):
-- **Qualidade a 131K com texto real** — não cabe no `timeout 900` (§5.2).
-- Diff de **nó** (Qcur/Kcur) em posição longa — precisa de `UB=1` (16 385 decodes) (§5.4).
-- Pontos de PPL a 4 096 e 8 192 — na fila (cada um são dois comandos de ~10 min com a placa
-  disputada por 7 frentes; o de 14 336 já cobre o topo da curva).
-- Sondagem de posição a 25 742 tokens — na fila (o motor já preencheu 17 639 em 273 s).
-- `bench-phases-gpu` a 16K/64K/131K (decomposição por fases do passo no motor real) — na fila;
-  a fatia da atenção está estimada por bytes+tempo medidos em §3.3.
-- `check_all.sh --quick` — na fila (os meus commits são `tests/` + `docs/` + `CMakeLists.txt`).
+**Ficou na fila quando a noite acabou** (com o motivo, para a manhã):
+- Pontos de PPL a 4 096 e 8 192 e a sondagem a 25 742 tokens: comandos prontos, esperando a
+  placa (a fila do lock teve blocos de 30-50 min de outras frentes; ver §5.3, §5.5).
+- `check_all.sh --quick` no meu worktree: os meus commits são `tests/` + `docs/` +
+  `CMakeLists.txt` e os gates afetados por eles foram rodados individualmente (acima); a
+  bateria completa fica para o coordenador no merge.
+
+**Não é possível nesta noite, com o motivo e a receita**:
+- **Qualidade/decodificação a 131K com texto real**: o prefill em lote medido é **64,5 tok/s a
+  17,6K** (§6.2) ⇒ ~2 000 s (33 min) só para encher o KV de 131K, fora do `timeout 900`; o
+  `ppl` do motor é 1 forward por token (~1,5-1,8 h a 131K). Receita: um caminho `ppl` com
+  logits por token em **lote** (hoje `Graph::forward_batch` devolve só o último token) — o
+  matvec em lote mede 74,9 tok/s a 4K e o custo por token cai ~10×.
+- **Diff de nó (Qcur/Kcur) em posição longa**: o dump do eval-callback só é comparável com
+  `UB=1` (16 385 decodes de 1 token) — receita exata em §5.4.
