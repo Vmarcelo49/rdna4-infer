@@ -388,7 +388,7 @@ Além dessas, os achados `F11` (números do README contra os docs, 5 de 12 com p
 
 ---
 
-## P0 DE CORRETUDE, achado em 14/09 (tarde) — o KV do alvo quebra o prefill
+## P0 DE CORRETUDE — RESOLVIDO em 14/09 (tarde): o KV do alvo quebrava o prefill
 
 - **`K=q5_0`/`V=q4_1` faz PAGE FAULT no prefill em lote** (`Memory access fault ... Page not present
   or supervisor privilege`). Reproduzido por mim com o binário de produção
@@ -401,6 +401,10 @@ Além dessas, os achados `F11` (números do README contra os docs, 5 de 12 com p
   para K e V com tamanhos de linha diferentes (`graph.cuh:873-877`).
 - **Por que é P0**: é exatamente o par que a rodada noturna recomendou (K `q5_0`, V `q4_1`) para os
   131K — o alvo do usuário. Corrigir ou vetar explicitamente; não deixar como está.
-- Ferramenta que fecha: `compute-sanitizer`/`hip-memcheck` (ausentes no sistema), ou leitura de
-  `attn.cuh` (`attn_batch_kernel`/`attn_split_batch_kernel`) + `kv.h` (`kv_load*`) com um caso
-  mínimo `--prefill 16`.
+- **RESOLVIDO**: `kv_write_batch` (`graph.cuh:870`) e a leitura de V na atenção em lote
+  (`graph.cuh:1083`) usavam `kv_bytes_` (stride de K) na V, cujo cache é alocado com
+  `n_attn * kv_bytes_v_` — overflow de heap quando a linha de K > a de V (f16/q4_1: 86,5 MB;
+  q5_0/q4_1: 3,9 MB; **q8_0/q4_1: 27,5 MB, que passava corrompendo memória alheia**). Corrigido
+  para `kv_bytes_v_` nos dois sítios. **Gate novo** `scripts/check_kvbatch.sh` (5 pares, exige
+  bit-exatidão) ligado ao `check_all.sh`; 5/5 OK. Alvo medido: `q5_0`/`q4_1` a 104,61 tok/s de
+  prefill e 28,60 de decode.

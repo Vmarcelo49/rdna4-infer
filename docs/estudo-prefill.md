@@ -282,7 +282,35 @@ passam `q4_0/q4_1`, `q8_0/q4_1`, `q4_1/q4_1`, `q5_0/q5_0`, `q5_0/f16`, `q4_1/q5_
   (`n_tok*NKV*HD`) para K e V com **ponteiros de tamanhos de linha diferentes**
   (`graph.cuh:873-877`), e/ou o caminho de leitura da atenção em lote para `V=q4_1`.
 
-**Isto não é tuning: é um bug de corretude na configuração que a rodada noturna recomendou**
+#### RESOLVIDO (mesmo dia): o stride de V no caminho em lote
+
+**Causa raiz, encontrada e corrigida**: `d_k_` e `d_v_` são alocados com tamanhos diferentes
+(`n_attn * kv_k_bytes` e `n_attn * kv_v_bytes`), mas **dois sítios do caminho em lote usavam
+`kv_bytes_` (o stride de K) também para a V**:
+`Graph::kv_write_batch` (`graph.cuh:870`) e a leitura de V na atenção em lote (`graph.cuh:1083`).
+Sempre que a linha de K fosse **maior** que a de V, a camada `il` era endereçada em
+`il * kv_bytes_` num cache onde cabem `il * kv_bytes_v_` — overflow de heap:
+
+| par | bytes além do fim da alocação (última camada) | sintoma |
+|---|---|---|
+| `f16`/`q4_1` | **86,5 MB** | page fault |
+| `q5_0`/`q4_1` | **3,9 MB** | page fault |
+| `q8_0`/`q4_1` | **27,5 MB** | **passava, corrompendo memória alheia** |
+| `q4_0`/`q4_1`, `q4_1`/`q4_1`, `q5_0`/`q5_0` | ≤ 0 | passa |
+
+Isso explica o conjunto de falhas aparentemente arbitrário (por que `q8_0` passava e `q5_0` não):
+**o sintoma dependia do que o alocador tinha colocado logo depois de `d_v_`** — mapeado (corrupção
+silenciosa) ou não (fault). O caso `q8_0`/`q4_1` era o pior dos três e *passava*.
+
+**Conserto**: os dois sítios passaram a usar `kv_bytes_v_` (os outros três já usavam, o que é a
+assinatura do bug: era inconsistência, não desconhecimento). **Gate novo**:
+`scripts/check_kvbatch.sh`, com 5 pares (`f16/f16`, `q5_0/q5_0`, e os três que quebravam), rodando o
+`check-batch-gpu` por par e exigindo **bit-exatidão** — o gate antigo cravava `F16/F16`, e é por isso
+que o bug passou. Resultado: **5 de 5 pares OK, todos `rel-L2 0.000e+00`**, e o par do alvo
+(`q5_0`/`q4_1`) mede **104,61 tok/s de prefill e 28,60 tok/s de decode**, contra 104,09 do controle
+`f16/f16` (inalterado).
+
+**Isto não é tuning: era um bug de corretude na configuração que a rodada noturna recomendou**
 (K=`q5_0`, V=`q4_1`) para os 131K. Ou ele é corrigido, ou o par sai da lista permitida — não pode
 ficar como está, porque o alvo do usuário é exatamente esse par. Está no backlog como o item de
 maior prioridade de corretude.
