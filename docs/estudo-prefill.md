@@ -53,6 +53,18 @@ acelera nada — 58-94 % do tempo dos dois protótipos é *staging*, e o staging
 instrução depois** — mas a instrução é necessária no fim, porque o llama.cpp faz **32,7 T-MAC/s =
 74 % do pico do dp4a** deste cartão, e nenhum protótipo de dp4a passou de 29 %.
 
+### Os picos medidos neste cartão — **reproduzidos por mim** na mesma bancada
+
+Rodei `./scripts/gpu-lock.sh timeout 900 ./build/bench-wmma-gpu` eu mesmo, depois de a frente D
+entregar, e os números batem: WMMA int8 **161,7-183,3 T-MAC/s** (323-364 TOPS), dp4a
+**39,4-45,4 T-MAC/s** (79-91 TOPS), WMMA f16 acc f32 **82,1-87,7**, acc f16 **90,8**; razão
+**≈4,2×**; o laço misto (1 WMMA + 8 dp4a, acumuladores disjuntos) custa **1,00-1,16× a soma dos
+dois laços puros**, ou seja **não são pipes separados** — eles dividem issue.
+
+Em MACs por ciclo por CU (a forma mais comparável): **dp4a 232, WMMA f16 468, WMMA int8 1022**.
+Note que os números de folha de especificação que circularam antes (dp4a 512 MAC/CU/clk, fp16
+WMMA 512) são ~2,2× os medidos neste cartão — **valem os medidos**.
+
 ### Os picos medidos neste cartão (frente D, dentro da mesma corrida)
 
 | laço | T-MAC/s | TOPS | nota |

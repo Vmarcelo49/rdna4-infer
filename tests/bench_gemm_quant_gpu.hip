@@ -436,7 +436,7 @@ bool launch(const Cfg &c, const int mode, const int M, const std::int64_t N, con
 
 int main(int argc, char **argv) {
   std::vector<int> ms_list{16, 64, 128};
-  int BK_sel = 64, reps = 5;
+  int BK_sel = 64, reps = 5, BM_ovr = 0;
   std::int64_t n_ovr = -1, k_ovr = -1;
   std::string tensor_name;
   bool list_only = false, verify = true;
@@ -452,6 +452,8 @@ int main(int argc, char **argv) {
       }
     } else if (std::strcmp(argv[i], "--bk") == 0 && i + 1 < argc) {
       BK_sel = std::atoi(argv[++i]);
+    } else if (std::strcmp(argv[i], "--bm") == 0 && i + 1 < argc) {
+      BM_ovr = std::atoi(argv[++i]);
     } else if (std::strcmp(argv[i], "--reps") == 0 && i + 1 < argc) {
       reps = std::atoi(argv[++i]);
     } else if (std::strcmp(argv[i], "--n") == 0 && i + 1 < argc) {
@@ -674,11 +676,23 @@ int main(int argc, char **argv) {
   }
 
   // ---- 4. configuracao por M (mesma geometria da bench-gemm-gpu int8) -----
+  // `--bm` forca o tile de M (para varrer ocupacao de LDS x paralelismo); o
+  // RM sai de BM/16 no mesmo desenho da bench int8 (TM=16, TN=16, 256 threads).
+  static const char *kTags[4] = {"BM16  BN128 RM2 RN8", "BM32  BN128 RM2 RN8",
+                                 "BM64  BN128 RM4 RN8", "BM128 BN128 RM8 RN8"};
   auto cfg_for = [&](const int M) {
-    if (M >= 128) return Cfg{128, 128, BK_sel, 8, 8, "BM128 BN128 RM8 RN8"};
-    if (M >= 64) return Cfg{64, 128, BK_sel, 4, 8, "BM64  BN128 RM4 RN8"};
-    if (M >= 32) return Cfg{32, 128, BK_sel, 2, 8, "BM32  BN128 RM2 RN8"};
-    return Cfg{16, 128, BK_sel, 2, 8, "BM16  BN128 RM2 RN8"};
+    int bm = 0;
+    if (BM_ovr == 16) bm = 0;
+    else if (BM_ovr == 32) bm = 1;
+    else if (BM_ovr == 64) bm = 2;
+    else if (BM_ovr == 128) bm = 3;
+    else {
+      bm = (M >= 128) ? 3 : (M >= 64) ? 2 : (M >= 32) ? 1 : 0;
+    }
+    if (M < 32 && bm > 0) bm = 0;  // tile maior que o M disponivel
+    static const int kBM[4] = {16, 32, 64, 128};
+    static const int kRM[4] = {2, 2, 4, 8};
+    return Cfg{kBM[bm], 128, BK_sel, kRM[bm], 8, kTags[bm]};
   };
 
   EvPair ev;
@@ -731,11 +745,14 @@ int main(int argc, char **argv) {
     const double tmacs = macs / (t[0] * 1e-3) / 1e12;
     std::printf("%5d %-22s %11.3f %11.2f %11.1f %11.3f %11.3f %11.3f\n", M, c.tag, t[0], tmacs,
                 2 * tmacs, t[1], t[2], t[1] - t[2]);
-    // item 1: staging isolado
-    const double wts = (double)N * (double)K;
+    // item 1: staging isolado. Com BM < M o peso e' estagiado DE NOVO por
+    // fatia de M (a grade tem M/BM blocos em y), entao o total de pesos
+    // estagiados por passada e' N*K*(M/BM) -- e' o custo que decide.
+    const int m_tiles = (M + c.BM - 1) / c.BM;
+    const double wts = (double)N * (double)K * (double)m_tiles;
     const double src_b = wts * (double)kBlockBytes / (double)kQK;
     const double lds_b = wts * 2.0;
-    const int n_cta = (int)(N / c.BN) * (int)((M + c.BM - 1) / c.BM);
+    const int n_cta = (int)(N / c.BN) * m_tiles;
     const double t_w = (t[1] - t[2]) > 0 ? (t[1] - t[2]) : t[1];
     std::printf(
         "      staging (ativacao+peso, modo 1): %.3f ms -> %.1f G pesos/s | fonte %.1f GB/s |\n"
