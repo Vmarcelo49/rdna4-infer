@@ -521,10 +521,10 @@ O escape `\x9C` é seguido de `e`, que é dígito hexadecimal: o compilador lê 
   U+FF5C, e esse texto não existe no vocab, então o `token_to_id_.find(txt)` simplesmente não
   acha (os FIM 248063/248064/248065 vêm da outra lista, `kFimTexts`, e o `check-eog` passa
   5/5). É uma bomba-relógio de manutenção, não um bug ativo.
-- **Correção:** quebrar o literal (`"<\xEF\xBD\x9C" "end" …`) ou usar `"\uFF5C end…"` com
-  `u8`/UTF-8 direto no arquivo. Vale corrigir junto com qualquer mexida no tokenizer.
+- **Correção:** quebrar o literal (`"<\xEF\xBD\x9C" "end" …`) ou escrever os bytes UTF-8
+  direto no arquivo, sem escapes. Vale corrigir junto com qualquer mexida no tokenizer.
 
-### 6.7 `hypcc`/`hipcc` **não** é aceito pelo CMake (o comentário do arquivo confere)
+### 6.7 `hipcc` **não** é aceito pelo CMake (o comentário do arquivo confere)
 
 ```
 $ cmake -S . -B /tmp/cfg-hipcc -DCMAKE_HIP_COMPILER=/opt/rocm/bin/hipcc
