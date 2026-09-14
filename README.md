@@ -423,9 +423,27 @@ Ordered by how much they cost the user, with the number that justifies each. Not
    The spread from the smallest to the largest cache that runs is **1.9 %**: at 131K the
    decode is limited by attention latency/occupancy (165-172 GB/s effective on the weights,
    27-29 % of peak), not by KV bandwidth, so the format choice is quality plus headroom.
-   Default is `q5_0`/`q4_1` because it leaves 1.68 GiB for the MTP state planes; `q8_0`/`q4_1`
-   is the documented better-quality trade (mean KLD 0.002920 against 0.004181 for `K q5_0`,
-   measured upstream on Qwen3.5, `docs/referencias-noturnas.md`) for 0.75 GiB more.
+   Default is `q5_0`/`q4_1` because it leaves 1.68 GiB for the MTP state planes. The quality
+   question was then measured instead of assumed — mean KL over the full vocabulary at 4096
+   tokens of real text (256 probes, `docs/journal-kv.md` §7.1):
+
+   | K / V | mean KL (nats/pos) | PPL | greedy token changed |
+   |---|---|---|---|
+   | `f16`/`f16` (reference) | 0 | 5.91711 | 0/256 |
+   | `q8_0`/`q8_0` | **0.000492** | 5.92405 | 3/256 |
+   | `q8_0`/`q4_1` | 0.001443 | 5.93386 | 5/256 |
+   | **`q5_0`/`q4_1`** (default) | 0.001715 | 5.95800 | 4/256 |
+   | `q5_0`/`q4_0` | 0.002118 | 5.93234 | 7/256 |
+   | `q4_0`/`q4_0` | 0.003208 | 5.93976 | 8/256 |
+
+   Isolating each axis: **K `q8_0` is 16 % lower KL than K `q5_0`** (0.001443 vs 0.001715, with
+   V fixed) and **V `q4_1` is 19 % lower KL than V `q4_0`** (0.001715 vs 0.002118, with K
+   fixed) — the same directions llama.cpp's PR #21038 measured, now reproduced here. So the
+   night's premise holds: `q4_1` for V pays, and `q4_0` must not be used for K (worst of all,
+   0.003208). `q8_0`/`q4_1` is the better-quality option (16 % less KL for 0.75 GiB more) for
+   anyone not spending that headroom on MTP. Note that **perplexity does not order these
+   formats**: `q5_0`/`q4_0` beats `q5_0`/`q4_1` on PPL (5.932 vs 5.958) while having 23 % more
+   KL and nearly double the greedy divergence — PPL is blind to this, KL is not.
 3. **MTP (block 64) is implemented and exact but does not pay yet.** The NextN head drafts at
    86.7 % acceptance (llama.cpp's own driver: 87.5 %) and `--mtp` output is byte-identical to
    plain greedy — but every mode still runs one trunk forward per committed token, so it

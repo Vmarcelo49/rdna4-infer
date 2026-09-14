@@ -127,6 +127,21 @@ pior. Repassado à frente KV.
   está nisso.
 - **Veredito**: ainda em medição; o relatório da frente decide.
 
+### C7. A premissa do alvo foi testada e confirmada (frente KV, 04:00)
+- **Hipótese do enunciado**: "K `q5_0` + V `q4_1` é o ponto doce do KV".
+- **Medido** (KL média sobre o vocabulário, 4096 tokens de texto real, 256 probes, piso f16
+  rodado duas vezes, mesmo processo): `q8_0/q8_0` **0,000492** · `q8_0/q4_1` 0,001443 ·
+  **`q5_0/q4_1` 0,001715** · `q5_0/q4_0` 0,002118 · `q4_0/q4_0` 0,003208.
+- **Eixos isolados**: K `q8_0` é **16 % melhor** que K `q5_0` (V fixo em q4_1) e V `q4_1` é
+  **19 % melhor** que V `q4_0` (K fixo em q5_0). As duas direções que o PR #21038 do llama.cpp
+  mediu em Qwen3.5, reproduzidas aqui — e `q4_0` em K é o pior de todos.
+- **Needle a 8K**: 8/8 agulhas recuperadas em **todos** os formatos, inclusive `q4_0/q4_0` —
+  a sonda não discrimina nesse tamanho; a KL é que ordena.
+- **PPL não ordena** (medido, não argumentado): a ordem por PPL e a ordem por KL discordam
+  nos dois configs do meio, e `q5_0/q4_0` tem PPL *melhor* que `q5_0/q4_1` com 23 % mais KL.
+- **Veredito**: MANTIDO o padrão `q5_0/q4_1` (é o alvo, KL é o 2º melhor e sobram 1,68 GiB para
+  o MTP); `q8_0/q4_1` documentado como a opção de melhor qualidade (0,75 GiB a mais).
+
 ## Estado do alvo (atualizado pelo coordenador)
 
 - **131K**: ainda não medido nesta rodada. No baseline, 131K com KV `q4_0` roda a 14,0 tok/s
