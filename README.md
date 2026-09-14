@@ -204,7 +204,7 @@ is comparable (64 tokens).
 | decode, 64K `f16` | **does not fit**: 2.1 GB spill to GTT, 2.16-7.97 tok/s | — |
 | decode, 64K `q8_0` | **19.3 tok/s** (13.75 GiB in use; the measurement front's window saw 18.28 on the same configuration) | — |
 | decode, 128K `q4_0` | **14.0 tok/s** (13.88 GiB in use) | — |
-| prefill, batched (N≤16) | **72.9 tok/s** on a 512-token prompt; 56.7 on a 64-token prompt | 575 ± 65 tok/s (pp64, re-measured; 440 ± 77 recorded in M5 — pp64 is noisy), 1143 ± 30 (pp512) |
+| prefill, batched (N≤16) | **123.9 tok/s** on a 512-token prompt (73.05 at the start of the night; +69.7 % from batching the per-token scaffolding) | 575 ± 65 tok/s (pp64, re-measured; 440 ± 77 recorded in M5 — pp64 is noisy), 1143 ± 30 (pp512) |
 | weight bandwidth, end to end | **325 GB/s at 4K = 51 %** of the measured 633 GB/s DRAM roofline | ≥442 GB/s (derived) |
 | weight bandwidth, matvec alone | **436 GB/s = 69 %**; the LM head reaches 620 GB/s = 98 % | — |
 | IQ4_XS decode, 4K `f16` | 27.0 tok/s | — |
@@ -367,15 +367,20 @@ noise, not engine risk.
 Ordered by how much they cost the user, with the number that justifies each. Nothing here is
 "should be fine" — each line is a measurement or a code fact with a pointer.
 
-1. **Prefill is the weak number: 72.9 tok/s at 512 tokens against llama.cpp's 1143 (a 15×
-   gap)**, so a 4K prompt costs ~56 s before the first token. The matvec is *not* the whole
+1. **Prefill is still the weak number: 123.9 tok/s at 512 tokens against llama.cpp's 1143 (a
+   9× gap)**, so a 4K prompt costs ~33 s before the first token (was 56 s at the start of the
+   night; the batching of the per-token scaffolding bought +69.7 %). The matvec is *not* the whole
    story: inside `forward_batch` the weight pass is shared across the 16-token chunk, but the
    attention, the GDN recurrence, the norms and the elementwise chains still run **per token**
    (~11 ms/token of scaffolding, measured in `docs/medicoes-banda-e-gargalos.md` §1), which is
    ~80 % of prefill time. Even with an infinitely fast matvec that scaffolding caps prefill
-   near 145 tok/s. Two honest routes: batch the scaffolding (the prefill front's work) or
-   replace the `vec_dot` with a tiled MMQ-style int8 kernel (weights in LDS, WMMA int8 —
-   possible on this card, but it gives up bit-exactness and needs numeric gating).
+   near 145 tok/s — a bound the night already beat by batching, which moved the ceiling too.
+   What is left is the batched matvec itself: it re-runs the dequantization/LUT/sign assembly
+   once per token (`matvec.cuh` `matvec_kernel_batch`), reading 12 GB per 16-token chunk at
+   **109 GB/s** against 446 GB/s for the same weights on the per-token path. Hoisting the
+   block dequantization out of the token loop is bit-exact and worth an estimated 2-2.5×
+   (≈200 tok/s); past that the route is a tiled MMQ-style int8 kernel (weights in LDS, WMMA
+   int8 — possible on this card, gives up bit-exactness, needs numeric gating).
 2. **The KV cache has a cliff, not a curve — and at 131K the format buys quality, not
    speed.** IQ3_S + `f16` KV fits to 48K; at 64K it spills ~2.1 GB into GTT and decode
    collapses from ~18 to **2.16-7.97 tok/s** with no error message, and `f16` at 131K does

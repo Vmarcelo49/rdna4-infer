@@ -626,6 +626,26 @@ coordenador:
 Regras do lote: cada agente só commita na sua branch; o merge é em série; GPU só com o
 lock; agente que não precisa de GPU não usa GPU.
 
+### Frente prefill da rodada noturna (merge `264044e`)
+
+O andaime que rodava por token **dentro** do `forward_batch` virou kernels em lote (atenção
+com máscara causal, recorrência GDN com os tokens andados dentro do kernel, `conv1d`, normas,
+escalares e `kv_write` em um lançamento), mais o `delta_rule` lendo a linha do estado com
+`float4` (a warp lia a 512 B de distância = 8× de amplificação de setor). Medido em janela
+limpa, `bench --prefill 512 --prefill-reps 3`, melhor de 3, piso de ruído 1,2 %:
+
+| | prefill 512 tokens |
+|---|---|
+| baseline da noite | 73,05 tok/s |
+| + andaime em lote | 104,5 tok/s (+40,6 %) |
+| + `delta_rule` com `float4` | **123,9 tok/s (+69,7 %)** |
+
+`check-batch-gpu` continua **BIT-EXACT** em N=2/3/4/8/16 e no prompt completo, e o
+`check-graph-gpu` passa. O que sobrou: o matvec em lote lê 12,0 GB por chunk de 16 em 110 ms
+(**109 GB/s**) contra 446 GB/s do caminho por token, porque o `vec_dot` reexecuta a
+dequantização/LUT/sinais N vezes — dequantizar o bloco uma vez e fazer N `dp4a` é o item
+seguinte (estimativa de 2-2,5× no matvec ⇒ ~200 tok/s de prefill).
+
 ### O que o autotuning embarcou (medido, com A/B intercalado e piso de ruído de 1,001×)
 
 - **`UNROLL=2`** nos quatro tipos de ILP=1 (`iq3_s` **1,073×**, `iq3_xxs` 1,031×,
