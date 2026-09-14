@@ -81,6 +81,7 @@ fresh machine, all verified there:
 
 # benchmark (decode/prefill tok/s, VRAM, effective bandwidth)
 ./build/rdna4-infer bench -m model.gguf -n 64 --reps 3
+./build/rdna4-infer bench -m model.gguf --prefill 512 --prefill-reps 3   # prefill only, best of 3
 ./build/rdna4-infer bench -m model.gguf --ctx-size 131072 --start-pos 131000 \
     --cache-type-k q4_0 --cache-type-v q4_0 --fill-cache     # long-context decode
 
@@ -277,6 +278,30 @@ and separates the two error sources. The result is counter-intuitive and useful:
 - Measured recommendation: **IQ3_S + `f16` KV up to 48K**, **IQ3_S + `q8_0` KV above ~56K**.
   IQ4_XS does not even initialize at 48K with `q4_0` KV or 32K with `f16` (`hipMalloc`
   measured), so it is not the file to use for long context on this card.
+
+## The 131K target, as measured tonight
+
+The night's target was **131K of context with the KV cache quantized to `q5_0` (K) / `q4_1`
+(V) and MTP delivering a real speedup**. State of each part, with the number that supports it:
+
+- **KV `q5_0`/`q4_1` implemented and measured at 131K**: 13.73 tok/s, 14.25 GiB of VRAM in
+  use, 1.68 GiB free, no GTT spill. The two new formats were validated byte-for-byte against
+  llama.cpp's reference quantizers (0 differing bytes on 8 patterns) and their load paths match
+  the reference dequantization exactly (`max|gpu−cpu| = 0`).
+- **At 131K the KV format does not buy speed** (13.73 to 14.34 tok/s across a 2× range of
+  cache sizes): the decode is limited by attention latency/occupancy (165-172 GB/s effective
+  on the weights, 27-29 % of peak). So the choice is quality and headroom, and `q8_0`/`q4_1`
+  (best measured mean KLD, 0.93 GiB free) is the documented alternative for non-MTP use.
+- **`f16`/`f16` at 131K does not allocate** (`hipMalloc failed`): 8 GiB of KV do not fit.
+- **Prefill, which is what makes a long context usable at all**, went from 73.05 to
+  **123.9 tok/s** (+69.7 %, bit-exact) by batching the per-token scaffolding; a real 131K
+  prompt therefore costs ~18 minutes before the first token. Everything about the 131K decode
+  numbers above is a *synthetic seeded cache* (`bench --start-pos --fill-cache`): the cost of
+  decoding at that position, not the quality of a real 131K conversation.
+- **Quality at long context**: the RoPE path is verified against the reference up to position
+  262 143 (see limitation 5), and per-chunk perplexity against llama.cpp is ≤ 0.25 % at
+  512-token windows. Quality with **real text** was probed to 16-24K tonight; a real 131K
+  quality measurement does not fit in a night at 123.9 tok/s of prefill.
 
 ## How it compares to llama.cpp's Vulkan backend
 
