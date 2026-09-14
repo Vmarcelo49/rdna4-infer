@@ -1033,6 +1033,8 @@ inline bool attn_split_batch_launch(const float *d_q, const void *d_k, const voi
         RD_ATTN_SB_PAIR(KvType::F32, F16);
         RD_ATTN_SB_PAIR(KvType::F32, Q8_0);
         RD_ATTN_SB_PAIR(KvType::F32, Q4_0);
+        RD_ATTN_SB_PAIR(KvType::F32, Q5_0);
+        RD_ATTN_SB_PAIR(KvType::F32, Q4_1);
       }
       break;
     case KvType::F16:
@@ -1041,6 +1043,8 @@ inline bool attn_split_batch_launch(const float *d_q, const void *d_k, const voi
         RD_ATTN_SB_PAIR(KvType::F16, F16);
         RD_ATTN_SB_PAIR(KvType::F16, Q8_0);
         RD_ATTN_SB_PAIR(KvType::F16, Q4_0);
+        RD_ATTN_SB_PAIR(KvType::F16, Q5_0);
+        RD_ATTN_SB_PAIR(KvType::F16, Q4_1);
       }
       break;
     case KvType::Q8_0:
@@ -1049,6 +1053,8 @@ inline bool attn_split_batch_launch(const float *d_q, const void *d_k, const voi
         RD_ATTN_SB_PAIR(KvType::Q8_0, F16);
         RD_ATTN_SB_PAIR(KvType::Q8_0, Q8_0);
         RD_ATTN_SB_PAIR(KvType::Q8_0, Q4_0);
+        RD_ATTN_SB_PAIR(KvType::Q8_0, Q5_0);
+        RD_ATTN_SB_PAIR(KvType::Q8_0, Q4_1);
       }
       break;
     case KvType::Q4_0:
@@ -1057,6 +1063,32 @@ inline bool attn_split_batch_launch(const float *d_q, const void *d_k, const voi
         RD_ATTN_SB_PAIR(KvType::Q4_0, F16);
         RD_ATTN_SB_PAIR(KvType::Q4_0, Q8_0);
         RD_ATTN_SB_PAIR(KvType::Q4_0, Q4_0);
+        RD_ATTN_SB_PAIR(KvType::Q4_0, Q5_0);
+        RD_ATTN_SB_PAIR(KvType::Q4_0, Q4_1);
+      }
+      break;
+    // Q5_0/Q4_1 (the KV front's formats, and the night's target): the same 4x4
+    // product, so the switch is exhaustive again and the target KV gets the batched
+    // split kernel instead of the per-token fallback. The `-Wswitch` warning the
+    // prefill front left here on purpose (20 of them) is what pointed at the gap.
+    case KvType::Q5_0:
+      switch (vt) {
+        RD_ATTN_SB_PAIR(KvType::Q5_0, F32);
+        RD_ATTN_SB_PAIR(KvType::Q5_0, F16);
+        RD_ATTN_SB_PAIR(KvType::Q5_0, Q8_0);
+        RD_ATTN_SB_PAIR(KvType::Q5_0, Q4_0);
+        RD_ATTN_SB_PAIR(KvType::Q5_0, Q5_0);
+        RD_ATTN_SB_PAIR(KvType::Q5_0, Q4_1);
+      }
+      break;
+    case KvType::Q4_1:
+      switch (vt) {
+        RD_ATTN_SB_PAIR(KvType::Q4_1, F32);
+        RD_ATTN_SB_PAIR(KvType::Q4_1, F16);
+        RD_ATTN_SB_PAIR(KvType::Q4_1, Q8_0);
+        RD_ATTN_SB_PAIR(KvType::Q4_1, Q4_0);
+        RD_ATTN_SB_PAIR(KvType::Q4_1, Q5_0);
+        RD_ATTN_SB_PAIR(KvType::Q4_1, Q4_1);
       }
       break;
   }
