@@ -107,6 +107,26 @@ pior. Repassado à frente KV.
   medição da noite ser menor do que o planejado — e por isso a limitação vai escrita no
   relatório.
 
+### C6. Economia do MTP medida pela própria frente (03:55, antes da varredura final)
+- **Referência**: `docs/mtp.md`; a projeção antiga de 2,5× e a recalibração da frente de
+  referências para 1,3-1,5× (com o `cf(N)` velho).
+- **Peças medidas** (`/tmp/mtp-gate2.log`, gates do próprio worktree): passo de rascunho
+  **2,21 ms** (6,7-6,8 % de um passo do tronco); *snapshot+restore* do estado GDN
+  **0,53 ms por par** (149,6 MiB); verificação em lote: 2 linhas 32,6 ms, 3 linhas 36,7,
+  4 linhas 43,9 ⇒ **custo marginal de uma linha extra = 7,2 ms** contra 32,7 ms de um passo
+  por token.
+- **O que isso implica**: com D=4 (verificação de 5 linhas ≈ 51 ms + 4 rascunhos ≈ 8,8 ms, mais
+  o raro restore/replay) e ~3,8 tokens aceitos por rodada, o custo por token cai para ~16 ms
+  contra 33 ms — da ordem de **~2×**, e não os 1,3-1,5× que a recalibração previa com o
+  `forward_batch` antigo. A frente está medindo.
+- **Prova de correção que já existe**: o *snapshot/restore* do estado reproduz as linhas do
+  lote de forma **bit-idêntica** (`max|d| = 0, argmax igual`) — é o que torna a rejeição de
+  rascunho segura, e era o ponto que eu tinha marcado como "a crux" no briefing.
+- **Aberta**: 1 falha no gate deles ("um passo de rascunho por proposta mais uma linha de
+  reconstrução de KV por token aceito") — é eficiência do caminho novo, não correção; a frente
+  está nisso.
+- **Veredito**: ainda em medição; o relatório da frente decide.
+
 ## Estado do alvo (atualizado pelo coordenador)
 
 - **131K**: ainda não medido nesta rodada. No baseline, 131K com KV `q4_0` roda a 14,0 tok/s
