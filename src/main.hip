@@ -349,6 +349,13 @@ int cmd_bench(int argc, char **argv) {
   sp.seed = seed;
   rdna4::Sampler sampler;
   sampler.init(sp, (std::int32_t)graph.n_vocab());
+  // The bench is greedy (temp = 0, no penalties): the token is the device argmax,
+  // which is exactly what Sampler would return, and the 993 KB logits copy per
+  // token disappears from the measurement (it is part of the token cost the bench
+  // reports, so this changes the number for the better and honestly).
+  const bool argmax_only =
+      sp.temp <= 0.0f && (sp.repeat_penalty == 1.0f || sp.repeat_last_n <= 0);
+  graph.set_want_argmax(argmax_only);
 
   graph.set_want_hidden(false);  // the bench does not use `hidden`
   std::vector<float> hidden, logits;
@@ -370,7 +377,37 @@ int cmd_bench(int argc, char **argv) {
   }
   const double t_prefill = now_s() - tp0;
 
-  const std::size_t bytes_per_token = loader.total_bytes();
+  // Per-token weight traffic = what decode actually reads: the whole file minus
+  // the embedding matrix (one row is read, not the matrix), minus the MTP block
+  // (never executed by the engine) and minus every tensor that is not a weight
+  // matvec (F32 norms, 1-D tensors). The bench used to report
+  // loader.total_bytes() -- the *file* size, 12.030 GB -- as the per-token
+  // traffic, which made every published bandwidth 8.2% optimistic (review finding
+  // F4). The exclusion rule is the one docs/quants-inventario.md 3 and
+  // tests/bench_matvec_shapes_gpu.hip already use.
+  std::size_t bytes_per_token = 0;
+  {
+    std::size_t emb_row = 0;
+    for (std::size_t i = 0; i < loader.n_tensors(); ++i) {
+      const auto &info = loader.meta().tensors[i];
+      const std::string &name = info.name;
+      const std::size_t tb = loader.tensor_bytes(i);
+      if (name == "token_embd.weight") {
+        emb_row = info.dims.size() == 2 && info.dims[1] > 0
+                      ? tb / (std::size_t)info.dims[1]
+                      : 0;
+        continue;
+      }
+      rdna4::MatvecShape shape{};
+      const int dt = (int)loader.dtype(i);
+      if (name.rfind("blk.64.", 0) == 0 || !rdna4::matvec_shape(dt, shape) ||
+          info.dims.size() != 2 || (std::int64_t)info.dims[0] % shape.qk != 0) {
+        continue;
+      }
+      bytes_per_token += tb;
+    }
+    bytes_per_token += emb_row;
+  }
   const double gib = 1024.0 * 1024.0 * 1024.0;
 
   // decode: warm up outside the timed window, then `reps` timed passes
@@ -390,7 +427,8 @@ int cmd_bench(int argc, char **argv) {
     std::size_t pos = first_pos;
     for (long long i = 0; i < n; ++i) {
       const double s0 = now_s();
-      const std::int32_t id = sampler.sample(logits.data(), history);
+      const std::int32_t id =
+          argmax_only ? graph.last_argmax() : sampler.sample(logits.data(), history);
       sample_ms += (now_s() - s0) * 1000.0;
       if (id < 0) return false;
       history.push_back(id);
@@ -1188,6 +1226,14 @@ int cmd_run(int argc, char **argv) {
   }
   rdna4::Sampler sampler;
   sampler.init(sp, (std::int32_t)graph.n_vocab());
+  // Greedy fast path: with temp <= 0 and no repeat penalty, the sampler's whole
+  // chain reduces to "first strict maximum in id order" (Sampler::filter, temp <=
+  // 0 branch) -- which the device can compute without shipping the 993 KB logits
+  // vector to the host every token. Any other setting keeps the host path, so the
+  // sampled and penalised cases are bit-for-bit what they were.
+  const bool argmax_only =
+      sp.temp <= 0.0f && (sp.repeat_penalty == 1.0f || sp.repeat_last_n <= 0);
+  graph.set_want_argmax(argmax_only);
   const double t_loaded = now_s();
 
   if (stats) {
@@ -1354,7 +1400,7 @@ int cmd_run(int argc, char **argv) {
   bool hit_eos = false;
   const double t_gen0 = now_s();
   for (long long step = 0; step < n_predict; ++step) {
-    if (verbose) {
+    if (verbose && !argmax_only) {
       const std::vector<rdna4::Candidate> cands = sampler.filter(logits.data(), history);
       std::fprintf(stderr, "step %lld: %zu candidate(s):", step, cands.size());
       for (std::size_t c = 0; c < cands.size() && c < 5; ++c) {
@@ -1362,7 +1408,10 @@ int cmd_run(int argc, char **argv) {
       }
       std::fprintf(stderr, "\n");
     }
-    const std::int32_t id = sampler.sample(logits.data(), history);
+    // In argmax_only mode the token is already known (computed on the device in
+    // the forward); the host sample would return exactly the same id.
+    const std::int32_t id =
+        argmax_only ? graph.last_argmax() : sampler.sample(logits.data(), history);
     if (id < 0) {
       std::fprintf(stderr, "rdna4-infer: sampler produced no token (empty candidate set)\n");
       return 1;

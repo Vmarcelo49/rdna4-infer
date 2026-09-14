@@ -181,8 +181,8 @@ decode collapses from ~18 to **2.16 and 7.97 tok/s** in two identical runs, with
 and `/dev/kfd` empty. Phases that read a lot fail together (attention 13.3×, matvecs 6-23×)
 while the cheap ones do not move: the signature of traffic over the system bus, not of
 contention. Above ~56K the supported configuration is **KV `q8_0`**, which is also *faster*
-than `q4_0` at 64K (18.28 vs 18.10-18.17 tok/s; attention 19.87 vs 21.03 ms) and leaves
-2.18 GiB free — attention there is issue-bound in the dequantization, not bandwidth-bound, so
+than `q4_0` at 64K (18.28 vs 18.10-18.17 tok/s in the measurement front's window; attention
+19.87 vs 21.03 ms) and leaves 2.18 GiB free — attention there is issue-bound in the dequantization, not bandwidth-bound, so
 paying for the extra precision costs nothing.
 
 ## Measured numbers
@@ -196,13 +196,13 @@ is comparable (64 tokens).
 | | this engine | llama.cpp Vulkan, same machine |
 |---|---|---|
 | decode, short context (positions 5-37) | **30.4 tok/s** (best of 3; 29.5 mean) | 40.0 ± 0.02 tok/s (tg64; 39.7 in M5) |
-| decode, end of 4K `f16` | **29.3 tok/s** (34.2 ms/token, 352 GB/s of weights) | 37-38 tok/s at 32K (`llama-cli`) |
+| decode, end of 4K `f16` | **29.3 tok/s** (34.2 ms/token, 325 GB/s of weights) | 37-38 tok/s at 32K (`llama-cli`) |
 | decode, 16K `f16` | **26.7 tok/s** (321 GB/s of weights) | — |
 | decode, 64K `f16` | **does not fit**: 2.1 GB spill to GTT, 2.16-7.97 tok/s | — |
-| decode, 64K `q8_0` | **19.3 tok/s** (13.75 GiB of VRAM in use) | — |
+| decode, 64K `q8_0` | **19.3 tok/s** (13.75 GiB in use; the measurement front's window saw 18.28 on the same configuration) | — |
 | decode, 128K `q4_0` | **14.0 tok/s** (13.88 GiB in use) | — |
 | prefill, batched (N≤16) | **72.9 tok/s** on a 512-token prompt; 56.7 on a 64-token prompt | 575 ± 65 tok/s (pp64, re-measured; 440 ± 77 recorded in M5 — pp64 is noisy), 1143 ± 30 (pp512) |
-| weight bandwidth, end to end | **352 GB/s at 4K = 56 %** of the measured 633 GB/s DRAM roofline | ≥442 GB/s (derived) |
+| weight bandwidth, end to end | **325 GB/s at 4K = 51 %** of the measured 633 GB/s DRAM roofline | ≥442 GB/s (derived) |
 | weight bandwidth, matvec alone | **436 GB/s = 69 %**; the LM head reaches 620 GB/s = 98 % | — |
 | IQ4_XS decode, 4K `f16` | 27.0 tok/s | — |
 | perplexity (wikitext-2, 10×512 tokens, per position) | within **0.25 %** (IQ3_S) / **0.15 %** (IQ4_XS) | reference |
@@ -239,13 +239,14 @@ Full detail in `docs/medicoes-banda-e-gargalos.md` §1.
 
 | phase | ms/token | share | lever measured |
 |---|---|---|---|
-| weight matvec (496 launches + LM head) | 24.94 | 69.3 % | issue-bound at 436 GB/s: 5.9 ms recoverable in the `vec_dot` bodies |
+| weight matvec, trunk (496 launches) | 23.51 | 65.3 % | issue-bound at 436 GB/s: 5.9 ms recoverable in the `vec_dot` bodies |
 | GDN recurrence (`delta_rule` 3.97 + conv + scalars + norms) | 5.63 | 15.6 % | 48 CTAs = 9 % occupancy; a 4-threads-per-row rewrite is worth up to ~3 ms |
 | norms / rope / elementwise | 2.96 | 8.2 % | fusing `rms_norm`+`quantize`, the GDN scalars and `kv_write` 8→1 ≈ 1.1 ms |
-| LM head + logits copy + sampler | 2.08 | 5.8 % | the LM head is at 98 % of the read roofline (874 MB/token, unavoidable) |
+| LM head (1 launch) | 1.43 | 4.0 % | at 98 % of the read roofline (874 MB/token, unavoidable) |
 | attention (16 layers, split) | 1.38 | 3.8 % | memory-latency bound here; at 64K it becomes issue-bound in the KV dequant |
-| activation quantization | 0.88 | 2.4 % | the q8_1 activation is also the entire numerical error of the matvec (see below) |
-| **total** | **36.0** | | cross-checked against `bench` (36.29 ms) at the same position |
+| activation quantization (257 launches) | 0.88 | 2.4 % | the q8_1 activation is also the entire numerical error of the matvec (see below) |
+| logits copy + sampler | 0.65 | 1.8 % | 993 KB per token; the greedy path now takes the argmax on the device |
+| **total** | **36.4** | | clean measurement at the same position: 35.65 ms; the head appears once |
 
 The 1 940 launches per token cost ~4.0 ms (11 %) at the measured 2.2-3.5 µs dispatch floor —
 but measure before believing it: replaying the same launch sequence as a HIP graph bought only
