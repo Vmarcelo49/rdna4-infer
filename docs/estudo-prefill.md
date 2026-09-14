@@ -386,12 +386,17 @@ A ISA confirma que o motor e a bancada emitem a **mesma sequência** por bloco d
 não precisa de gate numérico/PPL, ao contrário da rota f16 (rel-L2 2,07e-4) e ao contrário do que
 eu tinha escrito de manhã.
 
-**Velocidade: 7,5 / 16,7 / 19,7 / 22,8 T-MAC/s em M=16/64/128/512** = 3,8-11,8 % do pico remedido na
-mesma janela (198 T-MAC/s). Contra o dp4a tilejado **com o mesmo staging e a mesma correção**, na
+**Velocidade: 7,5 / 16,7 / 19,7 / 22,8 T-MAC/s em M=16/64/128/512** = 3,8-11,8 % do pico
+remedido na mesma janela (**198,0 T-MAC/s**; a frente D mediu 182 numa janela diferente — a placa
+esteve compartilhada e os absolutos variaram 1,5-1,6× entre janelas, então **o que vale são as
+razões intra-janela**: 4,12× WMMA/dp4a no pico). Contra o dp4a tilejado **com o mesmo staging e a mesma correção**, na
 mesma janela: 2,82× em M=16, 1,56× em M=64, 1,68× em M=128, **1,83× em M=512**.
 
 **O ganho não é o 4,2× do pico, e o motivo tem nome e número**: a **correção de escala bit-exata
-custa 53-56 % do miolo** (miolo isolado: 84 T-MAC/s sem correção contra 37 T-MAC/s com ela). E o
+custa 53-56 % do miolo** — 132 instruções por lane por bloco de 32 (32 IMAD + 32 FMUL + 32 CVT +
+32 FMA + 4 LDS), contra 8 WMMA; o miolo isolado faz **37,0 T-MAC/s com a correção e 83,9 sem**
+(42 % do pico). A receita da frente D está certa na *forma* (`d_a` = 8 floats consecutivos = 2
+`LDS.128`, `d_w` = 1 `int2` por tile de N, sem gather) e **subestima o custo por 3,2×**. E o
 gargalo volta a ser o **staging: 50-61 % do tempo do kernel em M≥64**, a 132-275 GB/s de fonte
 contra 633 de roofline. Duplo buffer **piora 32 %** (14,46 contra 21,37 T-MAC/s em M=512) — o mesmo
 resultado negativo das frentes F e G, agora no kernel do WMMA.

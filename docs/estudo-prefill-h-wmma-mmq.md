@@ -22,8 +22,8 @@ próprio motor** (`rdna4::quantize_q8_1_batch_launch`, `matvec.cuh:78`).
    2 228 224` (M=128) e **`0 de 8 912 896` (M=512, N=17408)**; contra o
    `vec_dot_iq3_s_q8_1` do motor, `0 de 4096`; contra o oráculo de CPU,
    `0 de 256`. A ISA confirma que o motor e esta bancada emitem a **mesma
-   sequência** por bloco de 32: `v_mul_f32` (d_w·d_a), `v_mul_lo_u32`
-   (sumi·(1+2·sc) em inteiro), `v_cvt_f32_i32`, `v_fmac_f32`.
+   sequência** por bloco de 32: `v_mul_lo_u32` (sumi·(1+2·sc) em inteiro),
+   `v_cvt_f32_i32`, `v_mul_f32` (d_w·d_a), `v_fmac_f32`.
 2. **Velocidade: 7,5 / 16,7 / 19,7 / 22,8 T-MAC/s em M=16/64/128/512** = 3,8 /
    8,4 / 10,0 / **11,8 %** do pico de **198 T-MAC/s remedido na mesma janela**
    (a frente D mediu 182 numa janela diferente; contra 182 os mesmos números dão
@@ -383,7 +383,34 @@ M do lote**, com 80-82 % do tempo em staging. Se o motor não puder processar 64
 tokens por GEMM, este é o número que ele pode embarcar; se puder, o alvo é
 **19,7-22,8 T-MAC/s (0,60-0,70× o llama.cpp)** com os tiles da tabela do §3.
 
-**4. O que esta bancada não mediu** (fica para a próxima frente): a
+**4. O que os dois lados medidos juntos dão (EXTRAPOLAÇÃO, não medição).** A
+frente G (`docs/estudo-prefill-g-staging2.md`) atacou exatamente o gargalo que
+esta frente isolou: o staging dela caiu de 41-43 % para **17,0-18,3 % do kernel**
+(0,51 → 0,16 ms em M=128; 1,47 → ~0,53 ms em M=512, ~2,8× menos tempo) e a cópia
+da ativação deixou de existir, com o caminho **f16** a 12,5-14,9 T-MAC/s e a
+**95 % do muro de issue** (3,60e11 de 3,80e11 slots/s). Ou seja: a frente G
+removeu o staging e mostrou que o caminho vetorial f16 chegou ao fim da linha —
+*o que sobra lá é remover instrução de MAC*, que é precisamente o que o WMMA faz
+(8 WMMA + 132 instruções de correção por bloco de 32 por warp, contra ~512
+`v_dot2_f32_f16` do mesmo trabalho).
+
+Com os dois números na mão, o kernel combinado (staging da G + miolo desta
+frente) fica em **27-34 T-MAC/s** em M=512:
+
+```
+staging da G (M=512, BM128 BN128) ......... ~0,36 ms   (2,8x menos que os 1,00 ms daqui)
+miolo desta frente, sem staging ........... 0,99 ms (medido no GEMM, com sobreposição entre CTAs)
+                                        ou 1,33 ms (modo 4, miolo isolado, sem sobreposição)
+total ..................................... 1,35-1,69 ms -> 33,8-27,0 T-MAC/s
+```
+
+Isto é: **0,83-1,03× o prefill do llama.cpp (32,7 T)** — o empate, não a vitória.
+E, nessa configuração, o próximo muro passa a ser a correção de escala, que hoje
+é 0,589 ms = **30 % do kernel** e 53-56 % do miolo. A ordem que os números impõem
+para o D4 é: (i) juntar as duas frentes (o staging da G com o miolo daqui);
+(ii) atacar a correção, que é o único item que sobra entre o empate e o ganho.
+
+**5. O que esta bancada não mediu** (fica para a próxima frente): a
 especialização de warps no staging (produtor/consumidor), que é a única alavanca
 apontada e não testada; o `ffn_down` (K=17408) e os tensores de atenção
 (5120×5120), onde o paralelismo de N cai; os outros tipos do inventário

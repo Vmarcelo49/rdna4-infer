@@ -107,7 +107,8 @@ sugere, porque o andaime não melhora junto:
 | D2 (frente G, V6) | 12,74 (M=128) | 4,0× | 1,774 | **~331 tok/s** | **2,7×** |
 | D2 em M=512 | 14,71 | 4,6× | 1,538 | **~347 tok/s** | 2,8× |
 | D4 (frente H, medido) | 22,8 | 7,2× | 0,990 | **~471 tok/s** | **3,8×** |
-| D4 + staging consertado (50-61 % do GEMM) | ~40 | 12,6× | 0,564 | **~613 tok/s** | 5,0× |
+| D4 com o staging da frente G (EXTRAPOLAÇÃO da frente H, não medida) | 27-34 | 8,5-10,7× | 0,66-0,84 | **~508-559 tok/s** | 4,1-4,5× |
+| e o teto do próprio WMMA com correção grátis | ~32 | 10,1× | 0,70 | **~545 tok/s** | 4,4× |
 | D4 no ritmo do llama.cpp | 32,7 | 10,3× | 0,690 | **~548 tok/s** | 4,4× |
 | D4 + andaime no ritmo deles | 32,7 | 10,3× | 0,690 | **~1050 tok/s** | 8,5× |
 
