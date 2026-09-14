@@ -1138,7 +1138,8 @@ int main(int argc, char **argv) {
         const int iters = (int)std::max(50.0, 4.0 / t1);
         double best = 1e9;
         for (int r = 0; r < 5; ++r) best = std::min(best, ev([&] { launch(iters); }));
-        const double per_s = macs_per_warp_iter * (double)ct * iters / (best * 1e-3);
+        // `ct` CTAs x 8 warps: MAC/s = MAC por warp por iteracao x nwarps x iters / t
+        const double per_s = macs_per_warp_iter * (double)ct * 8.0 * iters / (best * 1e-3);
         std::printf("  pico %s CTAs=%-4d (U=8, 8 cadeias, iters=%d): %.3f ms -> %.2f T-MAC/s\n",
                     name, ct, iters, best, per_s / 1e12);
         if (per_s > best_of_all) {

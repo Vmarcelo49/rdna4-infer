@@ -94,6 +94,27 @@ A transposição de D é boa notícia para a correção de escala: `d_w` é **1 
 são **8 floats consecutivos** (os 8 m do lane) — 2 `LDS.128` + 1 `LDS.32` + 8 FMA por lane por
 bloco de 32, sem gather.
 
+## 1b. O teto real de cada degrau, por Amdahl (aritmética sobre o orçamento medido)
+
+A frente C mediu o orçamento dentro do grafo a N=64: **matvec 7,103 ms/token**, andaime
+**1,13 ms/token** (dos quais **GDN recorrência 0,852**), total 8,233 ms/token = 123,4 tok/s. Com
+isso dá para dizer o que cada degrau entrega de verdade — e é menos do que a razão do kernel
+sugere, porque o andaime não melhora junto:
+
+| degrau | T-MAC/s do matvec | fator | matvec ms/token | **prefill total** | ganho real |
+|---|---|---|---|---|---|
+| hoje | 3,18 | 1,00× | 7,103 | **123,4 tok/s** | — |
+| D2 (frente G, melhor variante) | 12,49 (M=128) | 3,93× | 1,808 | **~325 tok/s** | **2,6×** |
+| D2 em M=512 | 14,89 | 4,68× | 1,518 | **~351 tok/s** | 2,8× |
+| D4 no ritmo do llama.cpp | 32,7 | 10,3× | 0,690 | **~548 tok/s** | 4,4× |
+| D4 + andaime no ritmo deles | 32,7 | 10,3× | 0,690 | **~1050 tok/s** | 8,5× |
+
+**A lição de planejamento**: com o matvec resolvido, **o andaime passa a mandar** — 0,852 ms/token
+só de recorrência do GDN é 29 % do que sobraria no melhor caso. O degrau que chega a ~550 tok/s
+exige, além do GEMM, atacar a recorrência do GDN (é o item 5 da tabela do §3, e é o único item do
+andaime com tamanho para importar). A frente C chegou ao mesmo teto por outro caminho (446 tok/s
+com o matvec na banda de 633 GB/s).
+
 ## 2. Decisões fixadas pelo estudo
 
 1. **f16, não int8, para os tipos IQ** (frente B §7, com argumento de precisão e de código):

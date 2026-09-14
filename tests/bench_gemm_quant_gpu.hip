@@ -817,6 +817,22 @@ void launch_v2(const int stg, const int mode, const dim3 grid, const int th, con
 }
 #undef RD_V2_STG_CASE
 
+// BN=136: e' a UNICA largura de tile que faz a grade de M=128 ter 128 CTAs em vez
+// de 136 (N/136 = 128), ou seja exatamente 2 ondas num cartao de 64 CUs em vez de
+// 2,125 (a grade de 136 CTAs roda em 3 ondas porque o CTA residente e' 1: 33 KB de
+// LDS). 136 = 17x8, entao TN = 17 e o bloco tem 272 threads (8,5 warps: a ultima
+// warp tem 16 lanes ociosas, 6 % dos slots). O tile continua RM=RN=8, entao o custo
+// de instrucao por MAC nao muda. So' existe com o caminho do V6 (STG=15).
+void launch_v2_bn136(const int mode, const dim3 grid, const __half *dA, const block_iq3_s *dW,
+                     float *dC, const int N, const int K, int *regs, std::size_t *lds, int *occ) {
+  const int th = (128 / 8) * (136 / 8);  // 272
+  if (mode == 0) {
+    launch_v2_one<128, 136, 64, 8, 8, 15, 0>(grid, th, dA, dW, dC, N, K, regs, lds, occ);
+  } else if (mode == 1) {
+    launch_v2_one<128, 136, 64, 8, 8, 15, 1>(grid, th, dA, dW, dC, N, K, nullptr, nullptr, nullptr);
+  }
+}
+
 bool launch(const Cfg &c, const int mode, const int M, const std::int64_t N, const std::int64_t K,
             const __half *dA, const block_iq3_s *dW, float *dC, const bool dbuf = false) {
   const dim3 grid((unsigned)(N / c.BN), (unsigned)((M + c.BM - 1) / c.BM), 1u);
