@@ -206,14 +206,25 @@ inline std::uint64_t required_bytes(std::uint64_t weights_bytes, std::uint64_t c
 inline int prefill_chunk_cap() {
   static const int v = [] {
     const char *e = std::getenv("RD_PREFILL_CHUNK");
-    // Default 128 desde 14/09: o GEMM tilejado (include/rdna4/gemm.cuh) cobre os
-    // tipos IQ que sao 68 % dos bytes deste modelo e e' BIT-EXATO contra o
-    // `vec_dot_*` do motor, entao o `check-batch-gpu` continua passando (medido:
-    // identico ao caminho por token nos chunks 16/64/128). Medido a 512 tokens:
-    // chunk 16 = 104,86 tok/s, chunk 64 = 189,40, chunk 128 = 210,25.
-    // Custo de VRAM: +93 MiB (257,32 contra 164,28 MiB); no alvo de 131K com
-    // q5_0/q4_1 o `need` vai de 14,10 para 14,19 GiB e cabe.
-    int n = e ? std::atoi(e) : 128;
+    // DEFAULT 16 -- e o motivo esta' medido, nao e' conservadorismo.
+    //
+    // O GEMM tilejado (include/rdna4/gemm.cuh) da' 104,86 -> 231,83 tok/s a 512
+    // tokens (2,21x) com chunk 128, e e' bit-exato contra o `vec_dot_*` do motor.
+    // Mas ele NAO e' bit-exato contra o `matvec_launch_batch` que embarca hoje: a
+    // particao da soma em k e' outra (bloco de 32 em int32 com fator inteiro, em vez
+    // do acumulador por lane com reducao butterfly), e a diferenca medida e'
+    // rel-L2 2,4e-7 / max|d| 3,3e-6. Como o `prefill_ids` do CLI e o loop do
+    // servidor cortam o mesmo prompt em chunks diferentes, um prefill pode MISTURAR
+    // os dois caminhos -- e ai dois consumidores do mesmo modelo divergem no ultimo
+    // bit e, as vezes, no ultimo token: foi exatamente o que o gate do `serve`
+    // pegou (118 checks, 2 falhas com chunk 128; 0 falhas com chunk 16), e o
+    // `check-batch-gpu` NAO pega porque ele so' chama chunks <= 16.
+    //
+    // Ou seja: o chunk maior so' pode virar default junto com o re-gate NUMERICO do
+    // caminho em lote (PPL/regressao com tolerancia declarada no lugar da
+    // bit-exatidao estrita), e com os dois consumidores cortando o prompt do MESMO
+    // jeito. Ate la', `RD_PREFILL_CHUNK=128` liga o ganho de 2,21x explicitamente.
+    int n = e ? std::atoi(e) : 16;
     if (n < 16) n = 16;
     if (n > 512) n = 512;  // == Graph::kMaxChunkHost
     return n;
