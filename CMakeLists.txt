@@ -207,6 +207,15 @@ target_link_libraries(check-matmul-gpu PRIVATE ${AMDHIP64})
 
 # M7 — attention bench: shipping kernel vs the GQA-sharing prototype, at long
 # context (the fix candidate for the 174 ms/token decode step at 64K).
+add_executable(bench-wmma-gpu tests/bench_wmma_gpu.hip)
+target_compile_options(bench-wmma-gpu PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_link_options(bench-wmma-gpu PRIVATE --offload-arch=gfx1201)
+target_include_directories(bench-wmma-gpu PRIVATE include)
+if(EXISTS "/opt/rocm/include")
+  target_include_directories(bench-wmma-gpu PRIVATE /opt/rocm/include)
+endif()
+target_link_libraries(bench-wmma-gpu PRIVATE ${AMDHIP64})
+
 add_executable(bench-attn-gpu tests/bench_attn_gpu.hip)
 target_compile_options(bench-attn-gpu PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
 target_link_options(bench-attn-gpu PRIVATE --offload-arch=gfx1201)
