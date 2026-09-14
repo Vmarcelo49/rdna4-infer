@@ -35,7 +35,7 @@ void usage_info() {
   std::fprintf(stderr,
                "usage: rdna4-infer [info] [-m model.gguf] [--ctx-size N] [--cache-type-k TYPE] "
                "[--cache-type-v TYPE] [--list-tensors]\n  cache types: f32, f16 (default), "
-               "q8_0, q4_0\n");
+               "q8_0, q4_0, q5_0, q4_1\n");
 }
 
 void usage_run() {
@@ -58,8 +58,8 @@ void usage_run() {
       "  --seed N                RNG seed (default 0)\n"
       "  --greedy                same as --temp 0\n"
       "  --ctx-size N            context (default 4096)\n"
-      "  --cache-type-k TYPE     f32, f16 (default), q8_0, q4_0\n"
-      "  --cache-type-v TYPE     f32, f16 (default), q8_0, q4_0\n"
+      "  --cache-type-k TYPE     f32, f16 (default), q8_0, q4_0, q5_0, q4_1\n"
+      "  --cache-type-v TYPE     f32, f16 (default), q8_0, q4_0, q5_0, q4_1\n"
       // ---- feat/mtp ----
       "  --mtp                   use the blk.64 NextN/MTP head for speculative decoding\n"
       "  --draft N               tokens drafted per round with the MTP head (default 3)\n"
@@ -104,21 +104,12 @@ bool parse_f32(const char *s, float *out) {
   return true;
 }
 
-// "f32" | "f16" | "q8_0" | "q4_0" -> KvType (kv.h). The names match llama.cpp's
-// --cache-type-k/-v values for the types this engine implements.
+// "f32" | "f16" | "q8_0" | "q4_0" | "q5_0" | "q4_1" -> KvType (kv.h). The names
+// match llama.cpp's --cache-type-k/-v values for the types this engine
+// implements; the parse table itself lives in kv.h so the CLI, the budget and the
+// graph cannot drift apart (there used to be three copies of this list).
 bool parse_kv_type(const char *s, rdna4::KvType *out) {
-  if (std::strcmp(s, "f32") == 0) {
-    *out = rdna4::KvType::F32;
-  } else if (std::strcmp(s, "f16") == 0) {
-    *out = rdna4::KvType::F16;
-  } else if (std::strcmp(s, "q8_0") == 0) {
-    *out = rdna4::KvType::Q8_0;
-  } else if (std::strcmp(s, "q4_0") == 0) {
-    *out = rdna4::KvType::Q4_0;
-  } else {
-    return false;
-  }
-  return true;
+  return rdna4::kv_type_parse(s, out) == nullptr;
 }
 
 // The GGUF's own sampling defaults (general.sampling.*), which SPEC.md §1.4 and
@@ -149,6 +140,8 @@ const char *kv_type_cstr(rdna4::KvType t) {
     case rdna4::KvType::F16: return "f16";
     case rdna4::KvType::Q8_0: return "q8_0";
     case rdna4::KvType::Q4_0: return "q4_0";
+    case rdna4::KvType::Q5_0: return "q5_0";
+    case rdna4::KvType::Q4_1: return "q4_1";
   }
   return "?";
 }
@@ -973,13 +966,35 @@ int cmd_info(int argc, char **argv) {
   const double gib = static_cast<double>(1u << 30);
   // One source of truth for the K + V budget (device.h), the same call serve
   // makes before loading: this used to be two hand-rolled half-constant sums.
+  //
+  // The weights term is the tensors the engine actually uploads, NOT the file
+  // size, and the buffers term is computed from the shape instead of the old flat
+  // 1 GiB. Measured for this model: file 11.214 GiB, uploaded 10.877 GiB
+  // (0.327 GiB of that file is the MTP block, which the trunk never binds), and
+  // the fixed buffers 157.98 MiB. The old pair overestimated by ~1.18 GiB and
+  // refused contexts that fit (docs/journal-kv.md §6).
+  const std::uint64_t weights = rdna4::uploaded_weight_bytes(loader, cfg.block_count - 1, false);
+  // vocab for the logits buffer: the graph takes it from output.weight's dim1
+  // (model.h's config carries no vocab field).
+  std::uint64_t vocab = 0;
+  for (const auto &t : gf.tensors) {
+    if (t.name == "output.weight" && t.dims.size() > 1) vocab = t.dims[1];
+  }
+  const rdna4::GraphBufferShape shape = rdna4::graph_buffer_shape(cfg, vocab);
+  const std::uint64_t buffers_est = rdna4::graph_buffer_bytes(shape);
   const std::uint64_t kv_bytes = rdna4::kv_cache_bytes(ctx_size, kt, vt);
-  const std::uint64_t need = file_bytes + kv_bytes + rdna4::kOverheadBytes;
-  std::printf("model: %.2f GiB + kv(ctx=%llu, k=%s/v=%s): %.2f GiB + overhead: %.2f GiB = need %.2f GiB\n",
-              file_bytes / gib, (unsigned long long)ctx_size, cache_k, cache_v,
-              kv_bytes / gib, rdna4::kOverheadBytes / gib, need / gib);
+  const std::uint64_t need =
+      rdna4::required_bytes(weights, ctx_size, kt, vt, buffers_est);
+  std::printf("model file: %.2f GiB, uploaded weights: %.2f GiB, graph buffers: %.2f MiB\n",
+              file_bytes / gib, weights / gib, buffers_est / (1024.0 * 1024.0));
+  std::printf("kv(ctx=%llu, k=%s/v=%s): %.2f GiB + margin: %.2f MiB = need %.2f GiB "
+              "(file-based estimate was %.2f GiB)\n",
+              (unsigned long long)ctx_size, cache_k, cache_v, kv_bytes / gib,
+              rdna4::kOverheadBytes / (1024.0 * 1024.0), need / gib,
+              (file_bytes + kv_bytes + (1u << 30)) / gib);
   if (need > total_vram) {
-    std::fprintf(stderr, "rdna4-infer: insufficient VRAM (need %.2f GiB)\n", need / gib);
+    std::fprintf(stderr, "rdna4-infer: insufficient VRAM (need %.2f GiB, have %.2f GiB)\n",
+                 need / gib, total_vram / gib);
     return 3;
   }
   std::printf("rdna4-infer: budget OK\n");

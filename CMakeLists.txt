@@ -246,6 +246,14 @@ target_compile_options(rdna4_serve PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-a
 target_compile_options(rdna4_serve PRIVATE ${RDNA4_WARNINGS})
 target_link_options(rdna4_serve PRIVATE --offload-arch=gfx1201)
 target_link_libraries(rdna4_serve PRIVATE ${AMDHIP64})
+# PIC for the shared library, explicitly and for BOTH passes. The trap: this header
+# set keeps small host-side tables in headers (kv.h's type-name table, the attention
+# WPB knob earlier), and a HIP TU that carries a PC32 relocation to one of them from
+# its device pass fails the shared link with "recompile with -fPIC" -- which is what
+# happened when the new KV types changed which translation unit instantiates the
+# table. Making the whole target PIC removes the class instead of chasing tables.
+set_target_properties(rdna4_serve PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_options(rdna4_serve PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-fPIC>)
 target_link_libraries(rdna4-infer PRIVATE rdna4_serve)
 
 # M8 (estudo ROCm) — bench do matvec por forma real: quanto custa cada tensor do
@@ -360,3 +368,60 @@ if(EXISTS "/opt/rocm/include")
   target_include_directories(check-regression-gpu PRIVATE /opt/rocm/include)
 endif()
 target_link_libraries(check-regression-gpu PRIVATE ${AMDHIP64})
+
+# ---------------------------------------------------------------------------
+# Frente KV (worktree rdna4-wt-noite-kv) — formatos de KV Q5_0 e Q4_1 para o alvo
+# de 131K, validados contra os quantizadores de referencia do proprio llama.cpp
+# (libggml-base exporta quantize_row_q5_0_ref / q4_1_ref e dequantize_row_q5_0 /
+# q4_1). Gate: bytes armazenados identicos ao llama.cpp e os dois caminhos de
+# load (escalar e o vetorial kv_load8) reconstruindo exatamente o que o
+# dequantizador do llama.cpp reconstroi — mais as cotas de erro medidas.
+# Appended, como as outras frentes. Com um modelo como argumento ele tambem mede
+# o erro sobre linhas K/V reais capturadas dos nos `Kcur`/`Vcur` do grafo.
+add_executable(check-kvquant-gpu tests/check_kvquant_gpu.hip
+               tests/dequant_cpu_oracle.cpp src/backend/gguf.cpp src/backend/loader.cpp
+               src/backend/model.cpp)
+target_compile_options(check-kvquant-gpu PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_link_options(check-kvquant-gpu PRIVATE --offload-arch=gfx1201)
+target_include_directories(check-kvquant-gpu PRIVATE include /opt/rocm/include
+                          ${LLAMA_CPP_SRC}/ggml/src ${LLAMA_CPP_SRC}/ggml/include)
+target_link_libraries(check-kvquant-gpu PRIVATE ${GGML_BASE_LIB} ${AMDHIP64})
+set_target_properties(check-kvquant-gpu PROPERTIES HIP_ARCHITECTURES "gfx1201")
+
+# Frente KV — porta fechada do achado F6 (docs/adversarial-noite.md): as tres
+# tabelas de include/rdna4/kv.h nao podem mais responder "nao sei" com um 0
+# silencioso (kv_row_bytes -> passo de linha 0; kv_bytes_per_elem -> orcamento sem
+# KV) nem cair no corpo do q4_0 por fallthrough. O teste forka um filho, entrega
+# KvType(99) e EXIGE SIGABRT; roda em microssegundos, sem GPU e sem modelo, por
+# isso pode entrar em qualquer gate. Appended, como as outras frentes.
+add_executable(check-kvtype tests/check_kvtype.hip)
+target_compile_options(check-kvtype PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_link_options(check-kvtype PRIVATE --offload-arch=gfx1201)
+target_include_directories(check-kvtype PRIVATE include)
+if(EXISTS "/opt/rocm/include")
+  target_include_directories(check-kvtype PRIVATE /opt/rocm/include)
+endif()
+target_link_libraries(check-kvtype PRIVATE ${AMDHIP64})
+set_target_properties(check-kvtype PROPERTIES HIP_ARCHITECTURES "gfx1201")
+
+# Frente KV — sonda de qualidade do cache (o que a PPL NAO mede).
+#
+# A quantizacao do KV e um erro de CACHE: a NLL agregada de texto natural quase
+# nao se move quando o cache piora (na tabela AIME25 do upstream o KV q4_0 cai de
+# 37,9% para 2,0% com a PPL andando ~0,4%), entao a PPL nao consegue ordenar dois
+# formatos. Esta sonda compara a DISTRIBUICAO de saida do motor com KV f16 contra
+# a do formato alvo, nas MESMAS posicoes dos MESMOS tokens, no MESMO processo:
+# KL media em nats/posicao sobre todo o vocabulario, fracao de posicoes cujo argmax
+# (o token ganancioso) mudou, e |dNLL| pareado. Rodar f16 duas vezes da o piso do
+# harness. O stream de tokens vem de `rdna4-infer tokenize -f <corpus>`.
+# Appended, como as outras frentes.
+add_executable(check-kvquality-gpu tests/check_kvquality_gpu.hip
+               src/backend/gguf.cpp src/backend/loader.cpp src/backend/model.cpp)
+target_compile_options(check-kvquality-gpu PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_link_options(check-kvquality-gpu PRIVATE --offload-arch=gfx1201)
+target_include_directories(check-kvquality-gpu PRIVATE include)
+if(EXISTS "/opt/rocm/include")
+  target_include_directories(check-kvquality-gpu PRIVATE /opt/rocm/include)
+endif()
+target_link_libraries(check-kvquality-gpu PRIVATE ${AMDHIP64})
+set_target_properties(check-kvquality-gpu PROPERTIES HIP_ARCHITECTURES "gfx1201")

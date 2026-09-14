@@ -239,6 +239,11 @@ inline bool attn_launch_wpb(const float *d_q, const void *d_k, const void *d_v, 
   RD_ATTN_U_CASE(Q4_0, F32);
   RD_ATTN_U_CASE(Q8_0, Q4_0);
   RD_ATTN_U_CASE(Q4_0, Q8_0);
+  // The new formats, diagonal only: this entry point is the WPB A/B knob used by
+  // tests/bench_attn_gpu.hip, which benches K and V at the same type. The shipped
+  // path (attn_launch below) carries the full 6x6 product.
+  RD_ATTN_U_CASE(Q5_0, Q5_0);
+  RD_ATTN_U_CASE(Q4_1, Q4_1);
 #undef RD_ATTN_U_CASE
   return false;
 }
@@ -246,6 +251,10 @@ inline bool attn_launch_wpb(const float *d_q, const void *d_k, const void *d_v, 
 inline bool attn_launch(const float *d_q, const void *d_k, const void *d_v, float *d_out, int t,
                         int n_head, int n_head_kv, int head_dim, float scale, KvType kt,
                         KvType vt, hipStream_t stream = nullptr) {
+  // The full 6x6 product: every (K, V) pair the CLI can name is instantiated, so
+  // `--cache-type-k q5_0 --cache-type-v q4_1` cannot silently fall off the end of
+  // this dispatch and return false (the previous list was 4x4 minus f32/f32
+  // mirrors, i.e. a hand-maintained subset).
 #define RD_ATTN_CASE(K, V)                                                                        \
   if (kt == KvType::K && vt == KvType::V)                                                         \
   return attn_launch_typed<KvType::K, KvType::V>(d_q, d_k, d_v, d_out, t, n_head, n_head_kv,      \
@@ -254,18 +263,38 @@ inline bool attn_launch(const float *d_q, const void *d_k, const void *d_v, floa
   RD_ATTN_CASE(F32, F16);
   RD_ATTN_CASE(F32, Q8_0);
   RD_ATTN_CASE(F32, Q4_0);
+  RD_ATTN_CASE(F32, Q5_0);
+  RD_ATTN_CASE(F32, Q4_1);
   RD_ATTN_CASE(F16, F32);
   RD_ATTN_CASE(F16, F16);
   RD_ATTN_CASE(F16, Q8_0);
   RD_ATTN_CASE(F16, Q4_0);
+  RD_ATTN_CASE(F16, Q5_0);
+  RD_ATTN_CASE(F16, Q4_1);
   RD_ATTN_CASE(Q8_0, F32);
   RD_ATTN_CASE(Q8_0, F16);
   RD_ATTN_CASE(Q8_0, Q8_0);
   RD_ATTN_CASE(Q8_0, Q4_0);
+  RD_ATTN_CASE(Q8_0, Q5_0);
+  RD_ATTN_CASE(Q8_0, Q4_1);
   RD_ATTN_CASE(Q4_0, F32);
   RD_ATTN_CASE(Q4_0, F16);
   RD_ATTN_CASE(Q4_0, Q8_0);
   RD_ATTN_CASE(Q4_0, Q4_0);
+  RD_ATTN_CASE(Q4_0, Q5_0);
+  RD_ATTN_CASE(Q4_0, Q4_1);
+  RD_ATTN_CASE(Q5_0, F32);
+  RD_ATTN_CASE(Q5_0, F16);
+  RD_ATTN_CASE(Q5_0, Q8_0);
+  RD_ATTN_CASE(Q5_0, Q4_0);
+  RD_ATTN_CASE(Q5_0, Q5_0);
+  RD_ATTN_CASE(Q5_0, Q4_1);
+  RD_ATTN_CASE(Q4_1, F32);
+  RD_ATTN_CASE(Q4_1, F16);
+  RD_ATTN_CASE(Q4_1, Q8_0);
+  RD_ATTN_CASE(Q4_1, Q4_0);
+  RD_ATTN_CASE(Q4_1, Q5_0);
+  RD_ATTN_CASE(Q4_1, Q4_1);
 #undef RD_ATTN_CASE
   return false;
 }
@@ -414,6 +443,32 @@ inline bool attn_batch_launch(const float *d_q, const void *d_k, const void *d_v
   RD_ATTN_B_CASE(Q4_0, F16);
   RD_ATTN_B_CASE(Q4_0, Q8_0);
   RD_ATTN_B_CASE(Q4_0, Q4_0);
+  // Q5_0/Q4_1 (frente KV): the full product, for the same reason as attn_launch
+  // above -- this dispatcher was added by the prefill front while the KV front was
+  // adding the two formats, and the merge left it as a 4x4 minus-mirrors list. The
+  // caller in graph.cuh treats `false` as a hard error ("batch attn (batched)
+  // launch failed"), so a missing pair here does NOT degrade: it aborts the batched
+  // prefill of any run with --cache-type-k q5_0. Found by re-reading the merge.
+  RD_ATTN_B_CASE(F32, Q5_0);
+  RD_ATTN_B_CASE(F32, Q4_1);
+  RD_ATTN_B_CASE(F16, Q5_0);
+  RD_ATTN_B_CASE(F16, Q4_1);
+  RD_ATTN_B_CASE(Q8_0, Q5_0);
+  RD_ATTN_B_CASE(Q8_0, Q4_1);
+  RD_ATTN_B_CASE(Q4_0, Q5_0);
+  RD_ATTN_B_CASE(Q4_0, Q4_1);
+  RD_ATTN_B_CASE(Q5_0, F32);
+  RD_ATTN_B_CASE(Q5_0, F16);
+  RD_ATTN_B_CASE(Q5_0, Q8_0);
+  RD_ATTN_B_CASE(Q5_0, Q4_0);
+  RD_ATTN_B_CASE(Q5_0, Q5_0);
+  RD_ATTN_B_CASE(Q5_0, Q4_1);
+  RD_ATTN_B_CASE(Q4_1, F32);
+  RD_ATTN_B_CASE(Q4_1, F16);
+  RD_ATTN_B_CASE(Q4_1, Q8_0);
+  RD_ATTN_B_CASE(Q4_1, Q4_0);
+  RD_ATTN_B_CASE(Q4_1, Q5_0);
+  RD_ATTN_B_CASE(Q4_1, Q4_1);
 #undef RD_ATTN_B_CASE
   return false;
 }
@@ -647,6 +702,9 @@ inline bool attn_launch_split_wpb(const float *d_q, const void *d_k, const void 
   RD_ATTN_WPB_CASE(Q8_0, F32);
   RD_ATTN_WPB_CASE(Q4_0, F32);
   RD_ATTN_WPB_CASE(F16, F32);
+  // same reason as attn_launch_wpb above: bench-only WPB knob, diagonal entries.
+  RD_ATTN_WPB_CASE(Q5_0, Q5_0);
+  RD_ATTN_WPB_CASE(Q4_1, Q4_1);
 #undef RD_ATTN_WPB_CASE
   return false;
 }
@@ -654,6 +712,184 @@ inline bool attn_launch_split_wpb(const float *d_q, const void *d_k, const void 
 // Byte size of the partial buffer for `n_splits` (caller allocates once).
 inline std::size_t attn_partial_bytes(int n_head, int head_dim, int n_splits) {
   return (std::size_t)n_head * (std::size_t)n_splits * (2 + (std::size_t)head_dim) * sizeof(float);
+}
+
+// ---------------------------------------------------------------------------
+// BATCHED SPLIT attention (feat/noite-prefill): the split kernel above with all
+// the query tokens of one run in blockIdx.z.
+//
+// Why it is needed at all: from 512 keys on, the per-token path splits the key
+// range across CTAs, and the split COUNT depends on the token's position. The
+// prefill chunk and the MTP verification step (N = D+1 tokens at the end of a long
+// context) both hit that path, and launching it once per token costs N x 2
+// launches per layer for N kernels that differ only in their query row.
+//
+// Bit-exactness: the key assignment of CTA (h, s) -- j = w + WPB*s, step
+// WPB*n_splits -- and the merge arithmetic are the same statements in the same
+// order as attn_split_kernel/attn_merge_kernel, with `t = pos[qt]` carrying the
+// only token-dependent value. The caller groups tokens by equal split count (a
+// contiguous run, because splits is non-decreasing in position), so every token
+// inside a launch gets exactly the split count the per-token path would have used.
+// ---------------------------------------------------------------------------
+template <KvType KT, KvType VT, int WPB = kAttnWarpsPerBlock>
+__global__ void attn_split_batch_kernel(const float *__restrict__ q, const void *__restrict__ k,
+                                        const void *__restrict__ v, float *__restrict__ partial,
+                                        const int *__restrict__ pos, int n_head, int n_head_kv,
+                                        int head_dim, float dscale, int n_splits) {
+  extern __shared__ float smem[];
+  const int h = blockIdx.x;
+  const int s = blockIdx.y;
+  const int qt = blockIdx.z;  // index inside the group (pointers are pre-offset)
+  const int t = pos[qt];
+  const int w = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int kvh = h / (n_head / n_head_kv);
+  const int dpw = head_dim / 32;
+  float *pm = smem + (std::int64_t)w * (2 + head_dim);
+
+  const std::uint64_t krow = kv_row_bytes(KT, head_dim);
+  const std::uint64_t vrow = kv_row_bytes(VT, head_dim);
+  // The query row of THIS token (blockIdx.z), addressed exactly as the unsplit
+  // batched kernel above does it. Without the `qt` term every token of a split
+  // group read token 0's query while only the partial OUTPUT was indexed per
+  // token: rows 1..N-1 of any chunk above ~1040 keys came out wrong. Found by the
+  // adversarial review (R1) and caught by the long-context case this test now has
+  // to carry -- the short-prompt gate never reaches splits > 1.
+  const float *qp = q + ((std::int64_t)qt * n_head + h) * head_dim;
+
+  float qv[kAttnMaxDimsPerLane];
+  for (int i = 0; i < dpw; ++i) qv[i] = qp[lane * dpw + i];
+
+  float m = -INFINITY;
+  float l = 0.0f;
+  float acc[kAttnMaxDimsPerLane];
+  for (int i = 0; i < dpw; ++i) acc[i] = 0.0f;
+
+  const int step = WPB * n_splits;
+  for (int j = w + WPB * s; j <= t; j += step) {
+    const char *kr = (const char *)k + ((std::int64_t)j * n_head_kv + kvh) * krow;
+    float kk[kAttnMaxDimsPerLane];
+    if (dpw == 8) {
+      kv_load8<KT>(kr, lane, kk);
+    } else {
+      for (int i = 0; i < dpw; ++i) kk[i] = kv_load<KT>(kr, lane * dpw + i);
+    }
+    float partial_dot = 0.0f;
+    for (int i = 0; i < dpw; ++i) partial_dot = fmaf(qv[i], kk[i], partial_dot);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+      partial_dot += __shfl_xor_sync(0xffffffffull, partial_dot, off);
+    const float score = partial_dot * dscale;
+    if (score > m) {
+      const float corr = (m == -INFINITY) ? 0.0f : expf(m - score);
+      l *= corr;
+      for (int i = 0; i < dpw; ++i) acc[i] *= corr;
+      m = score;
+    }
+    const float p = (m == -INFINITY) ? 0.0f : expf(score - m);
+    l += p;
+    const char *vr = (const char *)v + ((std::int64_t)j * n_head_kv + kvh) * vrow;
+    float vv[kAttnMaxDimsPerLane];
+    if (dpw == 8) {
+      kv_load8<VT>(vr, lane, vv);
+    } else {
+      for (int i = 0; i < dpw; ++i) vv[i] = kv_load<VT>(vr, lane * dpw + i);
+    }
+    for (int i = 0; i < dpw; ++i) acc[i] = fmaf(p, vv[i], acc[i]);
+  }
+
+  // merge this CTA's WPB warps, then publish one partial for the CTA
+  if (lane == 0) {
+    pm[0] = m;
+    pm[1] = l;
+  }
+  for (int i = 0; i < dpw; ++i) pm[2 + lane * dpw + i] = acc[i];
+  __syncthreads();
+
+  __shared__ float wts[WPB];
+  __shared__ float cmax;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float mm = -INFINITY;
+    for (int i = 0; i < WPB; ++i) mm = fmaxf(mm, smem[(std::int64_t)i * (2 + head_dim)]);
+    cmax = mm;
+  }
+  __syncthreads();
+  if (threadIdx.x < WPB) {
+    wts[threadIdx.x] = (cmax == -INFINITY)
+                           ? 0.0f
+                           : expf(smem[(std::int64_t)threadIdx.x * (2 + head_dim)] - cmax);
+  }
+  __syncthreads();
+  float *out = partial + (((std::int64_t)qt * n_head + h) * n_splits + s) * (2 + head_dim);
+  if (threadIdx.x < 32) {
+    float lsum = 0.0f;
+    if (threadIdx.x < WPB)
+      lsum = wts[threadIdx.x] * smem[(std::int64_t)threadIdx.x * (2 + head_dim) + 1];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) lsum += __shfl_xor_sync(0xffffffffull, lsum, off);
+    if (threadIdx.x == 0) {
+      out[0] = cmax;
+      out[1] = lsum;
+    }
+  }
+  for (int d = (int)threadIdx.x; d < head_dim; d += (int)blockDim.x) {
+    float a = 0.0f;
+    for (int i = 0; i < WPB; ++i) a += smem[(std::int64_t)i * (2 + head_dim) + 2 + d] * wts[i];
+    out[2 + d] = a;
+  }
+}
+
+// Combine the n_splits partials of each query head of each token in the run
+// (one warp per (head, token)). Body identical to attn_merge_kernel.
+__global__ void attn_merge_batch_kernel(const float *__restrict__ partial,
+                                        float *__restrict__ out, int head_dim, int n_splits) {
+  const int h = blockIdx.x;
+  const int qt = blockIdx.y;
+  const int lane = threadIdx.x & 31;
+  const int dpw = head_dim / 32;
+  const float *base =
+      partial + (((std::int64_t)qt * gridDim.x + h) * n_splits) * (2 + head_dim);
+  float *op = out + ((std::int64_t)qt * gridDim.x + h) * head_dim;
+
+  float mm = -INFINITY;
+  for (int s = 0; s < n_splits; ++s) mm = fmaxf(mm, base[(std::int64_t)s * (2 + head_dim)]);
+  if (mm == -INFINITY) {  // every split empty: no keys at all
+    for (int i = 0; i < dpw; ++i) op[lane * dpw + i] = 0.0f;
+    return;
+  }
+  float ll = 0.0f;
+  for (int s = 0; s < n_splits; ++s) {
+    const float *ps = base + (std::int64_t)s * (2 + head_dim);
+    ll += ps[1] * expf(ps[0] - mm);
+  }
+  const float inv = (ll > 0.0f) ? 1.0f / ll : 0.0f;
+  for (int i = 0; i < dpw; ++i) {
+    float a = 0.0f;
+    for (int s = 0; s < n_splits; ++s) {
+      const float *ps = base + (std::int64_t)s * (2 + head_dim);
+      a += ps[2 + lane * dpw + i] * expf(ps[0] - mm);
+    }
+    op[lane * dpw + i] = a * inv;
+  }
+}
+
+template <KvType KT, KvType VT, int WPB = kAttnWarpsPerBlock>
+inline bool attn_split_batch_launch_typed(const float *d_q, const void *d_k, const void *d_v,
+                                          float *d_out, float *d_partial, const int *d_pos,
+                                          int n_tok, int n_head, int n_head_kv, int head_dim,
+                                          float scale, int n_splits, hipStream_t stream) {
+  if (head_dim % 32 != 0 || head_dim / 32 > kAttnMaxDimsPerLane) return false;
+  if (n_splits < 1 || n_tok < 1) return false;
+  const int threads = WPB * 32;
+  const std::size_t smem = (std::size_t)WPB * (2 + (std::size_t)head_dim) * sizeof(float);
+  dim3 grid((unsigned)n_head, (unsigned)n_splits, (unsigned)n_tok);
+  attn_split_batch_kernel<KT, VT, WPB><<<grid, threads, smem, stream>>>(
+      d_q, d_k, d_v, d_partial, d_pos, n_head, n_head_kv, head_dim, scale, n_splits);
+  if (hipGetLastError() != hipSuccess) return false;
+  dim3 mgrid((unsigned)n_head, (unsigned)n_tok);
+  attn_merge_batch_kernel<<<mgrid, 32, 0, stream>>>(d_partial, d_out, head_dim, n_splits);
+  return hipGetLastError() == hipSuccess;
 }
 
 // ---------------------------------------------------------------------------
@@ -728,22 +964,122 @@ inline bool attn_launch_split(const float *d_q, const void *d_k, const void *d_v
                                                             n_splits, stream);                      \
   }
   RD_ATTN_SPLIT_WPB(F32, F32);
-  RD_ATTN_SPLIT_WPB(F16, F16);
-  RD_ATTN_SPLIT_WPB(Q8_0, Q8_0);
-  RD_ATTN_SPLIT_WPB(Q4_0, Q4_0);
   RD_ATTN_SPLIT_WPB(F32, F16);
   RD_ATTN_SPLIT_WPB(F32, Q8_0);
   RD_ATTN_SPLIT_WPB(F32, Q4_0);
+  RD_ATTN_SPLIT_WPB(F32, Q5_0);
+  RD_ATTN_SPLIT_WPB(F32, Q4_1);
   RD_ATTN_SPLIT_WPB(F16, F32);
+  RD_ATTN_SPLIT_WPB(F16, F16);
   RD_ATTN_SPLIT_WPB(F16, Q8_0);
   RD_ATTN_SPLIT_WPB(F16, Q4_0);
+  RD_ATTN_SPLIT_WPB(F16, Q5_0);
+  RD_ATTN_SPLIT_WPB(F16, Q4_1);
   RD_ATTN_SPLIT_WPB(Q8_0, F32);
   RD_ATTN_SPLIT_WPB(Q8_0, F16);
+  RD_ATTN_SPLIT_WPB(Q8_0, Q8_0);
   RD_ATTN_SPLIT_WPB(Q8_0, Q4_0);
+  RD_ATTN_SPLIT_WPB(Q8_0, Q5_0);
+  RD_ATTN_SPLIT_WPB(Q8_0, Q4_1);
   RD_ATTN_SPLIT_WPB(Q4_0, F32);
   RD_ATTN_SPLIT_WPB(Q4_0, F16);
   RD_ATTN_SPLIT_WPB(Q4_0, Q8_0);
+  RD_ATTN_SPLIT_WPB(Q4_0, Q4_0);
+  RD_ATTN_SPLIT_WPB(Q4_0, Q5_0);
+  RD_ATTN_SPLIT_WPB(Q4_0, Q4_1);
+  RD_ATTN_SPLIT_WPB(Q5_0, F32);
+  RD_ATTN_SPLIT_WPB(Q5_0, F16);
+  RD_ATTN_SPLIT_WPB(Q5_0, Q8_0);
+  RD_ATTN_SPLIT_WPB(Q5_0, Q4_0);
+  RD_ATTN_SPLIT_WPB(Q5_0, Q5_0);
+  RD_ATTN_SPLIT_WPB(Q5_0, Q4_1);
+  RD_ATTN_SPLIT_WPB(Q4_1, F32);
+  RD_ATTN_SPLIT_WPB(Q4_1, F16);
+  RD_ATTN_SPLIT_WPB(Q4_1, Q8_0);
+  RD_ATTN_SPLIT_WPB(Q4_1, Q4_0);
+  RD_ATTN_SPLIT_WPB(Q4_1, Q5_0);
+  RD_ATTN_SPLIT_WPB(Q4_1, Q4_1);
 #undef RD_ATTN_SPLIT_WPB
+  return false;
+}
+
+inline bool attn_split_batch_launch(const float *d_q, const void *d_k, const void *d_v,
+                                    float *d_out, float *d_partial, const int *d_pos, int n_tok,
+                                    int n_head, int n_head_kv, int head_dim, float scale,
+                                    KvType kt, KvType vt, int n_splits,
+                                    hipStream_t stream = nullptr) {
+  // Same WPB policy as the per-token split path, so the arithmetic matches.
+  const int wpb = attn_split_wpb(n_splits);
+#define RD_ATTN_SB_CASE(K, V, W)                                                                  \
+  if (kt == KvType::K && vt == KvType::V && wpb == W)                                             \
+  return attn_split_batch_launch_typed<KvType::K, KvType::V, W>(                                   \
+      d_q, d_k, d_v, d_out, d_partial, d_pos, n_tok, n_head, n_head_kv, head_dim, scale, n_splits, \
+      stream)
+  RD_ATTN_SB_CASE(F32, F32, 16);
+  RD_ATTN_SB_CASE(F32, F16, 16);
+  RD_ATTN_SB_CASE(F32, Q8_0, 16);
+  RD_ATTN_SB_CASE(F32, Q4_0, 16);
+  RD_ATTN_SB_CASE(F16, F32, 16);
+  RD_ATTN_SB_CASE(F16, F16, 16);
+  RD_ATTN_SB_CASE(F16, Q8_0, 16);
+  RD_ATTN_SB_CASE(F16, Q4_0, 16);
+  RD_ATTN_SB_CASE(Q8_0, F32, 16);
+  RD_ATTN_SB_CASE(Q8_0, F16, 16);
+  RD_ATTN_SB_CASE(Q8_0, Q8_0, 16);
+  RD_ATTN_SB_CASE(Q8_0, Q4_0, 16);
+  RD_ATTN_SB_CASE(Q4_0, F32, 16);
+  RD_ATTN_SB_CASE(Q4_0, F16, 16);
+  RD_ATTN_SB_CASE(Q4_0, Q8_0, 16);
+  RD_ATTN_SB_CASE(Q4_0, Q4_0, 16);
+  RD_ATTN_SB_CASE(F32, F32, 8);
+  RD_ATTN_SB_CASE(F32, F16, 8);
+  RD_ATTN_SB_CASE(F32, Q8_0, 8);
+  RD_ATTN_SB_CASE(F32, Q4_0, 8);
+  RD_ATTN_SB_CASE(F16, F32, 8);
+  RD_ATTN_SB_CASE(F16, F16, 8);
+  RD_ATTN_SB_CASE(F16, Q8_0, 8);
+  RD_ATTN_SB_CASE(F16, Q4_0, 8);
+  RD_ATTN_SB_CASE(Q8_0, F32, 8);
+  RD_ATTN_SB_CASE(Q8_0, F16, 8);
+  RD_ATTN_SB_CASE(Q8_0, Q8_0, 8);
+  RD_ATTN_SB_CASE(Q8_0, Q4_0, 8);
+  RD_ATTN_SB_CASE(Q4_0, F32, 8);
+  RD_ATTN_SB_CASE(Q4_0, F16, 8);
+  RD_ATTN_SB_CASE(Q4_0, Q8_0, 8);
+  RD_ATTN_SB_CASE(Q4_0, Q4_0, 8);
+  // Q5_0/Q4_1 (frente KV): the list above was added by the prefill front while the KV
+  // front was adding the two formats, so the merge left it without them -- and the
+  // caller in graph.cuh treats `false` as a HARD error ("batch attn (batched) launch
+  // failed"), so with --cache-type-k q5_0 / --cache-type-v q4_1 and >=512 keys the
+  // batched prefill aborted instead of degrading. Review finding R11; the same hole was
+  // fixed for attn_batch_launch / attn_launch_split in the KV branch (a1fc8bd).
+  RD_ATTN_SB_CASE(Q5_0, Q4_1, 16);
+  RD_ATTN_SB_CASE(Q5_0, Q5_0, 16);
+  RD_ATTN_SB_CASE(Q4_1, Q4_1, 16);
+  RD_ATTN_SB_CASE(Q4_1, Q5_0, 16);
+  RD_ATTN_SB_CASE(Q5_0, F16, 16);
+  RD_ATTN_SB_CASE(Q5_0, Q8_0, 16);
+  RD_ATTN_SB_CASE(Q5_0, Q4_0, 16);
+  RD_ATTN_SB_CASE(F16, Q5_0, 16);
+  RD_ATTN_SB_CASE(F16, Q4_1, 16);
+  RD_ATTN_SB_CASE(Q8_0, Q5_0, 16);
+  RD_ATTN_SB_CASE(Q8_0, Q4_1, 16);
+  RD_ATTN_SB_CASE(Q4_0, Q5_0, 16);
+  RD_ATTN_SB_CASE(Q4_0, Q4_1, 16);
+  RD_ATTN_SB_CASE(Q5_0, Q4_1, 8);
+  RD_ATTN_SB_CASE(Q4_1, Q5_0, 8);
+  RD_ATTN_SB_CASE(Q5_0, Q5_0, 8);
+  RD_ATTN_SB_CASE(Q4_1, Q4_1, 8);
+  RD_ATTN_SB_CASE(Q5_0, F16, 8);
+  RD_ATTN_SB_CASE(Q5_0, Q8_0, 8);
+  RD_ATTN_SB_CASE(Q5_0, Q4_0, 8);
+  RD_ATTN_SB_CASE(F16, Q5_0, 8);
+  RD_ATTN_SB_CASE(F16, Q4_1, 8);
+  RD_ATTN_SB_CASE(Q8_0, Q5_0, 8);
+  RD_ATTN_SB_CASE(Q8_0, Q4_1, 8);
+  RD_ATTN_SB_CASE(Q4_0, Q5_0, 8);
+  RD_ATTN_SB_CASE(Q4_0, Q4_1, 8);
+#undef RD_ATTN_SB_CASE
   return false;
 }
 

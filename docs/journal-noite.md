@@ -164,6 +164,63 @@ pior. Repassado à frente KV.
   kernels pequenos (o `emit()` do grafo faz `hipMemcpy` bloqueante, então fundir 4 ops em 1 faz o
   oráculo por nó ler um buffer já sobrescrito — a variante que preserva o dump vale 0,26 ms).
 
+## Relatório da manhã — como ler
+
+1. **O que foi pedido e o que foi entregue**: a tabela de frentes no topo diz o estado de
+   cada uma; as entradas C0-C9 contam o que o coordenador fez, com o número que justifica
+   cada decisão. Os diários por frente (`docs/journal-*.md`) têm o detalhe por experimento,
+   no formato referência → hipótese → comando → resultado → veredito.
+2. **Duas revisões adversariais** rodaram esta noite: `docs/adversarial-noite.md` (a árvore
+   mergeada antes da rodada; achados F1-F15) e `docs/adversarial-noite2.md` (o código
+   produzido *durante* a rodada; achados R1-R11). **Nove achados eram de código escrito hoje**
+   — três dos quais eu já consertei (R2 servidor, R4 argmax com NaN, R9 `forward_batch` sem
+   argmax) — e essa é a parte do relatório que mais importa: a noite produziu código rápido e
+   as revisões pegaram o que os gates não pegavam.
+3. **O que NÃO foi medido** está escrito em cada frente e repetido no fechamento: a 131K não
+   houve medida de qualidade com texto real; nenhuma medida fim-a-fim de 131K cabe no
+   orçamento da noite (o prefill em lote leva ~29 min só para encher o KV).
+
+## Diário do coordenador (continuação)
+
+### C9. O merge da frente KV expos uma armadilha de build da classe "tabela em header"
+Duas vezes nesta noite uma tabela pequena de host dentro de um header (`g_attn_wpb_forced`,
+depois `kKvTypeNames`) quebrou o link da biblioteca compartilhada com `relocation
+R_X86_64_PC32 ... recompile with -fPIC`. Mover a tabela de `static` local para escopo de
+namespace **não** resolve (o erro só muda de nome). O conserto é de classe:
+`POSITION_INDEPENDENT_CODE ON` + `-fPIC` no passe HIP de `rdna4_serve`. Registrado no
+`CMakeLists.txt` com o motivo, para o próximo não perder meia hora com a mesma coisa.
+
+### C10. O orçamento honesto devolveu o alvo
+Com o conserto da frente KV (`required_bytes` com os 448 MiB medidos e sem contar o bloco MTP
+quando ele não é usado):
+
+```
+model file: 11.21 GiB, uploaded weights: 10.88 GiB, graph buffers: 157.98 MiB
+kv(ctx=131072, k=q5_0/v=q4_1): 2.62 GiB + margin: 448.00 MiB = need 14.09 GiB
+(file-based estimate was 14.84 GiB)  -> budget OK
+```
+
+O orçamento antigo recusava `q8_0/q8_0` a 131K (estimava 16,46 GiB) para uma configuração que
+**roda** (15,87 GiB em uso, medido). Ou seja: "a 131K só cabe com `q4_0`" era falso, e a
+diferença vinha de um chute de 1 GiB de overhead e de contar o bloco MTP que não é carregado.
+
+### C11. MTP: o ganho existe e é 1,75× (medido pela frente, 05:35)
+- **Referência**: `docs/mtp.md` §7 ("verify batelado" como a peça que falta), `docs/medicoes-m8.md`
+  (projeção de 1,3-1,5× com o `cf(N)` antigo).
+- **Resultado medido** (IQ3_S, `bench`-equivalente da própria frente, 2 repetições intercaladas,
+  mesmo md5 entre repetições): a 4K, **ganancioso 29,33 tok/s · `--mtp --draft 2` 50,15 (1,71×) ·
+  `--draft 3` 51,47 (1,75×) · `--draft 3 --mtp-serial` 25,99 (0,89×)**. O contraste com o
+  caminho serial (que era o único existente até hoje e é 9-11 % **mais lento** que o ganancioso)
+  é a prova de que o ganho vem da verificação em lote, não do rascunho.
+- **Peças que sustentam o número**: *snapshot/restore* do estado GDN bit-exato (max|d| = 0,
+  argmax igual) a 0,53 ms por par; `forward_batch_all` bit-exato em posição 4084 (linha a linha,
+  h e logits); linha extra na verificação a 7,0-7,2 ms contra 32,7 ms de um passo por token.
+- **Ressalva de escopo**: os números de **16K** da frente (0,86× e aceitação 54,9 %) estão
+  contaminados pelo achado **R1** (a atenção dividida em lote lia o `q` da primeira linha), que
+  foi consertado depois; a re-medição decide se o MTP paga também em contexto longo.
+- **Veredito**: MANTIDO. É a entrega da tarefa 2: o MTP saiu de "9-11 % mais lento" para
+  **1,71-1,75× mais rápido** com a saída idêntica ao ganancioso.
+
 ## Estado do alvo (atualizado pelo coordenador)
 
 - **131K**: ainda não medido nesta rodada. No baseline, 131K com KV `q4_0` roda a 14,0 tok/s

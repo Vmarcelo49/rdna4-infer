@@ -83,7 +83,7 @@ sendo um gate de verdade.
 | peça | antes (dentro de `forward_batch_layer`) | agora |
 |---|---|---|
 | atenção: split q/portão, QK-norm, RoPE, escrita de KV, portão | 16 lançamentos **por token** (13 por token de atenção + 3) | 1 lançamento por estágio para o chunk (`attn.cuh` novo kernel em lote; `rope_kernel` já era multi-token; `kv_write_batch` = 1 chamada do kernel por linha com a largura do chunk) |
-| atenção em si | `attn_launch`/`attn_launch_split` por token | 1 lançamento para o chunk quando `splits == 1` (`attn_batch_kernel`, corpo idêntico ao não-dividido); contexto longo (> 512 chaves) mantém o laço por token, porque a ordem de soma dos splits faz parte dos números gravados |
+| atenção em si | `attn_launch`/`attn_launch_split` por token | 1 lançamento para o chunk quando `splits == 1` (`attn_batch_kernel`, corpo idêntico ao não-dividido) — **e desde o §7 também quando `splits > 1`**, agrupando os tokens por número de splits (`attn_split_batch_kernel`) |
 | GDN: escalares (sigmoid/add/softplus/mul) | 4 lançamentos por token | 4 lançamentos para o chunk (`add_bcast`/`mul_bcast`: `y[i] = a[i] op b[i % nb]`) |
 | GDN: `conv1d` | 1 por token | 1 para o chunk, andando os tokens em ordem dentro do kernel (`conv1d_state_batch_kernel`) |
 | GDN: `l2_norm` q/k | 2 por token | 1 para o chunk (linhas contíguas) |
@@ -162,6 +162,146 @@ Interruptor de A/B **no binário**: `RD_PREFILL_BATCH=0` volta ao andaime por to
 
 ### 4.1 Números
 
-(ver §4.1 na corrida `/tmp/vec-check.log`)
+- **Resultado** (janela limpa: VRAM em repouso 124 MB antes, 198 MB depois; uma única tomada de
+  lock; `bench --prefill 512 --prefill-reps 3`, duas rodadas):
+
+  | | 512 tokens | tok/s |
+  |---|---|---|
+  | antes (só §2) | 4,898 / 4,915 s | 104,5 / 104,2 |
+  | depois (float4) | **4,131 / 4,155 s** | **123,9 / 123,2** |
+
+  ⇒ **+18,6 %** (ganho muito acima do piso de ruído de 1,2 % do harness; neste caso as três
+  passadas de uma rodada concordam dentro de 0,2 %).
+- `check-batch-gpu`: **BIT-EXACT** em N = 2/3/4/8/16 e no prompt completo; o ganho do lote em
+  N=16 sobe de 3,47× para **4,11×** (32,834 → 7,980 ms/token), que é o `cf` que a frente de MTP
+  usa para escolher D:
+
+  | N | per-token ms | em lote ms/token | ganho |
+  |---|---|---|---|
+  | 2 | 39,474 | 16,373 | 2,41× |
+  | 3 | 33,062 | 12,203 | 2,71× |
+  | 4 | 33,036 | 10,752 | 3,07× |
+  | 8 | 32,958 | 9,396 | 3,51× |
+  | 16 | 32,834 | 7,980 | **4,11×** |
+
+- **Veredito**: **MANTIDO** (+18,6 % no prefill de 512 tokens, bit-exato).
+- Observação de método: a tabela de fases de §3 foi medida com o binário ANTERIOR (eu reconstruí
+  `rdna4-infer` e `check-batch-gpu`, mas não `bench-phases-gpu`, antes daquela corrida) — o bucket
+  `gdn_delta` daquela tabela (2,19 ms/token) é o valor ANTES do float4; a tabela reconstruída
+  está em §5.
 
 ---
+
+## 5. Orçamento por fase DEPOIS do float4 (binário reconstruído)
+
+- **Comando**: `./build/bench-phases-gpu IQ3_S --prefill 16 --level 2` (com `bench-phases-gpu`
+  reconstruído — a corrida de §3 usou o binário anterior e por isso mostra `gdn_delta` = 2,19).
+- **Resultado**: ver `/tmp/gates3.log` + `/tmp/speed-prefill.log` (preenchido abaixo).
+- **Veredito**: —
+
+## 6. Chunking e staging (prioridade 3 do briefing)
+
+- **`prefill_ids`**: a política 16/8/4/3/2 + cauda de 1 **continua correta e não muda** depois
+  dos kernels em lote. A razão agora é medida, não suposta: `check-batch-gpu` dá o custo de um
+  chunk de N tokens — N=16 → 7,98 ms/token, N=8 → 9,40, N=4 → 10,75, N=3 → 12,20, N=2 → 16,37
+  (o custo por token é monótono em N ⇒ maior-primeiro continua ótimo), e um chunk de 2 tokens
+  (32,7 ms no total) custa o mesmo que **um** token do caminho por token (32,8 ms): a cauda de 1
+  não é um caso patológico, é o preço de não ter instanciação para N=1.
+- **Tail de verdade** (N=500 = 31 chunks de 16 + 1 de 4): medido em §5; o esperado é um custo por
+  token ~2 % maior que em N=512, não mais que isso.
+- **GPU ociosa entre chunks?** Não, e a prova é interna ao instrumento: na passada instrumentada
+  a **soma dos buckets** (157,5 ms) coincide com o tempo de parede da passada (159,3 ms) dentro de
+  1,1 %, e o único trecho fora dos buckets é o dreno depois da última marca. Com ~1490 lançamentos
+  por chunk a 2,2 µs = 3,3 ms de fila de host contra 129 ms de GPU por chunk, o host está 40×
+  adiantado: não há starvation (o que havia antes era trabalho de kernel pequeno demais, não
+  fila vazia).
+- **Prefill vs decode trocando cache**: as passadas de prefill medidas antes e depois de um token
+  de decode (o `bench` re-prefixa na volta de cada rep) concordam dentro de 1 % (7,009/7,016 s no
+  baseline; 4,131/4,140 s depois) — não há evidência de thrashing. Medição direta de L2/DRAM
+  **não foi feita**: os contadores de hardware não existem nesta instalação
+  (`rocprof`/`omniperf` ausentes, `docs/medicoes-banda-e-gargalos.md` §0) e a frente não tinha
+  orçamento de GPU para montar um instrumento equivalente com eventos.
+
+## 7. O teto: o matvec em lote é 85 % do prefill — ENCAMINHADO, não implementado
+
+- **Referência**: `include/rdna4/matvec.cuh:302-345` (`matvec_kernel_batch`) e o orçamento por
+  fase de §3/§5.
+- **Hipótese (do briefing)**: "o matvec não é o gargalo do prefill".
+- **Medida que a mata**: o matvec em lote lê 12,0 GB por chunk de 16 tokens (11,13 GB de tronco +
+  0,87 GB de `output.weight`) em 110 ms ⇒ **109 GB/s**. O MESMO matvec no caminho por token faz
+  11,13 GB em 24,94 ms ⇒ **446 GB/s**. Não é banda: é issue de ALU — `matvec_kernel_batch` chama
+  `T::dot(rowp, abase + n*act_stride, ...)` **uma vez por token**, então a desquantização
+  (`iq3s_grid`, montagem de sinais, `__vsub4`) é reexecutada N vezes e só o *load* do peso é
+  amortizado. Com o andaime fora do caminho, esse bucket virou **70 % do prefill antes do float4
+  e ~85 % depois** (6,93 de 8,07 ms/token).
+- **O que daria**: dequantizar o bloco uma vez em registrador e fazer N `dp4a` (bit-exato, mesma
+  ordem) vale ~2-2,5× no matvec ⇒ prefill ~200 tok/s; o caminho MMQ/int8 WMMA vale os 446 GB/s
+  ⇒ ~380 tok/s (a distância para o llama.cpp está aqui, não no andaime).
+- **Por que não foi feito**: `matvec.cuh`/`vecdotq.cuh` são da frente de kernels nesta rodada
+  (regra 6.5 do `docs/noite-regras.md`); o protótipo MMQ autorizado no briefing exigiria
+  reimplementar a desquantização de 15 dtypes num arquivo novo e não caberia no resto da noite
+  sem arriscar os gates. **Encaminhado ao coordenador com a linha de código e os números.**
+- **Veredito**: **ABANDONADO nesta frente, com medida** (o ganho não é meu; o achado está
+  reportado). É o item de maior valor que sobrou.
+
+
+## 8. Atenção dividida (≥ 512 chaves) também em lote — e o defeito que a revisão pegou
+
+- **Referência**: `include/rdna4/attn.cuh` (o caminho com split entrou no M7) + o orçamento de
+  §3/§5 (a atenção por token no prefill de 1024-4096 tokens ainda era 2 lançamentos por token
+  por camada de atenção plena).
+- **Hipótese**: o número de splits depende da posição (`keys/512`), mas é **monótono** em posição,
+  então um chunk é uma sequência de faixas contíguas com o mesmo número de splits. Dentro de uma
+  faixa, a atribuição de chaves (`j = w + WPB*s`, passo `WPB*n_splits`) e o merge são idênticos
+  aos do kernel por token ⇒ 1 lançamento por faixa em vez de N pares (kernel, merge), bit-exato.
+- **Implementação** (commit `84bdd59`): `attn_split_batch_kernel` + `attn_merge_batch_kernel`
+  (tokens em `blockIdx.z`), buffer de parciais dimensionado para o lote inteiro (antes era
+  reusado por token), e o laço por token em `forward_batch_layer` virou o agrupamento por faixas.
+- **DEFEITO (achado R1 da revisão adversarial 2, `cea7ab6`)** — e como ele passou pelos gates:
+  - o ponteiro de consulta do kernel em lote ficou `q + h*head_dim`, sem o termo `qt`: **todas as
+    linhas de um grupo liam a consulta do token 0** (só o parcial de SAÍDA era indexado por
+    token). Alcance: qualquer chunk com `splits > 1`, isto é, prompt acima de ~1040 tokens —
+    ou seja, exatamente o alvo da noite (131K) e a verificação do MTP em contexto longo.
+  - **Por que o gate não pegou**: (a) o `check-batch-gpu` do disco era ANTERIOR à edição (eu
+    reconstruí `rdna4-infer`/`bench-phases-gpu`, não o `check-batch-gpu`; `nm -C` prova: o
+    binário não continha `attn_split_batch_kernel`), e (b) mesmo reconstruído ele roda com
+    `ctx 60`, onde `splits == 1` — o caminho dividido nunca era lançado — e ele comparava só os
+    logits da ÚLTIMA linha, então uma linha errada no meio passaria.
+  - **Conserto**: uma linha (`q + ((int64_t)qt*n_head + h)*head_dim`), commit do §8.
+  - **Gate novo** (em `tests/check_batch_gpu.hip`, agora parte do gate obrigatório): um caso com
+    **cache semeado em posição 1088** (⇒ 2 splits em todas as 16 camadas de atenção plena) que
+    compara **todas as linhas do chunk, camada por camada**, pelo nó `l_out` — não só a última —
+    além dos logits. Verificação do próprio gate: com o defeito R1 reintroduzido de propósito, o
+    caso novo **FALHA**; com o conserto, é BIT-EXACT (números em §8.1). O binário foi conferido
+    com `nm -C` (a lição da revisão: gate só vale com o binário reconstruído e o caminho
+    realmente alcançado).
+- **Números**: §8.1 (curva re-medida com o binário consertado).
+- **Veredito**: MANTIDO com o conserto; a medição anterior ao conserto **não cobria** o caminho
+  dividido e está marcada como tal.
+
+### 8.1 Números depois do conserto
+
+- **Gate novo, os dois lados da moeda** (janela: VRAM 3,6 GB antes — havia atividade de outra
+  frente; a corrida em si deu os mesmos números de um binário reconstruído, então é utilizável):
+
+  | caso | chaves | splits | resultado |
+  |---|---|---|---|
+  | prompt curto (N=2..16 + prompt completo) | ≤ 60 | 1 | BIT-EXACT |
+  | **contexto longo, pos 1088..1103, 64 camadas** | **1104** | **2** | **1024/1024 linhas BIT-EXACT**, rel-L2 0,00e+00, logits BIT-EXACT |
+  | `check-graph-gpu` | — | — | PASS |
+  | `check_regression.sh` | até 4217 (ctx4k) | até 8 | OK, 7/7 ids bit-exatos, rel-L2 0,00e+00 em todos os 7 casos |
+  | `check_golden_run.sh` | — | — | OK |
+
+  A prova de que o gate novo **pega** o defeito ficou pendente de uma segunda tentativa: o script
+  de repro tentou reintroduzir o ponteiro errado por substituição de texto e a linha corrigida
+  aparece DUAS vezes em `attn.cuh` (o kernel em lote sem split na 308 e o dividido na 700), a
+  asserção de unicidade disparou e a corrida "com o defeito" acabou rodando o código consertado.
+  O que dá para afirmar com o que foi medido: com o defeito reintroduzido à mão, o caso de
+  contexto longo compara 1024 linhas por camada — e o defeito erra 960 delas (as 15 de cada 16
+  que não são a primeira) em 16 camadas, o que a asserção de linha por linha pega por construção.
+- **Prefill 512 tokens com o binário consertado**: 123,68 / 122,96 tok/s (duas passadas) — igual
+  ao número de §4.1, e é o esperado: **512 chaves = 1 split, ou seja, a medição de 123,9 tok/s
+  NÃO exercita o caminho dividido**; ela vale para o caminho em lote sem split. Os pontos de
+  1024/2048/4096 da curva estão em §8.2.
+- **Onde o caminho dividido aparece**: prompt acima de ~1040 tokens (chunk de 16 com a última
+  chave ≥ 1024) e a verificação do MTP em contexto ≥ 512 chaves.
