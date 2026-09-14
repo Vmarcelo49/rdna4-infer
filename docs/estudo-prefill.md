@@ -121,7 +121,11 @@ dequantizado **na LDS**, o que dá ~1,1-1,5 instruções por 4 MACs em vez de 3,
 
 ## 5. O plano que sai disto (ordem por ganho medido, não por gosto)
 
-**P0 — GEMM tilejado com staging na LDS (3,86× medido do lado deles, sem instrução exótica).**
+**P0 — M grande + GEMM tilejado com staging na LDS (3,86× medido do lado deles, sem instrução
+exótica; e o protótipo já mediu 3,99× em M=512 contra o nosso prefill).** As duas metades são
+inseparáveis: em M=16 o mesmo kernel tilejado rende 1,08× (medido), porque cada byte de peso
+estagiado é reusado 16 vezes em vez de 512. Subir o chunk de 16 para ≥128 é **pré-requisito**,
+não otimização posterior.
 Tiling de saída por thread (começar em 4×4), peso dequantizado para **int8** na LDS (mantém
 `dp4a`, que já é o nosso caminho validado), ativação em LDS com leitura vetorizada, escala por
 bloco de 32 aplicada como correção no final. Gate: **bit-exatidão não é possível** (muda a ordem
@@ -162,3 +166,55 @@ GGML_VK_DISABLE_COOPMAT=1 GGML_VK_DISABLE_COOPMAT2=1 <mesmo comando> -p 512 -n 0
 ./scripts/gpu-lock.sh timeout 900 ./build/rdna4-infer bench -m <modelo> --prefill 512 --prefill-reps 3
 ./scripts/gpu-lock.sh timeout 900 ./build/bench-matvec-shapes-gpu <modelo> --batch 2,4,8,16
 ```
+
+## 3b. O protótipo tilejado (medido, com verificação) — e a descoberta do tamanho do chunk
+
+`tests/bench_gemm_gpu.hip` (novo, `bench-gemm-gpu`) implementa o GEMM int8 com a estrutura do
+MMQ — tile de saída `BM × BN` por CTA, `RM × RN` acumuladores por thread, A e W estagiados na
+LDS, `dp4a` consumindo os dois de lá — e **verifica cada configuração contra um oráculo**
+(kernel naive de 1 elemento por thread, sem LDS) antes de cronometrar. A primeira versão desta
+bancada deu 1198 T MACs/s (24× o pico do cartão) porque o lançamento tinha número de threads
+errado e o kernel **não rodava**; o `hipGetLastError` e a verificação por configuração estão lá
+por causa disso.
+
+Forma real: tensor do tronco `17408 × 5120`, int8, 89,1 MB de peso, `BK=64`.
+
+| M (tokens no chunk) | tiled+LDS T MACs/s | vs **nosso prefill** (3,19 T) | vs llama.cpp s/ coopmat (12,26 T) |
+|---|---|---|---|
+| 16 (o NOSSO chunk hoje) | **3,46** | **1,08×** | 28 % |
+| 64 | 7,23 | 2,27× | 59 % |
+| 128 | 10,34 | 3,24× | 84 % |
+| 256 | 11,91 | 3,73× | 97 % |
+| **512** | **12,74** | **3,99×** | **104 %** |
+
+Três leituras, e a primeira é a que reorganiza o plano:
+
+1. **Em M=16, o GEMM tilejado NÃO ganha nada** (3,46 contra 3,19 T = 1,08×). O motivo é
+   aritmético: com 16 tokens, cada byte de peso estagiado na LDS é reusado só 16 vezes, e o
+   custo de estagiar (mais o `__syncthreads` por bloco de k) come o ganho do dp4a melhor
+   alimentado. Em M=16 o desenho certo é o GEMV que já temos (peso direto da DRAM, sem LDS).
+   **Ou seja: o nosso motor não é "ingênuo por escolha de kernel" — ele está estruturalmente
+   limitado pelo chunk de 16 tokens.** O `pass_ms ≈ 13,9 + 6,04·N` de hoje é a assinatura disso.
+2. **O ganho de 3,9× do llama.cpp é reproduzível com dp4a puro, sem matrix cores nenhum**: o
+   protótipo chega a **12,74 T MACs/s em M=512**, contra os **12,26 T** medidos do llama.cpp com
+   coopmat desligado (104 %). O "fator 3,86×" é *estrutura* (tile + LDS + M grande), não
+   instrução exótica.
+3. **O teto do caminho vetorial ainda é 2,4× menor que o do coopmat** (12,74 contra os 30,66 T
+   do llama.cpp com coopmat ligado). Ou seja: **os dois fatores do gap são independentes e ambos
+   são necessários** — e a ordem certa é: primeiro M grande + kernel tilejado (3,9×), depois
+   matrix cores (2,4×).
+
+### Consequência para o plano: o chunk de 16 tokens é a alavanca esquecida
+
+Não é só o kernel. Com M=16, cada byte de peso é lido **32× mais vezes** do que com M=512:
+11,122 GB por chunk de 16 = 695 MB por token contra 21,7 MB por token em M=512. O piso de banda
+disso, a 633 GB/s medidos, é **1,098 ms/token = 911 tok/s** em M=16 — e os 1114 tok/s do
+llama.cpp ficam *acima* desse piso, o que só é possível porque eles processam o prompt inteiro
+num "M" grande (o `pp2048 ≈ pp512` deles é a assinatura de ser compute-bound, não banda-bound).
+Nós estamos a 8,08 ms/token, isto é 7,4× acima do nosso próprio piso de banda.
+
+Portanto o P0 tem **duas** metades, e a segunda não funciona sem a primeira:
+**(i) subir o M do prefill de 16 para ≥128** (buffers de ativação, atenção causal com M>128,
+laço sequencial do GDN dentro do chunk, quantização em lote com M grande) e
+**(ii) o GEMM tilejado com staging na LDS** — o protótipo acima, que já roda a 10,3-12,7 T
+MACs/s e é verificado contra oráculo.
