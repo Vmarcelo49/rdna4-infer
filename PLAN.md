@@ -677,3 +677,35 @@ seguinte (estimativa de 2-2,5× no matvec ⇒ ~200 tok/s de prefill).
   greedy puro, ids bit-exatos e logits rel-L2 ≤ 1e-5; **79 s**. Controle negativo colado: com
   `amax/127 → amax/126` na quantização q8_1 da ativação ela falha 15 vezes (rel-L2 5,4e-3 a
   1,6e-2, e o caso de 32K diverge de id no passo 0) e volta a passar quando revertido.
+
+
+## Rodada noturna (2026-09-14) — sete frentes, um alvo: 131K + KV `q5_0`/`q4_1` + MTP
+
+Baseline: tag `noite-baseline-2026-09-14` (todas as nove tarefas anteriores mergeadas,
+`check_all.sh` PASS). Regras e diário: `docs/noite-regras.md`, `docs/journal-noite.md`
+(relatório da manhã, com TL;DR). Duas revisões adversariais rodaram: `docs/adversarial-noite.md`
+(a árvore de partida, F1-F15) e `docs/adversarial-noite2.md` (o código escrito durante a noite,
+R1-R11 — **dois críticos, ambos sem cobertura de gate**).
+
+**Resultado em números, todos com gate ou A/B intercalado:**
+
+| frente | antes | depois | exatidão |
+|---|---|---|---|
+| prefill 512 tokens | 73,05 tok/s | **123,68** (+69 %) | bit-exato (`check-batch-gpu`) |
+| decode 4K real | 28,97 tok/s | **34,00** (+17,4 %) | bit-exato (gate por tipo) |
+| KV `q5_0`/`q4_1` a 131K | não existia | **14,83 tok/s**, 14,26 GiB, zero GTT | bytes idênticos ao llama.cpp |
+| MTP (verificação em lote) | 0,88× (serial) | **1,22×** pré-kernels, **0,96×** na árvore final, **2,03×** em código | md5 do stdout == ganancioso |
+| contexto longo | — | RoPE vs `ggml` até 262 143; top-5 idêntico a 17 639 tokens | gate novo |
+
+**O que ficou aberto, com o número que o prioriza**: `matvec_kernel_batch` roda a
+**109 GB/s** contra 446 GB/s do mesmo trabalho por token — é 83,7 % do prefill **e** o que
+decide se o MTP paga em prosa; a hipótese da dequantização reexecutada foi refutada por ISA, e
+a questão (banda amortizada × issue/ocupação) segue aberta. Depois vêm o GQA compartilhado só
+para KV quantizado (até +18 % a 64K), `UNROLL=4` com LUT em LDS (sem medida) e as fusões de
+kernels pequenos (bloqueadas pelo `emit()` bloqueante do oráculo).
+
+**Lições de processo registradas**: (1) gate vermelho por contenção é pior que gate não rodado —
+`gpu-lock.sh` agora espera a VRAM do dono anterior drenar e marca os filhos (`GPU_LOCK_HELD`),
+porque ninho de lock custou ~2 h de GPU; (2) um ganho vale o que vale o baseline (o número do
+MTP ficou inflado por 40 min por causa de um baseline quebrado); (3) revisão adversarial no
+código escrito na própria sessão pegou dois críticos que nenhum gate pegava.
