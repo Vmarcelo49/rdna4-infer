@@ -32,6 +32,16 @@ Two methodology fixes were needed to trust the numbers, both worth recording:
 
 Speedup of one batched call vs N separate GEMV calls, per quant type:
 
+> **Correção da coluna "share of model" (tarefa 4 do lote paralelo).** A coluna foi
+> calculada sobre `loader.total_bytes()` — o arquivo inteiro — em vez do tráfego real por
+> token, que exclui `token_embd.weight` (lê-se uma linha, não a matriz) e o bloco MTP
+> `blk.64.*`, que a v1 não executa. O efeito é grande onde o tensor excluído domina:
+> `q3_k` é **3,6 %** do tráfego por token, não 7,9 %, e `q6_k` é **0,04 %**, não 2,9 %;
+> os tipos `iq*` estavam subestimados. `docs/quants-inventario.md` §3.3 reproduz, por
+> aritmética, exatamente esta coluna a partir de `total_bytes()` (as 14 linhas batem com
+> 1 casa decimal) e traz a tabela corrigida. As *velocidades* desta seção não mudam — o
+> que mudava era a leitura de "onde 1 byte de peso dói mais".
+
 | type | share of model | N=1 gemv tok/s | N=1 GB/s | N=2 | N=4 | N=8 | N=16 | best |
 |---|---|---|---|---|---|---|---|---|
 | iq3_s | 30.9 % | 729 | 416 | 2.05× | 3.21× | 3.53× | **4.35×** | 4.35× |
