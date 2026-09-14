@@ -13,6 +13,15 @@
 // (argmax) for up to N tokens, one token at a time, and writes the ids to
 // ORACLE_IDS_OUT and the detokenized text to ORACLE_TEXT_OUT — the reference the
 // engine's own `run --greedy` output is compared against.
+//
+// longctx front (docs/journal-longctx.md §4): the context used to be pinned at
+// 512 tokens, which made "what does the reference predict at position 16K/128K?"
+// unanswerable. ORACLE_NCTX / ORACLE_NBATCH / ORACLE_NUBATCH override it (the
+// defaults, 512/512/512, are unchanged). ORACLE_NUBATCH also matters as a
+// *measurement* knob: llama.cpp's batched MUL_MAT path is not bit-identical to
+// its own per-token path, so the reference's own ubatch sensitivity at a long
+// position is the floor any engine comparison has to clear.
+
 #include <llama.h>
 
 #include <algorithm>
@@ -129,9 +138,16 @@ int main(int argc, char **argv) {
     return 1;
   }
   llama_context_params cparams = llama_context_default_params();
-  cparams.n_ctx = 512;
-  cparams.n_batch = 512;
-  cparams.n_ubatch = 512;
+  // longctx: overridable so the reference can hold a prompt as long as the one
+  // being compared. Defaults are the historical 512/512/512: existing callers
+  // (compare_ppl.sh, compare_llama_greedy.sh, capture_oracle.sh) see no change.
+  auto env_u32 = [](const char *name, uint32_t dflt) {
+    const char *v = std::getenv(name);
+    return v ? (uint32_t)std::atoi(v) : dflt;
+  };
+  cparams.n_ctx = env_u32("ORACLE_NCTX", 512);
+  cparams.n_batch = env_u32("ORACLE_NBATCH", cparams.n_ctx);
+  cparams.n_ubatch = env_u32("ORACLE_NUBATCH", cparams.n_batch);
   cparams.no_perf = true;
   llama_context *ctx = llama_init_from_model(model, cparams);
   if (!ctx) {

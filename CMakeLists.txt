@@ -360,3 +360,27 @@ if(EXISTS "/opt/rocm/include")
   target_include_directories(check-regression-gpu PRIVATE /opt/rocm/include)
 endif()
 target_link_libraries(check-regression-gpu PRIVATE ${AMDHIP64})
+
+# ---------------------------------------------------------------------------
+# frente longctx (noite 2026-09-14) — RoPE contra o ggml REAL em posicao longa.
+#
+# Os dois gates de RoPE que existiam sao cegos para contexto longo:
+# tests/check_rope_gpu.hip compara contra uma referencia escrita a mao (mesma
+# ordem de operacoes do kernel) em posicoes 3..34, e check-graph-gpu usa um dump
+# de prompt de 8 tokens. Este alvo chama ggml_rope_multi/ggml_rope_ext no backend
+# CPU do llama.cpp -- as mesmas funcoes que o grafo qwen35 chama -- com os
+# parametros que o llama.cpp resolve de verdade para este GGUF, e compara com o
+# rope_kernel do motor em posicoes ate 262143. Ver docs/journal-longctx.md.
+add_executable(check-rope-long-gpu tests/check_rope_long_gpu.hip)
+target_include_directories(check-rope-long-gpu PRIVATE include /opt/rocm/include
+                          ${LLAMA_CPP_SRC}/ggml/src ${LLAMA_CPP_SRC}/ggml/include)
+find_library(GGML_LIB ggml PATHS ${LLAMA_CPP_BUILD}/bin NO_DEFAULT_PATH)
+find_library(GGML_CPU_LIB ggml-cpu PATHS ${LLAMA_CPP_BUILD}/bin NO_DEFAULT_PATH)
+if(NOT GGML_LIB OR NOT GGML_CPU_LIB)
+  message(FATAL_ERROR "libggml.so/libggml-cpu.so not found under ${LLAMA_CPP_BUILD}/bin")
+endif()
+target_link_options(check-rope-long-gpu PRIVATE --offload-arch=gfx1201)
+target_link_libraries(check-rope-long-gpu PRIVATE ${GGML_LIB} ${GGML_BASE_LIB} ${GGML_CPU_LIB}
+                      ${AMDHIP64})
+set_target_properties(check-rope-long-gpu PROPERTIES HIP_ARCHITECTURES "gfx1201"
+                      BUILD_RPATH "${LLAMA_CPP_BUILD}/bin")
