@@ -132,6 +132,29 @@ do teto do próprio desenho). O MMQ do llama.cpp tem **tiling de saída 4×4 por
 dequantizado **na LDS**, o que dá ~1,1-1,5 instruções por 4 MACs em vez de 3,3, e sem as esperas
 (o inner loop é uma cadeia longa de dp4a com operandos na LDS).
 
+## 3c. A curva do micro-lote (llama.cpp, medido por mim com `-b N -ub N`)
+
+`llama-bench -m MODEL -p 512 -n 0 -r 3 -b N -ub N`, mesma janela, mesmo modelo:
+
+| micro-lote | tok/s | ms/token | vs nosso prefill (123,4) |
+|---|---|---|---|
+| **16 (o nosso chunk)** | **199,27** | 5,02 | **1,61×** |
+| 64 | 663,77 | 1,51 | 5,38× |
+| 128 | 1007,95 | 0,99 | 8,17× |
+| 256 | 1017,56 | 0,98 | 8,25× |
+| 512 (default) | ~1170 | 0,855 | 9,48× |
+
+Duas leituras que dirigem o plano:
+
+1. **O joelho está em 128.** De 128 para 512 ganha-se só 16 %; de 16 para 128 ganha-se 5,1×.
+   Não há razão para perseguir chunks de 512: **128 é o alvo**, e é onde o tile BM=128 do
+   llama.cpp encaixa exatamente.
+2. **O ganho do chunk não é automático — é do kernel deles.** O nosso `matvec_kernel_batch` tem
+   custo `13,9 ms + 6,04 ms/token` (medido), ou seja o chunk maior só amortiza a parcela de
+   13,9 ms: em N=64 o modelo prevê 6,26 ms/token contra 6,92 em N=16 (**+10 %**), não 3,3×.
+   Quem transforma chunk grande em velocidade é o GEMM tilejado — e é por isso que as duas
+   metades do P0 são inseparáveis (o protótipo mediu 3,46 T MACs/s em M=16 e 10,34 T em M=128).
+
 ## 4. O que nós não temos, em uma tabela (e é isto que foi "pulado")
 
 ### O limiar que nós não temos: 8 colunas
