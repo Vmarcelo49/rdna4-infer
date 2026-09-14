@@ -79,10 +79,16 @@ inline bool rope_launch(float *d_x, int n_tokens, int n_heads, int head_dim, int
 // shuffle reduction, the accumulation is local, and the WPB slices are merged
 // through a small shared buffer at the end.
 // ---------------------------------------------------------------------------
-constexpr int kAttnWarpsPerBlock = 8;  // key slices per block
+constexpr int kAttnWarpsPerBlock = 8;  // key slices per block (shipped value)
 constexpr int kAttnMaxDimsPerLane = 16; // head_dim/32 <= 16 (head_dim <= 512)
 
-template <KvType KT, KvType VT>
+// WPB is a TEMPLATE knob (default = the shipped constant) so the bench can A/B
+// it without a second copy of the kernel. Changing it changes the number of
+// partial slices merged at the end of the CTA, i.e. the summation order across
+// key slices -- so the shipped default is kept wherever a bit-exact path is
+// expected, and any other value is validated as a numeric-equivalence change
+// (scripts/check_attn_split.sh, check-kvctx-gpu).
+template <KvType KT, KvType VT, int WPB = kAttnWarpsPerBlock>
 __global__ void attn_kernel(const float *__restrict__ q, const void *__restrict__ k,
                             const void *__restrict__ v, float *__restrict__ out, int t,
                             int n_head, int n_head_kv, int head_dim, float dscale) {
@@ -174,17 +180,64 @@ __global__ void attn_kernel(const float *__restrict__ q, const void *__restrict_
   }
 }
 
-template <KvType KT, KvType VT>
+template <KvType KT, KvType VT, int WPB = kAttnWarpsPerBlock>
 inline bool attn_launch_typed(const float *d_q, const void *d_k, const void *d_v, float *d_out,
                               int t, int n_head, int n_head_kv, int head_dim, float scale,
                               hipStream_t stream) {
   if (head_dim % 32 != 0 || head_dim / 32 > kAttnMaxDimsPerLane) return false;
-  const int threads = kAttnWarpsPerBlock * 32;
-  const std::size_t smem =
-      (std::size_t)kAttnWarpsPerBlock * (2 + (std::size_t)head_dim) * sizeof(float);
-  attn_kernel<KT, VT><<<n_head, threads, smem, stream>>>(d_q, d_k, d_v, d_out, t, n_head,
-                                                         n_head_kv, head_dim, scale);
+  const int threads = WPB * 32;
+  const std::size_t smem = (std::size_t)WPB * (2 + (std::size_t)head_dim) * sizeof(float);
+  attn_kernel<KT, VT, WPB><<<n_head, threads, smem, stream>>>(d_q, d_k, d_v, d_out, t, n_head,
+                                                              n_head_kv, head_dim, scale);
   return hipGetLastError() == hipSuccess;
+}
+
+// WPB dispatch for the single-CTA (unsplit) kernel (bench use). Same
+// numeric-equivalence caveat as the split one: the number of partial slices
+// merged per CTA changes the summation order across key slices.
+template <KvType KT, KvType VT>
+inline bool attn_launch_wpb_typed(const float *d_q, const void *d_k, const void *d_v, float *d_out,
+                                  int t, int n_head, int n_head_kv, int head_dim, float scale,
+                                  int wpb, hipStream_t stream) {
+  switch (wpb) {
+    case 8:
+      return attn_launch_typed<KT, VT, 8>(d_q, d_k, d_v, d_out, t, n_head, n_head_kv, head_dim,
+                                          scale, stream);
+    case 16:
+      return attn_launch_typed<KT, VT, 16>(d_q, d_k, d_v, d_out, t, n_head, n_head_kv, head_dim,
+                                           scale, stream);
+    case 32:
+      return attn_launch_typed<KT, VT, 32>(d_q, d_k, d_v, d_out, t, n_head, n_head_kv, head_dim,
+                                           scale, stream);
+    default: return false;
+  }
+}
+
+inline bool attn_launch_wpb(const float *d_q, const void *d_k, const void *d_v, float *d_out, int t,
+                            int n_head, int n_head_kv, int head_dim, float scale, KvType kt,
+                            KvType vt, int wpb, hipStream_t stream = nullptr) {
+#define RD_ATTN_U_CASE(K, V)                                                                      \
+  if (kt == KvType::K && vt == KvType::V)                                                         \
+  return attn_launch_wpb_typed<KvType::K, KvType::V>(d_q, d_k, d_v, d_out, t, n_head, n_head_kv,  \
+                                                     head_dim, scale, wpb, stream)
+  RD_ATTN_U_CASE(F32, F32);
+  RD_ATTN_U_CASE(F16, F16);
+  RD_ATTN_U_CASE(Q8_0, Q8_0);
+  RD_ATTN_U_CASE(Q4_0, Q4_0);
+  RD_ATTN_U_CASE(F16, Q8_0);
+  RD_ATTN_U_CASE(F16, Q4_0);
+  RD_ATTN_U_CASE(Q8_0, F16);
+  RD_ATTN_U_CASE(Q4_0, F16);
+  RD_ATTN_U_CASE(F32, F16);
+  RD_ATTN_U_CASE(F16, F32);
+  RD_ATTN_U_CASE(F32, Q8_0);
+  RD_ATTN_U_CASE(F32, Q4_0);
+  RD_ATTN_U_CASE(Q8_0, F32);
+  RD_ATTN_U_CASE(Q4_0, F32);
+  RD_ATTN_U_CASE(Q8_0, Q4_0);
+  RD_ATTN_U_CASE(Q4_0, Q8_0);
+#undef RD_ATTN_U_CASE
+  return false;
 }
 
 inline bool attn_launch(const float *d_q, const void *d_k, const void *d_v, float *d_out, int t,
@@ -234,7 +287,7 @@ inline bool attn_launch(const float *d_q, const void *d_k, const void *d_v, floa
 // across keys changes), so callers must accept ~1e-7 relative; the gate is
 // tests/bench_attn_gpu.hip's comparison against the unsplit kernel.
 // ---------------------------------------------------------------------------
-template <KvType KT, KvType VT>
+template <KvType KT, KvType VT, int WPB = kAttnWarpsPerBlock>
 __global__ void attn_split_kernel(const float *__restrict__ q, const void *__restrict__ k,
                                   const void *__restrict__ v, float *__restrict__ partial,
                                   int t, int n_head, int n_head_kv, int head_dim, float dscale,
@@ -259,8 +312,8 @@ __global__ void attn_split_kernel(const float *__restrict__ q, const void *__res
   float acc[kAttnMaxDimsPerLane];
   for (int i = 0; i < dpw; ++i) acc[i] = 0.0f;
 
-  const int step = kAttnWarpsPerBlock * n_splits;
-  for (int j = w + kAttnWarpsPerBlock * s; j <= t; j += step) {
+  const int step = WPB * n_splits;
+  for (int j = w + WPB * s; j <= t; j += step) {
     const char *kr = (const char *)k + ((std::int64_t)j * n_head_kv + kvh) * krow;
     float kk[kAttnMaxDimsPerLane];
     if (dpw == 8) {
@@ -304,17 +357,17 @@ __global__ void attn_split_kernel(const float *__restrict__ q, const void *__res
   // the weights exp(m_i - mm) are computed once (one per warp), then every dim is
   // a 32-term dot product with them. (A single-thread version costs 32*head_dim
   // expf calls in one lane and becomes the kernel's serial tail.)
-  __shared__ float wts[kAttnWarpsPerBlock];
+  __shared__ float wts[WPB];
   __shared__ float cmax;
   __syncthreads();
   if (threadIdx.x == 0) {
     float mm = -INFINITY;
-    for (int i = 0; i < kAttnWarpsPerBlock; ++i)
+    for (int i = 0; i < WPB; ++i)
       mm = fmaxf(mm, smem[(std::int64_t)i * (2 + head_dim)]);
     cmax = mm;
   }
   __syncthreads();
-  if (threadIdx.x < kAttnWarpsPerBlock) {
+  if (threadIdx.x < WPB) {
     // An EMPTY split (fewer keys than CTAs, e.g. two splits at position 0) leaves
     // every warp slice at m = -INFINITY; expf(-inf - -inf) is NaN and poisons the
     // whole attention output (found by forcing more splits than keys in the M7
@@ -327,7 +380,7 @@ __global__ void attn_split_kernel(const float *__restrict__ q, const void *__res
   float *out = partial + ((std::int64_t)h * n_splits + s) * (2 + head_dim);
   if (threadIdx.x < 32) {
     float lsum = 0.0f;
-    if (threadIdx.x < kAttnWarpsPerBlock)
+    if (threadIdx.x < WPB)
       lsum = wts[threadIdx.x] * smem[(std::int64_t)threadIdx.x * (2 + head_dim) + 1];
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) lsum += __shfl_xor_sync(0xffffffffull, lsum, off);
@@ -338,7 +391,7 @@ __global__ void attn_split_kernel(const float *__restrict__ q, const void *__res
   }
   if (threadIdx.x < head_dim) {
     float a = 0.0f;
-    for (int i = 0; i < kAttnWarpsPerBlock; ++i)
+    for (int i = 0; i < WPB; ++i)
       a += smem[(std::int64_t)i * (2 + head_dim) + 2 + threadIdx.x] * wts[i];
     out[2 + threadIdx.x] = a;
   }
@@ -374,22 +427,71 @@ __global__ void attn_merge_kernel(const float *__restrict__ partial, float *__re
   }
 }
 
-template <KvType KT, KvType VT>
+template <KvType KT, KvType VT, int WPB = kAttnWarpsPerBlock>
 inline bool attn_launch_split_typed(const float *d_q, const void *d_k, const void *d_v, float *d_out,
                                     float *d_partial, int t, int n_head, int n_head_kv,
                                     int head_dim, float scale, int n_splits,
                                     hipStream_t stream) {
   if (head_dim % 32 != 0 || head_dim / 32 > kAttnMaxDimsPerLane) return false;
   if (n_splits < 1) return false;
-  const int threads = kAttnWarpsPerBlock * 32;
-  const std::size_t smem =
-      (std::size_t)kAttnWarpsPerBlock * (2 + (std::size_t)head_dim) * sizeof(float);
+  const int threads = WPB * 32;
+  const std::size_t smem = (std::size_t)WPB * (2 + (std::size_t)head_dim) * sizeof(float);
   dim3 grid((unsigned)n_head, (unsigned)n_splits);
-  attn_split_kernel<KT, VT><<<grid, threads, smem, stream>>>(d_q, d_k, d_v, d_partial, t, n_head,
-                                                             n_head_kv, head_dim, scale, n_splits);
+  attn_split_kernel<KT, VT, WPB><<<grid, threads, smem, stream>>>(d_q, d_k, d_v, d_partial, t,
+                                                                 n_head, n_head_kv, head_dim, scale,
+                                                                 n_splits);
   if (hipGetLastError() != hipSuccess) return false;
   attn_merge_kernel<<<n_head, 32, 0, stream>>>(d_partial, d_out, n_head, head_dim, n_splits);
   return hipGetLastError() == hipSuccess;
+}
+
+// WPB is a template knob (bench use); the shipping path fixes it at
+// kAttnWarpsPerBlock. Only 8/16/32 are instantiated (32 = the 1024-thread cap).
+template <KvType KT, KvType VT>
+inline bool attn_launch_split_wpb(const float *d_q, const void *d_k, const void *d_v, float *d_out,
+                                  float *d_partial, int t, int n_head, int n_head_kv, int head_dim,
+                                  float scale, int n_splits, int wpb, hipStream_t stream) {
+  switch (wpb) {
+    case 8:
+      return attn_launch_split_typed<KT, VT, 8>(d_q, d_k, d_v, d_out, d_partial, t, n_head,
+                                                n_head_kv, head_dim, scale, n_splits, stream);
+    case 16:
+      return attn_launch_split_typed<KT, VT, 16>(d_q, d_k, d_v, d_out, d_partial, t, n_head,
+                                                 n_head_kv, head_dim, scale, n_splits, stream);
+    case 32:
+      return attn_launch_split_typed<KT, VT, 32>(d_q, d_k, d_v, d_out, d_partial, t, n_head,
+                                                 n_head_kv, head_dim, scale, n_splits, stream);
+    default: return false;
+  }
+}
+
+inline bool attn_launch_split_wpb(const float *d_q, const void *d_k, const void *d_v, float *d_out,
+                                  float *d_partial, int t, int n_head, int n_head_kv, int head_dim,
+                                  float scale, KvType kt, KvType vt, int n_splits, int wpb,
+                                  hipStream_t stream = nullptr) {
+#define RD_ATTN_WPB_CASE(K, V)                                                                    \
+  if (kt == KvType::K && vt == KvType::V)                                                         \
+  return attn_launch_split_wpb<KvType::K, KvType::V>(d_q, d_k, d_v, d_out, d_partial, t, n_head,  \
+                                                     n_head_kv, head_dim, scale, n_splits, wpb,   \
+                                                     stream)
+  RD_ATTN_WPB_CASE(F32, F32);
+  RD_ATTN_WPB_CASE(F16, F16);
+  RD_ATTN_WPB_CASE(F16, Q8_0);
+  RD_ATTN_WPB_CASE(F16, Q4_0);
+  RD_ATTN_WPB_CASE(Q8_0, Q8_0);
+  RD_ATTN_WPB_CASE(Q4_0, Q4_0);
+  RD_ATTN_WPB_CASE(F32, F16);
+  RD_ATTN_WPB_CASE(F32, Q8_0);
+  RD_ATTN_WPB_CASE(F32, Q4_0);
+  RD_ATTN_WPB_CASE(Q8_0, F16);
+  RD_ATTN_WPB_CASE(Q8_0, Q4_0);
+  RD_ATTN_WPB_CASE(Q4_0, F16);
+  RD_ATTN_WPB_CASE(Q4_0, Q8_0);
+  RD_ATTN_WPB_CASE(Q8_0, F32);
+  RD_ATTN_WPB_CASE(Q4_0, F32);
+  RD_ATTN_WPB_CASE(F16, F32);
+#undef RD_ATTN_WPB_CASE
+  return false;
 }
 
 // Byte size of the partial buffer for `n_splits` (caller allocates once).
@@ -397,32 +499,77 @@ inline std::size_t attn_partial_bytes(int n_head, int head_dim, int n_splits) {
   return (std::size_t)n_head * (std::size_t)n_splits * (2 + (std::size_t)head_dim) * sizeof(float);
 }
 
+// ---------------------------------------------------------------------------
+// Warps per CTA for the SPLIT kernel, by the number of key splits.
+//
+// Measured on gfx1201 (tests/bench_attn_gpu.hip, f16 KV, head_dim 256, 24 heads /
+// 4 kv heads, one layer, one query token):
+//
+//   splits  WPB=8     WPB=16    WPB=32      grid CTAs
+//   2       0.1777    0.1051    0.1057      48
+//   4       0.1014    0.0719    0.0884      96
+//   8       0.0744    0.0775    0.0969     192
+//   16      0.0819    0.0844    0.1111     384
+//
+// The CTA count fixes the parallelism the GPU is willing to take from this
+// kernel; what is left is how the KEY RANGE of each (head, split) pair is spread
+// over its warps. At few splits per head, 8 warps leave each warp with a long
+// serial key walk (latency exposed, measured 3.3x slower than the best config at
+// 4096 keys), so more warps win; once there are 8+ splits per head the key walk
+// is already short and the extra LDS traffic of a wider CTA (the merge reads
+// WPB*(2+head_dim) floats per CTA through shared memory) starts to dominate.
+//
+// This is a SHAPE decision (like a block-size policy), not a change to the split
+// count: the number of partials and the summation order across splits are
+// untouched, and the short-context path (keys < kAttnSplitMin -> the unsplit
+// kernel) never enters here, so the oracle/golden gates keep the arithmetic they
+// were recorded with. The numeric effect of a WPB change is the same class as the
+// M7 split change (rel-L2 ~2.5e-7 at the kernel level) and is gated by
+// scripts/check_attn_split.sh + check-kvctx-gpu.
+// The threshold is 4, not 8: at 8 splits per head the two independent kernel
+// runs disagree (WPB=16 measured 1.10x better in one and 1.003x in the other)
+// while at 2-4 splits every run shows 1.4-1.7x, and the end-to-end measurement
+// at 16K keys (7 splits) showed -1.3% with the wider CTA. Above 4 splits the
+// shipping 8 warps are therefore kept, which also means every context from 16K
+// up is byte-for-byte the code path it was before this change.
+constexpr int kAttnSplitWpbLimit = 4;
+
+inline int attn_split_wpb(int n_splits) {
+  return n_splits <= kAttnSplitWpbLimit ? 16 : kAttnWarpsPerBlock;
+}
+
 inline bool attn_launch_split(const float *d_q, const void *d_k, const void *d_v, float *d_out,
                               float *d_partial, int t, int n_head, int n_head_kv, int head_dim,
                               float scale, KvType kt, KvType vt, int n_splits,
                               hipStream_t stream = nullptr) {
-#define RD_ATTN_SPLIT_CASE(K, V)                                                                  \
-  if (kt == KvType::K && vt == KvType::V)                                                         \
-  return attn_launch_split_typed<KvType::K, KvType::V>(d_q, d_k, d_v, d_out, d_partial, t, n_head, \
-                                                       n_head_kv, head_dim, scale, n_splits,      \
-                                                       stream)
-  RD_ATTN_SPLIT_CASE(F32, F32);
-  RD_ATTN_SPLIT_CASE(F32, F16);
-  RD_ATTN_SPLIT_CASE(F32, Q8_0);
-  RD_ATTN_SPLIT_CASE(F32, Q4_0);
-  RD_ATTN_SPLIT_CASE(F16, F32);
-  RD_ATTN_SPLIT_CASE(F16, F16);
-  RD_ATTN_SPLIT_CASE(F16, Q8_0);
-  RD_ATTN_SPLIT_CASE(F16, Q4_0);
-  RD_ATTN_SPLIT_CASE(Q8_0, F32);
-  RD_ATTN_SPLIT_CASE(Q8_0, F16);
-  RD_ATTN_SPLIT_CASE(Q8_0, Q8_0);
-  RD_ATTN_SPLIT_CASE(Q8_0, Q4_0);
-  RD_ATTN_SPLIT_CASE(Q4_0, F32);
-  RD_ATTN_SPLIT_CASE(Q4_0, F16);
-  RD_ATTN_SPLIT_CASE(Q4_0, Q8_0);
-  RD_ATTN_SPLIT_CASE(Q4_0, Q4_0);
-#undef RD_ATTN_SPLIT_CASE
+  // Shape dispatch: the WPB chosen above, through the templated launcher.
+#define RD_ATTN_SPLIT_WPB(K, V)                                                                   \
+  if (kt == KvType::K && vt == KvType::V) {                                                        \
+    if (attn_split_wpb(n_splits) == 16)                                                            \
+      return attn_launch_split_typed<KvType::K, KvType::V, 16>(d_q, d_k, d_v, d_out, d_partial, t,  \
+                                                               n_head, n_head_kv, head_dim, scale,  \
+                                                               n_splits, stream);                   \
+    return attn_launch_split_typed<KvType::K, KvType::V, 8>(d_q, d_k, d_v, d_out, d_partial, t,     \
+                                                            n_head, n_head_kv, head_dim, scale,     \
+                                                            n_splits, stream);                      \
+  }
+  RD_ATTN_SPLIT_WPB(F32, F32);
+  RD_ATTN_SPLIT_WPB(F16, F16);
+  RD_ATTN_SPLIT_WPB(Q8_0, Q8_0);
+  RD_ATTN_SPLIT_WPB(Q4_0, Q4_0);
+  RD_ATTN_SPLIT_WPB(F32, F16);
+  RD_ATTN_SPLIT_WPB(F32, Q8_0);
+  RD_ATTN_SPLIT_WPB(F32, Q4_0);
+  RD_ATTN_SPLIT_WPB(F16, F32);
+  RD_ATTN_SPLIT_WPB(F16, Q8_0);
+  RD_ATTN_SPLIT_WPB(F16, Q4_0);
+  RD_ATTN_SPLIT_WPB(Q8_0, F32);
+  RD_ATTN_SPLIT_WPB(Q8_0, F16);
+  RD_ATTN_SPLIT_WPB(Q8_0, Q4_0);
+  RD_ATTN_SPLIT_WPB(Q4_0, F32);
+  RD_ATTN_SPLIT_WPB(Q4_0, F16);
+  RD_ATTN_SPLIT_WPB(Q4_0, Q8_0);
+#undef RD_ATTN_SPLIT_WPB
   return false;
 }
 
