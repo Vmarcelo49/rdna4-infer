@@ -48,6 +48,23 @@ O ganho cresce com o tamanho do prompt (até o teto de N=16 por chunk) e é plan
 em diante: 70 tok/s contra os 440 tok/s da referência (llama.cpp, Vulkan, em batch) —
 a distância que resta é o laço interno do `vec_dot`, não o batching.
 
+## Reuso da quantização de ativação no caminho de decode (+1,3%)
+
+O estudo de ROCm mediu que **192 das 305 quantizações de ativação por token eram
+redundantes** (a mesma `d_xn_` quantizada 3× na atenção, 2× no FFN, 4× no GDN; nada
+escreve nela entre as projeções). `proj_qq()` reusa os blocos `q8_1` já calculados
+pelo `proj()` anterior, com o contrato documentado no header. A/B na mesma máquina
+(3 repetições de 32 tokens, ctx 4096, aquecimento de 8 fora da medida):
+
+| | tok/s |
+|---|---|
+| re-quantizando (antes) | 28,89 |
+| reusando (agora) | **29,26** (+1,3 %) |
+
+São 384 lançamentos a menos por token (~2200 → ~1800), e o ganho está na borda do
+ruído de execução (1-2 %), mas é **bit-exato** — `check-graph-gpu` (oráculo por nó)
+PASS e `check_golden_run.sh` OK provam que os valores não mudaram.
+
 ## Decodificação especulativa com a cabeça MTP: medida, e **não** implementada
 
 Com `forward_batch` e a aceitação medida da cabeça MTP (86,7% em texto natural,

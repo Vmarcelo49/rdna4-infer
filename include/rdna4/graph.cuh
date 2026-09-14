@@ -235,6 +235,14 @@ class Graph {
   bool forward_batch_layer(int il, int n, int pos0, std::string &err);
   bool proj(const GpuTensor &w, const float *d_x, float *d_y, int nrows, int ncols,
             std::string &err);
+  // Same as proj() but reuses the activation already quantized into the q8
+  // scratch by the *previous* proj() call. Contract: the caller guarantees that
+  // (a) the previous call quantized exactly `ncols` floats from the same source,
+  // and (b) nothing wrote the q8 scratch since. Nothing writes d_xn_/d_q8_ between
+  // the q/k/v projections of a layer, nor between the FFN's gate and up, which is
+  // where the redundancy was measured (192 of the 305 activation quantizations per
+  // token were re-quantizing byte-identical blocks; docs/rocm-estudo.md §A1).
+  bool proj_qq(const GpuTensor &w, float *d_y, int nrows, int ncols, std::string &err);
   bool add_residual(float *d_src, float *d_dst, int n, std::string &err);
   bool full_attn(int il, int t, int pos, std::string &err);
   bool kv_write(int il, int t, const float *d_ksrc, const float *d_vsrc, std::string &err);
@@ -575,6 +583,25 @@ inline bool Graph::proj(const GpuTensor &w, const float *d_x, float *d_y, int nr
   return true;
 }
 
+inline bool Graph::proj_qq(const GpuTensor &w, float *d_y, int nrows, int ncols,
+                           std::string &err) {
+  if (w.dim0 != ncols || w.dim1 != nrows ||
+      w.bytes != tensor_bytes(w.dt, (std::uint64_t)nrows * (std::uint64_t)ncols)) {
+    err = "weight shape mismatch in proj_qq";
+    return false;
+  }
+  const int nb = ncols / QK8_1;
+  if (ncols % QK8_1 != 0 || (std::size_t)nb > q8_blocks_) {
+    err = "bad reduction dim for q8 scratch (proj_qq)";
+    return false;
+  }
+  if (!matvec_launch((int)w.dt, w.ptr, (const block_q8_1 *)d_q8_, d_y, nrows, ncols, nullptr)) {
+    err = "matvec_launch failed (proj_qq)";
+    return false;
+  }
+  return true;
+}
+
 // Residual add, with the optional diagnostic perturbation of the layer output.
 inline bool Graph::add_residual(float *d_src, float *d_dst, int n, std::string &err) {
   if (noise_rel_ > 0.0f) {
@@ -599,8 +626,9 @@ inline bool Graph::full_attn(int il, int t, int pos, std::string &err) {
   }
   emit("attn_norm", il, d_xn_, E);
   if (!proj(L.attn_q, d_xn_, d_proj_, NH * 2 * HD, E, err)) return false;
-  if (!proj(L.attn_k, d_xn_, d_kstage_, NKV * HD, E, err)) return false;
-  if (!proj(L.attn_v, d_xn_, d_vstage_, NKV * HD, E, err)) return false;
+  // k and v read the same activation as q: reuse its q8_1 blocks
+  if (!proj_qq(L.attn_k, d_kstage_, NKV * HD, E, err)) return false;
+  if (!proj_qq(L.attn_v, d_vstage_, NKV * HD, E, err)) return false;
   emit("Qcur_full", il, d_proj_, (std::int64_t)NH * 2 * HD);
   emit("Vcur", il, d_vstage_, (std::int64_t)NKV * HD);
 
@@ -706,9 +734,10 @@ inline bool Graph::gdn_layer(int il, int t, std::string &err) {
   }
   emit("attn_norm", il, d_xn_, E);
   if (!proj(L.attn_qkv, d_xn_, d_qkv_, chan, E, err)) return false;
-  if (!proj(L.attn_gate, d_xn_, d_z_, d_inner, E, err)) return false;
-  if (!proj(L.ssm_beta, d_xn_, d_beta_, nvh, E, err)) return false;
-  if (!proj(L.ssm_alpha, d_xn_, d_alpha_, nvh, E, err)) return false;
+  // all four GDN projections read d_xn_ unchanged: one quantization serves all
+  if (!proj_qq(L.attn_gate, d_z_, d_inner, E, err)) return false;
+  if (!proj_qq(L.ssm_beta, d_beta_, nvh, E, err)) return false;
+  if (!proj_qq(L.ssm_alpha, d_alpha_, nvh, E, err)) return false;
   emit("linear_attn_qkv_mixed", il, d_qkv_, chan);
   emit("z", il, d_z_, d_inner);
   emit("beta", il, d_beta_, nvh);
@@ -767,7 +796,8 @@ inline bool Graph::ffn(int il, std::string &err) {
   const LayerW &L = w_[il];
   if (!proj(L.ffn_gate, d_xn_, d_ffn_a_, F, E, err)) return false;  // d_xn_ holds attn_post_norm
   if (!unary_launch(d_ffn_a_, d_ffn_a_, F, UnOp::Silu)) return false;
-  if (!proj(L.ffn_up, d_xn_, d_ffn_b_, F, E, err)) return false;
+  // up reads the same activation as gate (silu only touched the output)
+  if (!proj_qq(L.ffn_up, d_ffn_b_, F, E, err)) return false;
   if (!mul_launch(d_ffn_a_, d_ffn_b_, d_ffn_a_, F)) return false;
   if (!proj(L.ffn_down, d_ffn_a_, d_ffnout_, E, F, err)) return false;
   emit("ffn_out", il, d_ffnout_, E);
