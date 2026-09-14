@@ -173,14 +173,36 @@ O GEMM muda a ordem das somas e o tipo da ativação, então **não vale bit-exa
 | chunk 128 quebra a atenção/GDN | é o item 4/5 da tabela; a frente C mediu os dois como 8,7 % do prefill somados, então há espaço para pagar |
 | `coopmat` não ser alcançável do HIP/gfx1201 | é exatamente o que a frente D mede agora; se falhar, o plano para em D2 (~480 tok/s = 3,9×) |
 
-## 6. Ordem de execução proposta
+## 6. Ordem de execução proposta (revisada com tudo o que foi medido hoje)
 
-1. **Medir a frente D** (WMMA f16/int8 vs dp4a em TOPS neste cartão) — decide se D3 é viável e
-   com que família.
-2. **Chunk 16 → 128** com o kernel atual estendido (N=64/128 no `matvec_kernel_batch`): entrega
-   a infraestrutura e mede o ganho real do D1 (previsto +10 %, e a previsão é falsificável).
-3. **GEMM f16 tilejado** (`gemm.cuh`) atrás de `RD_GEMM=1`, gate numérico, A/B contra o kernel
-   atual na mesma árvore: alvo 3,2×.
-4. **Laço `coopmat`** com o mesmo staging: alvo 2,5× sobre o passo 3.
-5. Só depois: as fusões (2,2 ms/token no decode, 0,06 % no prefill) e a atenção GQA por workgroup
-   (contexto longo).
+O caminho está medido de ponta a ponta: cada degrau tem número, e os dois gargalos que sobram estão
+localizados.
+
+1. **D2 — GEMM tilejado com os blocos reais, caminho int8.** Base medida: **12,74 T-MAC/s em M=128**
+   (frente G). Configuração recomendada, toda medida: `BM=128 BN=128 BK=64 RM=RN=8`, 256 threads,
+   **≤32 KB de LDS por CTA** (para 2 CTAs/CU), staging de 1 sub-bloco de 32 pesos por thread,
+   ativação em `int4`, prefetch dos campos do peso em registrador, **duplo buffer só do W**, ativação
+   lida direto da global, padding de 1 `half2` por linha. **Não** usar duplo buffer de ativação
+   (medido: −17 %) e **cuidado com o prefetch sem liberar LDS** (medido: 413 `scratch_*` = 0,18×).
+   Gate: como o caminho int8 é bit-exato, valem os gates que já existem (`check-matmul-gpu`,
+   `check-batch-gpu`, `check-graph-gpu`, golden) — **não** é preciso PPL.
+2. **D4 — trocar o miolo por WMMA int8** (mesmo staging, mesma correção): **19,7 T em M=128 e 22,8
+   em M=512 (6,2-7,2×), bit-exato com 0 de 8 912 896 elementos** (frente H). A receita do operando
+   está em `docs/estudo-prefill-d-wmma.md` §(c) e a da correção (D transposto → `d_w` 1 valor por
+   lane, `d_a` 8 floats consecutivos) em §(a) da frente H.
+3. **D3 — staging**, que é o gargalo comum e **o item nº 1 que sobra**: 50-61 % do tempo do GEMM em
+   M≥64, a 132-275 GB/s de fonte contra 633 de roofline; e no WMMA a **correção de escala custa
+   53-56 % do miolo**. As duas coisas são *remoção de instrução*, não escalonamento: o candidato
+   medido é o staging int8 (1,31× mais rápido que o f16, 396 contra 590 instruções por sub-bloco),
+   e o candidato não medido é especialização de warps (produtor/consumidor) e CTA persistente para
+   a cauda de onda (11,8 % em M=128, medido).
+4. **Chunk de 128** — pré-requisito de tudo acima (`kMaxBatch`, buffers, atenção causal com M>128,
+   laço do GDN dentro do chunk). **Medido: subir o chunk com o kernel ATUAL regride** (−18 % em
+   N=32, −71 % em N=64), então isto anda junto com o item 1, não antes.
+5. **Recorrência do GDN (0,852 ms/token)** — é o único item do andaime com tamanho para importar
+   depois que o matvec estiver resolvido: no degrau D4 ele passa a ser ~52 % do que sobra (Amdahl
+   §1b).
+6. **O que NÃO fazer** (todas refutadas por medição hoje): fusão de kernels para o prefill (1,1 %),
+   subir o chunk com o kernel atual (regressão), duplo buffer de ativação (−17 %), ampliar o tile
+   em M para matar a cauda de onda (−13 %), `UNROLL` no kernel em lote (+5,6 % pior), staging LDS da
+   ativação (−5 %), persistir com o caminho f16 vetorial (95 % do muro de issue dele).
