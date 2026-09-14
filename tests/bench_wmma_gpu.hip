@@ -1435,11 +1435,18 @@ int main(int argc, char **argv) {
     }
     const double ms = best_ms([&] { launch(iters); }, reps, rounds);
     const double bytes = 2.0 * 16.0 * (double)nthreads * iters;  // 16 B lidos + 16 B escritos
+    const double clk = fma_per_s > 0.0 ? clk_hz : clk_khz * 1e3;
     std::printf("  copia LDS->LDS (int4, iters=%d): %.3f ms, %.1f GB/s (lido+escrito), %.1f "
-                "B/ciclo/CU\n", iters, bytes / (ms * 1e-3) / 1e9,
-                bytes / (ms * 1e-3) / ((double)cu * clk_hz));
-    std::printf("  modelo de 32 bancos x 4 B = 128 B/ciclo/CU = %.1f GB/s no clock derivado\n",
-                128.0 * (double)cu * clk_hz / 1e9);
+                "B/ciclo/CU (clock %s)\n", iters, bytes / (ms * 1e-3) / 1e9,
+                bytes / (ms * 1e-3) / ((double)(2 * cu) * clk), fma_per_s > 0.0 ? "derivado" : "nominal do driver");
+    std::printf("  modelo de 32 bancos x 4 B = 128 B/ciclo/CU = %.1f GB/s no mesmo clock\n",
+                128.0 * (double)(2 * cu) * clk / 1e9);
+    std::printf("  ATENCAO: esta celula mediu tempo ~CONSTANTE (1,4 s por lancamento com iters=100, "
+                "1000 e 5000,\n  e 57 ms com iters=1) em todas as tentativas -- nao escala com o "
+                "trabalho e nao tem ordem de\n  grandeza plausivel. E' uma anomalia deste kernel/"
+                "caminho de lancamento, NAO uma medida de banda;\n  nao use o numero acima. A folga "
+                "da LDS no estudo vem do modo 1 do GEMM (mesma grade, sem WMMA),\n  que e' uma "
+                "comparacao dentro da mesma corrida.\n");
     HIPCHECK(hipFree(d_i));
     std::printf("\n");
   }

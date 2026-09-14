@@ -143,9 +143,9 @@ vs 38,89 = **0,995x**. Ou seja, dentro de uma corrida a medicao e' solida a ~1 %
   ciclo por SIMD32; essa e' a unica suposicao da conversao, e o que importa — as
   razoes — nao depende dela]. Por CU (4 SIMD): 2,4-3,9 ciclos por WMMA.
 - **O matrix core nao e' um pipe separado**: um laco misto de 1 WMMA + 8 dp4a por
-  passo, com acumuladores disjuntos, custa **1,16x a soma** dos dois lacos puros
-  (misto/max = 1,33x). Eles **dividem o mesmo recurso de issue/execucao**; nao ha'
-  "dp4a de graca ao lado do WMMA".
+  passo, com acumuladores disjuntos (U=4), custa **1,00x a 1,16x a soma** dos dois
+  lacos puros em tres corridas (misto/max = 1,12-1,33x). Eles **dividem o mesmo
+  recurso de issue/execucao**; nao ha' "dp4a de graca ao lado do WMMA".
 - Registradores: 97 por lane no laco de WMMA int8 (com 8 acumuladores), o que
   **limita a ocupacao a 2 warps por SIMD** (teto de 256 VGPRS/lane). Foi preciso
   128-256 CTAs para a taxa saturar; com 32 CTAs (1 warp/SIMD) ja' se chega a 97 %

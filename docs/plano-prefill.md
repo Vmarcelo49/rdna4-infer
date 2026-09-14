@@ -9,11 +9,12 @@ que o sustenta; nenhuma escolha é por preferência. O que **não** está medido
 
 | degrau | o que muda | ganho medido/derivado | prefill esperado |
 |---|---|---|---|
-| **hoje** | chunk 16 + GEMV em lote (dp4a, 1 saída/thread, sem LDS) | — | **123,4 tok/s** (`--prefill 512`, melhor de 3) |
-| **D1** | chunk maior com o MESMO kernel | **MEDIDO: −18 % em N=32, −71 % em N=64** (ver §0.1) | ~100 / 58 tok/s — **não fazer** |
-| **D2** | D1 + GEMM tilejado com staging na LDS, caminho vetorial (`dot2`/dp4a) | protótipo: 10,34 T MAC/s em M=128 vs 3,18 T do motor = **3,24×** | **~400-480 tok/s** |
-| **D3** | D2 + laço interno na **unidade de matriz** (coopmat/WMMA f16→f32) | 1196/478 = **2,50×** (medido no llama.cpp, mesma máquina) | **~1000-1200 tok/s** |
-| referência | llama.cpp Vulkan, `-ub 512` | — | 1170-1196 tok/s |
+| **hoje** | chunk 16 + GEMV em lote (dp4a, 1 saída/thread, sem LDS) | — | **123,4 tok/s** = 3,0-3,2 T-MAC/s (7 % do pico de dp4a medido) |
+| ~~D1~~ | chunk maior com o MESMO kernel | **MEDIDO E REPROVADO**: −18 % em N=32, −71 % em N=64 (§0.1) | **não fazer** |
+| **D2** | GEMM tilejado com staging na LDS, **M=64-128** | dois protótipos independentes: **10,3-13,7 T-MAC/s = 3,2-4,3×** | **~400-530 tok/s** |
+| **D3** | D2 + **caminho de dados consertado** (BK=128/linha de cache cheia, ordem k-maior, mais warps) | não medido; é o que destrava os dois caminhos (hoje 58-94 % do tempo é staging, a 280 GB/s de 633) | a medir |
+| **D4** | D2/D3 + laço interno na **unidade de matriz** | teto medido: WMMA int8 **182 T-MAC/s** (364 TOPS) contra 44 do dp4a = **4,2×** | alvo llama.cpp: 32,7 T-MAC/s = **~1100 tok/s** |
+| referência | llama.cpp Vulkan, `-ub 512` | 32,7 T-MAC/s (74 % do pico de dp4a, 37 % do teto f16-WMMA) | 1170-1196 tok/s |
 
 Os degraus não são independentes: **D2 não rende nada sem D1** (medido: o mesmo GEMM tilejado em
 M=16 dá 3,46 T MAC/s = 1,08× o kernel de hoje; em M=128 dá 10,34 T = 3,24×). E **D3 não existe
@@ -47,21 +48,51 @@ Consequências para o plano:
 3. O `kMaxBatch = 16` do motor não é um número mal escolhido para o kernel que existe — é o ótimo
    dele (medido). Só faz sentido mudar junto com o kernel novo.
 
-## 1. Por que a unidade de matriz é obrigatória (e não uma otimização)
+## 1. A ordem certa: caminho de dados primeiro, instrução depois
 
-Medido, nesta máquina:
+Isto é o que a frente D mediu e o que corrige o plano que eu tinha escrito de manhã:
 
-| caminho | instruções por 4 MAC | MAC por instrução de warp | teto prático |
-|---|---|---|---|
-| dp4a no kernel de hoje (ISA, medido) | 3,31 (33 % esperas) | 44,7 | ~27 TOPS, e realizamos 6,4 |
-| dp4a num tile bom (4×4 + LDS) | 2,5-3,0 | 128 | **~12-13 T MAC/s** — o protótipo chegou em 12,74 |
-| f16 `v_dot2_f32_f16` empacotado | ~2,56 | 64 | 39-49 TOPS, **saturado de issue** (o fallback do Vulkan roda a ~94 % dos slots) |
-| **matriz (WMMA/coopmat 16×16×16)** | **~0,0103** | **4096** | **97,4 T MAC/s fp16** (o mesmo teto do dp4a *por ciclo*, mas a 1/250 das instruções) |
+| caminho | pico medido neste cartão | o que os protótipos **realmente** alcançam |
+|---|---|---|
+| dp4a (`v_dot4_i32_iu8`) | **44 T-MAC/s = 88 TOPS** | 12,74 T-MAC/s (o meu, int8, M=512) = **29 % do pico** |
+| WMMA f16 16×16×16 (o que o Vulkan usa) | **89,6 T-MAC/s** (acc f32) / 95,1 (acc f16) | 10,3-13,7 T-MAC/s (minigemm da frente D, M=64) = **11-15 % do pico** |
+| WMMA int8 16×16×16 | **182 T-MAC/s = 364 TOPS** | não testado ponta a ponta |
 
-O protótipo `bench-gemm-gpu` (12,74 T MAC/s em M=512) já está a **65-78 % dos slots de issue** do
-cartão. Ou seja: **o caminho vetorial está no fim da estrada; de ~480 tok/s para cima só existe a
-unidade de matriz.** Não há terceira via, e a única pergunta em aberto é *qual* família de matriz
-— que a frente D está medindo agora (f16 WMMA vs int8 WMMA vs dp4a, em TOPS, neste cartão).
+Dois protótipos escritos de forma independente, com instruções internas diferentes, chegam ao
+**mesmo lugar (~10-14 T-MAC/s)** — e a frente D diagnosticou o porquê com o mesmo kernel em três
+modos: **58-94 % do tempo é staging (global→LDS)**, rodando a **280 GB/s de 633** porque lê 64 B
+por linha de peso com stride de 5120 B (meia linha de cache), e **sem sobreposição** entre
+staging e compute quando o mesmo warp faz os dois.
+
+Consequências, e são elas que ordenam o plano:
+
+1. **Trocar dp4a por WMMA sem arrumar o caminho de dados não acelera nada** (o teto sobe de 44
+   para 182 T-MAC/s; o tempo continua sendo o staging). A frente D foi explícita: *"WMMA compra
+   teto, não velocidade"*.
+2. **Mas o teto é necessário para empatar com o llama.cpp**: eles fazem 32,7 T-MAC/s, que é
+   **74 % do pico do dp4a** — nenhum protótipo de dp4a chegou perto disso (29 % no melhor caso),
+   enquanto é apenas **37 % do teto do f16-WMMA** e 18 % do int8-WMMA. Ou seja: **D2/D3
+   (caminho de dados) primeiro, D4 (unidade de matriz) depois** — e não o contrário.
+3. **A boa notícia do dia**: um MMQ int8 com WMMA **pode ser bit-exato**. A frente D mediu
+   **0 divergências em 40960** comparações contra o dp4a ao longo de K=5120, com o GEMM int8
+   batendo a referência de CPU **bit a bit (0/2048)**, desde que se acumule int32 por bloco de 32
+   e a multiplicação `1+2*sc` do IQ3_S seja feita **em inteiro** antes do `d_w*d_a` em fp32
+   (15×31 = 465 não cabe em int8 — é o mesmo cuidado que `vecdotq.cuh:725-728` já tem). Isso
+   significa que a rota int8 mantém os gates bit-exatos, enquanto a rota f16 (a do Vulkan) exige
+   gate numérico: **int8 é 1,9× mais rápido que f16 neste cartão e ainda é bit-exato.**
+
+### A receita do operando (medida pela frente D, para não ser redescoberta)
+
+```
+A: lane L, byte p (0..7) = A[m = L%16][k = 8*(L/16) + p]
+B: lane L, byte p (0..7) = B[n = L%16][k = 8*(L/16) + p]     (B guardado [n][k], linha = n)
+D: slot j do lane L      = C[m = 8*(L/16) + j][n = L%16]    (C TRANSPOSTO em relação a A/B)
+```
+`__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(signed_a, a, signed_b, b, c, clamp)`;
+f16 usa `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` com o **mesmo empacotamento**.
+A transposição de D é boa notícia para a correção de escala: `d_w` é **1 valor por lane** e `d_a`
+são **8 floats consecutivos** (os 8 m do lane) — 2 `LDS.128` + 1 `LDS.32` + 8 FMA por lane por
+bloco de 32, sem gather.
 
 ## 2. Decisões fixadas pelo estudo
 
