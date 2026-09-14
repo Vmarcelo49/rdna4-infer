@@ -113,6 +113,20 @@ warp count per split + the M8 split policy `kAttnSplitMin = 512`):
 (A 64K-f16 run once reported 1.06 tok/s: that was another workstream holding the GPU
 without the lock, not a regression — re-measured clean it is 18.91.)
 
+> **Correção (medida na tarefa 2/5 do lote paralelo, `docs/medicoes-banda-e-gargalos.md`
+> §2.4):** o número **18,91 tok/s a 64K com KV f16 não é reprodutível** e não deve ser
+> citado como configuração viável. A 64K com KV f16 este motor **não cabe** nos 16 GiB:
+> o `sysfs` mostra `gtt_used` em 2 557 MB contra 466-472 MB nas configurações que cabem,
+> ou seja ~2,1 GB transbordam para a memória do sistema, e o decode cai para **2,16 e 7,97
+> tok/s** em duas corridas idênticas, com o lock tomado e `fuser /dev/kfd` vazio (portanto
+> não era "outro workstream"). As fases que leem muito colapsam juntas (atenção 13,3×,
+> matvecs 6-23×) e as que leem pouco não mudam — assinatura de tráfego por GTT, não de
+> contenção. O limite medido: **48K f16 ainda cabe** (1,30 GiB livres), 64K f16 deixa 0,30
+> GiB e transborda. A configuração de 64K nesta placa é **KV `q8_0`** (18,28 tok/s, atenção
+> 19,87 ms, e cabe com 2,18 GiB de folga) — `q4_0` é *mais lento* (18,10-18,17 tok/s,
+> atenção 21,03 ms) porque a atenção ali é limitada por *issue* na desquantização, não por
+> banda. O ganho do M7 a 64K continua real; o que estava errado era o nome da configuração.
+
 **Decode is now nearly flat in context** (23.7 tok/s at 4K, 24.1 at 16K, 19.0 at 64K,
 13.2 at 131K): the attention is no longer what long context costs. It also flips the
 KV-type advice back — at 64K f16 (18.98) now beats q4_0 (17.81) — and long *prefill*
