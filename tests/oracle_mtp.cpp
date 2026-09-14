@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -441,6 +442,16 @@ int main(int argc, char ** argv) {
     char meta[256] = { 0 };
     const int meta_rc = llama_model_meta_val_str(model, "qwen35.nextn_predict_layers", meta, sizeof(meta));
 
+    // Which weights this dump came from, so a consumer can refuse to compare a
+    // dump captured from a different quantization (the node values are those
+    // weights' values).
+    {
+      struct stat st;
+      long long bytes = 0;
+      if (stat(argv[1], &st) == 0) bytes = (long long)st.st_size;
+      printf("MTPORACLE: model_path %s\n", argv[1]);
+      printf("MTPORACLE: model_bytes %lld\n", bytes);
+    }
     printf("MTPORACLE: n_embd %d\n", n_embd);
     printf("MTPORACLE: n_embd_out %d\n", n_embd_out);
     printf("MTPORACLE: n_embd_inp %d\n", n_embd_inp);

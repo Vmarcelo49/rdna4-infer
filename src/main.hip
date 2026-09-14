@@ -1268,12 +1268,20 @@ int cmd_run(int argc, char **argv) {
         for (std::int32_t id : gs.ids) std::fprintf(stderr, " %d", id);
         std::fprintf(stderr, "\n");
       }
-      std::fprintf(stderr,
-                   "rdna4-infer: MTP %s: %lld/%lld drafts matched the trunk (%.1f%%), "
-                   "%d trunk steps, %d draft steps, %d rounds (%.2f tokens/round)\n",
-                   mtp_score ? "score" : "spec", gs.accepted, gs.drafted,
-                   gs.acceptance() * 100.0, gs.trunk_steps, gs.draft_steps, gs.rounds,
-                   gs.rounds > 0 ? (double)gs.ids.size() / (double)gs.rounds : 0.0);
+      if (mtp_score) {
+        std::fprintf(stderr,
+                     "rdna4-infer: MTP score: %lld/%lld drafts matched the trunk (%.1f%%), "
+                     "%d trunk steps, %d draft steps\n",
+                     gs.accepted, gs.drafted, gs.acceptance() * 100.0, gs.trunk_steps,
+                     gs.draft_steps);
+      } else {
+        std::fprintf(stderr,
+                     "rdna4-infer: MTP spec: %lld/%lld drafts matched the trunk (%.1f%%), "
+                     "%d trunk steps, %d draft steps, %d rounds (%.2f tokens/round)\n",
+                     gs.accepted, gs.drafted, gs.acceptance() * 100.0, gs.trunk_steps,
+                     gs.draft_steps, gs.rounds,
+                     gs.rounds > 0 ? (double)gs.ids.size() / (double)gs.rounds : 0.0);
+      }
       std::fprintf(stderr, "rdna4-infer: generated %zu tokens in %.2f s (%.2f tok/s)%s\n",
                    gs.ids.size(), gen, gen > 0 ? (double)gs.ids.size() / gen : 0.0,
                    gs.hit_eos ? " [eos]" : "");

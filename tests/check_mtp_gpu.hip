@@ -33,6 +33,7 @@
 #include <cstdio>
 #include <fstream>
 #include <map>
+#include <sys/stat.h>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -81,6 +82,27 @@ std::string dims_str(const std::vector<std::int64_t> &d) {
     s += std::to_string(d[i]);
   }
   return s + "]";
+}
+
+// The weight file the dump was captured from (tests/oracle_mtp.cpp prints its
+// path and size): comparing a dump against a *different* quantization is
+// meaningless — the node values ARE those weights' values.
+long long oracle_model_bytes(const char *path) {
+  std::ifstream f(path);
+  if (!f) return -1;
+  std::string line;
+  while (std::getline(f, line)) {
+    const std::size_t p = line.find("MTPORACLE: model_bytes");
+    if (p == std::string::npos) continue;
+    return std::atoll(line.c_str() + p + 23);
+  }
+  return -1;
+}
+
+long long file_bytes(const char *path) {
+  struct stat st;
+  if (stat(path, &st) != 0) return -1;
+  return (long long)st.st_size;
 }
 
 // The reference driver's own draft token for the dumped step (tests/oracle_mtp.cpp
@@ -371,9 +393,16 @@ int main(int argc, char **argv) {
   {
     const char *oracle_path = argc > 4 ? argv[4] : "reference/oracle_mtp_prompt6_cpu.txt";
     const std::map<std::string, OracleMtpNode> oracle = parse_mtp_oracle(oracle_path);
+    const long long want_bytes = oracle_model_bytes(oracle_path);
+    const long long have_bytes = file_bytes(argv[1]);
     if (oracle.empty()) {
       std::printf("== oracle: %s not found, skipped (see docs/mtp.md to capture it) ==\n",
                   oracle_path);
+    } else if (want_bytes > 0 && have_bytes > 0 && want_bytes != have_bytes) {
+      std::printf("== oracle: %s was captured from a %lld-byte model, this one is %lld bytes "
+                  "(different quantization): comparison skipped ==\n",
+                  oracle_path, want_bytes, have_bytes);
+      ok(true, "oracle dump belongs to another weight file (skipped, not silently mismatched)");
     } else {
       // the dump is for a fixed prompt (the project's 8-token oracle prompt)
       const std::vector<std::int32_t> oids = {9419, 1814, 11, 411, 369, 264, 1228, 13};
