@@ -90,6 +90,23 @@ quantizar** (llama.cpp PR #21038, `HADAMARD_Q` no ExLlamaV2). No upstream: PPL c
 hoje**, então todo número de qualidade de KV publicado lá não é o nosso regime — o nosso é
 pior. Repassado à frente KV.
 
+### C4. Incidente: segundo deadlock de lock, ~2 h de GPU perdidas (corrigido, 03:02)
+- **Referência**: o primeiro caso (wrapper ad-hoc) já tinha sido corrigido exportando
+  `GPU_LOCK_HELD=1` do wrapper para o filho.
+- **O que aconteceu**: um script de matriz da frente MTP pegou o lock uma vez e chamava
+  `./scripts/gpu-lock.sh` de novo por configuração. Como o *wrapper* não checava a variável
+  (só os gates checavam), cada configuração esperava 900 s pelo lock do próprio avô e morria
+  com `RC=124` — 5 configs a 4K + 4 a 16K, GPU ociosa (VRAM 189 MB) e 13 processos na fila
+  parados atrás por 11 min (detectado pela frente de contexto longo, que provou a árvore de
+  processos).
+- **Ação**: matei a árvore (27622/30730/30732/30733/30739); a fila andou em 20 s.
+- **Conserto estrutural**: `gpu-lock.sh` agora roda direto quando `GPU_LOCK_HELD=1` (um
+  ancestral já segura o lock), em vez de confiar em disciplina de cada chamador. Cópia
+  corrigida distribuída aos 5 worktrees ativos. Documentado em `docs/gpu-queue.md`.
+- **Veredito**: MANTIDO (o conserto). Custo: ~2 h de GPU da noite, que é o motivo de o teto de
+  medição da noite ser menor do que o planejado — e por isso a limitação vai escrita no
+  relatório.
+
 ## Estado do alvo (atualizado pelo coordenador)
 
 - **131K**: ainda não medido nesta rodada. No baseline, 131K com KV `q4_0` roda a 14,0 tok/s
