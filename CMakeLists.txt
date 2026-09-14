@@ -244,3 +244,30 @@ if(EXISTS "/opt/rocm/include")
   target_include_directories(bench-matvec-shapes-gpu PRIVATE /opt/rocm/include)
 endif()
 target_link_libraries(bench-matvec-shapes-gpu PRIVATE ${AMDHIP64})
+
+# ---------------------------------------------------------------------------
+# feat/mtp — the NextN / MTP draft block (blk.64): structure, drafts, the
+# acceptance rate and speculative decoding's token-for-token equivalence with
+# plain greedy decode. Appended (never inserted) so the parallel-agent merge
+# stays trivial.
+add_executable(check-mtp-gpu tests/check_mtp_gpu.hip src/backend/gguf.cpp
+               src/backend/loader.cpp src/backend/model.cpp src/backend/unicode.cpp
+               src/backend/unicode_data.cpp src/backend/tokenizer.cpp
+               src/backend/sampler.cpp)
+target_compile_options(check-mtp-gpu PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_link_options(check-mtp-gpu PRIVATE --offload-arch=gfx1201)
+target_include_directories(check-mtp-gpu PRIVATE include)
+if(EXISTS "/opt/rocm/include")
+  target_include_directories(check-mtp-gpu PRIVATE /opt/rocm/include)
+endif()
+target_link_libraries(check-mtp-gpu PRIVATE ${AMDHIP64})
+
+# feat/mtp — the llama.cpp oracle for the draft block: runs llama.cpp's own
+# LLM_GRAPH_TYPE_DECODER_MTP graph (qwen35.cpp graph_mtp) on the CPU and dumps
+# every node of one draft step, in the same format tests/check_graph_gpu.hip
+# parses. Captured output goes to reference/oracle_mtp_prompt6_cpu.txt (see
+# docs/mtp.md); check-mtp-gpu compares its own nodes against it.
+add_executable(oracle-mtp tests/oracle_mtp.cpp)
+target_include_directories(oracle-mtp PRIVATE ${LLAMA_CPP_SRC}/include ${LLAMA_CPP_SRC}/ggml/include)
+target_link_libraries(oracle-mtp PRIVATE ${LLAMA_CPP_BUILD}/bin/libllama.so ${LLAMA_CPP_BUILD}/bin/libggml.so ${LLAMA_CPP_BUILD}/bin/libggml-base.so ${AMDHIP64})
+set_target_properties(oracle-mtp PROPERTIES BUILD_RPATH "${LLAMA_CPP_BUILD}")

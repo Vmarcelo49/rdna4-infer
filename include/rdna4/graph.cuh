@@ -32,6 +32,7 @@
 #include "rdna4/loader.h"
 #include "rdna4/matvec.cuh"
 #include "rdna4/model.h"
+#include "rdna4/mtp.cuh"
 #include "rdna4/nn.cuh"
 
 namespace rdna4 {
@@ -162,6 +163,29 @@ class Graph {
 
   int n_embd() const { return (int)cfg_.embedding_length; }
   int n_vocab() const { return output_.dim1; }
+
+  // ---- MTP (feat/mtp) -----------------------------------------------------
+  // Read-only borrow of the two weights the draft block shares with the trunk:
+  // `token_embd.weight` (the draft's input embedding) and `output.weight` (the
+  // shared LM head). Additive: nothing in the trunk forward changes, and the MTP
+  // tensors themselves are only ever loaded by MtpHead::init(), so a run without
+  // MTP keeps the exact same allocations and numerics as before.
+  bool mtp_shared_weights(MtpShared &out, std::string &err) const {
+    if (!tok_embd_.valid || !output_.valid) {
+      err = "mtp_shared_weights: the trunk weights are not loaded";
+      return false;
+    }
+    if (tok_embd_.dim1 != output_.dim1) {
+      err = "mtp_shared_weights: token_embd and output disagree on n_vocab";
+      return false;
+    }
+    out.tok_embd = tok_embd_.ptr;
+    out.tok_embd_dt = tok_embd_.dt;
+    out.output = output_.ptr;
+    out.output_dt = output_.dt;
+    out.n_vocab = output_.dim1;
+    return true;
+  }
   // Executed trunk blocks. block_count covers the trunk *plus* the MTP block(s),
   // so the trunk is block_count - nextn_predict_layers: 65 - 1 = 64 blocks
   // (0..63), of which the full-attention ones are i = 3, 7, ..., 63 (16 layers).

@@ -24,6 +24,7 @@
 #include "rdna4/graph.cuh"
 #include "rdna4/loader.h"
 #include "rdna4/model.h"
+#include "rdna4/mtp_gen.h"
 #include "rdna4/sampler.h"
 #include "rdna4/stream.h"
 #include "rdna4/tokenizer.h"
@@ -59,6 +60,13 @@ void usage_run() {
       "  --ctx-size N            context (default 4096)\n"
       "  --cache-type-k TYPE     f32, f16 (default), q8_0, q4_0\n"
       "  --cache-type-v TYPE     f32, f16 (default), q8_0, q4_0\n"
+      // ---- feat/mtp ----
+      "  --mtp                   use the blk.64 NextN/MTP head for speculative decoding\n"
+      "  --draft N               tokens drafted per round with the MTP head (default 3)\n"
+      "  --mtp-score             draft-and-score only: report the head's acceptance rate\n"
+      "                          against the trunk's own greedy tokens (generation is\n"
+      "                          unchanged); implies --mtp\n"
+      // ---- end feat/mtp ----
       "  -v                      verbose: per-step timings and the token ids\n"
       "  --no-stats              suppress the stderr statistics\n");
 }
@@ -891,6 +899,10 @@ int cmd_run(int argc, char **argv) {
   bool temp_set = false, top_k_set = false, top_p_set = false, min_p_set = false;
   bool chat = false, thinking = true, verbose = false, stats = true;
   std::string effort = "xhigh";
+  // ---- feat/mtp ----
+  bool mtp_on = false, mtp_score = false;
+  long long mtp_draft = 3;
+  // ---- end feat/mtp ----
 
   for (int i = 1; i < argc; ++i) {
     const char *a = argv[i];
@@ -1000,6 +1012,20 @@ int cmd_run(int argc, char **argv) {
         usage_run();
         return 1;
       }
+    // ---- feat/mtp ---- (draft head / speculative decoding)
+    } else if (std::strcmp(a, "--mtp") == 0) {
+      mtp_on = true;
+    } else if (std::strcmp(a, "--mtp-score") == 0) {
+      mtp_on = true;
+      mtp_score = true;
+    } else if (std::strcmp(a, "--draft") == 0) {
+      const char *v = need_arg("--draft");
+      if (!v || !parse_i64(v, &mtp_draft) || mtp_draft < 1 || mtp_draft > 16) {
+        usage_run();
+        return 1;
+      }
+      mtp_on = true;
+    // ---- end feat/mtp ----
     } else if (std::strcmp(a, "-v") == 0) {
       verbose = true;
     } else if (std::strcmp(a, "--no-stats") == 0) {
@@ -1133,6 +1159,140 @@ int cmd_run(int argc, char **argv) {
                  sp.temp <= 0.0f ? " [greedy]" : "");
   }
 
+  // ===================== feat/mtp (delimited block) ==========================
+  // Draft head / speculative decoding. The plain path is untouched: this block
+  // only runs when --mtp / --draft / --mtp-score was given, and it takes over
+  // prefill *and* decode (see include/rdna4/mtp_gen.h for the modes and the
+  // correctness contract).
+  //
+  // It owns the prefill on purpose: the draft block keeps its own KV cache, and
+  // every one of its rows is built from a trunk h and one token, so the whole
+  // prompt has to be replayed through it (llama.cpp's speculative.cpp does the
+  // same: process() decodes the entire batch into the MTP context, whose `h`
+  // input is the target's hidden state shifted right by one). Prefilling one
+  // token at a time here costs the same as the single forward_tokens() call the
+  // plain path makes — that call is already a per-token loop internally.
+  if (mtp_on) {
+    if (sp.temp > 0.0f) {
+      std::fprintf(stderr,
+                   "rdna4-infer: MTP needs greedy decoding (--temp 0/--greedy): with "
+                   "temperature > 0 the draft changes the RNG stream, so the output could "
+                   "not be compared against plain sampling\n");
+      return 1;
+    }
+    if (mtp_score && sp.repeat_penalty != 1.0f) {
+      std::fprintf(stderr,
+                   "rdna4-infer: warning: --mtp-score compares the draft against the raw "
+                   "argmax of the trunk's logits, but repeat_penalty %.3f makes the trunk "
+                   "pick a penalized token; the measured rate is then a lower bound\n",
+                   sp.repeat_penalty);
+    }
+    rdna4::MtpHead mtp;
+    std::string mtop_err;
+    const double t_mtp0 = now_s();
+    if (!mtp.init(loader, cfg, (int)ctx_size, kv_k, kv_v, mtop_err)) {
+      std::fprintf(stderr, "rdna4-infer: MTP init failed: %s\n", mtop_err.c_str());
+      return 1;
+    }
+    rdna4::MtpShared shared;
+    if (!graph.mtp_shared_weights(shared, mtop_err)) {
+      std::fprintf(stderr, "rdna4-infer: MTP shared weights failed: %s\n", mtop_err.c_str());
+      return 1;
+    }
+    mtp.set_shared(shared);
+    if (stats) {
+      std::fprintf(stderr,
+                   "rdna4-infer: MTP: block %d loaded (%.1f MiB, eh_proj [%d, %d], concat %s), "
+                   "%.2f s\n",
+                   mtp.dims().block, (double)mtp.weight_bytes() / (1024.0 * 1024.0),
+                   2 * mtp.dims().n_embd, mtp.dims().n_embd,
+                   mtp.concat_order_e_first() ? "[e ; h]" : "[h ; e]", now_s() - t_mtp0);
+    }
+
+    std::vector<float> hidden, logits;
+    std::vector<float> h_prev((std::size_t)graph.n_embd(), 0.0f);  // h at position -1
+    const double t_pre0 = now_s();
+    for (std::size_t i = 0; i < prompt_ids.size(); ++i) {
+      if (!graph.forward_tokens({prompt_ids[i]}, (int)i, hidden, logits, mtop_err)) {
+        std::fprintf(stderr, "rdna4-infer: prefill failed: %s\n", mtop_err.c_str());
+        return 1;
+      }
+      // row `i` of the draft block's cache: token i with the trunk h of i-1
+      // (zeros for i == 0, which is what llama.cpp's zero-initialised pending_h
+      // row holds)
+      if (!mtp.step_host(h_prev.data(), prompt_ids[i], (int)i, nullptr, nullptr, mtop_err)) {
+        std::fprintf(stderr, "rdna4-infer: MTP prefill step failed: %s\n", mtop_err.c_str());
+        return 1;
+      }
+      h_prev = hidden;
+    }
+    const double t_pre1 = now_s();
+
+    rdna4::MtpGenParams gp;
+    gp.n_predict = (int)n_predict;
+    gp.draft = (int)mtp_draft;
+    gp.score_only = mtp_score;
+    gp.verbose = verbose;
+    rdna4::MtpGenStats gs;
+    std::string emitted_mtp;
+    const double t_gen0 = now_s();
+    const bool ok = rdna4::mtp_generate(
+        graph, &mtp, [&](std::int32_t id) { return tk.is_eog(id); }, sampler, prompt_ids, hidden,
+        logits, gp, gs, mtop_err, [&](const std::vector<std::int32_t> &ids) {
+          // same streaming rule as the plain loop: re-decode the prefix and emit
+          // only what is new and ends on a UTF-8 boundary
+          const std::string all = tk.decode(ids, /*skip_special=*/true);
+          const std::size_t keep = rdna4::utf8_keep_len(all);
+          if (keep > emitted_mtp.size()) {
+            std::fwrite(all.data() + emitted_mtp.size(), 1, keep - emitted_mtp.size(), stdout);
+            std::fflush(stdout);
+            emitted_mtp.assign(all, 0, keep);
+          }
+        });
+    const double t_gen1 = now_s();
+    if (!ok) {
+      std::fprintf(stderr, "rdna4-infer: MTP decode failed: %s\n", mtop_err.c_str());
+      return 1;
+    }
+    const std::string all_mtp = tk.decode(gs.ids, /*skip_special=*/true);
+    if (all_mtp.size() > emitted_mtp.size()) {
+      std::fwrite(all_mtp.data() + emitted_mtp.size(), 1, all_mtp.size() - emitted_mtp.size(),
+                  stdout);
+    }
+    std::fflush(stdout);
+    if (stats) {
+      const double pre = t_pre1 - t_pre0, gen = t_gen1 - t_gen0;
+      std::fprintf(stderr, "rdna4-infer: prefill %zu tokens in %.2f s (%.2f tok/s)\n",
+                   prompt_ids.size(), pre, pre > 0 ? (double)prompt_ids.size() / pre : 0.0);
+      if (std::getenv("RD_MTP_IDS") != nullptr) {
+        std::fprintf(stderr, "generated ids:");
+        for (std::int32_t id : gs.ids) std::fprintf(stderr, " %d", id);
+        std::fprintf(stderr, "\n");
+      }
+      if (mtp_score) {
+        std::fprintf(stderr,
+                     "rdna4-infer: MTP score: %lld/%lld drafts matched the trunk (%.1f%%), "
+                     "%d trunk steps, %d draft steps\n",
+                     gs.accepted, gs.drafted, gs.acceptance() * 100.0, gs.trunk_steps,
+                     gs.draft_steps);
+      } else {
+        std::fprintf(stderr,
+                     "rdna4-infer: MTP spec: %lld/%lld drafts matched the trunk (%.1f%%), "
+                     "%d trunk steps, %d draft steps, %d rounds (%.2f tokens/round)\n",
+                     gs.accepted, gs.drafted, gs.acceptance() * 100.0, gs.trunk_steps,
+                     gs.draft_steps, gs.rounds,
+                     gs.rounds > 0 ? (double)gs.ids.size() / (double)gs.rounds : 0.0);
+      }
+      std::fprintf(stderr, "rdna4-infer: generated %zu tokens in %.2f s (%.2f tok/s)%s\n",
+                   gs.ids.size(), gen, gen > 0 ? (double)gs.ids.size() / gen : 0.0,
+                   gs.hit_eos ? " [eos]" : "");
+      std::fprintf(stderr, "rdna4-infer: trunk %.2f ms/step, draft total %.2f ms\n",
+                   gs.trunk_steps > 0 ? gs.trunk_ms / gs.trunk_steps : 0.0, gs.draft_ms);
+    }
+    return 0;
+  }
+  // =================== end feat/mtp (delimited block) ========================
+
   // ---- prefill -----------------------------------------------------------
   std::vector<float> hidden, logits;
   const double t_pre0 = now_s();
@@ -1141,6 +1301,7 @@ int cmd_run(int argc, char **argv) {
     return 1;
   }
   const double t_pre1 = now_s();
+
 
   // ---- decode ------------------------------------------------------------
   std::vector<std::int32_t> history = prompt_ids;
