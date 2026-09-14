@@ -284,3 +284,35 @@ if(EXISTS "/opt/rocm/include")
   target_include_directories(check-batch-gpu PRIVATE /opt/rocm/include)
 endif()
 target_link_libraries(check-batch-gpu PRIVATE ${AMDHIP64})
+
+# ---------------------------------------------------------------------------
+# Agente de medicoes (worktree rdna4-wt-medicoes-gpu) — orcamento medido por
+# fase (eventos HIP no grafo real), pico de leitura de DRAM/L2 desta placa,
+# custo de despacho/evento e trafego de KV. Nao e gate: e instrumento de
+# medicao (docs/medicoes-banda-e-gargalos.md). Appended, como as outras frentes.
+add_executable(bench-phases-gpu tests/bench_phases_gpu.hip
+               src/backend/gguf.cpp src/backend/loader.cpp src/backend/model.cpp
+               src/backend/unicode.cpp src/backend/unicode_data.cpp
+               src/backend/tokenizer.cpp)
+target_compile_options(bench-phases-gpu PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_link_options(bench-phases-gpu PRIVATE --offload-arch=gfx1201)
+target_include_directories(bench-phases-gpu PRIVATE include)
+if(EXISTS "/opt/rocm/include")
+  target_include_directories(bench-phases-gpu PRIVATE /opt/rocm/include)
+endif()
+target_link_libraries(bench-phases-gpu PRIVATE ${AMDHIP64})
+
+# Precisao por formato de quantizacao: matvec quantizado (caminho do motor) vs
+# matvec fp32 sobre os pesos desquantizados, e o erro da propria quantizacao da
+# ativacao (q8_1) - as duas metades do orcamento de erro sem precisar de um
+# modelo F16 (docs/quants-precisao.md).
+add_executable(check-quant-precision-gpu tests/check_quant_precision_gpu.hip
+               tests/dequant_cpu_oracle.cpp
+               src/backend/gguf.cpp src/backend/loader.cpp src/backend/model.cpp
+               src/backend/unicode.cpp src/backend/unicode_data.cpp
+               src/backend/tokenizer.cpp)
+target_compile_options(check-quant-precision-gpu PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_link_options(check-quant-precision-gpu PRIVATE --offload-arch=gfx1201)
+target_include_directories(check-quant-precision-gpu PRIVATE include /opt/rocm/include
+                          ${LLAMA_CPP_SRC}/ggml/src ${LLAMA_CPP_SRC}/ggml/include)
+target_link_libraries(check-quant-precision-gpu PRIVATE ${GGML_BASE_LIB} ${AMDHIP64})
