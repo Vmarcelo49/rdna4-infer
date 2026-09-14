@@ -395,3 +395,25 @@ if(EXISTS "/opt/rocm/include")
 endif()
 target_link_libraries(check-kvtype PRIVATE ${AMDHIP64})
 set_target_properties(check-kvtype PROPERTIES HIP_ARCHITECTURES "gfx1201")
+
+# Frente KV — sonda de qualidade do cache (o que a PPL NAO mede).
+#
+# A quantizacao do KV e um erro de CACHE: a NLL agregada de texto natural quase
+# nao se move quando o cache piora (na tabela AIME25 do upstream o KV q4_0 cai de
+# 37,9% para 2,0% com a PPL andando ~0,4%), entao a PPL nao consegue ordenar dois
+# formatos. Esta sonda compara a DISTRIBUICAO de saida do motor com KV f16 contra
+# a do formato alvo, nas MESMAS posicoes dos MESMOS tokens, no MESMO processo:
+# KL media em nats/posicao sobre todo o vocabulario, fracao de posicoes cujo argmax
+# (o token ganancioso) mudou, e |dNLL| pareado. Rodar f16 duas vezes da o piso do
+# harness. O stream de tokens vem de `rdna4-infer tokenize -f <corpus>`.
+# Appended, como as outras frentes.
+add_executable(check-kvquality-gpu tests/check_kvquality_gpu.hip
+               src/backend/gguf.cpp src/backend/loader.cpp src/backend/model.cpp)
+target_compile_options(check-kvquality-gpu PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_link_options(check-kvquality-gpu PRIVATE --offload-arch=gfx1201)
+target_include_directories(check-kvquality-gpu PRIVATE include)
+if(EXISTS "/opt/rocm/include")
+  target_include_directories(check-kvquality-gpu PRIVATE /opt/rocm/include)
+endif()
+target_link_libraries(check-kvquality-gpu PRIVATE ${AMDHIP64})
+set_target_properties(check-kvquality-gpu PROPERTIES HIP_ARCHITECTURES "gfx1201")

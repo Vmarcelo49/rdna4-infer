@@ -377,23 +377,37 @@ bool Engine::init(const ServeArgs &a, std::string &err) {
   // hipMalloc (review finding M4).
   const std::uint64_t kv_bytes =
       rdna4::kv_cache_bytes(a.ctx_size, a.kv_k, a.kv_v);
-  const std::uint64_t need = static_cast<std::uint64_t>(st.st_size) + kv_bytes +
-                             rdna4::kOverheadBytes;
+  // The budget needs the model's shape, so the header has to be read before the
+  // check (it is a few MiB of metadata, not the weights). Counting the file size
+  // and a flat 1 GiB of overhead instead overestimated by ~1.18 GiB and refused
+  // contexts that fit -- see the note in include/rdna4/device.h and
+  // docs/journal-kv.md §6. Same computation as `info` in src/main.hip.
+  if (!loader_.open(a.model_path, err)) return false;
+  if (!rdna4::parse_qwen35_config(loader_.meta(), cfg_, err)) return false;
+  const std::uint64_t weights =
+      rdna4::uploaded_weight_bytes(loader_, cfg_.block_count - 1, false);
+  std::uint64_t vocab = 0;
+  for (const auto &t : loader_.meta().tensors) {
+    if (t.name == "output.weight" && t.dims.size() > 1) vocab = t.dims[1];
+  }
+  const std::uint64_t buffers_est =
+      rdna4::graph_buffer_bytes(rdna4::graph_buffer_shape(cfg_, vocab));
+  const std::uint64_t need =
+      rdna4::required_bytes(weights, a.ctx_size, a.kv_k, a.kv_v, buffers_est);
   if (need > total_vram) {
-    char buf[256];
+    char buf[320];
     std::snprintf(buf, sizeof(buf),
-                  "insufficient VRAM: model %.2f GiB + kv(ctx=%llu, %s/%s) %.2f GiB + overhead "
-                  "%.2f GiB = %.2f GiB of %.2f GiB",
-                  (double)st.st_size / (1u << 30), (unsigned long long)a.ctx_size,
-                  kv_type_cstr(a.kv_k), kv_type_cstr(a.kv_v), (double)kv_bytes / (1u << 30),
-                  (double)rdna4::kOverheadBytes / (1u << 30), (double)need / (1u << 30),
-                  (double)total_vram / (1u << 30));
+                  "insufficient VRAM: weights %.2f GiB + graph buffers %.2f MiB + "
+                  "kv(ctx=%llu, %s/%s) %.2f GiB + margin %.2f MiB = %.2f GiB of %.2f GiB",
+                  (double)weights / (1u << 30), (double)buffers_est / (1024.0 * 1024.0),
+                  (unsigned long long)a.ctx_size, kv_type_cstr(a.kv_k), kv_type_cstr(a.kv_v),
+                  (double)kv_bytes / (1u << 30), (double)rdna4::kOverheadBytes / (1024.0 * 1024.0),
+                  (double)need / (1u << 30), (double)total_vram / (1u << 30));
     err = buf;
     return false;
   }
 
-  if (!loader_.open(a.model_path, err)) return false;
-  if (!rdna4::parse_qwen35_config(loader_.meta(), cfg_, err)) return false;
+  if (!tk_.init(loader_.meta(), err)) return false;
   if (!tk_.init(loader_.meta(), err)) return false;
 
   graph_.reset(new rdna4::Graph(loader_, cfg_));

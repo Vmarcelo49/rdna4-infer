@@ -132,3 +132,256 @@ medição abaixo desconta esse valor antes de dizer "vram em uso" do motor.
 - **Resultado**: _(preenchido em §2.1 abaixo)_
 
 - **Veredito**: _(ver §2.1)_
+
+### 2.1 Resultado da validação (oráculo llama.cpp) — medido
+
+**Comando**: `timeout 900 ./scripts/gpu-lock.sh ./build/check-kvquant-gpu` (sem
+modelo). Janela: **limpa** — `mem_info_vram_used` = 198 225 920 B (189 MiB, só o
+desktop) antes, 198 156 288 B depois; `gtt_used` = 30 253 056 B antes, 30 208 000 B
+depois. Nenhum `flock` esperando além do meu. `rocm-smi`/`rocprof` não existem
+nesta máquina (só `rocminfo`), então todos os números de VRAM vêm de
+`/sys/class/drm/card*/device/mem_info_*` e de `hipMemGetInfo`.
+
+```
+== sintético (sem modelo): 48 linhas x 256 elementos, 8 padrões x 6 repetições
+type   bytes    step_tol   max_err    err/step     err/range    err/|x|    check
+f32    exact    0.0000     0.000000   0.0000       0.00000      0.000000   OK
+f16    exact    0.0000     0.031166   0.0000       0.00016      0.000312   OK
+q8_0   exact    0.5500     0.409378   0.5201       0.00205      0.004095   OK
+q4_0   exact    1.0200    12.065948   0.9653       0.06047      0.120686   OK
+q5_0   exact    1.0200     5.815948   0.9306       0.02915      0.058172   OK
+q4_1   exact    0.5200     6.589973   0.4953       0.03303      0.065914   OK
+       (para todas as seis: "bytes differ from llama.cpp: 0 |
+        scalar load 0.000e+00 (rel 0.00e+00), load8 0.000e+00 (rel 0.00e+00)")
+```
+Erro por padrão hostil (q5_0 / q4_1), o que a tabela agregada esconde:
+
+```
+padrão                                  q5_0 err/range   q4_1 err/range
+0 uniforme [-1,1)                          0.03046          0.03276
+1 só positivo [0,1)                        0.03107          0.03304
+2 31 valores ~1e-3 + um outlier 1.0        0.00098          0.00194
+3 constante 0.5                            0.00000          0.00000
+4 tudo zero                                0.00000          0.00000
+5 alternando +-1                           0.03125          0.00024
+6 gaussiana-ish                            0.01736          0.03281
+7 faixa larga (|x| até 100)                0.02915          0.03303
+```
+
+Leitura dos números, que é o ponto do exercício:
+
+1. **Os bytes que o motor grava são byte a byte os do llama.cpp** para os seis
+   tipos, nos oito padrões, incluindo os dois novos (`quantize_row_q5_0_ref` /
+   `quantize_row_q4_1_ref` de `libggml-base.so`). Não é "parecido": zero bytes
+   diferentes, incluindo o campo `qh` do q5_0 e o `m` do q4_1.
+2. **Os dois caminhos de load reconstroem exatamente o que
+   `dequantize_row_q5_0`/`q4_1` reconstroem** — `max |gpu − cpu| = 0.000e+00`
+   (igualdade bit a bit, não tolerância) para o `kv_load` escalar e para o
+   `kv_load8` vetorial. Isso cobre o `qh` do q5_0 lido byte a byte e o `q*d + m`
+   do q4_1.
+3. **A cota de erro do q5_0 é ~1/32 da faixa do bloco** (`err/range` ≈ 0,029-0,031
+   nos padrões realistas) **e a do q4_1 é ~1/30** (0,0328-0,0330).
+   A razão aritmética: a grade do `q5_0`/`q4_0` é **assimétrica** — `d` sai do
+   máximo *com sinal* (`d = vmax/-16` no q5_0, `/-8` no q4_0), então o extremo do
+   sinal oposto cai a **um passo inteiro** (medido `err/step` 0,93-1,00), enquanto
+   o `q4_1` tem grade afim `[min, max]` com as duas pontas exatas e erro de **meio
+   passo** (medido 0,491-0,496).
+   **Correção ao briefing**: o texto da tarefa dizia "~1/32 e ~1/16 da faixa" para
+   q5_0 e q4_1. O q5_0 confere (1/32); o q4_1 mede **1/30, não 1/16** — meio passo
+   de uma grade de 16 níveis, e não um passo. Quem comparar os dois formatos pelo
+   "1/16" vai concluir que o q4_1 é 2x pior que o q5_0, quando na verdade eles
+   erram quase o mesmo (`err/range` 0,033 vs 0,029) com 6 bits a menos por bloco
+   no q4_1.
+4. O `q8_0` tem `err/step` 0,52 e não 0,50 porque o `d` dele é guardado em fp16:
+   o termo relativo 2^-11 entra por cima do meio passo. Sem esse detalhe a
+   tolerância de 0,50 reprova o próprio q8_0 (foi o que aconteceu na primeira
+   versão do teste).
+5. O `f16` (a linha de base da correção) mede erro relativo máximo 3,12e-4, dentro
+   da cota de 5e-4 que o `check-rope-gpu` já usa.
+
+**Veredito**: MANTIDO. Gate fechado (`check-kvquant-gpu`, sem modelo roda em ~1 s).
+
+### 2.2 `check-rope-gpu` estendido aos dois formatos novos
+
+- **Comando**: `timeout 600 ./build/check-rope-gpu` (janela limpa, 189 MiB).
+- **Resultado**: os seis tipos passam — `kv store (f32/f16/q8_0/q4_0/q5_0/q4_1)
+  bytes differing from the ggml reference: 0` e
+  `attn (1 key, <tipo>) max|out - cache| = 0.000e+00`.
+  Esse segundo número é o que importa para o q5_0/q4_1: com `head_dim = 256` o
+  kernel de atenção usa o caminho `kv_load8` (`dpw == 8`), então ele prova que o
+  kernel **de produção** devolve exatamente o que os bytes do cache decodificam,
+  em todos os offsets da linha — não só o `kv_load` escalar que o teste acima usa.
+- **Veredito**: MANTIDO.
+
+---
+
+## 3. Achado F6 — as três portas do `kv.h` (bloqueante do coordenador)
+
+- **Referência**: `docs/adversarial-noite.md` F6, enviado pelo coordenador. As três
+  portas eram reais e eu as confirmei no código antes de mexer:
+  `kv_row_bytes` devolvia `0` para um `KvType` fora do enum (`return 0;` depois do
+  switch) → passo de linha 0 → todas as linhas no mesmo endereço, "roda, não
+  avisa, sai errado"; `kv_store_row_kernel` e `kv_fill_kernel` terminavam num corpo
+  **q4_0 implícito** (o último ramo era um `else` sem `if`), então qualquer tipo
+  fora de F32/F16/Q8_0 era gravado como q4_0; `kv_bytes_per_elem` devolvia `0.0`,
+  que faz `info`/`serve` aprovarem uma configuração sem contar KV nenhum.
+- **Hipótese**: fechar as três com um teste que **exige falha** impede que o
+  próximo tipo acrescentado (por mim ou por outra frente) caia nessas portas.
+- **Implementação** (tudo em `kv.h`, sem tocar em nada de outra frente):
+  - Os switches continuam **exaustivos e sem `default:`** de propósito: um
+    `default:` silenciaria o `-Wswitch`, que é justamente o mecanismo que pega um
+    tipo novo. O que mudou é o que vem **depois** do switch: `kv_unreachable()`,
+    que faz `abort()` no host e `__builtin_trap()` no device, com mensagem.
+  - O corpo do q4_0 em `kv_store_row_kernel` e em `kv_fill_kernel` virou um ramo
+    explícito `if (CT == KvType::Q4_0) { ... }` e a cadeia termina em
+    `kv_unreachable()`. Como `CT` é parâmetro de template, isso não custa nada em
+    tempo de execução e **não muda um byte** do caminho do q4_0.
+- **Porta extra que o coordenador não listou e o teste novo encontrou**:
+  `kv_fill_launch` fazia `return hipGetLastError() == hipSuccess;` **depois** do
+  switch, ou seja devolvia o status do *último launch* — para um tipo desconhecido
+  isso é "sem erro", então o despachante respondia **`true`**: "cache preenchido"
+  para um cache que ele nunca tocou. Agora cada `case` devolve o status do seu
+  próprio launch e o `tail` é `return false;` (o contrato do chamador em
+  `graph.cuh:1308` já é "false = erro").
+- **Teste de regressão**: `tests/check_kvtype.hip` (alvo `check-kvtype`,
+  appendado no `CMakeLists.txt`). Ele **forka um filho, entrega `KvType(99)` e
+  exige `SIGABRT`** nas três tabelas; confere também que `kv_type_parse` rejeita
+  `q9_9`, `q5_1` e a string vazia; que `kv_store_row_launch`/`kv_fill_launch`
+  devolvem `false`; e fixa a aritmética do orçamento a 131 072 tokens contra
+  contas feitas à mão dentro do próprio teste (ver §6).
+- **Comando**: `./build/check-kvtype` — **microssegundos, sem GPU, sem modelo, sem
+  lock** (por isso pode entrar em qualquer gate).
+- **Resultado**: `check-kvtype: OK`, 40 asserções, incluindo os três `abort` e os
+  dois `return false`. As expectativas de orçamento batem:
+  `f16/f16 8,000 GiB`, `q8_0/q8_0 4,250`, `q4_0/q4_0 2,250`, `q5_0/q4_1 2,625`,
+  `q8_0/q4_0 3,250`, `q5_0/q4_0 2,500`, `q8_0/q4_1 3,375`.
+- **Veredito**: MANTIDO.
+- **Nota de merge para o coordenador**: as três portas estão fechadas, mas a mesma
+  forma existe em **`mtp.cuh:365`** (`kv_bytes_` é calculado com `kv_row_bytes(kv_k_)`
+  e usado para alocar `d_ck_` **e** `d_cv_`, enquanto o passo de V no forward usa
+  `kv_row_bytes(kv_v_)`). Com K=q5_0 (22 B) e V=q4_1 (20 B) o MTP **super**-aloca V
+  e fica apenas correto por sorte; com K=q4_1 e V=q5_0, `--mtp` **estoura o cache de
+  V** (20 B de passo para linhas de 22 B). Não toquei em `mtp.cuh` porque está na
+  lista de arquivos de outra frente: a correção é a mesma que eu fiz no trunk
+  (`graph.cuh`), dois tamanhos separados.
+
+---
+
+## 4. Orçamento de VRAM do motor — a conta exata (§6 da tarefa)
+
+Modelo: `Qwen3.8-27B-UD-IQ3_S.gguf`, 866 tensores, `block_count 65`,
+`embedding_length 5120`, `feed_forward_length 17408`, `head_count 24`,
+`head_count_kv 4`, `key_length = value_length 256`, `ssm {conv_kernel 4,
+state_size 128, group_count 16, time_step_rank 48}`, `full_attention_interval 4`,
+vocab 248 320. Derivados: 64 camadas de tronco (16 de atenção completa,
+`i%4==3`, e 48 GDN), `n_attn = 16`, `n_recr = 48`, `chan = 2*16*128 + 48*128 =
+10 240`, `d_inner = 6144`.
+
+### 4.1 Pesos — o ficheiro de 12,03 GB não é o que vai para a VRAM
+
+| parcela | bytes | GiB / MiB | de onde |
+|---|---:|---:|---|
+| ficheiro GGUF | 12 040 883 104 | 11,214 GiB | `stat` |
+| cabeçalho GGUF + padding de alinhamento | 10 945 408 | 10,44 MiB | offset do 1º tensor, alinhamento 32 |
+| **soma exata dos 866 tensores** | **12 029 886 464** | **11,204 GiB** | `dtype_block_bytes` de `include/rdna4/dtype.h:78` |
+| padding **entre** tensores | **0** | 0 | os offsets são contíguos |
+| cauda depois do último tensor | 51 232 | 0,05 MiB | |
+| pesos do tronco (**o que é mesmo `hipMalloc`ado**) | **11 678 877 696** | **10,877 GiB** | `Graph::up()`/`up_f32()`, `graph.cuh:464-495` |
+| bloco MTP `blk.64.*` (15 tensores, só com `--mtp`) | 351 008 768 | 0,327 GiB | `MtpHead::init` |
+
+**Achado 1 (o maior de todos):** `rdna4::required_bytes` (`device.h:76-87`) usa o
+**tamanho do ficheiro** como estimativa de pesos — `file_bytes + kv +
+kOverheadBytes`. O ficheiro tem 11,214 GiB mas só **10,877 GiB** de tronco sobem
+para a GPU: os 0,327 GiB do bloco MTP ficam de fora quando `--mtp` não é usado.
+Ou seja, `info`/`serve` **superestimam** a VRAM em ~340 MiB, e a conta de
+"11,20 GiB de pesos" que circulou de manhã também — a certa é 10,88 GiB. Isso
+importa porque a folga a 131K é justamente da ordem de centenas de MiB.
+
+### 4.2 Buffers do grafo (tudo `hipMalloc`ado em `Graph::init`)
+
+| buffer | bytes | MiB | linha |
+|---|---:|---:|---|
+| ativações 1-token (`d_x_`…`d_vstage_`, 16 buffers) | 414 272 | 0,40 | `graph.cuh:518-522` |
+| buffers de batch, `kMaxBatch = 16` (16 floats-buffers) | 6 619 136 | 6,31 | `graph.cuh:544-553` |
+| blocos de ativação q8_1 do batch (`d_aqb_`, 16×544×36) | 313 344 | 0,30 | `graph.cuh:554-557` |
+| posições do batch (`d_posb_`) | 64 | 0,00 | `graph.cuh:559` |
+| **parciais do split-KV** `24 × 16 × (2+256) × 4 B` | 396 288 | 0,38 | `graph.cuh:565` |
+| **estado GDN** `48 × 48 × 128 × 128 × 4 B` | 150 994 944 | **144,00** | `graph.cuh:570` |
+| conv state GDN `48 × 3 × 10240 × 4 B` | 5 898 240 | 5,62 | `graph.cuh:571` |
+| `d_pos_` | 4 | 0,00 | `graph.cuh:572` |
+| scratch q8 `(17408/32 + 8) × 36` | 19 872 | 0,02 | `graph.cuh:583` |
+| logits `248320 × 4` | 993 280 | 0,95 | `graph.cuh:1130`/`1262` |
+| **total buffers fixos** | **165 658 660** | **157,98** | |
+
+Por token o bloco de batch custa 423,7 KiB; ele é **fixo em 16 tokens**, não
+escala com `--ctx-size`. Todos os 16 buffers de batch são usados (contei as
+referências uma a uma: nenhum morto).
+
+### 4.3 KV cache por token e por combinação (números exatos, gateados)
+
+`16 camadas × 4 cabeças × 256 dims = 16 384 elementos por lado por token`.
+
+| K / V | B/token | 131 072 tokens | pesos+buffers+KV | folga de 15,900 GiB |
+|---|---:|---:|---:|---:|
+| f16/f16 | 65 536 | **8,000 GiB** | 19,031 GiB | **−3,131** |
+| q8_0/q8_0 | 34 816 | 4,250 GiB | 15,281 GiB | +0,619 |
+| q4_0/q4_0 | 18 432 | 2,250 GiB | 13,281 GiB | +2,619 |
+| **q5_0/q4_1** | **21 504** | **2,625 GiB** | **13,656 GiB** | **+2,244** |
+| q5_0/q5_0 | 22 528 | 2,750 GiB | 13,781 GiB | +2,119 |
+| q4_1/q4_1 | 20 480 | 2,500 GiB | 13,531 GiB | +2,369 |
+| q8_0/q4_1 | 27 648 | 3,375 GiB | 14,406 GiB | +1,494 |
+| q8_0/q4_0 | 26 624 | 3,250 GiB | 14,281 GiB | +1,619 |
+| q5_0/q4_0 | 20 480 | 2,500 GiB | 13,531 GiB | +2,369 |
+
+(15,900 GiB é o que `hipMemGetInfo` reporta como total — a VRAM visível da placa,
+não os 16 GiB do anúncio. O piso do desktop nesta janela é 189-318 MiB.)
+
+**A correção ao número que circulou**: K `q8_0` + V `q4_0` = **3,250 GiB** e
+K `q5_0` + V `q4_0` = **2,500 GiB** — confere com o coordenador, e os dois estão
+fixados como asserção em `tests/check_kvtype.hip`, não como prosa.
+
+### 4.4 Resíduo não explicado
+
+Falta reconciliar 4.3 com o `vram in use` do `bench` (medição em §5): a diferença
+esperada é o allocator do HIP (arredondamento de cada `hipMalloc` para a página do
+driver), os ~190-320 MiB do desktop e os contextos/`hipModule`s do runtime. Com
+~150 `hipMalloc` de pesos, um arredondamento de 64 KiB por tensor já vale 10 MiB;
+o HIP costuma arredondar para 2 MiB em alocações grandes, o que daria centenas de
+MiB. O número medido em §5 fecha a conta.
+
+### 4.5 Desperdício encontrado (e o que custaria recuperar)
+
+1. **Cache de V alocado com o tamanho de K — 128 MiB a 131K (CORRIGIDO).**
+   `graph.cuh:514-521` (antes da minha mudança) calculava `kv_bytes` com
+   `kv_row_bytes(kv_k_, HD)` e usava o **mesmo** valor para `hipMalloc(&d_k_, …)` e
+   `hipMalloc(&d_v_, …)`, enquanto o passo de linha de V em `kv_write` já usava
+   `kv_row_bytes(kv_v_, HD)` corretamente. Com K=q5_0 (176 B/linha) e V=q4_1
+   (160 B/linha) isso é 16 B de lixo por linha de V: 16 B × 4 cabeças × 131 072
+   tokens × 16 camadas = **128 MiB** (134,2 MB) alocados e nunca tocados a 131K.
+   Corrigido com `kv_bytes_v_` + `kv_layer_bytes_v()`; com K e V do mesmo tipo o
+   valor é idêntico ao de antes (as duas expressões coincidem), então **nenhum
+   caminho existente mudou**.
+2. **Falta de `default:`/retorno silencioso nas tabelas de `kv.h` (CORRIGIDO)** —
+   ver §3. Não é MiB, é a classe de erro que produz número errado com cara de certo.
+3. **`kOverheadBytes = 1 GiB` (`device.h:49`)** é uma constante fixa de "kernels,
+   buffers e fragmentação". Medido: buffers fixos = **158 MiB**. Os 866 MiB
+   restantes são reserva; enquanto reserva, é o que faz `info` recusar configurações
+   que caberiam (por exemplo `q8_0/q8_0` a 131K, que cabe com 619 MiB de folga e a
+   reserva de 1 GiB rejeita). Trocar a constante por um valor medido é uma linha,
+   mas mexe na política de aceitação de `run`/`bench`/`ppl`/`serve` — **não fiz**,
+   porque é decisão do coordenador e não estava no meu escopo.
+4. **`d_attn_partial_` é dimensionado para o número MÁXIMO de splits** (16) em
+   todas as configurações: 396 288 B = 387 KiB. A contextos curtos (menos de
+   `kAttnSplitMin = 512`) ele nunca é lido. 387 KiB é irrelevante a 131K; fica
+   registrado, não vale mexer.
+5. **`d_projb_`/`d_ffnab_`/`d_ffnbb_`/`d_qkvb_`/`d_convb_` são fixos em 16 tokens**
+   e dominam os buffers de batch (6,62 MiB). Reduzir `kMaxBatch` de 16 para 8
+   devolveria ~3,3 MiB e custaria prefill — não vale.
+6. **O bloco MTP (0,327 GiB de pesos + cache próprio) é 100% desperdício quando
+   `--mtp` não é passado** — o `up()` nunca é chamado, então nada é alocado. Não é
+   desperdício; é o motivo pelo qual a estimativa por tamanho de ficheiro erra (§4.1).
+
+Isto responde ao "cace cada GiB": **10,877 (tronco) + 0,158 (buffers) + KV** e mais
+nada. Não há buffer duplicado, padding de pesos (0 bytes entre tensores) nem
+alocação morta no caminho do tronco. O único desperdício real era o de 128 MiB do
+item 1.

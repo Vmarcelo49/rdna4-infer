@@ -173,6 +173,40 @@ int main() {
     }
   }
 
+  std::printf("== the VRAM budget mirror (device.h) vs the allocator (graph.cuh)\n");
+  {
+    // The exact shape of the IQ3_S (scripts/inspect_gguf.py) -- so a change to
+    // graph.cuh's allocations, or to the mirror in device.h, breaks HERE instead
+    // of silently making `info`/`serve` approve a context that does not fit.
+    rdna4::GraphBufferShape s;
+    s.n_embd = 5120;
+    s.ffn_len = 17408;
+    s.n_head = 24;
+    s.head_dim = 256;
+    s.n_head_kv = 4;
+    s.n_kv_layers = 16;
+    s.n_recr_layers = 48;
+    s.ssm_state = 128;
+    s.ssm_group = 16;
+    s.ssm_tsr = 48;
+    s.conv_k = 4;
+    s.vocab = 248320;
+    const std::uint64_t got = rdna4::graph_buffer_bytes(s);
+    std::printf("   graph buffers for the IQ3_S shape: %llu B = %.2f MiB\n",
+                (unsigned long long)got, (double)got / (1024.0 * 1024.0));
+    ok(got == 165658660ull, "graph_buffer_bytes == 165 658 660 B (157.98 MiB), the sum of "
+                            "graph.cuh:518-585 added up by hand");
+    // ... and the budget must not count the whole file: 10.877 GiB of trunk
+    // weights, not 11.214 GiB.
+    const std::uint64_t need = rdna4::required_bytes(11678877696ull, 131072,
+                                                     rdna4::KvType::Q5_0, rdna4::KvType::Q4_1, got);
+    std::printf("   131K q5_0/q4_1 with the honest terms: %.3f GiB\n",
+                (double)need / 1073741824.0);
+    ok(need == 11678877696ull + got + 2818572288ull + (256ull << 20) + (64ull << 20),
+       "required_bytes = weights + buffers + kv + the named margin (no flat gigabyte)");
+    ok(need < 15900000000ull, "131K q5_0/q4_1 fits in the 15.900 GB hipMemGetInfo reports");
+  }
+
   std::printf("== the three doors: an out-of-enum KvType must abort, not guess\n");
   {
     const rdna4::KvType bad = static_cast<rdna4::KvType>(99u);

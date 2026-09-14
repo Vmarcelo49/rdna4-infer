@@ -908,13 +908,35 @@ int cmd_info(int argc, char **argv) {
   const double gib = static_cast<double>(1u << 30);
   // One source of truth for the K + V budget (device.h), the same call serve
   // makes before loading: this used to be two hand-rolled half-constant sums.
+  //
+  // The weights term is the tensors the engine actually uploads, NOT the file
+  // size, and the buffers term is computed from the shape instead of the old flat
+  // 1 GiB. Measured for this model: file 11.214 GiB, uploaded 10.877 GiB
+  // (0.327 GiB of that file is the MTP block, which the trunk never binds), and
+  // the fixed buffers 157.98 MiB. The old pair overestimated by ~1.18 GiB and
+  // refused contexts that fit (docs/journal-kv.md §6).
+  const std::uint64_t weights = rdna4::uploaded_weight_bytes(loader, cfg.block_count - 1, false);
+  // vocab for the logits buffer: the graph takes it from output.weight's dim1
+  // (model.h's config carries no vocab field).
+  std::uint64_t vocab = 0;
+  for (const auto &t : gf.tensors) {
+    if (t.name == "output.weight" && t.dims.size() > 1) vocab = t.dims[1];
+  }
+  const rdna4::GraphBufferShape shape = rdna4::graph_buffer_shape(cfg, vocab);
+  const std::uint64_t buffers_est = rdna4::graph_buffer_bytes(shape);
   const std::uint64_t kv_bytes = rdna4::kv_cache_bytes(ctx_size, kt, vt);
-  const std::uint64_t need = file_bytes + kv_bytes + rdna4::kOverheadBytes;
-  std::printf("model: %.2f GiB + kv(ctx=%llu, k=%s/v=%s): %.2f GiB + overhead: %.2f GiB = need %.2f GiB\n",
-              file_bytes / gib, (unsigned long long)ctx_size, cache_k, cache_v,
-              kv_bytes / gib, rdna4::kOverheadBytes / gib, need / gib);
+  const std::uint64_t need =
+      rdna4::required_bytes(weights, ctx_size, kt, vt, buffers_est);
+  std::printf("model file: %.2f GiB, uploaded weights: %.2f GiB, graph buffers: %.2f MiB\n",
+              file_bytes / gib, weights / gib, buffers_est / (1024.0 * 1024.0));
+  std::printf("kv(ctx=%llu, k=%s/v=%s): %.2f GiB + margin: %.2f MiB = need %.2f GiB "
+              "(file-based estimate was %.2f GiB)\n",
+              (unsigned long long)ctx_size, cache_k, cache_v, kv_bytes / gib,
+              rdna4::kOverheadBytes / (1024.0 * 1024.0), need / gib,
+              (file_bytes + kv_bytes + (1u << 30)) / gib);
   if (need > total_vram) {
-    std::fprintf(stderr, "rdna4-infer: insufficient VRAM (need %.2f GiB)\n", need / gib);
+    std::fprintf(stderr, "rdna4-infer: insufficient VRAM (need %.2f GiB, have %.2f GiB)\n",
+                 need / gib, total_vram / gib);
     return 3;
   }
   std::printf("rdna4-infer: budget OK\n");
