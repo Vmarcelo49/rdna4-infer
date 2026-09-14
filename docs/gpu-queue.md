@@ -76,3 +76,35 @@ próprio `scripts/gpu-lock.sh` passa a exportar `GPU_LOCK_HELD=1` para o comando
 (`exec flock -w "$WAIT" "$LOCK" env GPU_LOCK_HELD=1 "$@"`), de modo que qualquer script aninhado
 — gate, wrapper ou `check_all.sh` — detecta que o lock já está tomado sem que ninguém precise
 lembrar. Verificado: `./scripts/gpu-lock.sh bash -c 'echo $GPU_LOCK_HELD'` imprime `1`.
+
+## Terceiro furo, da madrugada: lock aninhado de novo — e agora o wrapper se protege
+
+Segunda ocorrência do mesmo erro, agora por um script de matriz: `/tmp/matrix-mtp.sh` pegou o
+lock **uma vez** ("a matriz inteira sob uma tomada de lock") e o script interno chamava
+`./scripts/gpu-lock.sh` de novo, sem `GPU_LOCK_HELD=1`. Árvore medida às 03:00:
+
+```
+flock(27622, SEGURA) -> bash /tmp/matrix-mtp.sh -> bash /tmp/mtp-matrix.sh
+  -> timeout 900 ./scripts/gpu-lock.sh ./build/rdna4-infer run ...   (espera o avô)
+```
+
+Cada configuração esperava 900 s e morria com `RC=124`; eram 5 configs a 4K + 4 a 16K, ou seja
+**~2,25 h de GPU ociosa** (VRAM 189 MB, nenhum kernel rodando por 11 minutos) e 13 processos na
+fila parados atrás. O coordenador matou a árvore e a fila andou em 20 s.
+
+O conserto de disciplina ("exporte `GPU_LOCK_HELD=1`") já tinha falhado uma vez. Agora é
+estrutural, no próprio wrapper:
+
+```bash
+# scripts/gpu-lock.sh
+if [ "${GPU_LOCK_HELD:-0}" = 1 ]; then exec "$@"; fi   # um ancestral já segura o lock
+```
+
+Como o wrapper marca os filhos que executa, qualquer aninhamento — gate, script de matriz ou
+wrapper ad-hoc — passa a rodar direto em vez de esperar o próprio pai. Verificado:
+`GPU_LOCK_HELD=1 ./scripts/gpu-lock.sh bash -c 'echo ok'` roda na hora. Os cinco worktrees
+ativos receberam a cópia corrigida no mesmo minuto.
+
+Lição para o relatório: duas das três falhas de fila desta noite foram *ninho de lock*, e as
+duas custaram tempo de GPU. A regra "todo comando de GPU passa pelo wrapper" só funciona se o
+wrapper for seguro para aninhar — não basta pedir disciplina aos agentes.

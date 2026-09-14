@@ -23,6 +23,7 @@ QUICK=0
 for a in "$@"; do [ "$a" = "--quick" ] && QUICK=1; done
 PHASE="${CHECK_ALL_PHASE:-all}"   # all | gpu (the re-exec that holds the lock)
 fail=0
+missing=""   # gate binaries that should exist but do not (see F3)
 step() {  # step <label> <cmd...>
   local label="$1"; shift
   local t0=$SECONDS
@@ -47,7 +48,15 @@ if [ "$PHASE" = all ]; then
   step "check-server-http" "$B/check-server-http"
   step "check-loader"      "$B/check-loader" "$MODEL"
   step "check-hardening"   "$ROOT/scripts/check_hardening.sh"
-  [ -x "$B/check-tuning" ] && step "check-tuning" "$B/check-tuning"
+  if [ -x "$B/check-tuning" ]; then
+    step "check-tuning" "$B/check-tuning"
+  else
+    # A missing gate binary must FAIL, not quietly shrink the battery: the review
+    # front proved this construct printed PASS with 9 of 10 gates (finding F3).
+    missing="$missing check-tuning"
+    printf '  FAIL  %-32s binary not built (%s)\n' "check-tuning" "$B/check-tuning"
+    fail=1
+  fi
 
   if [ "${CHECK_ALL_CPU_ONLY:-0}" = 1 ]; then
     if [ "$fail" -eq 0 ]; then echo "check_all (CPU half): PASS"; else echo "check_all (CPU half): FAIL"; fi
@@ -63,6 +72,9 @@ if [ "$PHASE" = all ]; then
 
   echo "== C. gates that lock by themselves =="
   step "serve (HTTP)" "$ROOT/scripts/check_server.sh"
+  if [ -n "$missing" ]; then
+    echo "check_all: FAIL — gate binaries missing:$missing (build them: cmake --build build)"
+  fi
   if [ "$fail" -eq 0 ]; then echo "check_all: PASS"; else echo "check_all: FAIL"; fi
   exit "$fail"
 fi
@@ -88,7 +100,14 @@ fi
 if [ -x "$B/check-regression-gpu" ]; then
   step "regression suite"   "$B/check-regression-gpu" "$MODEL" \
                             "$ROOT/tests/golden/regression_greedy_f16.txt"
+else
+  printf '  FAIL  %-32s binary not built (%s)\n' "regression suite" "$B/check-regression-gpu"
+  missing="$missing check-regression-gpu"
+  fail=1
 fi
 
+if [ -n "$missing" ]; then
+  echo "check_all(B): FAIL — gate binaries missing:$missing (build them: cmake --build build)"
+fi
 if [ "$fail" -eq 0 ]; then echo "check_all(B): PASS"; else echo "check_all(B): FAIL"; fi
 exit "$fail"

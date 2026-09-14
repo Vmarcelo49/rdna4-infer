@@ -60,7 +60,13 @@ double now_ms() {
 const char *kUsage =
     "usage: bench-phases-gpu <file.gguf> [--ctx N] [--kv-k T] [--kv-v T] [--pos N]\n"
     "                        [--tokens N] [--level 1|2] [--count-only] [--mem] [--gdn]\n"
-    "                        [--no-clean]\n";
+    "                        [--no-clean]\n"
+    "       bench-phases-gpu <file.gguf> --prefill N [--prefill-reps K] [--level 1|2]\n"
+    "                        [--count-only] [--ctx N] [--kv-k T] [--kv-v T]\n"
+    "         --prefill N: a BATCHED PREFILL pass (forward_batch chunks, exactly the\n"
+    "         chunk policy of src/main.hip prefill_ids) instead of decode tokens:\n"
+    "         the per-phase budget of prefill, and ms per chunk size. N <= 128 when\n"
+    "         the phase profiler is on (one hipEvent_t per mark).";
 
 // ---------------------------------------------------------------------------
 // Memory roofline: grid-stride read of a buffer that is much larger than L2
@@ -248,6 +254,29 @@ struct RunResult {
   std::vector<std::int32_t> ids;
 };
 
+// --------------------------------------------------------------- prefill ----
+// Added by the prefill front (feat/noite-prefill). The batched prefill path
+// (Graph::forward_batch) has a completely different per-phase budget from decode:
+// the weight matvecs are amortized over N tokens, while the attention, the GDN
+// recurrence and every norm still run once per token INSIDE the batch. This mode
+// makes that visible: it runs the same chunk sequence src/main.hip::prefill_ids
+// runs (16/8/4/3/2, then one token at a time), times each chunk, and can arm the
+// same opt-in phase profiler the decode mode uses.
+struct PrefillChunk {
+  int size = 0;
+  double ms = 0;
+};
+
+struct PrefillResult {
+  double total_ms = 0;
+  std::size_t tokens = 0;
+  std::vector<PrefillChunk> chunks;
+  double ms_by_size[17] = {};    // size -> total ms
+  int n_by_size[17] = {};        // size -> number of chunks
+  double best_ms_by_size[17] = {};
+  int splits_last = 0;
+};
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -257,6 +286,7 @@ int main(int argc, char **argv) {
   }
   const char *model = argv[1];
   int ctx = 4096, tokens = 24, level = 1, pos = -1, splits = -1;
+  int prefill_n = 0, prefill_reps = 2;
   bool count_only = false, do_mem = false, do_clean = true, do_gdn = false;
   rdna4::KvType kv_k = rdna4::KvType::F16, kv_v = rdna4::KvType::F16;
   for (int i = 2; i < argc; ++i) {
@@ -264,6 +294,8 @@ int main(int argc, char **argv) {
     auto next = [&]() -> const char * { return (i + 1 < argc) ? argv[++i] : nullptr; };
     if (!std::strcmp(a, "--ctx")) { const char *v = next(); ctx = v ? std::atoi(v) : ctx; }
     else if (!std::strcmp(a, "--pos")) { const char *v = next(); pos = v ? std::atoi(v) : pos; }
+    else if (!std::strcmp(a, "--prefill")) { const char *v = next(); prefill_n = v ? std::atoi(v) : prefill_n; }
+    else if (!std::strcmp(a, "--prefill-reps")) { const char *v = next(); prefill_reps = v ? std::atoi(v) : prefill_reps; }
     else if (!std::strcmp(a, "--tokens")) { const char *v = next(); tokens = v ? std::atoi(v) : tokens; }
     else if (!std::strcmp(a, "--level")) { const char *v = next(); level = v ? std::atoi(v) : level; }
     else if (!std::strcmp(a, "--splits")) { const char *v = next(); splits = v ? std::atoi(v) : splits; }
@@ -285,6 +317,8 @@ int main(int argc, char **argv) {
     }
   }
   if (pos < 0) pos = 0;
+  // prefill mode needs room for the whole batch in the KV cache
+  if (prefill_n > 0 && ctx < prefill_n + 16) ctx = prefill_n + 16;
 
   std::printf("== bench-phases-gpu (worktree medicoes-gpu)\n");
   std::printf("model: %s\nctx %d, kv %s/%s, decode positions %d..%d, tokens %d, level %d%s\n", model,
@@ -581,6 +615,149 @@ int main(int argc, char **argv) {
   };
 
   if (pos > 0) std::printf("  cache sintetico preenchido a cada warm-up (custo, nao qualidade)\n");
+
+  // ------------------------------------------------------------- prefill mode
+  // --prefill N: the measured pass is a batched prefill of N tokens, chunked
+  // exactly like src/main.hip::prefill_ids, instead of N decode tokens.
+  if (prefill_n > 0) {
+    auto build_chunks = [](int total) {
+      std::vector<PrefillChunk> out;
+      static const int kSizes[] = {16, 8, 4, 3, 2};
+      int p = 0;
+      while (p < total) {
+        int take = 1;
+        for (int sz : kSizes) {
+          if (total - p >= sz) { take = sz; break; }
+        }
+        out.push_back(PrefillChunk{take, 0.0});
+        p += take;
+      }
+      return out;
+    };
+    std::vector<std::int32_t> idsv((std::size_t)prefill_n, id);
+
+    auto prefill_pass = [&](rdna4::PhaseProf *prof, PrefillResult &out) -> bool {
+      {  // warm-up outside the timed window (DPM: >= 300 ms of GPU busy)
+        g.set_phase_prof(nullptr);
+        const std::vector<std::int32_t> warm(16, id);
+        const double w0 = now_ms();
+        double last = w0;
+        while (last - w0 < 300.0) {
+          if (!g.reset_state(err) || !g.forward_batch(warm, 0, hidden, logits, err)) return false;
+          (void)hipDeviceSynchronize();
+          last = now_ms();
+        }
+      }
+      if (!g.reset_state(err)) return false;
+      std::vector<PrefillChunk> chunks = build_chunks(prefill_n);
+      if (prof) g.set_phase_prof(prof);
+      const double t0 = now_ms();
+      int p = 0;
+      for (PrefillChunk &c : chunks) {
+        const double c0 = now_ms();
+        if (c.size == 1) {
+          if (!g.forward_tokens({idsv[(std::size_t)p]}, p, hidden, logits, err)) return false;
+        } else {
+          const std::vector<std::int32_t> part(idsv.begin() + p, idsv.begin() + p + c.size);
+          if (!g.forward_batch(part, p, hidden, logits, err)) return false;
+        }
+        c.ms = now_ms() - c0;
+        p += c.size;
+      }
+      out.total_ms = now_ms() - t0;
+      out.tokens = (std::size_t)prefill_n;
+      out.chunks = chunks;
+      out.splits_last = g.debug_attn_splits();
+      for (const PrefillChunk &c : chunks) {
+        const int k = c.size <= 16 ? c.size : 16;
+        out.ms_by_size[k] += c.ms;
+        out.n_by_size[k] += 1;
+        if (out.best_ms_by_size[k] == 0.0 || c.ms < out.best_ms_by_size[k])
+          out.best_ms_by_size[k] = c.ms;
+      }
+      if (prof) {
+        (void)hipDeviceSynchronize();
+        prof->finish();
+        prof->set_tokens((std::int64_t)prefill_n);
+      }
+      g.set_phase_prof(nullptr);
+      return true;
+    };
+
+    std::printf("\n== prefill em lote (N=%d, chunks 16/8/4/3/2/1 como prefill_ids, "
+                "%d passadas limpas)\n", prefill_n, prefill_reps);
+    PrefillResult acc;
+    double best_total = 0;
+    for (int r = 0; r < prefill_reps; ++r) {
+      PrefillResult rr;
+      if (!prefill_pass(nullptr, rr)) {
+        std::fprintf(stderr, "prefill: %s\n", err.c_str());
+        return 1;
+      }
+      std::printf("  passada %d: %.3f ms total, %.3f ms/token, %.2f tok/s, %d chunks\n", r + 1,
+                  rr.total_ms, rr.total_ms / (double)prefill_n,
+                  (double)prefill_n / (rr.total_ms / 1000.0), (int)rr.chunks.size());
+      if (best_total == 0.0 || rr.total_ms < best_total) {
+        best_total = rr.total_ms;
+        acc = rr;
+      }
+      for (int k = 2; k <= 16; ++k) {
+        if (rr.best_ms_by_size[k] > 0 &&
+            (acc.best_ms_by_size[k] == 0.0 || rr.best_ms_by_size[k] < acc.best_ms_by_size[k])) {
+          acc.best_ms_by_size[k] = rr.best_ms_by_size[k];
+        }
+      }
+    }
+    std::printf("  melhor: %.3f ms para %d tokens = %.3f ms/token (%.2f tok/s), %d splits\n",
+                best_total, prefill_n, best_total / (double)prefill_n,
+                (double)prefill_n / (best_total / 1000.0), acc.splits_last);
+    std::printf("  %-6s %10s %10s %10s %12s\n", "chunk", "n", "ms/chunk", "us/token",
+                "best ms/chunk");
+    for (int k = 2; k <= 16; ++k) {
+      if (acc.n_by_size[k] == 0) continue;
+      const double per_chunk = acc.ms_by_size[k] / (double)acc.n_by_size[k];
+      std::printf("  %-6d %10d %10.3f %10.1f %12.3f\n", k, acc.n_by_size[k], per_chunk,
+                  1000.0 * per_chunk / (double)k, acc.best_ms_by_size[k]);
+    }
+
+    if (count_only) {
+      rdna4::PhaseProf cp;
+      cp.level = level;
+      cp.count_only = true;
+      PrefillResult rr;
+      if (!prefill_pass(&cp, rr)) return 1;
+      std::printf("\n== contagem de marcas do prefill (count-only, sem eventos): %.3f ms/token\n",
+                  rr.total_ms / (double)prefill_n);
+      std::printf("  %-24s %15s\n", "bucket", "marks/token");
+      for (const auto &b : cp.buckets) {
+        std::printf("  %-24s %15.1f\n", b.name.c_str(),
+                    cp.tokens ? (double)b.marks / (double)cp.tokens : 0.0);
+      }
+      std::printf("  TOTAL de marcas/token: %.1f\n",
+                  cp.tokens ? (double)cp.marks_tot() / (double)cp.tokens : 0.0);
+      return 0;
+    }
+
+    if (prefill_n > 128) {
+      std::printf("\n(passada instrumentada pulada: N=%d cria %d hipEvent_t; use N<=128)\n",
+                  prefill_n, prefill_n * 900);
+      return 0;
+    }
+    rdna4::PhaseProf prof;
+    prof.level = level;
+    prof.ev_us = d.ev_us;
+    PrefillResult inst;
+    if (!prefill_pass(&prof, inst)) return 1;
+    std::printf("\n== prefill instrumentado (nivel %d): %.3f ms/token (%.2f tok/s)\n", level,
+                inst.total_ms / (double)prefill_n, (double)prefill_n / (inst.total_ms / 1000.0));
+    std::printf("  soma dos buckets: %.3f ms; inflacao da instrumentacao: %+.1f%%\n",
+                prof.total_ms(),
+                100.0 * (inst.total_ms / best_total - 1.0));
+    prof.print("buckets por fase");
+    std::printf("\n  (ms/token = tempo da fase no lote inteiro / tokens do lote;\n"
+                "   as fases 'por token' do decode aparecem aqui divididas pelo mesmo N)\n");
+    return 0;
+  }
 
   // -------------------------------------------------------------- clean pass
   RunResult clean;
