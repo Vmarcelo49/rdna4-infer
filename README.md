@@ -182,8 +182,11 @@ and `/dev/kfd` empty. Phases that read a lot fail together (attention 13.3×, ma
 while the cheap ones do not move: the signature of traffic over the system bus, not of
 contention. Above ~56K the supported configuration is **KV `q8_0`**, which is also *faster*
 than `q4_0` at 64K (18.28 vs 18.10-18.17 tok/s in the measurement front's window; attention
-19.87 vs 21.03 ms) and leaves 2.18 GiB free — attention there is issue-bound in the dequantization, not bandwidth-bound, so
-paying for the extra precision costs nothing.
+19.87 vs 21.03 ms) and leaves 2.18 GiB free. (The **speed** argument was weaker than it looked: `q8_0` measured 18.28 against
+18.10-18.17 for `q4_0` in two *separate* runs, i.e. inside the 2-3 % session-to-session
+variance, not in an interleaved A/B. What justifies the recommendation is the VRAM headroom and
+the doubled precision, not a speed win — the attention there is issue-bound in the dequant, so
+the extra precision is close to free, which is a weaker and truer claim.)
 
 ## Measured numbers
 
@@ -297,7 +300,9 @@ dispatch). The five findings that matter:
    ROPE+VIEW+SET_ROWS). At the measured 3.5 µs per-launch floor that is ~6.8 ms/token, 20 %
    of a 4K token — the highest-value, lowest-risk item on the list.
 5. **Derived effective bandwidth**: ≥ 442 GB/s (≈480 GB/s discounting the LM head and glue)
-   against this engine's measured 402-421 GB/s.
+   against this engine's 436 GB/s on the trunk matvec (measured) and 325 GB/s end to end; the
+   "402-421 GB/s" that used to be quoted here came from a *replay estimate*
+   (`docs/rocm-estudo.md` §A.1), not from a measurement.
 
 Capability line measured on this machine (`llama-bench`, RADV):
 `fp16: dot2 | int dot: 1 | matrix cores: KHR_coopmat` — coopmat1 *is* enabled on RADV
@@ -350,10 +355,12 @@ findings and three IMPORTANT ones are **fixed in this tree**, each with before/a
 | M5 | `--ctx-size` was cast from `uint64_t` to `int` unvalidated | capped at `1..2^24` with a message, before any HIP call |
 
 `scripts/check_hardening.sh` reproduces the loader proofs (it compiles the probe against a
-pre-fix checkout, so the "before" column is a measurement, not a claim). Warning hygiene is
-tracked per translation unit: the engine compiles with **0** warnings under `-Wall -Wextra`
-except one line repeated in `attn.cuh` (98 × `-Wsign-compare`) and three unused parameters —
-those are queued with the attention changes rather than silenced with a flag.
+pre-fix checkout, so the "before" column is a measurement, not a claim). Warning hygiene: `-Wall -Wextra` is **on** for both shipping targets (`rdna4-infer` and
+`rdna4_serve`) and the build is clean — the 98 × `-Wsign-compare` and three unused parameters
+that used to be the reason for leaving it off are fixed (the split kernel's tail write is now a
+strided loop, and the parameters are `[[maybe_unused]]`). The test binaries are deliberately
+left out: ROCm 7.2 marks `hipError_t` `[[nodiscard]]` and their 422 ignored returns are test
+noise, not engine risk.
 
 ## Known limitations (v1)
 
