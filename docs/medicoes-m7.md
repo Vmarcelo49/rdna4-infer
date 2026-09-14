@@ -24,7 +24,16 @@ The fix was therefore not a new algorithm but **more requests in flight**:
    consecutive dims in ONE access (16 B for f16, 8 B for q4_0/q8_0, 32 B for f32)
    instead of 8 scalar 1-2 byte loads whose warp-wide addresses straddle cache lines.
    The values and their order are identical to 8 `kv_load()` calls.
-2. **32 warps per CTA** (`kAttnWarpsPerBlock`, the 1024-thread maximum, up from 8).
+2. **More warps per CTA.** `kAttnWarpsPerBlock` was raised 8 → 16 → 32 in the
+   working tree and measured at each step (3.6× at t=512, 2.6× at 16K/64K for 32 vs
+   the 8-warp scalar-load baseline). **Correction (caught by the ROCm workstream):
+   32 was reverted to 8 while measuring a baseline and never restored, so the
+   committed line is `kAttnWarpsPerBlock = 8`** — commit `a830570`'s subject says
+   "cargas vetorizadas + 32 warps" and that second half is wrong. What actually ships
+   is the vectorized load plus the split-KV kernel below, and with split-KV active
+   32 warps measures *worse* (0.73-1.19×, `docs/rocm-estudo.md`), so 8 is the right
+   value; the "32 warps" column in the table below is a measurement of a build that
+   was not committed and is kept only to show the shape of the curve.
 
 ## Result
 
@@ -88,15 +97,21 @@ path over the same inputs:
 
 End to end (`bench --start-pos`), decode at the END of the context:
 
-| model | ctx / KV | M5 baseline | 32 warps | + split-KV | total |
-|---|---|---|---|---|---|
-| IQ3_S | 4 096 f16 | 22.13 | 24.11 | 23.73 | 1.07× |
-| IQ3_S | 16 384 f16 | 13.72 | 14.82 | **24.08** | **1.76×** |
-| IQ3_S | 65 536 f16 | — | — | **18.98** | — |
-| IQ3_S | 65 536 q4_0 | 4.18 | 6.40 | **17.81** | **4.3×** |
-| IQ3_S | 131 072 q4_0 | 2.27 | 3.66 | **13.19** | **5.8×** |
-| IQ4_XS | 32 768 f16 | 9.09 | — | **20.79** | **2.3×** |
-| IQ4_XS | 65 536 q4_0 | 4.18 | — | **17.11** | **4.1×** |
+Final numbers, measured on the **merged** tree (vectorized loads + split-KV +
+warp count per split + the M8 split policy `kAttnSplitMin = 512`):
+
+| model | ctx / KV | M5 baseline | vectorized + split | total |
+|---|---|---|---|---|
+| IQ3_S | 4 096 f16 | 22.13 | **26.82** | **1.21×** |
+| IQ3_S | 16 384 f16 | 13.72 | **24.29** | **1.77×** |
+| IQ3_S | 65 536 f16 | — | **18.91** | — |
+| IQ3_S | 65 536 q4_0 | 4.18 | **17.88** | **4.3×** |
+| IQ3_S | 131 072 q4_0 | 2.27 | **12.99** | **5.7×** |
+| IQ4_XS | 32 768 f16 | 9.09 | ~20.8 | ~2.3× |
+| IQ4_XS | 65 536 q4_0 | 4.18 | ~17.1 | ~4.1× |
+
+(A 64K-f16 run once reported 1.06 tok/s: that was another workstream holding the GPU
+without the lock, not a regression — re-measured clean it is 18.91.)
 
 **Decode is now nearly flat in context** (23.7 tok/s at 4K, 24.1 at 16K, 19.0 at 64K,
 13.2 at 131K): the attention is no longer what long context costs. It also flips the

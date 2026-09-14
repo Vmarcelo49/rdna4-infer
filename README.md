@@ -10,7 +10,8 @@ graph, sampler) can be tuned for exactly that target.
 ## Objectives
 
 - Run `Qwen3.8-27B` (`UD-IQ3_S` 12 GB primary, `UD-IQ4_XS` 14 GB secondary) fully in VRAM
-  on a stock RX 9070 XT via a `run` CLI with streaming output.
+  on a stock RX 9070 XT via a `run` CLI with streaming output, or behind an
+  **OpenAI-compatible HTTP server** (`serve`) that common harnesses can talk to.
 - HIP-only backend compiled for `gfx1201`, reusing battle-tested llama.cpp modules
   (GGUF reader, RDNA4-tuned MMVQ/MMQ, Q/I-quant dequant, sampler) under MIT — no full fork.
 - Beat-the-reference mindset: llama.cpp baselines are recorded in `docs/` and every
@@ -62,6 +63,11 @@ Requires Linux + ROCm with `amdclang++` (tested with ROCm 7.2).
 ./build/rdna4-infer bench -m model.gguf -n 64 --reps 3
 ./build/rdna4-infer bench -m model.gguf --ctx-size 65536 --cache-type-k q4_0                           --cache-type-v q4_0 --fill-cache      # long-context decode
 
+# OpenAI-compatible server (chat completions with SSE streaming, /v1/models, /health)
+./build/rdna4-infer serve -m model.gguf --port 8080 --ctx-size 8192
+curl -s http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"hi"}],"stream":true}'
+
 # perplexity on a corpus (llama-perplexity-compatible tiling)
 ./build/rdna4-infer ppl -m model.gguf -f corpus.txt --ctx-size 512 --stride 512 --chunks 10
 ```
@@ -85,12 +91,13 @@ lengths) with the exact command for every number. Headline, IQ3_S on the RX 9070
 
 | | this engine | llama.cpp (Vulkan) on the same machine |
 |---|---|---|
-| decode (IQ3_S, 4K, KV f16) | 27.6 tok/s | 39.7 tok/s |
+| decode (IQ3_S, 4K, KV f16) | 26.8 tok/s | 39.7 tok/s |
 | decode (IQ4_XS) | 27.0 tok/s | — |
 | prefill (per-token path) | 28.8 tok/s | 440 tok/s (batched) |
 | effective weight bandwidth | 336 GB/s (IQ3_S) / 364 GB/s (IQ4_XS) | — |
 | perplexity (wikitext-2, 10×512 tokens, per position) | within **0.25 %** (IQ3_S) / **0.15 %** (IQ4_XS) | reference |
-| long context | 131K ctx on IQ3_S (13.2 tok/s there), 64K on IQ4_XS | — |
+| decode 64K f16 / 131K q4_0 (IQ3_S) | 18.9 / 13.0 tok/s | — |
+| MTP (NextN) draft acceptance | 86.7 % on natural text (llama.cpp's own driver: 87.5 %) | — |
 
 ## Validation
 
@@ -131,8 +138,15 @@ runtime by the engine.
 - The CLI is single-turn (`--chat` renders one system+user turn); multi-turn
   rendering is implemented and tested in `chat_render`, the CLI just does not offer
   a conversation file yet.
-- `output.weight` is required (no tied-embedding fallback), block 64 (MTP) is never
-  executed, and only `gfx1201` builds/runs.
+- `output.weight` is required (no tied-embedding fallback) and only `gfx1201`
+  builds/runs.
+- **MTP (block 64) works but does not pay yet**: `--mtp` drafts with the NextN head
+  at 86.7 % acceptance and reproduces plain greedy output exactly, but every mode
+  still runs one trunk forward per committed token, so it is 9-10 % *slower* than
+  plain greedy. With batched verification it would be ~2.5× (measured draft step
+  2.24 ms vs 35-36 ms trunk step). See `docs/mtp.md`.
+- The server is single-request and has no keep-alive or prefix-cache reuse; see
+  `docs/servidor-openai.md` for the full list of what it does not implement.
 
 ## Docs
 
