@@ -619,9 +619,37 @@ coordenador:
 | 3 | Vulkan (llama.cpp) vs HIP, código a código | `docs/vulkan-vs-hip.md` |
 | 4 | inventário de quantizações | `docs/quants-inventario.md` |
 | 5 | desenho do cache KV e orçamento de tráfego | `docs/kv-memoria-desenho.md` |
-| 6-7 | autotuning e regressão | `docs/autotuning-gfx1201.md`, `include/rdna4/tuning.h` |
+| 6-7 | autotuning e regressão | `docs/autotuning-gfx1201.md`, `include/rdna4/tuning.h` (tabela única), `check-tuning` + `scripts/check_regression.sh` como gates |
 | 8 | build reprodutível | `docs/build-repro.md` |
 | 9 | README com os números reais | `README.md` |
 
 Regras do lote: cada agente só commita na sua branch; o merge é em série; GPU só com o
 lock; agente que não precisa de GPU não usa GPU.
+
+### O que o autotuning embarcou (medido, com A/B intercalado e piso de ruído de 1,001×)
+
+- **`UNROLL=2`** nos quatro tipos de ILP=1 (`iq3_s` **1,073×**, `iq3_xxs` 1,031×,
+  `iq2_s` 1,011×, `iq4_nl` 1,055×) e **`rows=1`** em `iq2_xs` (1,020×) e `iq2_xxs`
+  (1,002-1,011×): **bit-exatos** (mesmas operações, mesma ordem; `rows` só muda qual CTA
+  calcula qual linha). Somados: matvec **25,2 → 24,5 ms/token (1,028×)** sobre o inventário
+  real (497 tensores, 10,36 GiB por token).
+- **Regra de duas pontas no `WPB` da atenção** (`kAttnSplitWpbWide`): 131K com KV `q4_0` mede
+  **1,087×** (24×16 contra 16×8, 12/15 rodadas); abaixo disso ≤ 1 %. Não é bit-exato (muda a
+  ordem do merge), então é a mesma classe numérica do split-KV, coberta pelo
+  `check_attn_split.sh`.
+- **Rejeitados com dado**: `rows` global (1,010/1,005/0,991/0,988×), ILP global
+  (0,82/0,76/0,77×), `unroll=4` (0,917×), prefetch L2 real (0,984×), `kAttnMaxSplits` 16→24
+  (0,921× a 16K), e "poucos splits + CTA larga" em 4K/16K (real no kernel, 0,2-0,5 % no
+  total). Armadilha medida: `rows=1` e `unroll=2` **não compõem** (`iq3_s`: 8,081 ms contra
+  7,723 ms = 4,6 % pior).
+- **Fim a fim** (A/B com dois binários, janela limpa): contexto curto 27,71 → **28,35 tok/s
+  (+2,3 %, 3/3)**, fim de 4K +1,2 % (2 empates), 131K `q4_0` +0,8 % (dentro do ruído daquela
+  configuração).
+- **Gate novo da tabela** (`check-tuning`, CPU puro): compara a configuração embarcada com
+  `tests/golden/ml_tuning.txt` (22 linhas e 22 chaves obrigatórias) — um refactor que troque um
+  parâmetro medido quebra o gate em vez de mudar o desempenho em silêncio.
+- **Suíte de regressão** (`scripts/check_regression.sh` + `check-regression-gpu`): 7 casos
+  fixos (curto, prosa, código, CJK, chat, prefill real de 4096 tokens, 32K com cache semeado),
+  greedy puro, ids bit-exatos e logits rel-L2 ≤ 1e-5; **79 s**. Controle negativo colado: com
+  `amax/127 → amax/126` na quantização q8_1 da ativação ela falha 15 vezes (rel-L2 5,4e-3 a
+  1,6e-2, e o caso de 32K diverge de id no passo 0) e volta a passar quando revertido.
