@@ -691,7 +691,13 @@ __global__ void attn_split_batch_kernel(const float *__restrict__ q, const void 
 
   const std::uint64_t krow = kv_row_bytes(KT, head_dim);
   const std::uint64_t vrow = kv_row_bytes(VT, head_dim);
-  const float *qp = q + (std::int64_t)h * head_dim;
+  // The query row of THIS token (blockIdx.z), addressed exactly as the unsplit
+  // batched kernel above does it. Without the `qt` term every token of a split
+  // group read token 0's query while only the partial OUTPUT was indexed per
+  // token: rows 1..N-1 of any chunk above ~1040 keys came out wrong. Found by the
+  // adversarial review (R1) and caught by the long-context case this test now has
+  // to carry -- the short-prompt gate never reaches splits > 1.
+  const float *qp = q + ((std::int64_t)qt * n_head + h) * head_dim;
 
   float qv[kAttnMaxDimsPerLane];
   for (int i = 0; i < dpw; ++i) qv[i] = qp[lane * dpw + i];

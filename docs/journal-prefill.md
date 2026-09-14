@@ -83,7 +83,7 @@ sendo um gate de verdade.
 | peça | antes (dentro de `forward_batch_layer`) | agora |
 |---|---|---|
 | atenção: split q/portão, QK-norm, RoPE, escrita de KV, portão | 16 lançamentos **por token** (13 por token de atenção + 3) | 1 lançamento por estágio para o chunk (`attn.cuh` novo kernel em lote; `rope_kernel` já era multi-token; `kv_write_batch` = 1 chamada do kernel por linha com a largura do chunk) |
-| atenção em si | `attn_launch`/`attn_launch_split` por token | 1 lançamento para o chunk quando `splits == 1` (`attn_batch_kernel`, corpo idêntico ao não-dividido); contexto longo (> 512 chaves) mantém o laço por token, porque a ordem de soma dos splits faz parte dos números gravados |
+| atenção em si | `attn_launch`/`attn_launch_split` por token | 1 lançamento para o chunk quando `splits == 1` (`attn_batch_kernel`, corpo idêntico ao não-dividido) — **e desde o §7 também quando `splits > 1`**, agrupando os tokens por número de splits (`attn_split_batch_kernel`) |
 | GDN: escalares (sigmoid/add/softplus/mul) | 4 lançamentos por token | 4 lançamentos para o chunk (`add_bcast`/`mul_bcast`: `y[i] = a[i] op b[i % nb]`) |
 | GDN: `conv1d` | 1 por token | 1 para o chunk, andando os tokens em ordem dentro do kernel (`conv1d_state_batch_kernel`) |
 | GDN: `l2_norm` q/k | 2 por token | 1 para o chunk (linhas contíguas) |
@@ -244,3 +244,64 @@ Interruptor de A/B **no binário**: `RD_PREFILL_BATCH=0` volta ao andaime por to
 - **Veredito**: **ABANDONADO nesta frente, com medida** (o ganho não é meu; o achado está
   reportado). É o item de maior valor que sobrou.
 
+
+## 8. Atenção dividida (≥ 512 chaves) também em lote — e o defeito que a revisão pegou
+
+- **Referência**: `include/rdna4/attn.cuh` (o caminho com split entrou no M7) + o orçamento de
+  §3/§5 (a atenção por token no prefill de 1024-4096 tokens ainda era 2 lançamentos por token
+  por camada de atenção plena).
+- **Hipótese**: o número de splits depende da posição (`keys/512`), mas é **monótono** em posição,
+  então um chunk é uma sequência de faixas contíguas com o mesmo número de splits. Dentro de uma
+  faixa, a atribuição de chaves (`j = w + WPB*s`, passo `WPB*n_splits`) e o merge são idênticos
+  aos do kernel por token ⇒ 1 lançamento por faixa em vez de N pares (kernel, merge), bit-exato.
+- **Implementação** (commit `84bdd59`): `attn_split_batch_kernel` + `attn_merge_batch_kernel`
+  (tokens em `blockIdx.z`), buffer de parciais dimensionado para o lote inteiro (antes era
+  reusado por token), e o laço por token em `forward_batch_layer` virou o agrupamento por faixas.
+- **DEFEITO (achado R1 da revisão adversarial 2, `cea7ab6`)** — e como ele passou pelos gates:
+  - o ponteiro de consulta do kernel em lote ficou `q + h*head_dim`, sem o termo `qt`: **todas as
+    linhas de um grupo liam a consulta do token 0** (só o parcial de SAÍDA era indexado por
+    token). Alcance: qualquer chunk com `splits > 1`, isto é, prompt acima de ~1040 tokens —
+    ou seja, exatamente o alvo da noite (131K) e a verificação do MTP em contexto longo.
+  - **Por que o gate não pegou**: (a) o `check-batch-gpu` do disco era ANTERIOR à edição (eu
+    reconstruí `rdna4-infer`/`bench-phases-gpu`, não o `check-batch-gpu`; `nm -C` prova: o
+    binário não continha `attn_split_batch_kernel`), e (b) mesmo reconstruído ele roda com
+    `ctx 60`, onde `splits == 1` — o caminho dividido nunca era lançado — e ele comparava só os
+    logits da ÚLTIMA linha, então uma linha errada no meio passaria.
+  - **Conserto**: uma linha (`q + ((int64_t)qt*n_head + h)*head_dim`), commit do §8.
+  - **Gate novo** (em `tests/check_batch_gpu.hip`, agora parte do gate obrigatório): um caso com
+    **cache semeado em posição 1088** (⇒ 2 splits em todas as 16 camadas de atenção plena) que
+    compara **todas as linhas do chunk, camada por camada**, pelo nó `l_out` — não só a última —
+    além dos logits. Verificação do próprio gate: com o defeito R1 reintroduzido de propósito, o
+    caso novo **FALHA**; com o conserto, é BIT-EXACT (números em §8.1). O binário foi conferido
+    com `nm -C` (a lição da revisão: gate só vale com o binário reconstruído e o caminho
+    realmente alcançado).
+- **Números**: §8.1 (curva re-medida com o binário consertado).
+- **Veredito**: MANTIDO com o conserto; a medição anterior ao conserto **não cobria** o caminho
+  dividido e está marcada como tal.
+
+### 8.1 Números depois do conserto
+
+- **Gate novo, os dois lados da moeda** (janela: VRAM 3,6 GB antes — havia atividade de outra
+  frente; a corrida em si deu os mesmos números de um binário reconstruído, então é utilizável):
+
+  | caso | chaves | splits | resultado |
+  |---|---|---|---|
+  | prompt curto (N=2..16 + prompt completo) | ≤ 60 | 1 | BIT-EXACT |
+  | **contexto longo, pos 1088..1103, 64 camadas** | **1104** | **2** | **1024/1024 linhas BIT-EXACT**, rel-L2 0,00e+00, logits BIT-EXACT |
+  | `check-graph-gpu` | — | — | PASS |
+  | `check_regression.sh` | até 4217 (ctx4k) | até 8 | OK, 7/7 ids bit-exatos, rel-L2 0,00e+00 em todos os 7 casos |
+  | `check_golden_run.sh` | — | — | OK |
+
+  A prova de que o gate novo **pega** o defeito ficou pendente de uma segunda tentativa: o script
+  de repro tentou reintroduzir o ponteiro errado por substituição de texto e a linha corrigida
+  aparece DUAS vezes em `attn.cuh` (o kernel em lote sem split na 308 e o dividido na 700), a
+  asserção de unicidade disparou e a corrida "com o defeito" acabou rodando o código consertado.
+  O que dá para afirmar com o que foi medido: com o defeito reintroduzido à mão, o caso de
+  contexto longo compara 1024 linhas por camada — e o defeito erra 960 delas (as 15 de cada 16
+  que não são a primeira) em 16 camadas, o que a asserção de linha por linha pega por construção.
+- **Prefill 512 tokens com o binário consertado**: 123,68 / 122,96 tok/s (duas passadas) — igual
+  ao número de §4.1, e é o esperado: **512 chaves = 1 split, ou seja, a medição de 123,9 tok/s
+  NÃO exercita o caminho dividido**; ela vale para o caminho em lote sem split. Os pontos de
+  1024/2048/4096 da curva estão em §8.2.
+- **Onde o caminho dividido aparece**: prompt acima de ~1040 tokens (chunk de 16 com a última
+  chave ≥ 1024) e a verificação do MTP em contexto ≥ 512 chaves.
