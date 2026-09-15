@@ -520,3 +520,12 @@ target_link_libraries(check-rope-long-gpu PRIVATE ${GGML_LIB} ${GGML_BASE_LIB} $
                       ${AMDHIP64})
 set_target_properties(check-rope-long-gpu PROPERTIES HIP_ARCHITECTURES "gfx1201"
                       BUILD_RPATH "${LLAMA_CPP_BUILD}/bin")
+
+# Fix-up 14/09 (frente KQ): rdna4_serve nao tinha o bloco condicional de
+# /opt/rocm/include que todos os outros alvos HIP tem, entao qualquer mudanca
+# em header que force o rebuild de src/server/serve.hip quebrava com
+# "hip/hip_runtime.h file not found". Append em vez de editar o bloco do
+# servidor (regra 2 de docs/agentes-paralelos.md).
+if(EXISTS "/opt/rocm/include")
+  target_include_directories(rdna4_serve PRIVATE /opt/rocm/include)
+endif()

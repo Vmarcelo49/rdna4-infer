@@ -199,6 +199,22 @@ int main() {
     ok(got == 172258340ull, "graph_buffer_bytes == 172 258 340 B (164.27 MiB), the sum of "
                             "graph.cuh:518-590 added up by hand, com as parciais de atencao "
                             "multiplicadas pelo max_batch (16)");
+    // ... e com o chunk default em 128 (KQ + prefill em lote): o mesmo espelho,
+    // com max_batch = 128. O numero exato e' pinado aqui pelo mesmo motivo.
+    {
+      rdna4::GraphBufferShape s128 = s;
+      s128.max_batch = 128;
+      const std::uint64_t got128 = rdna4::graph_buffer_bytes(s128);
+      std::printf("   graph buffers for the IQ3_S shape at max_batch = 128: %llu B = %.2f MiB\n",
+                  (unsigned long long)got128, (double)got128 / (1024.0 * 1024.0));
+      ok(got128 == 269822436ull, "graph_buffer_bytes == 269 822 436 B (257.32 MiB) at max_batch 128");
+      const std::uint64_t need128 =
+          rdna4::required_bytes(11678877696ull, 131072, rdna4::KvType::Q5_0, rdna4::KvType::Q4_1,
+                                got128);
+      std::printf("   131K q5_0/q4_1 with chunk-128 buffers: %.3f GiB\n",
+                  (double)need128 / 1073741824.0);
+      ok(need128 < 15900000000ull, "131K q5_0/q4_1 still fits with chunk-128 buffers");
+    }
     // ... and the budget must not count the whole file: 10.877 GiB of trunk
     // weights, not 11.214 GiB.
     const std::uint64_t need = rdna4::required_bytes(11678877696ull, 131072,

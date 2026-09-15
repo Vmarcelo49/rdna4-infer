@@ -62,6 +62,7 @@ void usage_run() {
       "  --cache-type-v TYPE     f32, f16 (default), q8_0, q4_0, q5_0, q4_1\n"
       // ---- feat/mtp ----
       "  --mtp                   use the blk.64 NextN/MTP head for speculative decoding\n"
+      "                          (greedy only: --temp 0/--greedy; run-only, bench has no --mtp)\n"
       "  --draft N               tokens drafted per round with the MTP head (default 3)\n"
       "  --mtp-score             draft-and-score only: report the head's acceptance rate\n"
       "                          against the trunk's own greedy tokens (generation is\n"
@@ -269,7 +270,14 @@ int cmd_bench(int argc, char **argv) {
                   "[--cache-type-k T] [--cache-type-v T] [--fill-cache] [--seed N] [--layers N]\n");
       return 0;
     } else {
-      std::fprintf(stderr, "rdna4-infer bench: unknown argument '%s'\n", a);
+      if (std::strncmp(a, "--mtp", 5) == 0 || std::strncmp(a, "--draft", 7) == 0) {
+        std::fprintf(stderr, "rdna4-infer bench: '%s' is run-only (MTP speculation needs the "
+                             "generate loop); bench is greedy deterministic prefill+decode. "
+                             "Use `run --mtp` instead.\n",
+                     a);
+      } else {
+        std::fprintf(stderr, "rdna4-infer bench: unknown argument '%s'\n", a);
+      }
       return 1;
     }
   }

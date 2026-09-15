@@ -1243,25 +1243,23 @@ inline bool gemm_launch(int dt, const void *d_w, const block_q8_1 *d_a, float *d
     RD_GEMM(SolverIq3S, 12, 256)
     RD_GEMM(SolverIq3XXS, 9, 256)
     RD_GEMM(SolverIq4XS, 14, 256)
-    // Os cinco solvers k-quant abaixo estao' IMPLEMENTADOS mas DESLIGADOS do despacho
-    // ate' serem medidos. Motivo, registrado na hora em que foi descoberto (14/09):
-    // eles entraram na arvore varridos por um `git add -A` junto do commit do chunk
-    // 128, sem relatorio de velocidade (o agente que os escreveu falhou antes de
-    // reportar). O estado medido deles, no bench (`--kq`): staging BIT-EXATO
-    // (0/256), mas o GEMM diverge do `vec_dot_*` do motor em rel-L2 4,5e-07 (q2_K) e
-    // 7,4e-07 (q3_K) -- plausivelmente so' ordem de soma (os k-quants tem duas cadeias
-    // fp32 por saida, `sumf_d`/`sumf_m`), o que a autorizacao do dono cobre. So' que
-    // 'autorizacao para quebrar o contrato' nao e' autorizacao para embarcar um ganho
-    // NAO MEDIDO: sem numero de T-MAC/s nao ha' como saber se vale o risco, e o
-    // caminho de volta e' de graca (`gemm_launch` devolve false -> o `proj_batch` cai
-    // no GEMV em sub-lote, que e' o que estava em producao e e' bit-exato).
-    // Reabilitar = item KQ do docs/plano-ninfer-pendente.md (medir, declarar a
-    // tolerancia por tipo, entao descomentar estas cinco linhas).
-    // RD_GEMM(SolverQ2K, 2, 256)
-    // RD_GEMM(SolverQ3K, 3, 256)
-    // RD_GEMM(SolverQ4K, 4, 256)
-    // RD_GEMM(SolverQ5K, 5, 256)
-    // RD_GEMM(SolverQ6K, 6, 256)
+    // k-quants REABILITADOS (item KQ de docs/plano-ninfer-pendente.md, 14/09):
+    // velocidade re-medida de forma independente (`bench-gemm-engine-gpu --kq`,
+    // min de 5, piso de ruido <= 1,006x) e CONFERE com a tabela do cabecalho
+    // (dentro de 1-3 %): q2_K 2,11x/3,30x/3,50x/3,86x do GEMV em M=16/64/128/512,
+    // q3_K 1,09x/2,54x/3,42x/4,44x, q4_K 1,99x/2,87x/4,17x/6,40x,
+    // q5_K 2,71x/3,67x/3,70x/3,75x, q6_K 1,49x/3,32x/4,58x/5,62x.
+    // Regra do plano (>= 1,5x entra): os cinco entram -- o pior caso (q3_K em
+    // M=16, 1,09x) continua sendo ganho, e n <= 16 nem usa o GEMM (vai de GEMV
+    // em lote, bit-exato). Staging 0/2048 vs dequant canonico, oraculo de CPU
+    // da formulacao do kernel bit-exato (0/256); a divergencia vs `vec_dot` e'
+    // arredondamento (duas cadeias fp32), com a tolerancia por tipo declarada
+    // no cabecalho e cobrada em tests/check_batch_gpu.hip.
+    RD_GEMM(SolverQ2K, 2, 256)
+    RD_GEMM(SolverQ3K, 3, 256)
+    RD_GEMM(SolverQ4K, 4, 256)
+    RD_GEMM(SolverQ5K, 5, 256)
+    RD_GEMM(SolverQ6K, 6, 256)
     default:
       return false;  // sem kernel: o chamador decide (SPEC 1.3)
   }

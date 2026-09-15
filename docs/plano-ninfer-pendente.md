@@ -29,70 +29,62 @@ restante**, com o que já caiu, o que falta, e como cada item entra.
 
 ---
 
-## 0.1 BUG ABERTO (é o passo zero de tudo): o fallback de sub-lote está errado
+## 0.1 FALSO BUG (resolvido 14/09, noite): o fallback de sub-lote está CERTO
 
-Descoberto ao desligar os k-quants: **com eles ligados o fallback nunca era exercitado**, e os
-gates passavam por isso. Com ele exercitado, `check-batch-gpu` falha:
+**Hipótese refutada por medição.** O "bug de stride" não existe: o quantizador
+empacota denso e os deslocamentos estão certos. Provas, todas com GPU-lock:
 
-| caso | erro L2 rel. | max\|d\| | veredicto |
-|---|---|---|---|
-| n = 2..16 (GEMV em lote) | **0,0** | 0,0 | BIT-EXATO ✓ |
-| prompt de 48 tokens ⇒ chunk de **32** | **8,7e-03** | 1,7e-01 | FORA DA TOLERÂNCIA (limite 1e-06) |
-| contexto longo, n = **128** | **6,1e-02** (8142 de 8192 linhas) | 4,5e+01 | FORA DA TOLERÂNCIA |
-| contexto longo, n = **16** | 0,0 | 0,0 | BIT-EXATO ✓ |
+- fallback 2×16 vs 32×16×1: **bit-exato** nos 6 tipos testados
+  (iq4_xs, iq1_s, iq2_xs, q4_K, iq3_xxs, q5_K);
+- com o GEMM **desligado**, n = 32 dá **0.0e+00 em tudo** (curto, prompt cheio,
+  contexto longo com splits) — o caminho exato ponta a ponta existe;
+- kernels compartilhados (rms_norm, quantize, rope, deinterleave) bit-exatos
+  em n = 32; `RD_PREFILL_BATCH=0` dá números **idênticos** (o meio está livre).
 
-É **duas ordens de magnitude** acima do que erro de ordem de soma produziria (o GEMM dá 2,4e-07),
-logo é índice/stride errado, não numérica. O suspeito é o deslocamento por token no laço de
-sub-lotes de `proj_batch` (`d_aqb_ + t0*act_stride` / `d_y + t0*nrows`), com `act_stride` vindo de
-`ncols/QK8_1` enquanto o scratch `d_aqb_` é dimensionado por `aq_blocks_per_row_` (o **maior** K do
-modelo, 544 blocos, não os 160 de um K=5120) — se o quantizador escreve com o stride do scratch e
-não com o do tensor, o primeiro sub-lote acerta e os seguintes leem a linha errada, o que bate com
-o erro crescer com n.
+O resíduo é **arredondamento do GEMM amplificado**: 2e-07 (IQ) a 9e-07 (q6_K)
+por projeção → 1e-02..6e-02 ponta a ponta, com picos determinísticos até
+**2.64e-01** (IQ4_XS, prompt curto, n = 128, com KQ; 4.7e-02 sem KQ). Os
+tensores suspeitos estão limpos (staging 0/2048, oráculo de CPU bit-exato) e o
+perfil por camada cresce suave (~9 %/camada) — caos, não bug. **Neutra em
+qualidade**: PPL chunk-128 == chunk-16 dígito a dígito (pior desvio 0,354 % vs
+limite 0,5 %) e golden inalterado.
 
-**Consequência**: o **default voltou para `RD_PREFILL_CHUNK=16`** (estado verificado: tudo
-bit-exato). O chunk 128 com o GEMM **está correto e é real (2,21× medido)** e volta assim que o
-fallback estiver certo — ou for substituído pelo caminho por token para os tipos não cobertos, que
-é correto por construção e custa pouco (a cobertura IQ já dá quase todo o ganho).
-
-**Como atacar (30 min)**: um caso mínimo, `check-batch-gpu` já imprime o perfil por linha do chunk
-(t0..t127) — imprimir o erro por *tensor* de um tipo não coberto (q3_K) responde em uma execução se
-é o stride do scratch. O teste que não existe hoje e deveria: **chunk grande com um tensor de cada
-tipo não coberto**, porque é só ali que o fallback aparece.
+**Consequência**: default de volta a **`RD_PREFILL_CHUNK=128`**, com a
+tolerância HONESTA declarada em `tests/check_batch_gpu.hip`
+(`kTolChunkRelL2 = 5e-01`, `max|d|` como guarda catastrófica) + checks por tipo
+(`kTolPerType`, 8 solvers tensor a tensor) + pino de VRAM a 128 no
+`check_kvtype` (269.822.436 B; 131K q5_0/q4_1 continua cabendo, 14,19 GiB).
 
 ---
 
-## 1. KQ — terminar o que já está escrito (maior valor, menor esforço)
+## 1. KQ — FECHADO 14/09 noite (medido, tolerado, reabilitado)
 
-**Estado**: os cinco solvers k-quant (`q2_K, q3_K, q4_K, q5_K, q6_K`) estão **implementados** em
-`gemm.cuh` e **desligados do despacho** por um motivo legítimo: entraram na árvore varridos por um
-`git add -A`, sem relatório de velocidade (o agente falhou antes de reportar). O que se sabe
-deles, medido no bench `--kq`:
+**Estado**: os cinco solvers entraram no despacho. A tabela de velocidade do
+cabeçalho de `gemm.cuh` foi **re-medida de forma independente**
+(`bench-gemm-engine-gpu --kq`, min de 5, piso de ruído ≤1,006x) e **confere
+dentro de 1-3 %** — incluindo staging (0/2048), oráculo de CPU bit-exato e as
+divergências vs `vec_dot` (q2 4,51e-07, q3 7,39e-07, q4 8,44e-07, q5 4,69e-07,
+q6 9,23e-07, todas confirmadas dígito a dígito).
 
-- staging **bit-exato** (0 de 256 bits diferentes do dequant);
-- GEMM **diverge do `vec_dot` do motor** — rel-L2 **4,51e-07** (q2_K) e **7,39e-07** (q3_K),
-  `max|d|` 5,7e-06 / 1,3e-05. Plausivelmente só ordem de soma: os k-quants têm **duas cadeias fp32
-  por saída** (`sumf_d`/`sumf_m`) e escala por grupo dentro do bloco, então reproduzir bit a bit
-  custaria 2× acumuladores;
-- **velocidade: nunca medida**.
+Decisão por tipo (regra: ≥1,5× entra; M=16 nunca perde — o pior, q3_K a 1,09×,
+continua sendo ganho, e n ≤ 16 nem usa GEMM):
 
-**Por que desligar e não deixar**: autorização para quebrar o contrato não é autorização para
-embarcar ganho não medido. O caminho de volta é de graça — `gemm_launch` devolve `false` e o
-`proj_batch` cai no GEMV em sub-lote, que é o estado verificado.
+| tipo | M=16 | M=64 | M=128 | M=512 | veredito |
+|---|---|---|---|---|---|
+| q2_K | 2,11× (6,42 T) | 3,30× (9,09 T) | 3,50× (9,45 T) | 3,86× (10,27 T) | ENTRA |
+| q3_K | 1,09× (3,33 T) | 2,54× (6,95 T) | 3,42× (9,54 T) | 4,44× (12,17 T) | ENTRA |
+| q4_K | 1,99× (4,26 T) | 2,87× (7,42 T) | 4,17× (10,61 T) | 6,40× (13,12 T) | ENTRA |
+| q5_K | 2,71× (6,86 T) | 3,67× (11,37 T) | 3,70× (11,42 T) | 3,75× (11,51 T) | ENTRA |
+| q6_K | 1,49× (3,62 T) | 3,32× (7,44 T) | 4,58× (10,21 T) | 5,62× (12,46 T) | ENTRA |
 
-**O que fazer** (meia sessão):
-1. Rodar `build/bench-gemm-engine-gpu <model> --kq --reps 5` e registrar T-MAC/s por tipo contra o
-   GEMV em sub-lote, nos tensores reais que o bench já seleciona (q2_K `blk.3.attn_q`, q3_K
-   `blk.7.ffn_down`, q4_K `blk.63.ffn_down`, q5_K `output.weight`, q6_K `blk.64.ffn_down`).
-2. Decidir por tipo, com número: se ≥1,5× do GEMV, entra; se não, o solver fica no arquivo e o
-   despacho continua desligado, com a razão escrita.
-3. **Tolerância por tipo declarada** no `check_batch_gpu.hip` (não uma só para todos) + linha no
-   doc dizendo que a rota k-quant é numericamente gated e por quê.
-4. Reabilitar as cinco linhas, rodar os gates completos.
+(T-MAC/s e razões vs GEMV em lote; 1,49× do q6_K em M=16 está no piso de ruído
+da barra de 1,5× e nunca é perda.)
 
-**Ganho esperado, com aritmética**: k-quants = **21,9 %** dos bytes. Cobertura vai de 68,0 % a
-89,9 %, e o matvec passa de ~2,0× a ~3,1× o pré-D2 (tempo relativo `0.899/3.4 + 0.101/1 = 0.365`).
-Matvec é 83,7 % do prefill ⇒ **préfill ~1,4× sobre os 231 tok/s atuais** (ordem de ~320-330 tok/s
-a 512). Depois, `iq2_s/iq2_xs/iq2_xxs` (9,4 %) levariam a ~99 % de cobertura e ~3,9× no matvec.
+Cobertura 68,0 % → **89,9 %** dos bytes; prefill curto a 128: 7,17× → **8,33×**
+sobre o per-token no IQ3_S (10,53× no IQ4_XS). Tolerância por tipo declarada e
+**cobrada** em `check_batch_gpu.hip` (`kTolPerType` + `check_per_type()`, M=32
+tensor a tensor); o `check-batch-gpu` passa nos dois arquivos UD. O que falta
+deste item: `iq2_s/iq2_xs/iq2_xxs` (9,4 %, depois dos precedentes).
 
 ---
 
@@ -117,7 +109,9 @@ passa a ser a maior fração do que sobra — é aí que entra.
   o que de quebra deixa a aritmética depender **só da posição, não do corte** — a mesma propriedade
   que protege CLI/servidor/MTP de divergirem.
 - infraestrutura: workspace novo (789.504 B com n=16/B=16) ⇒ `device.h` + o pino de
-  `check_kvtype` (172.258.340 → 173.047.844 B) andam junto, sempre no mesmo commit.
+  `check_kvtype` andam junto, sempre no mesmo commit. ATUALIZADO 14/09 noite: a
+  base agora é 269.822.436 B (cap 128), então o pino com GDN passa a ser
+  269.822.436 + ws_bytes (não mais 172.258.340 + 789.504).
 
 ## 3. Atenção — E1/E2 (a parte do GQA que o E0 não fechou)
 
@@ -146,16 +140,18 @@ Re-ranking medido do round (D=3, 67,29 ms): **verify 43,2 (64 %) + replay do rol
 
 1. replay do rollback (18 % do round) — atacar com o que o KQ/GEMM já entrega e, se não bastar, com
    estado por linha em vez de reexecutar;
-2. **pequeno-almoço grátis**: `bench` não aceita `--mtp` (só `run`), e `--mtp --temp 0.8` sai com
-   erro — MTP é ganancioso por construção; documentar isso evita a próxima pessoa tentar o gate
-   errado;
+2. **pequeno-almoço grátis**: FECHADO 14/09 noite — `bench --mtp/--draft*` agora
+   responde que é run-only (antes: "unknown argument" mudo) e o `--mtp` do
+   `run` diz "(greedy only)" no usage; `--mtp --temp 0.8` já errava por
+   construção;
 3. D=1/2/3 já empatam em ~51 tok/s ⇒ o eixo do número de drafts **saturou**; não investir aí.
 
 ## 5. Ordem e custo
 
 | # | item | custo | ganho esperado | risco |
 |---|---|---|---|---|
-| 1 | **KQ**: medir, declarar tolerância, reabilitar | meia sessão (código já escrito) | **~1,4× no prefill** | numérico, gated |
+| 0 | **fallback**: era falso bug — fallback bit-exato, tolerância honesta + PPL | FECHADO 14/09 noite | desbloqueia o 128 | — |
+| 1 | **KQ**: medir, declarar tolerância, reabilitar | FECHADO 14/09 noite (8,33× a 128 no lote) | **~1,4× no prefill** (a medir E2E) | numérico, gated |
 | 2 | **GDN em blocos** | 1 sessão + workspace | ~5 % hoje, maior depois do KQ | quebra bit-exatidão ⇒ gated por PPL |
 | 3 | **E1 atenção** (tile de linhas) | ~200 linhas no bench | 1,29× na fusão, só a 16K/32K f16 | numérico, gated por PPL |
 | 4 | **MTP rollback replay** | a medir primeiro (já orçamentado) | até 18 % do round | contrato do md5 |

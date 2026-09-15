@@ -233,14 +233,18 @@ inline int prefill_chunk_cap() {
     //      `RD_PREFILL_CHUNK=16` volta ao comportamento anterior.
     // A medicao de ponta a ponta (512/2048 tokens, decode a 4K, 131K com
     // q5_0/q4_1) e os gates estao no relatorio da frente.
-    // 16 POR ENQUANTO. O chunk 128 esta' medido (104,86 -> 231,83 tok/s a 512 tokens) e
-    // o GEMM que ele usa esta' certo, mas o fallback de sub-lote que cobre os tipos que o
-    // GEMM nao cobre esta' ERRADO: `check-batch-gpu` falha com erro L2 rel. de 8,7e-03
-    // (chunk de 32) e 6,1e-02 (n=128) contra uma tolerancia declarada de 1e-06, enquanto
-    // n<=16 continua bit-exato. Nada disso aparecia com os k-quants ligados no GEMM,
-    // porque ai o fallback nao era exercitado -- foi desliga-los que expôs o bug.
-    // Volta a 128 quando o fallback estiver corrigido: docs/plano-ninfer-pendente.md §1.
-    int n = e ? std::atoi(e) : 16;
+    // DEFAULT 128 (de volta) desde 14/09, noite: o recuo para 16 foi por uma
+    // hipotese de bug no fallback de sub-lote que a medicao REFUTOU -- o
+    // fallback e' bit-exato ponta a ponta (com o GEMM desligado, n = 32 da'
+    // 0.0e+00 em tudo) e o residuo e' arredondamento do GEMM amplificado
+    // (2e-07..9e-07 por projecao -> 1e-02..6e-02 ponta a ponta, picos
+    // deterministicos ate 2.64e-01), NEUTRO em PPL (chunk 128 == chunk 16
+    // digito a digito, pior desvio 0,354 % vs limite de 0,5 %) e no golden.
+    // A tolerancia honesta esta' declarada em tests/check_batch_gpu.hip
+    // (kTolChunkRelL2/kTolChunkMaxAbs + kTolPerType); a cobertura do GEMM e'
+    // de 89,9 % dos bytes com os k-quants (iq3_s/iq3_xxs/iq4_xs + q2/q3/q4/q5/q6_K).
+    // Volta a 16 so' com `RD_PREFILL_CHUNK=16` (a saida de emergencia e o A/B).
+    int n = e ? std::atoi(e) : 128;
     if (n < 16) n = 16;
     if (n > 512) n = 512;  // == Graph::kMaxChunkHost
     return n;
