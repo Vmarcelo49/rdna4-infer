@@ -70,3 +70,123 @@ Máximo **64 waves wave32/WGP** (16/SIMD32, 2048 threads). Até **~96 VGPRs/thre
 3. Esquecer `global_load_lds` e `__builtin_prefetch`; usar `s_prefetch_data` e `GLOBAL_LOAD_BLOCK`/`GLOBAL_STORE_BLOCK` (até 32 VGPRs por instrução, novo em RDNA4, [ISA §11.5](https://docs.amd.com/api/khub/documents/uQpkEvk3pv~kfAb2x~j4uw/content)).
 4. ≤96 VGPRs/thread para ocupação máxima.
 5. Antes de medir: `echo high > /sys/class/drm/card*/device/power_dpm_force_performance_level` e conferir ausência de nível `S:` em `pp_dpm_sclk`.
+
+## 8. Micro-otimizações de banda — missão memória (2026-09-16, READ-ONLY)
+
+Origem: auditoria arquitetura+ISA+assembly sobre `include/rdna4/{matvec,vecdotq,gemm,attn,gdn}.cu{h}`,
+`kv.h`, `tuning.h`, `quants.h` (nenhum arquivo do repo foi editado; tudo abaixo é proposta +
+receita de medição). Convenção **[D]/[M]/[I]** como no resto do brief. Contexto medido
+(`docs/medicoes-banda-e-gargalos.md` §2.2): LM-head GEMV ~620 GB/s (98% do pico de 632,9),
+tronco matvec 436 GB/s (69%), GEMM staging 132–275 GB/s, GDN 152 GB/s. Pico teórico 640 GB/s
+(256-bit × 20 Gbps / 8); 644,6 GB/s implicaria ~20,14 Gbps efetivos.
+
+### 8.1 Correções de contas que circulavam (usar os §§1–5 deste brief, não os números antigos)
+- **[M]** Little com a latência **medida** (§5): 640 GB/s × 226 ns ≈ **145 KB em voo** no
+  chip ≈ **4,5 KB ≈ 36 linhas de 128 B por WGP** (32 WGPs). É o que cada WGP precisa
+  sustentar — não 27 linhas/CU. Teto de MLP (63 loads/wave × 64 waves/WGP) tem folga
+  ampla; o gargalo é ILP/ocupação, como já diz o §5.
+- **[D]** LDS tem **64 bancos × 4 B por WGP** (§1), não 32. Toda a matemática de
+  conflito abaixo usa `banco = (addr/4) % 64` por WGP (modo CU/WGP, §2.3 do ISA, pode
+  mudar o particionamento — checar o modo antes de micro-otimizar bancos).
+- **[D]** `sched_barrier`/`sched_group_barrier` emitem **só anotação** (§3): NÃO servem
+  para fixar schedule de loads. Pipelining de software aqui = hoisting manual +
+  barreira asm (`s_wait_loadcnt` & cia via **inline asm**, §3) + verificação no dump.
+- **[D]** `global_load_lds` **não existe** em gfx1201 (§3): nenhum caminho de staging
+  pode contar com load global direto para LDS. O veículo de alargamento novo em RDNA4
+  é o **`GLOBAL_LOAD_BLOCK`** (até 32 VGPRs por instrução, ISA §11.5, §7 item 3).
+
+### 8.2 Achados novos (não estão nos outros docs)
+1. **[I→receita] `kv_load8` quantizado faz `uint64` DESALINHADO.** `block_q8_0.qs` está
+   em +2 (lanes atingem +2/+10/+18/+26 mod 8), `block_q4_0`/`block_q4_1` em +4,
+   `block_q5_0` em +6 (`kv.h:270-334`). Todo load vetorial de 8 B nesses caminhos é
+   split e/ou cruza setor de 32 B. Fix barato: 2× `dwordx2` em offsets 4-alinhados
+   (só `kv.h`, valores bit-idênticos); fix caro: pad nos structs (muda layout em
+   disco + loader + re-gate `check-kvctx-gpu`). Receita: `--save-temps`, contar
+   `global_load_b64` splitados vs pares `b32` no `kv_load8<Q*_0>`.
+2. **[I→receita] Staging do GEMM usa ~23% da linha.** Por tarefa (linha, 32 pesos),
+   `SolverIq3S::load` (`gemm.cuh:200`) puxa qs0+qs1 (8 B) + qh (1 B) + sg (4 B) + dsc
+   (4 B) ≈ 17 B em 4–5 pontos de um bloco de 110 B; janela BK=64 = 2 sub-blocos/linha
+   ≈ 29–34 B úteis por linha de 128 B; 16 linhas/warp ⇒ ~464 B úteis / 2048 B
+   buscados. 0,23 × 640 ≈ 147 GB/s + ativações ≈ a faixa medida 132–275 GB/s. Todos
+   os `Solver*::load` têm a mesma doença. Fix estrutural: W com campos
+   intercalados/offline-transposto por janela (loads viram 1–2× b128 sequenciais) —
+   ver R1 abaixo.
+3. **[D, derivado de `quants.h`] Strides reais por linha (tensores classe K=5120):**
+   q4_K 20×144 = 2880 B; iq3_s 20×110 = 2200 B; q6_K 20×210 = 4200 B; q5_K (LM head)
+   20×176 = 3520 B. Linhas adjacentes de CTAs adjacentes são contíguas — o
+   desperdício do GEMV de tronco é granularidade **intra-warp** (`get_int_b2/b4` =
+   b32/b64 por lane, `vecdotq.cuh:102-124`), não inter-linha.
+4. **[M, cruzado]** O doc de banda (`medicoes-banda-e-gargalos.md` §4.1) atribui o
+   gap do tronco a issue (171 instr/220 B em iq3_s, teto 395 GB/s previsto vs 436
+   medido). O item 3 aqui é o mecanismo complementar no lado memória: ~10–20 ops
+   VMEM/lane/bloco nos k-quants (21,8% dos bytes). As duas vistas concordam no fix
+   (alargar vetorização dos loads / `perm`+`dp4a` no q3_K).
+
+### 8.3 Lista rankeada (mecanismo / delta / risco / alvo exato)
+- **R1 — Staging coalescido via W com campos intercalados (offline).** Utilização da
+  linha 23%→~85–95% no stream de staging (hoje ~17,5% do kernel); 1,5–2,5× nos
+  shapes staging-bound (M≤128): 132–275 → 400–500 GB/s. **[I]** Risco MÉDIO
+  (loader + pares `Solver::load/store` em `gemm.cuh:189-880` + re-gate bit-exato vs
+  `vec_dot`). Receita antes: contadores TCC_MISS/byte confirmando overfetch ~4×
+  (quando `rocprofv3` com `STABLE_STD`, §6).
+- **R2 — Política TH_NT nos reads sem reuso.** `__builtin_nontemporal_load` em
+  `get_int_b2/b4` (`vecdotq.cuh:113-124`), `Solver*::load`, `kv_load8` quant,
+  walks do GDN. Codificação exata já neste brief: `th:TH_LOAD_NT`(1),
+  `TH_LOAD_HT`(2), `scope:SCOPE_DEV`(16) (§3). **[I]** +3–8% GEMV/GEMM (~+20–50 GB/s;
+  0,5–1,3 ms/token em 10,36 GiB). Risco BAIXO-MÉDIO (só codegen; LUT e ativações
+  ficam TH_RT; conferir `th:1` no dump).
+- **R3 — Alargar loads estreitos (b128 ou GLOBAL_LOAD_BLOCK).** Cooperativo por warp
+  nos k-quants; `GLOBAL_LOAD_BLOCK` (32 VGPRs/instr, §7.3) é o veículo preferido a
+  `dwordx4` onde couber. **[I]** +5–12% nos tipos k-quant. Risco MÉDIO
+  (`vecdotq.cuh:380-560` + walk em `matvec.cuh:372-410`; bit-exatidão pela regra
+  mesma-ordem do UNROLL).
+- **R4 — Alinhar/dividir `kv_load8` quant (§8.2.1).** **[I]** +2–5% (variante b32,
+  risco BAIXO, só `kv.h:270-334`) a +10–15% (pad + broadcast de escala via
+  `readfirstlane`+`s_load`, risco MÉDIO). Relevante onde KV domina (64K).
+- **R5 — Fundir as 2 passadas do GDN dentro do token.** Estender o path com tile em
+  LDS (`gdn.cuh:479-580`) para ler cada linha 1×/token (2 acumuladores ou linha
+  residente em LDS). **[I]** +10–20% no GDN de prefill; ~0 delta de DRAM no decode
+  (decode-VEC 1496 GB/s é residente em IC — não perseguir como DRAM). Risco MÉDIO
+  (ordem da recorrência bit-exata; maquinaria RPT em `gdn.cuh:107-200` mostra o
+  padrão). Alvo: `gdn.cuh:363-430` + variante tile.
+- **R6 — MINB no path de produção para ≤96 VGPRs.** `matvec_launch` passa MINB=0
+  (`matvec.cuh:760`); iq4_xs usa 119 VGPR (~8 waves/CU) — cap por tipo (8–12) dobra
+  os misses em voo/CU nos tipos latency-bound. **[I]** +2–6%. Risco BAIXO
+  (bit-exato; zerar `scratch_*` no dump). Alvo: `matvec.cuh:624-633` + `tuning.h`.
+- **R7 — Pipeline de `pf_load` sobre o consumo (asm, sem sched_barrier).**
+  Hoist de `pf_load(k0+BK)` + interleave `load[i+1]`/store`[i]` (`gemm.cuh:898-945`,
+  loop 979-1311); fixar com `s_wait_loadcnt`-via-asm (§3) se o compilador afundar os
+  loads. **[I]** +2–5%. Risco BAIXO.
+- **R8 — Broadcast via scalar cache do que é uniforme no warp.** `scales[sub>>1]`,
+  `d` do bloco, `dsc` do iq3_s, `gate[h]/beta[h]` (`gdn.cuh:119-120`):
+  `v_readfirstlane` + `s_load` via K$ (§1). **[I]** +1–3% no GEMV IQ. Risco BAIXO.
+  (Linha `q` da atenção NÃO é uniforme — fora.)
+- **R9 — Stream-K nos GEMVs pequenos do tronco.** Cauda de 436 GB/s = poucas CTAs ou
+  linhas ≤20 blocos (rampa/cauda dominam); dividir K longo entre CTAs com redução
+  em 2 estágios (padrão já provado pelo `attn_split`, `attn.cuh:496-660`).
+  **[I]** +5–15% na cauda, ~+2–4% no tronco agregado. Risco MÉDIO (kernel novo +
+  entrada em `tuning.h`; ordem de soma muda ⇒ gate de equivalência numérica como
+  `scripts/check_attn_split.sh`). Alvo: família `matvec_kernel_batch`
+  (`matvec.cuh:447`) + `tuning.h`.
+- **R10 — FLAT→MUBUF com scope:DEV explícito.** `__builtin_amdgcn_raw_buffer_load`
+  + `__amdgpu_buffer_rsrc_t` (§3): offset em 1 VGPR, melhor info p/ coalescer.
+  **[I]** +1–2%. Risco BAIXO-MÉDIO (setup nos launch helpers; conferir
+  `buffer_load_* scope:2` no dump). Alvos: walk de `rowp` (`matvec.cuh:328`),
+  `gemm.cuh:911`, `kv.h:251`.
+- **R11 — LDS-LUT nos iq2_* condicional a R9.** Hoje é perda medida (0,60–0,91×)
+  porque LUT (2–8 KB) ≥ peso/CTA (regra 2×, `matvec.cuh:806-826`); com mais
+  linhas/CTA o denominador vira e o precedente iq3_s (1,070×)/iq3_xxs (1,182×)
+  pode se repetir. **[I]** até +7–18% nesses tipos SE a razão virar. Risco BAIXO
+  (código existe, `matvec.cuh:828-882`). Follow-up, não standalone.
+- **Abaixo da barra de 1% (excluídos com motivo):** merge/split-partials da atenção,
+  RoPE, `deinterleave_q_gate`, `kv_store_row` — O(KB) contra 10,36 GiB/token. (Nota:
+  a 4K/16K a atenção é cache-bound a ~1,2–1,3 TB/s emitidos pelo 6× do GQA e a 64K
+  q4_0 é issue-bound a 346 GB/s — `medicoes-banda-e-gargalos.md` §§2.3/3; nada disso
+  é DRAM: não aplicar R2/R10 ali esperando banda.)
+
+### 8.4 Ordem de A/B sugerida
+Instrumentação (§6 + contadores TCC quando disponíveis) → R2 → R6 → R4-b32 → R3
+(q4_K) → R1 (protótipo iq3_s) → R7 → R5 → R9 → R10 → R11-condicional. Cada passo:
+diff de ISA (`--save-temps`) + atribuição (contadores ou A/B de bytes) + gates
+existentes (`check-matvec-gpu --check-lds`, `check-matmul-gpu`, `check-batch-gpu`,
+`check-kvctx-gpu`, `check_attn_split.sh`).

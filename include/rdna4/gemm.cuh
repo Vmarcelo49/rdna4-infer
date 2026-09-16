@@ -501,8 +501,61 @@ struct SolverIq2S {
   static constexpr int raw_words = 4;
 };
 
-// ===========================================================================
-// 1b. k-quants (q2_K..q6_K): QUANT CRU na LDS + escala/minimo no record
+// ---- iq2_xs (2,3125 bpw, 2,63 % do trafego/token no IQ3_S) ----
+// Mesma familia `dual_scale` do iq2_s (ls0 nos pesos 0..15, ls1 em 16..31,
+// mesma correcao inteira `corr2`), so' que a fonte dos 32 pesos e' outra:
+//   qs[4*sub .. 4*sub+4)  4 uint16 (8 pesos cada: 9 bits de indice + 7 de sinal)
+//   scales[sub]            ls0 no nibble baixo, ls1 no alto
+// A decomposicao segue o `vec_dot_iq2_xs_q8_1` (vecdotq.cuh:582-618) termo a
+// termo: `il` = l0/2 cobre os mesmos 4 grupos, `grid_l`/`grid_h` (uint2 da
+// `iq2xs_grid` com os sinais de `unpack_ksigns`) vao para dst[2*il]/dst[2*il+1]
+// (a mesma convencao do SolverIq2S), e a primeira metade (il 0,1) cai no
+// acumulador de ls0 via `corr2`, como o `l0 < 4` do motor.
+struct SolverIq2XS {
+  static constexpr int qk = QK_K;
+  static constexpr int block_bytes = (int)sizeof(block_iq2_xs);
+  static constexpr bool is_kq = false;
+  static constexpr bool dual_scale = true;  // ls0 nos pesos 0..15, ls1 em 16..31
+  struct Pf {
+    int q0, q1;    // qs[4*sub .. 4*sub+4) como 2 ints (4 uint16)
+    unsigned sc;   // scales[sub]
+    unsigned d;    // d (fp16) do super-bloco
+  };
+  static __device__ __forceinline__ Pf load(const char *blk, const int sub) {
+    const block_iq2_xs *b = (const block_iq2_xs *)blk;
+    Pf p;
+    const int *q = (const int *)(const void *)(b->qs + 4 * sub);
+    p.q0 = q[0];
+    p.q1 = q[1];
+    p.sc = b->scales[sub];
+    p.d = b->d;
+    return p;
+  }
+  static __device__ __forceinline__ void store(const Pf &p, const int /*sub*/, int *dst, float *dw,
+                                               int *scf) {
+    const std::uint16_t *q = (const std::uint16_t *)&p.q0;
+    *dw = fp16_to_float((uint16_t)p.d);
+    *scf = (int)((p.sc & 0x0Fu) | ((p.sc & 0xF0u) << 12));  // ls0 | ls1 << 16
+#pragma unroll
+    for (int il = 0; il < 4; ++il) {
+      const unsigned qi = q[il];
+      const uint2 grid_pos = ((const uint2 *)iq2xs_grid)[qi & 0x1FFu];
+      const unsigned signs = unpack_ksigns((std::uint8_t)(qi >> 9));
+      const int signs0 = __vcmpne4(signs & 0x08040201u, 0u);
+      const int signs1 = __vcmpne4(signs & 0x80402010u, 0u);
+      dst[2 * il + 0] = __vsub4((int)(grid_pos.x ^ (unsigned)signs0), signs0);
+      dst[2 * il + 1] = __vsub4((int)(grid_pos.y ^ (unsigned)signs1), signs1);
+    }
+  }
+  static __device__ __forceinline__ float corr2(const int i0, const int i1, const int scf) {
+    const int ls0 = scf & 0xFFFF;
+    const int ls1 = (scf >> 16) & 0xFFFF;
+    return (float)((i0 * ls0 + i1 * ls1 + (i0 + i1) / 2) / 4);
+  }
+
+  // Sem caminho RAW (mesmo motivo do iq2_s): `raw_words` so' para o RSTR.
+  static constexpr int raw_words = 4;
+};
 // ===========================================================================
 // Diferenca estrutural em relacao aos tipos IQ ja' cobertos: o peso do motor
 // NAO e' `d_w * q` com um unico fator inteiro por bloco de 32. Sao tres formas
@@ -1397,6 +1450,7 @@ inline bool gemm_launch(int dt, const void *d_w, const block_q8_1 *d_a, float *d
   switch (dt) {
     RD_GEMM(SolverIq3S, 12, 256)
     RD_GEMM(SolverIq2S, 13, 256)
+    RD_GEMM(SolverIq2XS, 8, 256)
     RD_GEMM(SolverIq3XXS, 9, 256)
     RD_GEMM(SolverIq4XS, 14, 256)
     // k-quants REABILITADOS (item KQ de docs/plano-ninfer-pendente.md, 14/09):
@@ -1431,6 +1485,7 @@ inline bool gemm_attrs(int dt, int n_tokens, hipFuncAttributes &attr, int &lds_b
   switch (dt) {
     RD_ATTR(SolverIq3S, 12)
     RD_ATTR(SolverIq2S, 13)
+    RD_ATTR(SolverIq2XS, 8)
     RD_ATTR(SolverIq3XXS, 9)
     RD_ATTR(SolverIq4XS, 14)
     RD_ATTR(SolverQ2K, 2)
