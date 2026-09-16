@@ -149,6 +149,193 @@ struct Variant {
   int value = 0;
 };
 
+// ---------------------------------------------------------------------
+// R9 prototype (BENCH-ONLY, never shipped): stream-K split for the small-N
+// trunk GEMV tail.
+//
+// Target (this bench's own table): classes whose rows are short
+// (nrows <= 1024), whose CTA count cannot fill 64 CUs
+// (ceil(nrows/shipping ROWS) < 64, e.g. q8_0 48x160 = 24 CTAs), or whose
+// measured shipping rate sits below the trunk (~450 GB/s: the short-K
+// bpr<=24 classes). Mechanism, exactly like attn_split (attn.cuh:496-660):
+// split each row's K range over S CTAs; every split CTA walks its chunk with
+// the SAME per-lane mapping (slot/kqs), ILP/UNROLL structure and LUT source
+// the shipping kernel uses for that type, publishes one partial per
+// (row, split), and a second kernel reduces the S partials. No TH_NT loads
+// anywhere (measured dead); default cache policy on all loads; the shipping
+// kernel's grid is untouched (separate kernels, separate launches).
+//
+// NOT bit-exact by construction: the cross-CTA summation order changes, so
+// the gate is rel-L2 <= 1e-5 (attn_split-style policy gate), never memcmp.
+// ---------------------------------------------------------------------
+template <class T, class LUT, int ROWS, int WPR, int ILP, int UNROLL>
+__global__ void sk_part_kernel(const void *__restrict__ vx, const block_q8_1 *__restrict__ vy,
+                               float *__restrict__ partial, int64_t nrows, int64_t bpr,
+                               int n_splits) {
+  constexpr int vdr = T::vdr;
+  constexpr int qi = T::qi;
+  constexpr int qk = T::qk;
+  constexpr int slots_per_block = qi / vdr;
+  constexpr int blocks_per_iter = vdr * (WPR * 32) / qi;
+
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int row_group = warp / WPR;
+  const int w_in_group = warp % WPR;
+  const int tg = w_in_group * 32 + lane;
+
+  const int g = (int)blockIdx.x;
+  const int s = (int)blockIdx.y;
+  const int row_raw = g * ROWS + row_group;
+  const bool active = row_raw < nrows;
+  const int row = active ? row_raw : 0;
+
+  const char *rowp =
+      (const char *)vx + (int64_t)row * bpr * (int64_t)sizeof(typename T::block_t);
+  const int kqs = vdr * (tg % slots_per_block);
+  const int slot = tg / slots_per_block;
+
+  __shared__ uint32_t s_lut[LUT::words > 0 ? LUT::words : 1];
+  if (LUT::words > 0) {
+    const uint32_t *src = LUT::src_words();
+    for (int i = tid; i < LUT::words; i += ROWS * WPR * 32) s_lut[i] = src[i];
+    __syncthreads();
+  }
+
+  // Contiguous K-chunk for this split; the union over s covers [0, bpr).
+  // An empty split (S > bpr) publishes 0 and the merge adds nothing.
+  const int64_t chunk = (bpr + n_splits - 1) / n_splits;
+  const int64_t k_lo = (int64_t)s * chunk;
+  int64_t k_hi = k_lo + chunk;
+  if (k_hi > bpr) k_hi = bpr;
+
+  float acc[ILP];
+#pragma unroll
+  for (int i = 0; i < ILP; ++i) acc[i] = 0.0f;
+
+  // First block of this warp's residue class inside the chunk.
+  int64_t kb = slot;
+  if (kb < k_lo) kb += ((k_lo - kb + blocks_per_iter - 1) / blocks_per_iter) * blocks_per_iter;
+  if (UNROLL == 1) {
+    for (; kb + (ILP - 1) * blocks_per_iter < k_hi; kb += ILP * blocks_per_iter) {
+#pragma unroll
+      for (int u = 0; u < ILP; ++u) {
+        const int64_t k = kb + u * blocks_per_iter;
+        acc[u] += T::dot_lut((const void *)rowp, vy + k * (qk / QK8_1), (const int)k, kqs,
+                              (const void *)s_lut);
+      }
+    }
+  } else {
+    for (; kb + (UNROLL - 1) * blocks_per_iter < k_hi; kb += UNROLL * blocks_per_iter) {
+#pragma unroll
+      for (int u = 0; u < UNROLL; ++u) {
+        const int64_t k = kb + u * blocks_per_iter;
+        acc[0] += T::dot_lut((const void *)rowp, vy + k * (qk / QK8_1), (const int)k, kqs,
+                              (const void *)s_lut);
+      }
+    }
+  }
+  for (; kb < k_hi; kb += blocks_per_iter) {
+    acc[0] += T::dot_lut((const void *)rowp, vy + kb * (qk / QK8_1), (const int)kb, kqs,
+                          (const void *)s_lut);
+  }
+  float sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < ILP; ++i) sum += acc[i];
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor(sum, off);
+
+  if (WPR == 1) {
+    if (active && lane == 0) partial[(int64_t)row * n_splits + s] = sum;
+    return;
+  }
+  __shared__ float part[ROWS][WPR];
+  if (lane == 0) part[row_group][w_in_group] = sum;
+  __syncthreads();
+  if (active && w_in_group == 0 && lane == 0) {
+    float t = 0.0f;
+#pragma unroll
+    for (int i = 0; i < WPR; ++i) t += part[row_group][i];
+    partial[(int64_t)row * n_splits + s] = t;
+  }
+}
+
+// Stage 2: one warp per row reduces the S partials in split order.
+__global__ void sk_merge_kernel(const float *__restrict__ partial, float *__restrict__ dst,
+                                int64_t nrows, int n_splits) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int row = (int)blockIdx.x * (blockDim.x >> 5) + warp;
+  if (row >= nrows) return;
+  float t = 0.0f;
+  const float *ps = partial + (int64_t)row * n_splits;
+  for (int s = 0; s < n_splits; ++s) t += ps[s];
+  if (lane == 0) dst[row] = t;
+}
+
+template <class T, class LUT, int R, int W, int I, int U>
+inline bool sk_launch_t(const void *d_w, const block_q8_1 *d_a, float *d_o, float *d_part,
+                        int64_t nrows, int64_t bpr, int n_splits, hipStream_t stream) {
+  const int groups = (int)((nrows + R - 1) / R);
+  dim3 grid((unsigned)groups, (unsigned)n_splits);
+  sk_part_kernel<T, LUT, R, W, I, U>
+      <<<grid, R * W * 32, 0, stream>>>(d_w, d_a, d_part, nrows, bpr, n_splits);
+  if (hipGetLastError() != hipSuccess) return false;
+  const int mgrid = (int)((nrows + 3) / 4);
+  sk_merge_kernel<<<mgrid, 128, 0, stream>>>(d_part, d_o, nrows, n_splits);
+  return hipGetLastError() == hipSuccess;
+}
+
+template <int Dt, class Traits, class LUTt, int QK>
+inline bool sk_launch_dt(const void *d_w, const block_q8_1 *d_a, float *d_o, float *d_part,
+                         int64_t nrows, int64_t ncols, int n_splits, hipStream_t stream) {
+  return sk_launch_t<Traits, LUTt, rdna4::MtShape<Dt>::rows, rdna4::MtShape<Dt>::wpr,
+                     rdna4::MtIlp<Dt>::value, rdna4::MtUnroll<Dt>::value>(
+      d_w, d_a, d_o, d_part, nrows, ncols / QK, n_splits, stream);
+}
+
+// Same traits (incl. the LUT-in-LDS rule) and shape the shipping kernel uses
+// for each type, so any measured delta is the split + merge and nothing else.
+inline bool streamk_launch(int dt, const void *d_w, const block_q8_1 *d_a, float *d_o,
+                           float *d_part, int64_t nrows, int64_t ncols, int n_splits,
+                           hipStream_t stream) {
+  if (n_splits < 1 || nrows < 1 || ncols < 1) return false;
+#define RD_SK(Traits, LUTt, Dt, QK)                                   \
+  case Dt:                                                            \
+    return sk_launch_dt<Dt, Traits, LUTt, QK>(d_w, d_a, d_o, d_part,   \
+                                              nrows, ncols, n_splits, stream)
+  switch (dt) {
+    RD_SK(rdna4::TQ8_0, rdna4::NoLut, 1, 32);
+    RD_SK(rdna4::TQ2K, rdna4::NoLut, 2, 256);
+    RD_SK(rdna4::TQ3K, rdna4::NoLut, 3, 256);
+    RD_SK(rdna4::TQ4K, rdna4::NoLut, 4, 256);
+    RD_SK(rdna4::TQ5K, rdna4::NoLut, 5, 256);
+    RD_SK(rdna4::TQ6K, rdna4::NoLut, 6, 256);
+    RD_SK(rdna4::TIQ2XXS_S, rdna4::NoLut, 7, 256);
+    RD_SK(rdna4::TIQ2XS_S, rdna4::NoLut, 8, 256);
+    case 9:
+      if (rdna4::matvec_lut_lds_ok(dt, nrows, ncols))
+        return sk_launch_dt<9, rdna4::TIQ3XXS_LDS, rdna4::LutIq3XXS, 256>(
+            d_w, d_a, d_o, d_part, nrows, ncols, n_splits, stream);
+      return sk_launch_dt<9, rdna4::TIQ3XXS_S, rdna4::NoLut, 256>(d_w, d_a, d_o, d_part, nrows,
+                                                                 ncols, n_splits, stream);
+    RD_SK(rdna4::TIQ1S, rdna4::NoLut, 10, 256);
+    RD_SK(rdna4::TIQ4NL, rdna4::NoLut, 11, 32);
+    case 12:
+      if (rdna4::matvec_lut_lds_ok(dt, nrows, ncols))
+        return sk_launch_dt<12, rdna4::TIQ3S_LDS, rdna4::LutIq3S, 256>(
+            d_w, d_a, d_o, d_part, nrows, ncols, n_splits, stream);
+      return sk_launch_dt<12, rdna4::TIQ3S_S, rdna4::NoLut, 256>(d_w, d_a, d_o, d_part, nrows,
+                                                                ncols, n_splits, stream);
+    RD_SK(rdna4::TIQ2S_S, rdna4::NoLut, 13, 256);
+    RD_SK(rdna4::TIQ4XS, rdna4::NoLut, 14, 256);
+    default:
+      return false;
+  }
+#undef RD_SK
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -159,7 +346,8 @@ int main(int argc, char **argv) {
                  "[--repeat-ship] [--land] [--lut-lds] [--lut-lds-unroll 1,2,4] [--no-ab]\n"
                  "       [--batch 1,2,4,8,16]  (sweep tokens-per-weight-pass; N=1 = GEMV)\n"
                  "       [--batch-unroll 2,4]  (bit-exact MLP knob inside the batch kernel)\n"
-                 "       [--batch-cap]         (same pass on two streams: spare capacity?)\n");
+                 "       [--batch-cap]         (same pass on two streams: spare capacity?)\n"
+                 "       [--streamk 1,2,4]     (R9 prototype only: K-split x S + merge, numeric gate)\n");
     return 1;
   }
   double budget_mib = 12000.0;
@@ -172,6 +360,7 @@ int main(int argc, char **argv) {
   std::vector<int> lut_lds_unroll;
   std::vector<int> row_variants, minb_variants, unroll_variants, ilp_variants;
   std::vector<int> batch_list, unroll_list;
+  std::vector<int> sk_splits;  // R9 prototype (bench-only): split counts for the stream-K A/B
   bool cap_probe = false;
   for (int i = 2; i < argc; ++i) {
     auto list = [&](std::vector<int> &out) {
@@ -216,6 +405,9 @@ int main(int argc, char **argv) {
       // Sondagem de capacidade: a mesma passagem em duas streams (sobreposicao
       // possivel = latencia; 2x = throughput saturado).
       cap_probe = true;
+    } else if (std::strcmp(argv[i], "--streamk") == 0 && i + 1 < argc) {
+      // R9 prototype (bench-only): split counts for the stream-K A/B.
+      list(sk_splits);
     } else if (std::strcmp(argv[i], "--no-ab") == 0) {
       do_ab = false;
     } else {
@@ -233,6 +425,7 @@ int main(int argc, char **argv) {
     land = false;
     lut_lds = false;
     lut_lds_unroll.clear();
+    sk_splits.clear();
   }
   (void)pf_only;
 
@@ -878,6 +1071,194 @@ int main(int argc, char **argv) {
                   "%.3fx\n",
                   a, b, a / b);
     }
+  }
+
+  // ---------------------------------------------------------------------
+  // R9 stream-K A/B (--streamk S,...). Tail = classes of THIS bench's table
+  // with short rows (nrows <= 1024), too few CTAs to fill 64 CUs
+  // (ceil(nrows/shipping ROWS) < 64), or a shipping rate below the trunk
+  // (~450 GB/s). Interleaved A/B vs the ship cell on the SAME tensors,
+  // min-of-reps event-pair timing, DPM already warm; ship-vs-ship cell =
+  // the noise floor of this very comparison. S=1 is the control: same work
+  // as ship plus the stage-2 merge, i.e. the tax of the split alone.
+  // PASS = tail-aggregate >= 1.02x for some S AND worst rel-L2 <= 1e-5.
+  // ---------------------------------------------------------------------
+  if (!sk_splits.empty()) {
+    std::printf("\n=== STREAM-K prototype (R9, bench-only) ===\n");
+    auto sk_rate_of = [&](const Class *c) -> double {
+      for (const Row &r : rows)
+        if (r.c == c) return r.rate;
+      return 0.0;
+    };
+    auto sk_is_tail = [&](const Class *c) -> bool {
+      const int sr = rdna4::matvec_default_config(c->dt).rows;
+      const int ctas = (int)((c->nrows + sr - 1) / sr);
+      return ctas < 64 || c->nrows <= 1024 || sk_rate_of(c) < 450.0;
+    };
+    std::vector<std::size_t> tail;
+    for (std::size_t i = 0; i < sel.size(); ++i) {
+      Class *c = find_class(sel[i].dt, sel[i].nrows, sel[i].bpr);
+      if (sk_is_tail(c)) tail.push_back(i);
+    }
+    {
+      double tb = 0, tm = 0;
+      for (std::size_t i : tail) {
+        tb += sel[i].bytes;
+        tm += m[i].ship_ms;
+      }
+      std::printf("tail selector (ctas<64 || nrows<=1024 || ship<450 GB/s): %zu/%zu staged "
+                  "tensors, %.3f GB, ship %.3f ms staged\n",
+                  tail.size(), sel.size(), tb / 1e9, tm);
+    }
+
+    int sk_smax = 1;
+    for (int s : sk_splits) sk_smax = std::max(sk_smax, s);
+    std::int64_t sk_prow = 0;
+    for (std::size_t i : tail) sk_prow = std::max(sk_prow, sel[i].nrows);
+    float *d_y2 = nullptr, *d_part = nullptr;
+    if (tail.empty() || sk_prow <= 0 ||
+        hipMalloc(&d_y2, (std::size_t)sk_prow * sizeof(float)) != hipSuccess ||
+        hipMalloc(&d_part, (std::size_t)sk_prow * sk_smax * sizeof(float)) != hipSuccess) {
+      std::printf("streamk: no tail tensors or staging alloc failed\n");
+      return 1;
+    }
+    std::vector<float> h_sh((std::size_t)sk_prow), h_sk((std::size_t)sk_prow);
+
+    // Numeric gate first: rel-L2 / max|d| of prototype vs ship per S.
+    // Order across CTAs changes by construction, so this is a tolerance gate
+    // (attn_split policy precedent), never a bit-exact oracle.
+    std::vector<double> sk_worst_rel(sk_splits.size(), 0.0), sk_worst_abs(sk_splits.size(), 0.0);
+    std::vector<std::string> sk_worst_name(sk_splits.size());
+    bool sk_launch_ok = true;
+    for (std::size_t k = 0; k < sk_splits.size(); ++k) {
+      for (std::size_t i : tail) {
+        const Tensor &t = sel[i];
+        if (!rdna4::matvec_launch(t.dt, t.d_w, act_for(t.ncols), d_y, t.nrows, t.ncols,
+                                  nullptr) ||
+            hipMemcpy(h_sh.data(), d_y, (std::size_t)t.nrows * sizeof(float),
+                      hipMemcpyDeviceToHost) != hipSuccess) {
+          sk_launch_ok = false;
+          break;
+        }
+        if (!streamk_launch(t.dt, t.d_w, act_for(t.ncols), d_y2, d_part, t.nrows, t.ncols,
+                            sk_splits[k], nullptr) ||
+            hipMemcpy(h_sk.data(), d_y2, (std::size_t)t.nrows * sizeof(float),
+                      hipMemcpyDeviceToHost) != hipSuccess) {
+          sk_launch_ok = false;
+          break;
+        }
+        double num = 0, den = 0, mx = 0;
+        for (std::int64_t r = 0; r < t.nrows; ++r) {
+          const double d = (double)h_sk[r] - (double)h_sh[r];
+          num += d * d;
+          den += (double)h_sh[r] * (double)h_sh[r];
+          mx = std::max(mx, fabs(d));
+        }
+        const double rel = den > 0 ? std::sqrt(num / den) : std::sqrt(num);
+        if (!(rel < 1.0)) {
+          std::printf("streamk S=%d: NON-FINITE rel-L2 on %s\n", sk_splits[k], t.name.c_str());
+          sk_launch_ok = false;
+          break;
+        }
+        if (rel > sk_worst_rel[k]) {
+          sk_worst_rel[k] = rel;
+          sk_worst_abs[k] = mx;
+          sk_worst_name[k] = t.name;
+        }
+      }
+      if (!sk_launch_ok) break;
+      std::printf("streamk S=%d numeric vs ship over %zu tail tensors: worst rel-L2 %.3g "
+                  "(max|d| %.3g) on %s\n",
+                  sk_splits[k], tail.size(), sk_worst_rel[k], sk_worst_abs[k],
+                  sk_worst_name[k].c_str());
+    }
+    if (!sk_launch_ok) {
+      std::printf("streamk: launch/numeric failure, no timing attempted\n");
+      return 1;
+    }
+
+    // Timing: configs ship | sk(S...) | ship2(noise), rotated per round.
+    std::vector<std::string> sk_names;
+    std::vector<int> sk_cfg;  // -1 = ship, 0 = ship2, else S
+    sk_names.push_back("ship");
+    sk_cfg.push_back(-1);
+    for (int s : sk_splits) {
+      sk_names.push_back("sk" + std::to_string(s));
+      sk_cfg.push_back(s);
+    }
+    sk_names.push_back("ship2");
+    sk_cfg.push_back(0);
+    const int sk_ncfg = (int)sk_cfg.size();
+    std::vector<std::vector<double>> sk_best(sel.size(), std::vector<double>(sk_ncfg, -1.0));
+    auto sk_fire = [&](int c, std::size_t i) -> bool {
+      const Tensor &t = sel[i];
+      if (sk_cfg[c] <= 0)
+        return rdna4::matvec_launch(t.dt, t.d_w, act_for(t.ncols), d_y, t.nrows, t.ncols,
+                                    nullptr);
+      return streamk_launch(t.dt, t.d_w, act_for(t.ncols), d_y2, d_part, t.nrows, t.ncols,
+                            sk_cfg[c], nullptr);
+    };
+    for (int c = 0; c < sk_ncfg; ++c)
+      for (std::size_t i : tail) (void)sk_fire(c, i);  // untimed warm pass per config
+    for (int r = 0; r < reps; ++r) {
+      for (int c = 0; c < sk_ncfg; ++c) {
+        const int cfg = (c + r) % sk_ncfg;
+        for (std::size_t i : tail) {
+          const double ms = ev([&] { (void)sk_fire(cfg, i); });
+          if (ms < 0) continue;
+          if (sk_best[i][cfg] < 0 || ms < sk_best[i][cfg]) sk_best[i][cfg] = ms;
+        }
+      }
+    }
+
+    std::printf("\n%-9s %9s %6s %5s %6s %10s %10s", "type", "rows", "bpr", "ctas", "GB/s",
+                "ship_ms", "tail?");
+    for (int s : sk_splits) std::printf(" %16s", ("sk" + std::to_string(s) + "_ms/ratio").c_str());
+    std::printf(" %10s\n", "ship2_ms");
+    double sk_ship_agg = 0, sk_s2_agg = 0;
+    std::vector<double> sk_agg(sk_splits.size(), 0.0);
+    for (const Row &r : rows) {
+      const Class *c = r.c;
+      if (!sk_is_tail(c)) continue;
+      const int sr = rdna4::matvec_default_config(c->dt).rows;
+      const int ctas = (int)((c->nrows + sr - 1) / sr);
+      double b0 = 0;
+      std::vector<double> bk(sk_splits.size(), 0.0);
+      double b2 = 0;
+      for (std::size_t i : tail) {
+        if (sel[i].dt != c->dt || sel[i].nrows != c->nrows || sel[i].bpr != c->bpr) continue;
+        if (sk_best[i][0] > 0) b0 += sk_best[i][0];
+        for (std::size_t k = 0; k < sk_splits.size(); ++k)
+          if (sk_best[i][1 + k] > 0) bk[k] += sk_best[i][1 + k];
+        if (sk_best[i][sk_ncfg - 1] > 0) b2 += sk_best[i][sk_ncfg - 1];
+      }
+      if (b0 <= 0) continue;
+      sk_ship_agg += b0;
+      sk_s2_agg += b2;
+      for (std::size_t k = 0; k < sk_splits.size(); ++k) sk_agg[k] += bk[k];
+      std::printf("%-9s %9lld %6lld %5d %6.0f %10.4f %10s", dt_name(c->dt), (long long)c->nrows,
+                  (long long)c->bpr, ctas, r.rate, b0, "TAIL");
+      for (std::size_t k = 0; k < sk_splits.size(); ++k)
+        std::printf(" %16.4f/%5.3fx", bk[k], bk[k] > 0 ? b0 / bk[k] : 0.0);
+      std::printf(" %10.4f\n", b2);
+    }
+    std::printf("tail aggregate staged ms: ship %.3f vs ship2 %.3f (noise %.3fx)", sk_ship_agg,
+                sk_s2_agg, sk_s2_agg > 0 ? sk_ship_agg / sk_s2_agg : 0.0);
+    for (std::size_t k = 0; k < sk_splits.size(); ++k)
+      std::printf(" vs sk%d %.3f (%.3fx)", sk_splits[k], sk_agg[k],
+                  sk_agg[k] > 0 ? sk_ship_agg / sk_agg[k] : 0.0);
+    std::printf("\n");
+    for (std::size_t k = 0; k < sk_splits.size(); ++k) {
+      const double ratio = sk_agg[k] > 0 ? sk_ship_agg / sk_agg[k] : 0.0;
+      const bool pass = ratio >= 1.02 && sk_worst_rel[k] <= 1e-05;
+      std::printf("S=%d verdict: %s (tail %.3fx vs 1.02 gate; worst rel-L2 %.3g vs 1e-05 gate)\n",
+                  sk_splits[k], pass ? "PASS" : "FAIL", ratio, sk_worst_rel[k]);
+    }
+    std::printf("tolerance-gate proposal: accept iff worst tail rel-L2 <= 1e-05 (attn_split-style "
+                "policy gate in scripts/check_* + numeric cell in this bench); bit-exact oracle "
+                "is impossible by construction (cross-CTA summation order changes).\n");
+    (void)hipFree(d_y2);
+    (void)hipFree(d_part);
   }
   return 0;
 }
