@@ -211,6 +211,16 @@ existentes (`check-matvec-gpu --check-lds`, `check-matmul-gpu`, `check-batch-gpu
   perde nas 23 classes de cauda. A cauda é limitada por piso de
   lançamento/sync (coluna ms-fix): um segundo lançamento só soma taxa.
   Negativo documentado no bench, sem proposta de produção.
+- **Política de splits dependente de chaves: MORTA com medida (sessão 17/09).
+  [M]** A alegação pendente (+8,7% kernel com 24 splits @131K q4_0) não
+  reproduz nesta árvore: 24×16 = 2,1913 ms vs política 16×16 = 2,1960 ms =
+  **1,002×** com piso de ruído 0,999× (0,075 ms/token em jogo, ~0,1% do token
+  de 131K — abaixo da barra de 1%). A 64K q4_0 a melhor célula também == a
+  política. Provável causa: o hoist de unpack em `kv.h` (commit 81da3e5)
+  deslocou o ótimo. Sem mudança de política.
+- **E1 row-tile em q4_0 @64K: FAIL 0,575× (regime que faltava). [M]** 2,0864 vs
+  1,1998 ms da política; grade fina + loads de 1 warp + barriers por chave
+  perdem também onde o unpack domina. E1 morto nos dois regimes; E2 fechado.
 - **R7 sched-barrier: PULADO com motivo.** O hoist que ele queria
   (`pf_load(k0+BK)` acima do consume) já embarca no laço principal; o restante
   é só anotação de escalonador (~0 esperado). Sem medição.
