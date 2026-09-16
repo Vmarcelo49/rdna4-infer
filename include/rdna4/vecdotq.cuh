@@ -123,6 +123,14 @@ static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32
     return ((const int *) x)[i32]; // assume at least 4 byte alignment
 }
 
+// R2 TH_NT experiment, REVERTED (both twins slower on gfx1201):
+// b2 twin (two ushort NT loads): -14% tok/s, split transactions.
+// b4 twin (2 sites: q2_K, iq4_xs aux loop): -11% tok/s. Mechanism: these are
+// not pure streaming reads but load-to-use-latency-critical feeds (load ->
+// perm/table -> dp4a); bypassing L1/L2 trades ~30 ns hits for ~300 ns DRAM
+// on the dependent chain, which dwarfs any cache-pollution saving. Weight
+// streaming stays on the default cache policy.
+
 // q4 contains 8 indices with 4 bit each.
 // This function selects those bytes from table that are at those indices and returns them as int2.
 // The first int contains the bytes with even indices in q4, the second int contains the bytes with odd indices in q4.
@@ -441,14 +449,18 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     v[0] = q4[0];
     v[1] = q4[4];
 
-    // branchless so nvcc can hoist this out of the ncols_dst loop
-    const uint16_t * scales = (const uint16_t *)bq4_K->scales;
+    // R3: widen dm+scales header (dm b32 + 3x b16 -> 1x b128, default policy).
+    // block_q4_K is dm[0..3] + scales[4..15]; every block is 16-aligned
+    // (144 B stride, 16 B base), so one dwordx4 at offset 0 is alignment-safe
+    // and delivers the same bytes. Bit-exact: same values, same order below.
+    const uint4 hdr = ((const uint4 *)bq4_K)[0];
+    half2 dmh; dmh.d = (uint16_t)(hdr.x & 0xFFFFu); dmh.dmin = (uint16_t)(hdr.x >> 16);
     const int j  = bq8_offset/2;
     const int jm = j & 1;
 
-    const uint32_t s0 = scales[jm + 0];
-    const uint32_t s2 = scales[jm + 2];
-    const uint32_t s4 = scales[jm + 4];
+    const uint32_t s0 = (hdr.y >> (jm << 4)) & 0xFFFFu;
+    const uint32_t s2 = (hdr.z >> (jm << 4)) & 0xFFFFu;
+    const uint32_t s4 = (hdr.w >> (jm << 4)) & 0xFFFFu;
 
     const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
 
@@ -467,7 +479,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
         u[2*i+1] = q8[4];
     }
 
-    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
+    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, dmh, d8);
 }
 
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
@@ -490,14 +502,17 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     vh[0] = qh[0] >> bq8_offset;
     vh[1] = qh[4] >> bq8_offset;
 
-    // same as q4_K
-    const uint16_t * scales = (const uint16_t *)bq5_K->scales;
+    // same as q4_K (R3 widening mirrored here: dm b32 + 3x b16 scales -> 1x
+    // b128 at block offset 0; block_q5_K is dm[0..3] + scales[4..15], 176 B
+    // stride, 16 B base, so alignment-safe; same values, bit-exact).
+    const uint4 hdr5 = ((const uint4 *)bq5_K)[0];
+    half2 dmh5; dmh5.d = (uint16_t)(hdr5.x & 0xFFFFu); dmh5.dmin = (uint16_t)(hdr5.x >> 16);
     const int j  = bq8_offset/2;
     const int jm = j & 1;
 
-    const uint32_t s0 = scales[jm + 0];
-    const uint32_t s2 = scales[jm + 2];
-    const uint32_t s4 = scales[jm + 4];
+    const uint32_t s0 = (hdr5.y >> (jm << 4)) & 0xFFFFu;
+    const uint32_t s2 = (hdr5.z >> (jm << 4)) & 0xFFFFu;
+    const uint32_t s4 = (hdr5.w >> (jm << 4)) & 0xFFFFu;
 
     const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
 
@@ -518,7 +533,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
         u[2*i+1] = q8[4];
     }
 
-    return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
+    return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, dmh5, d8);
 }
 
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1(

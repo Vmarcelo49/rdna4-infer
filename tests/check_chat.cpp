@@ -48,17 +48,25 @@ std::string escape(const std::string &in) {
   return out;
 }
 
-// The same case matrix as tests/oracle_chat.cpp, in the same order.
+// The same case matrix as tests/oracle_chat.cpp, in the same order, plus the
+// tools cases (20+), which mirror /tmp/oracle_tools.cpp's scripted
+// conversations rendered through llama.cpp's Jinja engine on the qwen35
+// (Qwen3.8-family) template. Tool-call outputs are validated twice: the
+// render half against the golden file, the parse-back half (chat_parse) by
+// exact in-code expectations below.
 struct Case {
   const char *name;
   std::vector<rdna4::ChatMessage> messages;
   bool add_assistant;
   bool thinking;
   const char *effort = "xhigh";  // reasoning_effort; the oracle's "-" row is xhigh
+  std::vector<rdna4::ChatTool> tools;
 };
 
 std::vector<Case> make_cases() {
   using rdna4::ChatMessage;
+  using rdna4::ChatTool;
+  using rdna4::ChatToolCall;
   std::vector<Case> cases;
   auto msg = [](const char *role, const char *content) {
     ChatMessage m;
@@ -66,6 +74,32 @@ std::vector<Case> make_cases() {
     m.content = content;
     return m;
   };
+  auto tool = [](const char *name, const char *desc, const char *params) {
+    ChatTool t;
+    t.name = name;
+    t.description = desc;
+    t.parameters = params;
+    return t;
+  };
+  auto call = [](const char *name, const char *args) {
+    ChatToolCall c;
+    c.name = name;
+    c.arguments = args;
+    return c;
+  };
+  const ChatTool kWeather =
+      tool("get_weather", "Get the weather for a city",
+           "{\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, "
+           "\"units\": {\"type\": \"string\"}}, \"required\": [\"city\"]}");
+  const ChatTool kAdd =
+      tool("add", "Add two numbers",
+           "{\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"number\"}, "
+           "\"b\": {\"type\": \"number\"}}, \"required\": [\"a\", \"b\"]}");
+  const ChatTool kCode =
+      tool("run_code", "Run code", "{\"type\": \"object\", \"properties\": {\"code\": "
+                                   "{\"type\": \"string\"}}}");
+  const ChatTool kNoop =
+      tool("noop", "Does nothing", "{\"type\": \"object\", \"properties\": {}}");
 
   cases.push_back({"user-only", {msg("user", "Hello")}, true, true});
   cases.push_back({"user-only-no-gen", {msg("user", "Hello")}, false, true});
@@ -105,6 +139,53 @@ std::vector<Case> make_cases() {
   cases.push_back({"effort-low-system",
                    {msg("system", "You are terse."), msg("user", "Hi")}, true, true, "low"});
   cases.push_back({"effort-low-no-thinking", {msg("user", "Hi")}, true, false, "low"});
+
+  // --- tool-calling renders (validated against the Jinja oracle) ---
+  cases.push_back({"tools-user", {msg("user", "What is the weather in Paris?")}, true, true,
+                   "xhigh", {kWeather}});
+  cases.push_back({"tools-system-user",
+                   {msg("system", "You are terse."), msg("user", "What is the weather in Paris?")},
+                   true, true, "xhigh", {kWeather}});
+  {
+    ChatMessage a = msg("assistant", "");
+    a.reasoning_content = "I should check the weather.";
+    a.tool_calls = {call("get_weather", "{\"city\": \"Paris\", \"units\": \"metric\"}")};
+    cases.push_back({"tools-single-call",
+                     {msg("user", "Weather in Paris?"), a, msg("tool", "{\"temp\": 21}")}, true,
+                     true, "xhigh", {kWeather}});
+  }
+  {
+    ChatMessage a = msg("assistant", "Let me look that up.");
+    a.reasoning_content = "Two lookups needed.";
+    a.tool_calls = {call("get_weather", "{\"city\": \"Paris\"}"),
+                    call("get_weather", "{\"city\": \"Rome\", \"units\": \"metric\"}")};
+    cases.push_back({"tools-parallel", {msg("user", "Weather in Paris and Rome?"), a}, true, true,
+                     "xhigh", {kWeather}});
+  }
+  {
+    ChatMessage a = msg("assistant", "");
+    a.tool_calls = {call("add", "{\"a\": 2, \"b\": 3.5}")};
+    cases.push_back(
+        {"tools-nonstr-args", {msg("user", "Add 2 and 3.5"), a}, true, true, "xhigh", {kAdd}});
+  }
+  {
+    ChatMessage a = msg("assistant", "");
+    a.reasoning_content = "Running it.";
+    a.tool_calls = {call("run_code", "{\"code\": \"def hello():\\n    print(\\\"Hi\\\")\\n\\nhello()\"}")};
+    cases.push_back({"tools-code-arg", {msg("user", "Run it"), a}, true, true, "xhigh", {kCode}});
+  }
+  {
+    ChatMessage a = msg("assistant", "");
+    a.tool_calls = {call("noop", "{}")};
+    cases.push_back(
+        {"tools-empty-args", {msg("user", "Do nothing"), a}, true, true, "xhigh", {kNoop}});
+  }
+  cases.push_back({"tools-no-thinking", {msg("user", "Weather in Paris?")}, true, false, "xhigh",
+                   {kWeather}});
+  cases.push_back(
+      {"tools-low", {msg("user", "Weather in Paris?")}, true, true, "low", {kWeather}});
+  cases.push_back(
+      {"tools-all", {msg("user", "Hi")}, true, true, "xhigh", {kWeather, kAdd, kCode, kNoop}});
   return cases;
 }
 
@@ -154,6 +235,7 @@ int main(int argc, char **argv) {
     opts.add_generation_prompt = cases[i].add_assistant;
     opts.enable_thinking = cases[i].thinking;
     opts.reasoning_effort = cases[i].effort;
+    opts.tools = cases[i].tools;
     // refuse to compare against a reference rendered with another effort: the
     // failure would look like a rendering bug instead of a stale golden
     if (i < ref_effort.size()) {
@@ -210,6 +292,222 @@ int main(int argc, char **argv) {
     const bool ok4 = rdna4::chat_render({{"user", "hi"}}, o, out, err);
     std::printf("%-5s unknown reasoning effort rejected (%s)\n", !ok4 ? "ok" : "FAIL", err.c_str());
     if (ok4) ++failures;
+
+    // tools render errors mirror the template's raise_exception paths
+    {
+      rdna4::ChatTool bad;
+      bad.name = "";
+      rdna4::ChatOptions to;
+      to.tools = {bad};
+      const bool okb = rdna4::chat_render({{"user", "hi"}}, to, out, err);
+      std::printf("%-5s nameless tool rejected (%s)\n", !okb ? "ok" : "FAIL", err.c_str());
+      if (okb) ++failures;
+    }
+    {
+      rdna4::ChatTool bad;
+      bad.name = "f";
+      bad.parameters = "{oops";
+      rdna4::ChatOptions to;
+      to.tools = {bad};
+      const bool okb = rdna4::chat_render({{"user", "hi"}}, to, out, err);
+      std::printf("%-5s bad tool parameters rejected (%s)\n", !okb ? "ok" : "FAIL", err.c_str());
+      if (okb) ++failures;
+    }
+    {
+      rdna4::ChatMessage a;
+      a.role = "assistant";
+      rdna4::ChatToolCall c;
+      c.name = "";
+      a.tool_calls = {c};
+      rdna4::ChatOptions ao;  // fresh opts: the "ultra" effort above must not leak in
+      const bool okb = rdna4::chat_render({a}, ao, out, err);
+      std::printf("%-5s nameless tool call rejected (%s)\n", !okb ? "ok" : "FAIL", err.c_str());
+      if (okb) ++failures;
+    }
+    {
+      rdna4::ChatMessage a;
+      a.role = "assistant";
+      rdna4::ChatToolCall c;
+      c.name = "f";
+      c.arguments = "\"just a string\"";
+      a.tool_calls = {c};
+      rdna4::ChatOptions ao;
+      const bool okb = rdna4::chat_render({a}, ao, out, err);
+      std::printf("%-5s string tool arguments rejected (%s)\n", !okb ? "ok" : "FAIL", err.c_str());
+      if (okb) ++failures;
+    }
+  }
+
+  // parse-back (chat_parse): exact expectations mirroring llama.cpp's
+  // common_chat_parse with the qwen3-coder PEG parser on the same inputs
+  // (verified against the /tmp differential oracle during development).
+  {
+    struct PCall {
+      const char *name;
+      const char *args;
+    };
+    struct PCase {
+      const char *name;
+      const char *input;
+      bool thinking;
+      bool partial;
+      const char *reasoning;
+      const char *content;
+      std::vector<PCall> calls;
+    };
+    const std::vector<PCase> pcases = {
+        {"think-content", "I need to think.\n</think>\n\nHello there", true, false,
+         "I need to think.\n", "Hello there", {}},
+        {"content-only", "Just an answer.", true, false, "Just an answer.", "", {}},
+        {"single-call",
+         "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+         false, false, "", "", {{"get_weather", "{\"city\":\"Paris\"}"}}},
+        {"think-single-call",
+         "Checking now.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=units>\nmetric\n</parameter>\n</function>\n</tool_call>",
+         true, false, "Checking now.\n", "",
+         {{"get_weather", "{\"city\":\"Paris\",\"units\":\"metric\"}"}}},
+        {"content-single-call",
+         "Let me look that up.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+         false, false, "", "Let me look that up.\n",
+         {{"get_weather", "{\"city\":\"Paris\"}"}}},
+        {"parallel-calls",
+         "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n<parameter=units>\nmetric\n</parameter>\n</function>\n</tool_call>",
+         false, false, "", "",
+         {{"get_weather", "{\"city\":\"Paris\"}"},
+          {"get_weather", "{\"city\":\"Rome\",\"units\":\"metric\"}"}}},
+        {"numeric-args",
+         "<tool_call>\n<function=add>\n<parameter=a>\n2\n</parameter>\n<parameter=b>\n3.5\n</parameter>\n</function>\n</tool_call>",
+         false, false, "", "", {{"add", "{\"a\":2,\"b\":3.5}"}}},
+        {"code-arg",
+         "<tool_call>\n<function=run_code>\n<parameter=code>\ndef hello():\n    print(\"Hi\")\n\nhello()\n</parameter>\n</function>\n</tool_call>",
+         false, false, "", "",
+         {{"run_code", "{\"code\":\"def hello():\\n    print(\\\"Hi\\\")\\n\\nhello()\"}"}}},
+        {"trailing-nl-value",
+         "<tool_call>\n<function=run_code>\n<parameter=code>\nline1\nline2\n\n</parameter>\n</function>\n</tool_call>",
+         false, false, "", "", {{"run_code", "{\"code\":\"line1\\nline2\\n\"}"}}},
+        {"noop-call", "<tool_call>\n<function=noop>\n</function>\n</tool_call>", false, false, "",
+         "", {{"noop", "{}"}}},
+        {"empty-think", "</think>\n\nHi", true, false, "", "Hi", {}},
+        {"nothink-thinktext", "<think>\nHi\n</think>\n\nYo", false, false, "",
+         "<think>\nHi\n</think>\n\nYo", {}},
+        {"think-then-call-no-close",
+         "Plans here. <tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+         true, false, "Plans here. ", "", {{"get_weather", "{\"city\":\"Paris\"}"}}},
+        // streaming prefixes (partial=true): unterminated blocks yield prefixes
+        {"partial-think", "I need to th", true, true, "I need to th", "", {}},
+        {"partial-think-close", "I need to think.\n</thi", true, true, "I need to think.\n", "",
+         {}},
+        {"partial-tool", "Checking.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nPar",
+         true, true, "Checking.\n", "", {{"get_weather", "{\"city\":\"Par"}}},
+        {"partial-second-call",
+         "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nRo",
+         false, true, "", "",
+         {{"get_weather", "{\"city\":\"Paris\"}"}, {"get_weather", "{\"city\":\"Ro"}}},
+        {"partial-call-opener", "abc<tool_cal", true, true, "abc", "", {}},
+        {"partial-call-opener-nothink", "content here <tool_cal", false, true, "",
+         "content here ", {}},
+        {"partial-think-partial-close2", "abc</think>def</th", true, true, "abc", "def</th", {}},
+    };
+    for (const PCase &c : pcases) {
+      rdna4::ChatParseOptions po;
+      po.enable_thinking = c.thinking;
+      po.partial = c.partial;
+      rdna4::ChatParsedMessage got;
+      std::string perr;
+      const bool ok = rdna4::chat_parse(c.input, po, got, perr);
+      bool same = ok && got.reasoning_content == c.reasoning && got.content == c.content &&
+                  got.tool_calls.size() == c.calls.size();
+      if (same) {
+        for (std::size_t i = 0; i < c.calls.size(); ++i) {
+          if (got.tool_calls[i].name != c.calls[i].name ||
+              got.tool_calls[i].arguments != c.calls[i].args) {
+            same = false;
+            break;
+          }
+        }
+      }
+      std::printf("%-5s parse %-28s\n", same ? "ok" : "FAIL", c.name);
+      if (!same) {
+        std::printf("  reasoning: [%s] want [%s]\n  content: [%s] want [%s]\n",
+                    escape(got.reasoning_content).c_str(), escape(c.reasoning).c_str(),
+                    escape(got.content).c_str(), escape(c.content).c_str());
+        for (std::size_t i = 0; i < got.tool_calls.size(); ++i) {
+          std::printf("  got call [%s %s]\n", got.tool_calls[i].name.c_str(),
+                      escape(got.tool_calls[i].arguments).c_str());
+        }
+        ++failures;
+      }
+    }
+    // strict-mode malformed turns are errors, not silent truncations
+    const char *bad_inputs[] = {
+        "<tool_call>\n<function=f>\n<parameter=x>\n1\n</parameter>\n</function>\n",  // no </tool_call>
+        "<tool_call>\n<function=f>\n<parameter=x>\n1\n",  // no </parameter>
+        "<tool_call>\nGARBAGE",                          // no <function=>
+        "<tool_call>\n<function=>\n</function>\n</tool_call>",  // empty name
+        "content <tool_call> trailing junk, no block",          // junk after content
+    };
+    for (const char *in : bad_inputs) {
+      rdna4::ChatParseOptions po;
+      po.enable_thinking = false;
+      rdna4::ChatParsedMessage got;
+      std::string perr;
+      const bool ok = rdna4::chat_parse(in, po, got, perr);
+      std::printf("%-5s parse rejects [%.40s] (%s)\n", !ok ? "ok" : "FAIL", in, perr.c_str());
+      if (ok) ++failures;
+    }
+    // message-level round trip (mirrors llama.cpp's expect_reconstruction):
+    // parse a continuation, re-render the assistant turn, and require the
+    // generation prompt + continuation back (modulo the closing turn tag).
+    {
+      struct RCase {
+        const char *continuation;
+        bool thinking;
+        const char *gen_prompt;
+      };
+      const RCase rcases[] = {
+          {"Checking now.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+           true, "<|im_start|>assistant\n<think>\n"},
+          // NOTE: render trims message content and always joins it to the
+          // first tool call with "\n\n" (the template's `{% if content|trim %}`
+          // branch), so a content+tool-call turn is text-stable only when the
+          // content already ends with exactly "\n\n" — same normalization
+          // boundary as llama.cpp's expect_reconstruction, which is asserted
+          // only on stable shapes (call-only / content-only turns).
+          {"Let me look that up.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+           false, "<|im_start|>assistant\n<think>\n\n</think>\n\n"},
+      };
+      for (const RCase &c : rcases) {
+        rdna4::ChatParseOptions po;
+        po.enable_thinking = c.thinking;
+        rdna4::ChatParsedMessage pm;
+        std::string perr, rerr, rerender;
+        bool ok = rdna4::chat_parse(c.continuation, po, pm, perr);
+        rdna4::ChatMessage am;
+        am.role = "assistant";
+        am.content = pm.content;
+        am.reasoning_content = pm.reasoning_content;
+        am.tool_calls = pm.tool_calls;
+        rdna4::ChatOptions ro;
+        ro.add_generation_prompt = false;
+        ro.enable_thinking = c.thinking;
+        if (ok) ok = rdna4::chat_render({am}, ro, rerender, rerr);
+        // With thinking on and no user system message, render prepends the
+        // reasoning-effort system block; account for it in the expectation.
+        std::string sys;
+        if (c.thinking) {
+          sys = std::string("<|im_start|>system\n") +
+                rdna4::chat_reasoning_instructions("xhigh") + "<|im_end|>\n";
+        }
+        const std::string want = sys + std::string(c.gen_prompt) + c.continuation + "<|im_end|>\n";
+        const bool same = ok && rerender == want;
+        std::printf("%-5s round-trip %-12s\n", same ? "ok" : "FAIL",
+                    c.thinking ? "thinking" : "no-thinking");
+        if (!same) {
+          std::printf("  got : %s\n  want: %s\n", escape(rerender).c_str(), escape(want).c_str());
+          ++failures;
+        }
+      }
+    }
   }
 
   std::printf("check-chat: %s\n", failures ? "FAILED" : "OK");
