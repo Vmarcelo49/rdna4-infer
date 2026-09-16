@@ -2,7 +2,8 @@
 // quantization format, measured on the REAL tensors of a real GGUF.
 //
 //   check-quant-precision-gpu <file.gguf> [--max-elems N] [--rows N] [--seed N] [--time]
-//   check-quant-precision-gpu --cross <A.gguf> <B.gguf> [--max-elems N]
+//   check-quant-precision-gpu --cross <A.gguf> <B.gguf> [--max-elems N] [--rows N] [--cross-all]
+// (defaults: --max-elems 64M --rows 128; --cross compares 3 named tensors)
 //
 // Why not "perplexity per format": we have no F16/fp32 model of this network
 // (only IQ3_S and IQ4_XS), so the error of a format is measured where it is
@@ -280,11 +281,20 @@ std::vector<TypeRow> measure_all(rdna4::GgufLoader &ld, std::int64_t max_elems, 
 // Same tensor dequantized from two files: the distance between two FORMATS,
 // which is the only measurement of the weight-side error available without an
 // fp32 original.
-int cross(const char *path_a, const char *path_b, std::int64_t max_elems) {
+// Fast default: only a few named tensors and at most max_rows rows each (the
+// double loop below is O(rows*cols) per tensor). --cross-all (or CROSS_ALL=1)
+// restores the old full-file coverage.
+int cross(const char *path_a, const char *path_b, std::int64_t max_elems, std::int64_t max_rows,
+          bool cross_all) {
   rdna4::GgufLoader a, b;
   std::string err;
   if (!a.open(path_a, err)) { std::fprintf(stderr, "open A: %s\n", err.c_str()); return 1; }
   if (!b.open(path_b, err)) { std::fprintf(stderr, "open B: %s\n", err.c_str()); return 1; }
+  const char *env_all = std::getenv("CROSS_ALL");
+  if (env_all && env_all[0] == '1' && env_all[1] == '\0') cross_all = true;
+  // Representative named tensors for the fast default (matched by substring).
+  static const char *kCrossNames[] = {"ffn_down.weight", "attn_qkv.weight", "output.weight"};
+  int budget = 3;
   std::printf("A: %s\nB: %s\n", path_a, path_b);
   std::printf("%-34s %-9s %-9s %8s %10s %10s\n", "tensor", "tipo A", "tipo B", "bpw A", "rel-L2", "max|d|");
   double worst = 0, agg_num = 0, agg_den = 0;
@@ -295,6 +305,16 @@ int cross(const char *path_a, const char *path_b, std::int64_t max_elems) {
     if (!tb) continue;
     if (ta.dims.size() != 2 || tb->dims.size() != 2) continue;
     if (ta.dims != tb->dims) continue;
+    if (!cross_all) {
+      bool wanted = false;
+      for (const char *k : kCrossNames) {
+        if (std::strstr(ta.name.c_str(), k)) {
+          wanted = true;
+          break;
+        }
+      }
+      if (!wanted || budget <= 0) continue;
+    }
     const std::int64_t cols = ta.dims[0], rows = ta.dims[1];
     if (cols * rows > max_elems) continue;
     const int dta = (int)a.dtype(i);
@@ -305,9 +325,11 @@ int cross(const char *path_a, const char *path_b, std::int64_t max_elems) {
     if (!a.load_tensor(i, wa, err) || !b.load_tensor(ib, wb, err)) continue;
     const int64_t rca = (int64_t)(wa.size() / (std::size_t)rows);
     const int64_t rcb = (int64_t)(wb.size() / (std::size_t)rows);
+    // Same row cap as measure_all: the double loop below is O(rows*cols).
+    const std::int64_t rows_eff = std::min<std::int64_t>(rows, max_rows);
     std::vector<float> ra((std::size_t)cols), rb((std::size_t)cols);
     double num = 0, den = 0, mx = 0;
-    for (std::int64_t r = 0; r < rows; ++r) {
+    for (std::int64_t r = 0; r < rows_eff; ++r) {
       if (!rdna4_cpu_dequant_row(dta, wa.data() + (std::size_t)r * rca, ra.data(), cols) ||
           !rdna4_cpu_dequant_row(dtb, wb.data() + (std::size_t)r * rcb, rb.data(), cols)) {
         num = den = 0;
@@ -326,6 +348,7 @@ int cross(const char *path_a, const char *path_b, std::int64_t max_elems) {
     agg_num += num;
     agg_den += den;
     ++n;
+    if (!cross_all) --budget;
     std::printf("%-34s %-9s %-9s %8.3f %10.3e %10.3e\n", ta.name.c_str(), tc_name_of(dta),
                 tc_name_of(dtb), 8.0 * (double)wa.size() / (double)(cols * rows), rel, mx);
   }
@@ -337,14 +360,22 @@ int cross(const char *path_a, const char *path_b, std::int64_t max_elems) {
 }  // namespace
 
 int main(int argc, char **argv) {
-  std::int64_t max_elems = 512 * 1024 * 1024, max_rows = 2048;
+  // Fast defaults (full coverage is one flag away: --max-elems/--rows/--cross-all).
+  std::int64_t max_elems = 64 * 1024 * 1024, max_rows = 128;
   bool do_time = false;
+  // Pre-scan: the --cross handler below returns early, before later flags are
+  // parsed, so --cross-all must be visible regardless of position.
+  bool cross_all = false;
+  for (int i = 1; i < argc; ++i)
+    if (!std::strcmp(argv[i], "--cross-all")) cross_all = true;
   std::vector<const char *> files;
   for (int i = 1; i < argc; ++i) {
     const char *a = argv[i];
     if (!std::strcmp(a, "--cross")) {
       if (i + 2 >= argc) { std::fprintf(stderr, "--cross precisa de dois arquivos\n"); return 2; }
-      return cross(argv[i + 1], argv[i + 2], max_elems);
+      return cross(argv[i + 1], argv[i + 2], max_elems, max_rows, cross_all);
+    } else if (!std::strcmp(a, "--cross-all")) {
+      continue;  // handled in the pre-scan above
     } else if (!std::strcmp(a, "--max-elems")) {
       if (i + 1 < argc) max_elems = std::atoll(argv[++i]);
     } else if (!std::strcmp(a, "--rows")) {
@@ -361,7 +392,7 @@ int main(int argc, char **argv) {
   if (files.empty()) {
     std::fprintf(stderr,
                  "usage: check-quant-precision-gpu <file.gguf> [--max-elems N] [--rows N] [--time]\n"
-                 "       check-quant-precision-gpu --cross <A.gguf> <B.gguf>\n");
+                 "       check-quant-precision-gpu --cross <A.gguf> <B.gguf> [--cross-all]\n");
     return 2;
   }
   rdna4::GgufLoader ld;

@@ -16,9 +16,22 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BIN:-$ROOT/build/rdna4-infer}"
 MODEL="${MODEL:-/mnt/raid0/GGUF/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_S.gguf}"
+# QUICK=1 (or --quick): smaller server ctx + skip the second model load
+# (--greedy-cli-check), unless the caller explicitly set CTX/GREEDY_CHECK.
+# check_all.sh --quick does not skip this gate, so this is its iteration lever.
+_QUICK="${QUICK:-0}"
+for _a in "$@"; do [ "$_a" = "--quick" ] && _QUICK=1; done
 PORT="${PORT:-8099}"
-CTX="${CTX:-4096}"
-GREEDY_CHECK="${GREEDY_CHECK:-1}"
+if [ -z "${CTX+x}" ]; then
+  if [ "$_QUICK" = 1 ]; then CTX=1024; else CTX=4096; fi
+fi
+if [ -z "${GREEDY_CHECK+x}" ]; then
+  if [ "$_QUICK" = 1 ]; then GREEDY_CHECK=0; else GREEDY_CHECK=1; fi
+fi
+# Never forward --quick to check_server.py (it has no such flag).
+_filtered=()
+for _a in "$@"; do [ "$_a" = "--quick" ] || _filtered+=("$_a"); done
+if [ "${#_filtered[@]}" -gt 0 ]; then set -- "${_filtered[@]}"; else set --; fi
 
 if [ ! -x "$BIN" ]; then
   echo "no binary at $BIN (build first: cmake --build build -j6 --target rdna4-infer)" >&2

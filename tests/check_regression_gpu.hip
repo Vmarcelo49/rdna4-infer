@@ -315,7 +315,20 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  const int ctx = 32768 + 64;
+  // Quick smoke mode (REGRESSION_QUICK=1): shrink the dominant costs (32K ctx
+  // alloc + 4096-token real prefill + 32-token short decodes) and drop the
+  // seeded-32K case. Unset = full default behavior (unchanged). A quick run
+  // needs its own golden (record with --record under the same env).
+  const bool reg_quick = [] {
+    const char *e = std::getenv("REGRESSION_QUICK");
+    return e != nullptr && e[0] == '1';
+  }();
+  // Effective decode length: short cases 32/32/24/24/24 -> 8 in quick mode
+  // (ctx4k/ctx32k already generate 8). Default: the declared n_gen.
+  auto eff_gen = [reg_quick](const Case &c) { return reg_quick ? (c.n_gen < 8 ? c.n_gen : 8) : c.n_gen; };
+  const int eff_min_cases = reg_quick ? (kMinCases - 1) : kMinCases;
+
+  const int ctx = reg_quick ? (4096 + 64) : (32768 + 64);
   rdna4::GgufLoader loader;
   std::string err;
   if (!loader.open(model, err)) {
@@ -332,7 +345,8 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "tokenizer: %s\n", err.c_str());
     return 2;
   }
-  std::printf("check-regression-gpu: %d casos, ctx %d, kv f16/f16, greedy puro\n", kCaseCount, ctx);
+  std::printf("check-regression-gpu: %d casos, ctx %d, kv f16/f16, greedy puro%s\n", kCaseCount,
+                ctx, reg_quick ? " [REGRESSION_QUICK=1]" : "");
 
   std::vector<std::vector<std::int32_t>> prompts((std::size_t)kCaseCount);
   for (int i = 0; i < kCaseCount; ++i) {
@@ -351,17 +365,20 @@ int main(int argc, char **argv) {
     } else {
       text = kCases[i].prompt;
     }
-    // ctx4k: repete a prosa ate passar de 4096 tokens (deterministico)
+    // ctx4k: repete a prosa ate passar de 4096 tokens (deterministico;
+    // QUICK: 1024 tokens, que e o prefill real dominante que encolhe aqui)
     std::vector<std::int32_t> ids = tk.encode(text, true);
     if (kCases[i].min_prompt >= 4096) {
+      const int want_prompt = reg_quick ? 1024 : 4096;
       std::string big = text;
-      while ((int)tk.encode(big, true).size() < 4096) big += text;
+      while ((int)tk.encode(big, true).size() < want_prompt) big += text;
       ids = tk.encode(big, true);
     }
     prompts[(std::size_t)i] = ids;
-    if ((int)ids.size() < kCases[i].min_prompt) {
+    const int want_min = (reg_quick && kCases[i].min_prompt >= 4096) ? 1024 : kCases[i].min_prompt;
+    if ((int)ids.size() < want_min) {
       std::fprintf(stderr, "caso %s: prompt com %zu tokens, esperado >= %d\n", kCases[i].name,
-                   ids.size(), kCases[i].min_prompt);
+                   ids.size(), want_min);
       return 2;
     }
   }
@@ -392,6 +409,14 @@ int main(int argc, char **argv) {
               "d||logits||", "ids");
   for (int i = 0; i < kCaseCount; ++i) {
     const Case &c = kCases[i];
+    const int want_gen = eff_gen(c);
+    // QUICK: drop the seeded-32K case (needs ctx 32832); the remaining 6 cases
+    // still print the run table + rel-L2 comparison lines below.
+    if (reg_quick && c.synth_pos > 0) {
+      std::printf("%-9s %8s %6s %10s %12s %12s %8s  SKIPPED (REGRESSION_QUICK=1)\n", c.name,
+                  "-", "-", "-", "-", "-", "-");
+      continue;
+    }
     std::vector<float> hidden, logits;
     const double t0 = now_s();
     if (!g.reset_state(err)) {
@@ -425,7 +450,7 @@ int main(int argc, char **argv) {
     r.name = c.name;
     r.n_prompt = (int)ids.size();
     std::vector<float> last_logits;
-    for (int k = 0; k < c.n_gen; ++k) {
+    for (int k = 0; k < want_gen; ++k) {
       if (pos >= (std::size_t)ctx) {
         std::fprintf(stderr, "caso %s: posicao %zu estourou o ctx %d\n", c.name, pos, ctx);
         ++failures;
@@ -440,7 +465,7 @@ int main(int argc, char **argv) {
       }
       r.ids.push_back(id);
       history.push_back(id);
-      if (k + 1 == c.n_gen) break;
+      if (k + 1 == want_gen) break;
       if (!g.forward_tokens({id}, (int)pos, hidden, logits, err)) {
         std::fprintf(stderr, "caso %s: forward falhou: %s\n", c.name, err.c_str());
         ++failures;
@@ -461,8 +486,8 @@ int main(int argc, char **argv) {
     }
     // anti-teste-vazio: cada caso tem que gerar exatamente o que declara e
     // guardar uma subamostra de logits de tamanho util
-    if (r.n_gen != c.n_gen) {
-      std::fprintf(stderr, "caso %s: gerou %d tokens, esperado %d\n", c.name, r.n_gen, c.n_gen);
+    if (r.n_gen != want_gen) {
+      std::fprintf(stderr, "caso %s: gerou %d tokens, esperado %d\n", c.name, r.n_gen, want_gen);
       ++failures;
     }
     if (r.logs.size() < kMinSubsample) {
@@ -475,9 +500,9 @@ int main(int argc, char **argv) {
     got.push_back(r);
   }
 
-  if (got.size() < (std::size_t)kMinCases) {
+  if (got.size() < (std::size_t)eff_min_cases) {
     std::fprintf(stderr, "check-regression-gpu: FAIL: so %zu casos executaram (minimo %d)\n",
-                 got.size(), kMinCases);
+                 got.size(), eff_min_cases);
     return 1;
   }
 
@@ -502,16 +527,19 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "check-regression-gpu: FAIL: %s\n", err.c_str());
     return 1;
   }
-  if (want.size() < (std::size_t)kMinCases) {
+  if (want.size() < (std::size_t)eff_min_cases) {
     std::fprintf(stderr,
                  "check-regression-gpu: FAIL: a referencia tem %zu casos (minimo %d) — comparar "
                  "pouco nao e um gate\n",
-                 want.size(), kMinCases);
+                 want.size(), eff_min_cases);
     return 1;
   }
   if (want.size() != got.size()) {
-    std::fprintf(stderr, "check-regression-gpu: FAIL: referencia com %zu casos, execucao com %zu\n",
-                 want.size(), got.size());
+    std::fprintf(stderr,
+                 "check-regression-gpu: FAIL: referencia com %zu casos, execucao com %zu%s\n",
+                 want.size(), got.size(),
+                 reg_quick ? " (REGRESSION_QUICK=1: grave um golden rapido com --record sob o mesmo env)"
+                           : "");
     return 1;
   }
 
@@ -590,7 +618,7 @@ int main(int argc, char **argv) {
 
   if (failures == 0) {
     std::printf("check-regression-gpu: OK (%zu casos, %d ids bit-exatos, rel-L2 <= %.0e)\n",
-                got.size(), kCaseCount, kLogitRelL2);
+                got.size(), (int)got.size(), kLogitRelL2);
     return 0;
   }
   std::printf("check-regression-gpu: FAILED (%d falha(s))\n", failures);

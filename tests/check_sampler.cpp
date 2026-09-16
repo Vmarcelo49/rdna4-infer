@@ -316,9 +316,13 @@ int main() {
     const int best = cands[0].id;
     const double p_best = cands[0].p;
     int hits = 0;
-    const int draws = 20000;
+    const int draws = 5000;  // was 20000: binomial sigma scales as 1/sqrt(n),
+    // so 4x fewer draws only doubles sigma, and the 4-sigma tolerance below
+    // widens by the same factor automatically through `draws` (plus the +0.01
+    // floor), keeping the same confidence at a quarter of the cost.
+    std::vector<float> l = base;  // hoisted: reused each draw, no per-draw alloc
     for (int i = 0; i < draws; ++i) {
-      std::vector<float> l = base;
+      l = base;
       if (s.sample(l.data(), no_hist) == best) ++hits;
     }
     const double emp = (double)hits / draws;

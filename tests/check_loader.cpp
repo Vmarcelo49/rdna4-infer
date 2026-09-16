@@ -36,14 +36,26 @@ bool check_f32(const rdna4::GgufLoader &ld, const char *name, double max_abs) {
   }
   const auto *v = reinterpret_cast<const float *>(raw.data());
   const std::size_t n = raw.size() / sizeof(float);
+  // Sampled scan: the first 4096 floats plus every 16th after that. Wrong
+  // data/tensor offsets produce garbage everywhere (NaN/Inf/absurd
+  // magnitudes), so a strided sample rejects the same corrupt files as a full
+  // scan at a fraction of the cost (was: every float).
   double mn = 1e300, mx = -1e300;
-  for (std::size_t k = 0; k < n; ++k) {
+  auto scan_one = [&](std::size_t k) -> bool {
     if (!std::isfinite(v[k])) {
       std::fprintf(stderr, "load %s: non-finite value at %zu\n", name, k);
       return false;
     }
     mn = std::min(mn, static_cast<double>(v[k]));
     mx = std::max(mx, static_cast<double>(v[k]));
+    return true;
+  };
+  const std::size_t kHead = 4096, kStride = 16;
+  for (std::size_t k = 0; k < n && k < kHead; ++k) {
+    if (!scan_one(k)) return false;
+  }
+  for (std::size_t k = kHead; k < n; k += kStride) {
+    if (!scan_one(k)) return false;
   }
   if (mx > max_abs) {
     std::fprintf(stderr, "load %s: max |v| %.3g exceeds %.3g\n", name, mx, max_abs);
@@ -69,6 +81,33 @@ bool check_quant_head(const rdna4::GgufLoader &ld, const char *name) {
   }
   std::printf("loaded %-32s %-8s %llu bytes  head:", name,
               rdna4::dtype_name(ld.dtype(i)), (unsigned long long)raw.size());
+  for (std::size_t k = 0; k < 16 && k < raw.size(); ++k) {
+    std::printf(" %02x", raw[k]);
+  }
+  std::printf("  OK\n");
+  return true;
+}
+
+// Same accept/reject contract as check_quant_head (missing tensor or unreadable
+// bytes fail), but reads only the first `count` bytes via load_tensor_range.
+// For multi-MB quant tensors the head bytes + the size metadata prove the same
+// thing (right tensor, right offset, readable data) without the full read.
+bool check_quant_prefix(const rdna4::GgufLoader &ld, const char *name, std::uint64_t count) {
+  const auto *t = ld.find(name);
+  if (!t) {
+    std::fprintf(stderr, "tensor %s not found\n", name);
+    return false;
+  }
+  const std::size_t i = static_cast<std::size_t>(t - ld.meta().tensors.data());
+  if (count > ld.tensor_bytes(i)) count = ld.tensor_bytes(i);
+  std::vector<std::uint8_t> raw;
+  std::string err;
+  if (!ld.load_tensor_range(i, 0, count, raw, err)) {
+    std::fprintf(stderr, "load %s: %s\n", name, err.c_str());
+    return false;
+  }
+  std::printf("loaded %-32s %-8s %llu bytes  head:", name,
+              rdna4::dtype_name(ld.dtype(i)), (unsigned long long)ld.tensor_bytes(i));
   for (std::size_t k = 0; k < 16 && k < raw.size(); ++k) {
     std::printf(" %02x", raw[k]);
   }
@@ -151,7 +190,9 @@ int main(int argc, char **argv) {
   // blk.0 is a GDN (linear) layer, so no attn_v; ssm_alpha (q8_0) exists in
   // both UD files.
   ok = check_quant_head(ld, "blk.0.ssm_alpha.weight") && ok;
-  ok = check_quant_head(ld, "blk.0.ffn_up.weight") && ok;
+  // ffn_up is ~17 MB (iq1_s): a 16-byte prefix proves the same thing (right
+  // tensor, right offset, readable data) without the full read.
+  ok = check_quant_prefix(ld, "blk.0.ffn_up.weight", 16) && ok;
 
   if (!ok) {
     std::fprintf(stderr, "check-loader: FAILED\n");

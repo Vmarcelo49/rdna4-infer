@@ -25,12 +25,27 @@ if [ "${GPU_LOCK_HELD:-0}" != 1 ]; then
   exec "$ROOT/scripts/gpu-lock.sh" "$0" "$@"
 fi
 BIN="${BIN:-$ROOT/build/rdna4-infer}"
-MODEL="${1:-/mnt/raid0/GGUF/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_S.gguf}"
-SPLITS="${2:-4}"
+# Strip an optional --quick flag (iteration mode: fewer chunks, no wide case).
+# check_all.sh --quick skips this gate entirely; this flag is for direct runs.
+QUICK="${QUICK:-0}"
+_cli_model=""; _cli_splits=""
+for _a in "$@"; do
+  if [ "$_a" = "--quick" ]; then QUICK=1; else
+    if [ -z "$_cli_model" ]; then _cli_model="$_a"; else _cli_splits="$_a"; fi
+  fi
+done
+MODEL="${_cli_model:-/mnt/raid0/GGUF/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_S.gguf}"
+SPLITS="${_cli_splits:-4}"
 CORPUS="${CORPUS:-$ROOT/reference/data/wikitext-2-raw/wiki.test.raw}"
 CTX="${CTX:-1024}"
 STRIDE="${STRIDE:-1024}"
 CHUNKS="${CHUNKS:-2}"
+if [ "$QUICK" = 1 ]; then
+  # 3 loads -> 2 (CHUNKS 2->1 halves the cheapest gate; WIDE=0 drops the 3rd
+  # run). Real-text split equivalence still covered by the base-vs-split pair.
+  CHUNKS=1
+  WIDE="${WIDE:-0}"
+fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 

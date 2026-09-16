@@ -434,8 +434,9 @@ void drain_body(int fd, std::size_t announced) {
 
 void set_timeouts(int fd, const ServerOptions &opts) {
   struct timeval tv;
-  tv.tv_sec = opts.recv_timeout_s;
-  tv.tv_usec = 0;
+  // recv_timeout_s is fractional (tests use 0.2 s); split into sec + usec.
+  tv.tv_sec = static_cast<time_t>(opts.recv_timeout_s);
+  tv.tv_usec = static_cast<suseconds_t>((opts.recv_timeout_s - tv.tv_sec) * 1000000.0);
   ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   tv.tv_sec = opts.send_timeout_s;
   ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));

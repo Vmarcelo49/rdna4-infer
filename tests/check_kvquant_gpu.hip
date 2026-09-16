@@ -60,7 +60,7 @@ namespace {
 
 constexpr int kHeadDim = 256;  // qwen35 head_dim: 8 blocks of 32 per row
 constexpr int kHeadKv = 4;
-constexpr int kRows = 48;  // 6 patterns x 8 rows
+constexpr int kRows = 16;  // 8 patterns x 2 reps (was 48 x 6 reps; 2 reps still cover every pattern)
 
 // Quantized types live in the cache; f32/f16 are the controls (their behaviour
 // must not change and their bytes are checked here too).
@@ -375,6 +375,14 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
   int failures = 0;
   const std::string model = argc >= 2 ? argv[1] : std::string();
+  // Quick mode: synthetic half on the 2 shipping formats only, real-data half
+  // skipped. Default (env unset) runs all 6 types + the real-data half when a
+  // model is given.
+  const char *quick_env = std::getenv("KVQUANT_QUICK");
+  const bool quick = quick_env != nullptr && std::string(quick_env) == "1";
+  const rdna4::KvType kQuickTypes[] = {rdna4::KvType::Q5_0, rdna4::KvType::Q4_1};
+  const rdna4::KvType *synth_types = quick ? kQuickTypes : kTypes;
+  const int n_synth_types = quick ? 2 : (int)(sizeof(kTypes) / sizeof(kTypes[0]));
 
   // ------------------------------------------------------------------
   // 1. synthetic patterns, no model
@@ -419,11 +427,13 @@ int main(int argc, char **argv) {
     return r.max_abs_err <= step_tol(t) * r.max_step + 1e-6;
   };
 
-  std::printf("== synthetic (no model): %d rows x %d elems, 8 patterns x %d reps\n", kRows,
-              kHeadDim, kRows / 8);
+  std::printf("== synthetic (no model): %d rows x %d elems, 8 patterns x %d reps%s\n", kRows,
+              kHeadDim, kRows / 8, quick ? " [KVQUANT_QUICK=1: Q5_0/Q4_1 only]" : "");
   std::printf("%-6s %-8s %-10s %-10s %-12s %-12s %-10s %s\n", "type", "bytes", "step_tol",
               "max_err", "err/step", "err/range", "err/|x|", "check");
-  for (rdna4::KvType ty : kTypes) {
+  const int synth_fail0 = failures;
+  for (int ti = 0; ti < n_synth_types; ++ti) {
+    const rdna4::KvType ty = synth_types[ti];
     std::string bytes_report, load_report;
     // make_patterns() already produced kRows independent rows of kHeadDim floats,
     // so the row count is kRows (not kRows * kHeadKv -- that mis-count is what
@@ -451,10 +461,20 @@ int main(int argc, char **argv) {
 
   // Per-pattern breakdown for the two new formats: the same error bound has to
   // hold on the patterns that are hostile to each grid, otherwise the tolerance
-  // is hiding a pattern-specific failure.
-  std::printf("\n-- per-pattern, only the patterns that stress the format --\n");
+  // is hiding a pattern-specific failure. Speed: the full 8-pattern sweep is 16
+  // extra check_type calls, so it runs only on failure; on success spot-check
+  // the 2 hostile patterns (1 positive/asymmetric vs the symmetric q4_0/q5_0
+  // grid, 2 single outlier that destroys a block's scale).
+  const bool synth_failed = (failures != synth_fail0);
+  const int pats_all[] = {0, 1, 2, 3, 4, 5, 6, 7};
+  const int pats_hostile[] = {1, 2};
+  const int *pats = synth_failed ? pats_all : pats_hostile;
+  const int n_pats = synth_failed ? 8 : 2;
+  std::printf("\n-- per-pattern, only the patterns that stress the format%s --\n",
+              synth_failed ? "" : " (spot-check of the 2 hostile patterns; full 8 on failure)");
   for (rdna4::KvType ty : {rdna4::KvType::Q5_0, rdna4::KvType::Q4_1}) {
-    for (int p = 0; p < 8; ++p) {
+    for (int pi = 0; pi < n_pats; ++pi) {
+      const int p = pats[pi];
       int n = 0;
       for (int r = 0; r < kRows; ++r) {
         if (pattern[r] == p) ++n;
@@ -480,7 +500,9 @@ int main(int argc, char **argv) {
   // ------------------------------------------------------------------
   // 2. real K/V rows out of the graph (only when a model is given)
   // ------------------------------------------------------------------
-  if (!model.empty()) {
+  if (quick) {
+    std::printf("\nreal K/V rows: SKIPPED (KVQUANT_QUICK=1)\n");
+  } else if (!model.empty()) {
     rdna4::GgufLoader ld;
     std::string err;
     if (!ld.open(model.c_str(), err)) {

@@ -4,7 +4,24 @@
 #
 #   ./scripts/check_golden_run.sh            # verify against tests/golden/
 #   UPDATE=1 ./scripts/check_golden_run.sh   # rewrite the golden files
+#   QUICK=1 ./scripts/check_golden_run.sh    # fast gate (N=16, skips nightly cases)
+#   ./scripts/check_golden_run.sh --quick    # same as QUICK=1
 #
+# QUICK mode (QUICK=1 env or --quick flag):
+#   (a) N defaults to 16 instead of 32; an explicit N env still wins.
+#   (b) G7-G9 mixed-KV combos are skipped with a "SKIP (nightly)" note;
+#       G6 (kv-q4_0, the shipped config) still runs.
+#   (c) the argmax-vs-host loop runs 1 prompt x 2 arms instead of 3 prompts x 2.
+#   QUICK=1 refuses UPDATE=1 (goldens are full-mode): rewrite without --quick.
+#
+# Reuse hook for scripts/compare_llama_greedy.sh (that script is NOT edited here):
+#   G1's greedy stdout/full-stderr ($TMP/g.out, $TMP/g.err) are copied on success
+#   to the well-known path $ROOT/.tmp-golden-g1.out / $ROOT/.tmp-golden-g1.err so
+#   the compare script can reuse them without a second 12GB engine load (it needs
+#   the full stderr: prompt ids AND generated ids). $TMP/g.ids (generated only)
+#   goes to $ROOT/.tmp-golden-g1.ids for completeness.
+#   If GOLDEN_REUSE is set to an existing directory, copies are also placed there
+#   as $GOLDEN_REUSE/g.out, g.err and g.ids.
 # The golden files are the engine's own output for a fixed prompt/seed (there is
 # no independent oracle for a full sampled continuation — llama.cpp's RNG stream
 # is not ours, see PLAN.md M4); the independent cross-check of *greedy* decoding
@@ -25,13 +42,29 @@ BIN="${BIN:-$ROOT/build/rdna4-infer}"
 MODEL="${MODEL:-/mnt/raid0/GGUF/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_S.gguf}"
 GOLD="${GOLD:-$ROOT/tests/golden}"
 PROMPT="${PROMPT:-The capital of France is}"
-N="${N:-32}"
+QUICK="${QUICK:-0}"
+for _a in ${1+"$@"}; do
+  if [ "$_a" = "--quick" ]; then QUICK=1; fi
+done
+unset _a
+# QUICK default N=16; an explicit non-empty N env still wins.
+if [ -z "${N:-}" ]; then
+  if [ "$QUICK" = "1" ]; then N=16; else N=32; fi
+fi
+if [ "$QUICK" = "1" ] && [ "${UPDATE:-0}" = "1" ]; then
+  echo "QUICK=1 refuses UPDATE=1: goldens are full-mode (rewrite without --quick)" >&2
+  exit 2
+fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 fail=0
 note() { printf '%s\n' "$*"; }
 bad() { printf 'FAIL: %s\n' "$*"; fail=1; }
+
+if [ "$QUICK" = "1" ]; then
+  note "quick mode: N=$N, mixed-KV combos skipped, 1 argmax prompt"
+fi
 
 if [ ! -x "$BIN" ]; then
   echo "no binary at $BIN (build first)" >&2
@@ -75,6 +108,19 @@ else
       diff -u "$want" "$got" | head -30
     fi
   done
+fi
+
+# Reuse hook (see header): publish G1's greedy outputs so
+# scripts/compare_llama_greedy.sh can reuse them without reloading the engine.
+if [ "$greedy_ok" = "1" ] && [ -f "$TMP/g.out" ] && [ -f "$TMP/g.err" ]; then
+  cp "$TMP/g.out" "$ROOT/.tmp-golden-g1.out"
+  cp "$TMP/g.err" "$ROOT/.tmp-golden-g1.err"
+  cp "$TMP/g.ids" "$ROOT/.tmp-golden-g1.ids"
+  if [ -n "${GOLDEN_REUSE:-}" ] && [ -d "$GOLDEN_REUSE" ]; then
+    cp "$TMP/g.out" "$GOLDEN_REUSE/g.out"
+    cp "$TMP/g.err" "$GOLDEN_REUSE/g.err"
+    cp "$TMP/g.ids" "$GOLDEN_REUSE/g.ids"
+  fi
 fi
 
 # -------------------------------------------------------------- sampling ----
@@ -144,7 +190,10 @@ if ! head -c 8 "$TMP/q.out" | grep -q 'Paris'; then
 fi
 
 # mixed cache types (the graph supports k/v independently; only f16/f16 and
-# q4_0/q4_0 had been exercised)
+# q4_0/q4_0 had been exercised). Nightly-only: skipped in QUICK mode.
+if [ "$QUICK" = "1" ]; then
+  note "SKIP (nightly): mixed KV combos f16/q8_0, q8_0/f16, f32/q4_0"
+else
 for combo in "f16 q8_0" "q8_0 f16" "f32 q4_0"; do
   set -- $combo
   if run_case "kv-$1-$2" "$TMP/m.out" "$TMP/m.err" --greedy --cache-type-k "$1" --cache-type-v "$2"; then
@@ -155,6 +204,7 @@ for combo in "f16 q8_0" "q8_0 f16" "f32 q4_0"; do
     fi
   fi
 done
+fi
 
 # ---------------------------------------------------------------------------
 # The device argmax (greedy fast path) and the host sampler must return the SAME id
@@ -165,9 +215,13 @@ done
 # shape that does not trigger it -- which is why the suite stayed green (review
 # finding R9). RD_NO_ARGMAX=1 forces the host path, so this is a differential test
 # with no stored fixture to go stale.
-for p in "The capital of France is Paris" \
-         "Explain in one sentence what a KV cache is" \
-         "one two three four five six seven eight nine ten eleven twelve"; do
+argmax_prompts=("The capital of France is Paris"
+  "Explain in one sentence what a KV cache is"
+  "one two three four five six seven eight nine ten eleven twelve")
+if [ "$QUICK" = "1" ]; then
+  argmax_prompts=("The capital of France is Paris")
+fi
+for p in "${argmax_prompts[@]}"; do
   a="$("$BIN" run -m "$MODEL" -p "$p" -n 8 --greedy --no-stats 2>/dev/null)"
   b="$(RD_NO_ARGMAX=1 "$BIN" run -m "$MODEL" -p "$p" -n 8 --greedy --no-stats 2>/dev/null)"
   if [ -z "$a" ] || [ -z "$b" ]; then

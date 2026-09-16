@@ -294,7 +294,8 @@ void check_sockets() {
   ServerOptions opts;
   opts.host = "127.0.0.1";
   opts.port = 0;  // let the kernel pick a free port
-  opts.recv_timeout_s = 1;
+  opts.recv_timeout_s = 0.2;  // short on purpose: test 9 below only proves the
+                              // 408 timeout path, so 0.2 s is plenty (was 1 s)
   opts.max_body = 1024;
   rdna4::server::HttpServer server(opts, &router);
   std::string err;
@@ -350,10 +351,11 @@ void check_sockets() {
   // 7b. the same 413, but with the body actually being written: the server
   // drains a bounded amount before answering so the response is not lost to a
   // TCP reset (a client that gets ECONNRESET instead of the error is a bug
-  // report waiting to happen).
+  // report waiting to happen). 4096 bytes is plenty: drain logic is
+  // size-independent (was 99999, same 413 path, just slower).
   {
-    const std::string big(99999, 'A');
-    resp = raw_request(port, "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 99999\r\n\r\n" + big);
+    const std::string big(4096, 'A');
+    resp = raw_request(port, "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 4096\r\n\r\n" + big);
     CHECK(contains(resp, "HTTP/1.1 413 Payload Too Large"));
     CHECK(contains(resp, "unknown route") == false);  // the 413 body, not something else
   }
@@ -362,7 +364,7 @@ void check_sockets() {
   resp = raw_request(port, "GARBAGE\r\n\r\n");
   CHECK(contains(resp, "HTTP/1.1 400 Bad Request"));
 
-  // 9. a body that never arrives -> 408 after recv_timeout_s (1 s here)
+  // 9. a body that never arrives -> 408 after recv_timeout_s (0.2 s here)
   resp = raw_request(port, "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 10\r\n\r\n");
   CHECK(contains(resp, "HTTP/1.1 408 Request Timeout"));
 

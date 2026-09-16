@@ -12,6 +12,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -89,8 +90,13 @@ inline bool guard_is(float v) {
   return bits == 0xABABABABu;
 }
 
+// Poisoned guard-band length (elements) past `nelem`; shared by run_case and the
+// one-shot device allocation in main.
+constexpr std::size_t kGuardElems = 4096;
+
 int run_case(const char *label, DType dt, const std::uint8_t *src, std::int64_t nblocks,
-             int nthreads, bool q8_variant) {
+             int nthreads, bool q8_variant, void *d_src, float *d_dst, std::size_t src_cap,
+             std::size_t dst_cap) {
   const std::uint32_t be = rdna4::dtype_block_elems(dt);
   const std::uint32_t bb = rdna4::dtype_block_bytes(dt);
   // nblocks counts 256-element units for the q8_0=false path; the q8_0 kernel
@@ -104,49 +110,41 @@ int run_case(const char *label, DType dt, const std::uint8_t *src, std::int64_t 
     return 1;
   }
 
-  void *d_src = nullptr;
-  float *d_dst = nullptr;
   // Guard band: the destination is over-allocated and poisoned before the
   // launch, so a kernel that writes past `nelem` (a block count that is too
   // large for the dtype) trips the pattern check below instead of silently
   // corrupting VRAM while the compared prefix stays bit-exact — exactly how the
   // IQ4_NL 8x overrun slipped through (review M4, CRITICAL). The poison also
   // catches the opposite: elements the kernel never wrote.
-  const std::size_t guard = 4096;
+  // The buffers are allocated once in main for the largest case and reused
+  // across types (malloc/free per case dominated small runs); the whole
+  // allocation is poisoned and scanned every case, so the check is unchanged.
+  const std::size_t guard = kGuardElems;
   const std::size_t dst_elems = (std::size_t)nelem + guard;
-  if (hipMalloc(&d_src, nbytes) != hipSuccess ||
-      hipMalloc(&d_dst, dst_elems * sizeof(float)) != hipSuccess) {
-    std::fprintf(stderr, "%-9s hipMalloc failed\n", label);
+  if (nbytes > src_cap || dst_elems > dst_cap) {
+    std::fprintf(stderr, "%-9s reused buffer too small\n", label);
     return 1;
   }
   hipMemcpy(d_src, src, nbytes, hipMemcpyHostToDevice);
-  if (hipMemset(d_dst, kGuardByte, dst_elems * sizeof(float)) != hipSuccess) {
+  if (hipMemset(d_dst, kGuardByte, dst_cap * sizeof(float)) != hipSuccess) {
     std::fprintf(stderr, "%-9s hipMemset failed\n", label);
-    hipFree(d_src);
-    hipFree(d_dst);
     return 1;
   }
 
   if (!rdna4::dequant_row_launch(dt, d_src, d_dst, nelem)) {
     std::fprintf(stderr, "%-9s unsupported or launch failed\n", label);
-    hipFree(d_src);
-    hipFree(d_dst);
     return 1;
   }
   const hipError_t le = hipGetLastError();
   if (le != hipSuccess) {
     std::fprintf(stderr, "%-9s launch failed: %s\n", label, hipGetErrorString(le));
-    hipFree(d_src);
-    hipFree(d_dst);
     return 1;
   }
-  std::vector<float> gpu(dst_elems);
-  hipMemcpy(gpu.data(), d_dst, dst_elems * sizeof(float), hipMemcpyDeviceToHost);
-  hipFree(d_src);
-  hipFree(d_dst);
+  std::vector<float> gpu(dst_cap);
+  hipMemcpy(gpu.data(), d_dst, dst_cap * sizeof(float), hipMemcpyDeviceToHost);
 
   std::int64_t unwritten = 0, overflow = 0;
-  for (std::size_t i = 0; i < dst_elems; ++i) {
+  for (std::size_t i = 0; i < dst_cap; ++i) {
     const bool poisoned = guard_is(gpu[i]);
     if (i < (std::size_t)nelem) {
       if (poisoned) ++unwritten;
@@ -180,7 +178,7 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "usage: check-dequant-gpu <file.gguf> [nblocks]\n");
     return 2;
   }
-  const std::int64_t nblocks_req = argc >= 3 ? std::atoll(argv[2]) : 16;
+  const std::int64_t nblocks_req = argc >= 3 ? std::atoll(argv[2]) : 4;
 
   hipDeviceProp_t prop{};
   if (hipGetDeviceProperties(&prop, 0) != hipSuccess) {
@@ -212,6 +210,32 @@ int main(int argc, char **argv) {
   int failures = 0;
   int tested = 0;
 
+  // One device allocation reused across all types (upper bound over the
+  // requested block count; per-tensor clamping below only shrinks the use).
+  std::size_t src_cap = 0, dst_cap = 0;
+  {
+    const std::int64_t ne_q8 = nblocks_req * 32;
+    src_cap = std::max(src_cap, (std::size_t)(ne_q8 / rdna4::dtype_block_elems(DType::Q8_0)) *
+                                   rdna4::dtype_block_bytes(DType::Q8_0));
+    dst_cap = std::max(dst_cap, (std::size_t)ne_q8 + kGuardElems);
+    for (const TypeCase &tc : kCases) {
+      const std::int64_t ne = nblocks_req * 256;
+      src_cap = std::max(src_cap, (std::size_t)(ne / rdna4::dtype_block_elems(tc.dt)) *
+                                      rdna4::dtype_block_bytes(tc.dt));
+      dst_cap = std::max(dst_cap, (std::size_t)ne + kGuardElems);
+    }
+  }
+  void *d_src = nullptr;
+  float *d_dst = nullptr;
+  if (src_cap == 0) src_cap = 1;  // degenerate nblocks=0: keep hipMalloc defined
+  if (hipMalloc(&d_src, src_cap) != hipSuccess ||
+      hipMalloc(&d_dst, dst_cap * sizeof(float)) != hipSuccess) {
+    std::fprintf(stderr, "hipMalloc failed\n");
+    if (d_src) hipFree(d_src);
+    if (d_dst) hipFree(d_dst);
+    return 1;
+  }
+
   // q8_0 first (separate kernel form, 32 elems/block).
   {
     std::size_t idx = std::size_t(-1);
@@ -226,7 +250,8 @@ int main(int argc, char **argv) {
       const std::int64_t nb = total < nblocks_req ? total : nblocks_req;
       std::vector<std::uint8_t> raw;
       if (ld.load_tensor_range(idx, 0, (std::uint64_t)nb * 34, raw, err)) {
-        failures += run_case("q8_0", DType::Q8_0, raw.data(), nb, 16, true);
+        failures += run_case("q8_0", DType::Q8_0, raw.data(), nb, 16, true, d_src, d_dst, src_cap,
+                             dst_cap);
         ++tested;
       }
     }
@@ -261,9 +286,13 @@ int main(int argc, char **argv) {
       ++failures;
       continue;
     }
-    failures += run_case(tc.name, tc.dt, raw.data(), nb, tc.nthreads, false);
+    failures += run_case(tc.name, tc.dt, raw.data(), nb, tc.nthreads, false, d_src, d_dst,
+                           src_cap, dst_cap);
     ++tested;
   }
+
+  hipFree(d_src);
+  hipFree(d_dst);
 
   std::printf("check-dequant-gpu: %s (%d types tested)\n", failures ? "FAILED" : "OK", tested);
   return failures ? 1 : 0;

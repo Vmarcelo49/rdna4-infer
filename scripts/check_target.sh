@@ -90,13 +90,19 @@ say "4. correção (não se negocia)"
 n=0
 run_gate() { local l="$1"; shift; n=$((n+1));
   if timeout 900 "$@" > /tmp/target-gate.log 2>&1; then ok "$l"; else bad "$l: $(tail -3 /tmp/target-gate.log | tr '\n' ' ')"; fi; }
+# run_gate cannot wrap the gpu() shell function (timeout would exec a binary
+# literally named "gpu" and the model arg would receive that word), so raw GPU
+# binaries go through gpu() here: gpu-lock.sh + timeout 900 inside the lock,
+# same per-block pattern as sections 1-3 above.
+run_gate_gpu() { local l="$1"; shift; n=$((n+1));
+  if gpu "$@" > /tmp/target-gate.log 2>&1; then ok "$l"; else bad "$l: $(tail -3 /tmp/target-gate.log | tr '\n' ' ')"; fi; }
 run_gate "check_golden_run.sh" "$ROOT/scripts/check_golden_run.sh"
 run_gate "check_regression.sh" "$ROOT/scripts/check_regression.sh"
 run_gate "greedy vs llama.cpp (32)" "$ROOT/scripts/compare_llama_greedy.sh" 32
 if [ "$QUICK" -eq 0 ]; then
   run_gate "check_attn_split.sh" "$ROOT/scripts/check_attn_split.sh"
   run_gate "ppl vs llama.cpp" "$ROOT/scripts/compare_ppl.sh" "$MODEL" 10
-  run_gate "check-kvctx-gpu 131072 q4_0" gpu "$B/check-kvctx-gpu" "$MODEL" 131072 q4_0
+  run_gate_gpu "check-kvctx-gpu 131072 q4_0" "$B/check-kvctx-gpu" "$MODEL" 131072 q4_0
 fi
 
 say

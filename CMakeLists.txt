@@ -22,6 +22,16 @@ set(CMAKE_HIP_FLAGS_DEBUG "-O0 -g")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# ccache for host-side compiles (frente standard-suite): the backend sources
+# (gguf/loader/model/...) are compiled once per test target (~22x), so a warm
+# cache pays on every rebuild. CXX only, deliberately: ccache in front of the
+# HIP offload driver needs sloppiness/base_dir tuning and a false hit would
+# silently change device code that the bit-exact gates pin — not worth it.
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+  set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+endif()
+
 # v1 targets gfx1201 only (SPEC.md 1.3). No other arch is ever added here.
 # --offload-arch em vez de CMAKE_HIP_ARCHITECTURES: funciona em CMake antigo.
 add_executable(rdna4-infer src/main.hip src/backend/gguf.cpp src/backend/loader.cpp
@@ -529,3 +539,33 @@ set_target_properties(check-rope-long-gpu PROPERTIES HIP_ARCHITECTURES "gfx1201"
 if(EXISTS "/opt/rocm/include")
   target_include_directories(rdna4_serve PRIVATE /opt/rocm/include)
 endif()
+
+# ---------------------------------------------------------------------------
+# Standard-suite gate set + ccache (frente standard-suite).
+#
+# `cmake --build build --target rdna4_gates` builds exactly the binaries the
+# gates run — scripts/check_all.sh (Phase A, Phase B, Phase C) plus
+# scripts/check_server.sh — and nothing else. Included: the 10 Phase-A CPU
+# gates (check-forge is the probe behind scripts/check_hardening.sh), the
+# Phase-B GPU gates (check-batch-gpu also covers scripts/check_kvbatch.sh,
+# which reuses the same binary over --kv-k/--kv-v pairs), and rdna4-infer +
+# oracle-next-token behind check_golden_run.sh, compare_llama_greedy.sh,
+# check_attn_split.sh, compare_ppl.sh and check_server.sh. Excluded: all 10
+# bench-* (measurement instruments, not gates), oracle-chat/oracle-mtp/
+# oracle-eog (their committed outputs live in tests/golden/ + reference/; no
+# gate executes them), check-model and the CPU check-dequant (not driven by any
+# gate script), check-kvquality/check-kvtype/check-rope-long/
+# check-quant-precision/check-kvquant (frente-KV/longctx probes, not gates).
+# One exception: oracle-tokenize IS executed by a gate (compare_ppl.sh,
+# "$TOKORACLE" on its main path for the ppl-vs-llama reference ids), so it
+# stays in the set — otherwise a gates-only build would fail "ppl vs llama"
+# with a missing binary. Appended, never inserted (docs/agentes-paralelos.md
+# rule 2, "CMakeLists.txt: só append").
+add_custom_target(rdna4_gates DEPENDS
+  check-dtype check-loader check-tokenizer check-eog check-chat check-sampler
+  check-stream check-server-http check-tuning check-forge
+  check-graph-gpu check-dequant-gpu check-matvec-gpu check-nn-gpu check-rope-gpu
+  check-matmul-gpu check-batch-gpu check-mtp-gpu check-regression-gpu
+  check-kvctx-gpu rdna4-infer oracle-next-token oracle-tokenize)
+
+# ccache: configured near the top of this file (CXX only); nothing to do here.

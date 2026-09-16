@@ -2,7 +2,11 @@
 # M5 quality gate: perplexity of this engine vs llama.cpp's model on the *same*
 # sequences.
 #
-#   ./scripts/compare_ppl.sh [MODEL] [CHUNKS] [CORPUS]
+#   ./scripts/compare_ppl.sh [MODEL] [CHUNKS] [CORPUS] [--quick]
+#
+# QUICK=1 in the env (or a --quick argument anywhere) runs 3 windows instead
+# of 10: a fast smoke version of the same gate (same windows 0..2, same
+# comparison table). An explicit CHUNKS argument still wins over --quick.
 #
 # Why not compare against `llama-perplexity`'s own number: its strided mode resets
 # the cache per chunk but its per-chunk value does not correspond to a fresh
@@ -18,8 +22,11 @@
 #   - window = ctx + stride/2 tokens, scored positions [window - stride - 1, window - 1),
 #     exactly the tiling `llama-perplexity --ppl-stride` uses;
 #   - this engine scores every window in one process (`ppl --nll-out`);
-#   - the reference is driven per window with tests/oracle_next_token.cpp's
-#     ORACLE_NLL_OUT mode (one token at a time, logits at every step);
+#   - the reference is driven over the same windows with
+#     tests/oracle_next_token.cpp's ORACLE_NLL_OUT mode (one token at a time,
+#     logits at every step), loading the 12GB model ONCE via its --nll-batch
+#     mode (one process scores every window file in-process); binaries that
+#     predate the flag fall back to one run per window;
 #   - per chunk: mean NLL and PPL on both sides, plus the largest per-position
 #     difference.
 set -u
@@ -37,9 +44,24 @@ fi
 BIN="${BIN:-$ROOT/build/rdna4-infer}"
 ORACLE="${ORACLE:-$ROOT/build/oracle-next-token}"
 TOKORACLE="${TOKORACLE:-$ROOT/build/oracle-tokenize}"
-MODEL="${1:-/mnt/raid0/GGUF/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_S.gguf}"
-CHUNKS="${2:-10}"
-CORPUS="${3:-$ROOT/reference/data/wikitext-2-raw/wiki.test.raw}"
+MODEL=""
+CHUNKS=""
+CORPUS=""
+QUICK="${QUICK:-0}"
+for a in "$@"; do
+  case "$a" in
+    --quick) QUICK=1 ;;
+    *) if [ -z "$MODEL" ]; then MODEL="$a";
+       elif [ -z "$CHUNKS" ]; then CHUNKS="$a";
+       elif [ -z "$CORPUS" ]; then CORPUS="$a";
+       else echo "unexpected argument: $a" >&2; exit 2; fi ;;
+  esac
+done
+[ -n "$MODEL" ] || MODEL="/mnt/raid0/GGUF/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_S.gguf"
+if [ -z "$CHUNKS" ]; then
+  if [ "$QUICK" = 1 ]; then CHUNKS=3; else CHUNKS=10; fi
+fi
+[ -n "$CORPUS" ] || CORPUS="$ROOT/reference/data/wikitext-2-raw/wiki.test.raw"
 CTX="${CTX:-512}"
 STRIDE="${STRIDE:-512}"
 # KV cache types for THIS engine (frente KV). The llama.cpp reference below runs
@@ -71,6 +93,7 @@ if first is not None and first < n - 4:
     sys.exit(1)
 PY
 
+if [ "$QUICK" = 1 ]; then echo "== quick mode: 3 chunks"; fi
 echo "== this engine: $CHUNKS chunks of ctx $CTX / stride $STRIDE, KV k=$KV_K v=$KV_V"
 "$BIN" ppl -m "$MODEL" -f "$CORPUS" --ctx-size "$CTX" --stride "$STRIDE" --chunks "$CHUNKS" \
        --cache-type-k "$KV_K" --cache-type-v "$KV_V" \
@@ -92,15 +115,42 @@ for c in range(chunks):
 print(f"   windows written: {min(chunks, (len(ids) - window)//stride + 1)} of {window} tokens")
 PY
 
-echo "== reference model (llama.cpp, ngl $ORACLE_NGL): one run per window"
+echo "== reference model (llama.cpp, ngl $ORACLE_NGL): scoring windows with one model load"
+# Batch mode (--nll-batch: one 12GB load, every window scored in-process) when
+# the binary supports it. The probe needs no model or GPU (the binary prints
+# batch usage before any backend init); older binaries fall back to one run
+# per window. Either way each chunk ends with "$TMP/ref_$c.log" whose last
+# line is the historical "nll written to ..." line.
+: > "$TMP/winlist.txt"
 for c in $(seq 0 $((CHUNKS - 1))); do
   [ -f "$TMP/win$c.ids" ] || break
-  # shellcheck disable=SC2046
-  ORACLE_NGL="$ORACLE_NGL" ORACLE_NLL_OUT="$TMP/ref_nll_$c.txt" \
-    "$ORACLE" "$MODEL" $(cat "$TMP/win$c.ids") > "$TMP/ref_$c.log" 2>&1 || {
-      echo "   oracle failed on chunk $c (see $TMP/ref_$c.log)"; exit 1; }
-  printf "   chunk %s: %s\n" "$c" "$(tail -1 "$TMP/ref_$c.log")"
+  echo "$TMP/win$c.ids" >> "$TMP/winlist.txt"
 done
+NWINS="$(wc -l < "$TMP/winlist.txt" | tr -d ' ')"
+if [ "$NWINS" -gt 0 ] && "$ORACLE" x --nll-batch 2>&1 | grep -qi "nll-batch"; then
+  ORACLE_NGL="$ORACLE_NGL" "$ORACLE" "$MODEL" --nll-batch "$TMP/winlist.txt" "$TMP" \
+    > "$TMP/ref_batch.log" 2>&1 || {
+      echo "   oracle batch run failed (see $TMP/ref_batch.log)"; exit 1; }
+  c=0
+  while [ "$c" -lt "$NWINS" ]; do
+    grep -F "ref_nll_${c}.txt" "$TMP/ref_batch.log" 2>/dev/null | tail -1 > "$TMP/ref_${c}.log" || true
+    [ -s "$TMP/ref_${c}.log" ] || echo "oracle batch: no log line for chunk $c" > "$TMP/ref_${c}.log"
+    [ -f "$TMP/ref_nll_${c}.txt" ] || {
+      echo "   oracle failed on chunk $c (see $TMP/ref_batch.log)"; exit 1; }
+    printf "   chunk %s: %s\n" "$c" "$(tail -1 "$TMP/ref_$c.log")"
+    c=$((c + 1))
+  done
+else
+  echo "   (oracle predates --nll-batch: one run per window)"
+  for c in $(seq 0 $((CHUNKS - 1))); do
+    [ -f "$TMP/win$c.ids" ] || break
+    # shellcheck disable=SC2046
+    ORACLE_NGL="$ORACLE_NGL" ORACLE_NLL_OUT="$TMP/ref_nll_$c.txt" \
+      "$ORACLE" "$MODEL" $(cat "$TMP/win$c.ids") > "$TMP/ref_$c.log" 2>&1 || {
+        echo "   oracle failed on chunk $c (see $TMP/ref_$c.log)"; exit 1; }
+    printf "   chunk %s: %s\n" "$c" "$(tail -1 "$TMP/ref_$c.log")"
+  done
+fi
 
 python3 - "$TMP" "$CHUNKS" "$CTX" "$STRIDE" <<'PY'
 import math, sys, os

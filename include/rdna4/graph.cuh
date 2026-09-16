@@ -84,6 +84,11 @@ class Graph {
   // default and Q4_0 is what makes a 64K+ context fit the 16 GB budget.
   bool init(int max_ctx, KvType kv_k, KvType kv_v, std::string &err);
   bool init(int max_ctx, std::string &err) { return init(max_ctx, KvType::F32, KvType::F32, err); }
+  // Troca o tipo de KV reutilizando TUDO o mais (pesos, buffers, ctx): libera e
+  // realoca SOMENTE os caches K/V. Existe para o `--pairs` do check-batch-gpu
+  // percorrer varios pares (K,V) num unico processo com um unico upload dos
+  // pesos (~11 GiB); so' pode ser chamado depois de init().
+  bool reinit_kv(KvType kv_k, KvType kv_v, std::string &err);
 
   // Validation hook: llama.cpp's eval callback names every graph node the same
   // way, so a test can compare each intermediate against the oracle dump. The
@@ -763,6 +768,42 @@ inline bool Graph::init(int max_ctx, KvType kv_k, KvType kv_v, std::string &err)
     err = "hipMalloc failed (q8 scratch)";
     return false;
   }
+  return true;
+}
+
+// Ve' o comentario na declaracao: troca o tipo de KV sem reenviar os pesos.
+// Aloca os novos caches ANTES de liberar os antigos, para um OOM nao deixar o
+// grafo sem cache nenhum. Nada mais depende do tipo de KV no init (o staging
+// d_kstage_/d_vstage_ e' f32, o scratch de atencao parcial e' por (token,head,
+// split) e `attn_splits_for` le kv_k_/kv_v_ em tempo de execucao), entao trocar
+// os dois buffers + os tres campos e' a re-inicializacao completa.
+inline bool Graph::reinit_kv(KvType kv_k, KvType kv_v, std::string &err) {
+  if (max_ctx_ <= 0 || w_.empty()) {
+    err = "reinit_kv before init";
+    return false;
+  }
+  const int HD = head_dim(), NKV = n_head_kv();
+  const int n_attn = n_layer() - count_recr();
+  const std::size_t kv_k_bytes =
+      (std::size_t)max_ctx_ * NKV * (std::size_t)kv_row_bytes(kv_k, HD);
+  const std::size_t kv_v_bytes =
+      (std::size_t)max_ctx_ * NKV * (std::size_t)kv_row_bytes(kv_v, HD);
+  void *nk = nullptr, *nv = nullptr;
+  if (hipMalloc(&nk, (std::size_t)n_attn * kv_k_bytes) != hipSuccess ||
+      hipMalloc(&nv, (std::size_t)n_attn * kv_v_bytes) != hipSuccess) {
+    if (nk) (void)hipFree(nk);
+    if (nv) (void)hipFree(nv);
+    err = "hipMalloc failed (kv cache)";
+    return false;
+  }
+  if (d_k_) (void)hipFree(d_k_);
+  if (d_v_) (void)hipFree(d_v_);
+  d_k_ = nk;
+  d_v_ = nv;
+  kv_k_ = kv_k;
+  kv_v_ = kv_v;
+  kv_bytes_ = kv_k_bytes;
+  kv_bytes_v_ = kv_v_bytes;
   return true;
 }
 

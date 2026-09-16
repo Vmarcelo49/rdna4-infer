@@ -30,8 +30,21 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 # 1. this engine, greedy, verbose (stderr carries the prompt ids)
-"$BIN" run -m "$MODEL" -p "$PROMPT" -n "$N" --greedy -v >"$TMP/rdna4.txt" 2>"$TMP/rdna4.err" ||
-  { echo "rdna4 run failed" >&2; exit 1; }
+# GOLDEN_REUSE_TXT/_ERR: optional fast path. check_golden_run.sh's G1 case runs
+# byte-for-byte the same command (same PROMPT, same --greedy -v, same N); when
+# the caller sets both vars to G1's output files AND GOLDEN_REUSE_N/PROMPT match
+# this run's N/PROMPT, the engine load is skipped (saves one ~12GB load). The
+# oracle side below always runs — the cross-engine comparison is the point.
+if [ -n "${GOLDEN_REUSE_TXT:-}" ] && [ -n "${GOLDEN_REUSE_ERR:-}" ] \
+   && [ -f "$GOLDEN_REUSE_TXT" ] && [ -f "$GOLDEN_REUSE_ERR" ] \
+   && [ "${GOLDEN_REUSE_N:-}" = "$N" ] && [ "${GOLDEN_REUSE_PROMPT:-}" = "$PROMPT" ]; then
+  echo "reusing golden-run G1 output (skipping 1 engine load)"
+  cp "$GOLDEN_REUSE_TXT" "$TMP/rdna4.txt"
+  cp "$GOLDEN_REUSE_ERR" "$TMP/rdna4.err"
+else
+  "$BIN" run -m "$MODEL" -p "$PROMPT" -n "$N" --greedy -v >"$TMP/rdna4.txt" 2>"$TMP/rdna4.err" ||
+    { echo "rdna4 run failed" >&2; exit 1; }
+fi
 grep '^prompt ids:' "$TMP/rdna4.err" | sed 's/^prompt ids://' >"$TMP/prompt.ids"
 grep '^generated ids:' "$TMP/rdna4.err" | sed 's/^generated ids://' >"$TMP/rdna4.ids"
 echo "prompt ids:$(cat "$TMP/prompt.ids")"

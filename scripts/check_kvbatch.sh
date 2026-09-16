@@ -9,43 +9,80 @@
 #   K=q8_0/V=q4_1 -> 27,5 MB alem do fim  => passava CORROMPENDO memoria alheia
 # O gate antigo (check-batch-gpu) cravava F16/F16, entao nenhum dos tres tinha cobertura.
 #
-# Este script roda o gate por PAR de tipos de KV. Cada invocacao constroi um Graph
-# (uma copia dos pesos), entao a lista e' curta de proposito: os tres pares que
-# quebravam, os dois de controle (linhas iguais) e o default.
+# Este script roda o gate por PAR de tipos de KV. Se o binario aceitar --pairs, ha'
+# UMA UNICA invocacao (um unico upload de ~11 GiB dos pesos, com o cache K/V
+# realocado por par via Graph::reinit_kv); senao, uma invocacao por par (legado).
 #
-# uso: ./scripts/check_kvbatch.sh [modelo.gguf]
+# uso: ./scripts/check_kvbatch.sh [modelo.gguf] [--quick]
+#      QUICK=1 ./scripts/check_kvbatch.sh [modelo.gguf]   (equivale a --quick)
+# QUICK=1 (env ou flag): roda so' 2 pares (f16:f16 controle + q5_0:q4_1, o par que
+# deu page fault) com BATCH_QUICK=1 no binario (pula o caso longo n=cap, por-tipo
+# reduzido a 3 dtypes).
 set -u
 cd "$(dirname "$0")/.."
-MODEL="${1:-/mnt/raid0/GGUF/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_S.gguf}"
-PARES="f16:f16 q5_0:q5_0 f16:q4_1 q5_0:q4_1 q8_0:q4_1"
-falhas=0
-for par in $PARES; do
-  K="${par%%:*}"; V="${par##*:}"
-  printf '%-28s ' "KV K=$K V=$V"
-  out=$(./scripts/gpu-lock.sh timeout 900 ./build/check-batch-gpu "$MODEL" 2 4 16 \
-          --kv-k "$K" --kv-v "$V" 2>&1)
-  rc=$?
-  if [ $rc -ne 0 ]; then
-    echo "FALHA (rc=$rc)"; echo "$out" | tail -4; falhas=$((falhas+1)); continue
-  fi
+MODEL="/mnt/raid0/GGUF/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_S.gguf"
+QUICK="${QUICK:-0}"
+for arg in "$@"; do
+  case "$arg" in
+    --quick) QUICK=1 ;;
+    -h|--help) echo "uso: $0 [modelo.gguf] [--quick]  (ou QUICK=1 $0 [modelo.gguf])"; exit 0 ;;
+    *) MODEL="$arg" ;;
+  esac
+done
+if [ "$QUICK" = "1" ]; then
+  PARES="f16:f16 q5_0:q4_1"
+  export BATCH_QUICK=1
+else
+  PARES="f16:f16 q5_0:q5_0 f16:q4_1 q5_0:q4_1 q8_0:q4_1"
+fi
+# Checagem de UM output do binario (identica nos dois caminhos abaixo): o gate
+# imprime `rel-L2 0.000e+00 ... BIT-EXACT` por caso. A checagem tem de ser "toda
+# linha que fala de rel-L2 carrega 0.000e+00" -- a versao anterior usava
+# `grep -E "rel-L2 [^0]"` e casava com o CABECALHO da tabela
+# (`rel-L2     max|d|`), reprovando os 5 pares por engano.
+checar_saida() { # $1 = output, $2 = rotulo
+  local out="$1" rotulo="$2" ruins
   if ! echo "$out" | grep -q "^check-batch-gpu: OK"; then
-    echo "FALHA (sem OK)"; echo "$out" | tail -4; falhas=$((falhas+1)); continue
+    echo "$rotulo FALHA (sem OK)"; echo "$out" | tail -4; return 1
   fi
-  # Bit-exatidao: o gate imprime `rel-L2 0.000e+00 ... BIT-EXACT` por caso. A checagem
-  # tem de ser "toda linha que fala de rel-L2 carrega 0.000e+00" -- a versao anterior
-  # usava `grep -E "rel-L2 [^0]"` e casava com o CABECALHO da tabela
-  # (`rel-L2     max|d|`), reprovando os 5 pares por engano.
   ruins=$(echo "$out" | grep "rel-L2" | grep -v "0.000e+00" | grep -v "max|d|" | head -3)
   if [ -n "$ruins" ]; then
-    echo "FALHA (nao bit-exato)"; echo "$ruins"; falhas=$((falhas+1)); continue
+    echo "$rotulo FALHA (nao bit-exato)"; echo "$ruins"; return 1
   fi
   if ! echo "$out" | grep -q "BIT-EXACT"; then
-    echo "FALHA (sem BIT-EXACT)"; falhas=$((falhas+1)); continue
+    echo "$rotulo FALHA (sem BIT-EXACT)"; return 1
   fi
-  echo "OK"
-done
+  echo "$rotulo OK"
+  return 0
+}
+falhas=0
+if ./build/check-batch-gpu 2>&1 | grep -q -- --pairs; then
+  # Caminho rapido: uma invocacao com todos os pares (um upload dos pesos).
+  lista_pairs=$(echo "$PARES" | tr ' ' ',')
+  printf '%-28s ' "KV pares=$PARES"
+  out=$(./scripts/gpu-lock.sh timeout 900 ./build/check-batch-gpu "$MODEL" 2 4 16 \
+          --pairs "$lista_pairs" 2>&1)
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "FALHA (rc=$rc)"; echo "$out" | tail -4; falhas=$((falhas+1))
+  elif ! checar_saida "$out" ""; then
+    falhas=$((falhas+1))
+  fi
+else
+  for par in $PARES; do
+    K="${par%%:*}"; V="${par##*:}"
+    printf '%-28s ' "KV K=$K V=$V"
+    out=$(./scripts/gpu-lock.sh timeout 900 ./build/check-batch-gpu "$MODEL" 2 4 16 \
+            --kv-k "$K" --kv-v "$V" 2>&1)
+    rc=$?
+    if [ $rc -ne 0 ]; then
+      echo "FALHA (rc=$rc)"; echo "$out" | tail -4; falhas=$((falhas+1)); continue
+    fi
+    if ! checar_saida "$out" ""; then falhas=$((falhas+1)); continue; fi
+  done
+fi
 if [ $falhas -ne 0 ]; then
-  echo "check_kvbatch: FALHA em $falhas de $(echo $PARES | wc -w) pares"
+  echo "check_kvbatch: FALHA em $falhas etapa(s) ($(echo $PARES | wc -w) pares)"
   exit 1
 fi
 echo "check_kvbatch: OK ($(echo $PARES | wc -w) pares de KV, todos bit-exatos no caminho em lote)"

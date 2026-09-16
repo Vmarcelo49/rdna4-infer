@@ -16,16 +16,17 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 
 namespace {
-// 32 tokens (> kAttnWarpsPerBlock = 8) so every query has to walk several keys
-// per warp and the cross-warp merge is exercised with 8 non-empty slices, plus a
-// tail that is not a multiple of the warp count (32 % 8 == 0, but t = 13, 21, 29
-// inside the loop are not).
-constexpr int kTokens = 32;
+// 16 tokens (> kAttnWarpsPerBlock = 8) so every query has to walk several keys
+// per warp and the cross-warp merge is still exercised with 8 non-empty slices
+// (16 % 8 == 0, but t = 5, 13 inside the loop are not). Was 32; 16 halves the
+// O(t^2) CPU reference and the per-token launches without losing that cover.
+constexpr int kTokens = 16;
 constexpr int kHeadDim = 256;
 constexpr int kHead = 24;
 constexpr int kHeadKv = 4;
@@ -136,7 +137,9 @@ int main() {
     hipMemcpy(d_q, q.data(), nq * sizeof(float), hipMemcpyHostToDevice);
     hipMemcpy(d_k, k.data(), nkv * sizeof(float), hipMemcpyHostToDevice);
     hipMemcpy(d_v, v.data(), nkv * sizeof(float), hipMemcpyHostToDevice);
-    // one launch per query token, against the cache rows 0..t
+    // one launch per query token, against the cache rows 0..t; a single fused
+    // D2H at the end (the per-token blocking memcpys made this loop pay 32
+    // round trips — the launches are ordered, so one copy syncs them all)
     std::vector<float> got(nq, 0.0f);
     bool ok = true;
     for (int t = 0; t < kTokens; ++t) {
@@ -145,10 +148,8 @@ int main() {
       ok = ok && rdna4::attn_launch(d_q + (std::int64_t)t * kHead * kHeadDim, d_k, d_v,
                                     d_o + (std::int64_t)t * kHead * kHeadDim, t, kHead, kHeadKv,
                                     kHeadDim, scale, rdna4::KvType::F32, rdna4::KvType::F32);
-      hipMemcpy(got.data() + (std::int64_t)t * kHead * kHeadDim,
-                d_o + (std::int64_t)t * kHead * kHeadDim,
-                (std::size_t)kHead * kHeadDim * sizeof(float), hipMemcpyDeviceToHost);
     }
+    hipMemcpy(got.data(), d_o, (std::size_t)nq * sizeof(float), hipMemcpyDeviceToHost);
     const double rel = rel_l2(ref, got);
     std::printf("attn (causal) rel-L2=%.3e  %s\n", rel, (ok && rel < 1e-5) ? "OK" : "MISMATCH");
 
@@ -180,10 +181,20 @@ int main() {
       // dequantize_row_q5_0 / dequantize_row_q4_1) and NOT from the kernels, and
       // the attention check right after proves that the shipping kernel returns
       // exactly what those bytes decode to, at every offset of the row.
-      const rdna4::KvType types[] = {rdna4::KvType::F32,  rdna4::KvType::F16,
-                                     rdna4::KvType::Q8_0, rdna4::KvType::Q4_0,
-                                     rdna4::KvType::Q5_0, rdna4::KvType::Q4_1};
-      for (rdna4::KvType ty : types) {
+      // ROPE_QUICK=1 trims the sweep to Q4_1+Q8_0 (the affine format + the
+      // symmetric-format anchor); default (env unset) still runs all 6.
+      const char *rope_quick_env = std::getenv("ROPE_QUICK");
+      const bool rope_quick =
+          rope_quick_env != nullptr && std::string(rope_quick_env) == "1";
+      const rdna4::KvType types_all[] = {rdna4::KvType::F32,  rdna4::KvType::F16,
+                                         rdna4::KvType::Q8_0, rdna4::KvType::Q4_0,
+                                         rdna4::KvType::Q5_0, rdna4::KvType::Q4_1};
+      const rdna4::KvType types_quick[] = {rdna4::KvType::Q4_1, rdna4::KvType::Q8_0};
+      const rdna4::KvType *types = rope_quick ? types_quick : types_all;
+      const int n_types = rope_quick ? 2 : 6;
+      if (rope_quick) std::printf("kv sweep: ROPE_QUICK=1 (Q4_1+Q8_0 only)\n");
+      for (int tyi = 0; tyi < n_types; ++tyi) {
+        const rdna4::KvType ty = types[tyi];
         const std::uint64_t row = rdna4::kv_row_bytes(ty, kHeadDim);
         std::vector<std::uint8_t> kcache((std::size_t)kHeadKv * row, 0);
         std::vector<std::uint8_t> vcache((std::size_t)kHeadKv * row, 0);

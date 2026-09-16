@@ -206,8 +206,20 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "usage: check-mtp-gpu <model.gguf> [n_tokens] [draft]\n");
     return 2;
   }
-  const int n_tokens = argc > 2 ? std::atoi(argv[2]) : 32;
+  const int n_tokens_arg = argc > 2 ? std::atoi(argv[2]) : 32;
   const int draft_n = argc > 3 ? std::atoi(argv[3]) : 3;
+  // MTP_QUICK=1: fast iteration mode (check_all.sh --quick). Cuts the ~12-14 x
+  // N-token generations down to ~5-6 x 16-token ones: caps n_tokens, keeps only
+  // the D=3 arms, and skips the timing-only cost block. Default (unset) path is
+  // unchanged.
+  const char *quick_env = std::getenv("MTP_QUICK");
+  const bool quick = quick_env && std::strcmp(quick_env, "1") == 0;
+  int n_tokens = n_tokens_arg;
+  if (quick && n_tokens > 16) n_tokens = 16;
+  if (quick) {
+    std::printf("   MTP_QUICK=1: n_tokens %d -> %d, D-loops to {3} only, cost block skipped\n",
+                n_tokens_arg, n_tokens);
+  }
 
   rdna4::GgufLoader loader;
   std::string err;
@@ -532,7 +544,15 @@ int main(int argc, char **argv) {
     return true;
   };
   long long acc_eh = 0, tot_eh = 0, acc_he = 0, tot_he = 0;
-  if (!score_acceptance(true, &acc_eh, &tot_eh) || !score_acceptance(false, &acc_he, &tot_he)) {
+  if (!score_acceptance(true, &acc_eh, &tot_eh)) {
+    std::fprintf(stderr, "concat-order runs: %s\n", err.c_str());
+    return 1;
+  }
+  if (quick) {
+    // Order is settled (llama.cpp [e;h] wins by ~97pp on real text): skip the
+    // [h;e] arm in quick mode, saving one full scored generation.
+    std::printf("   MTP_QUICK=1: skipping the [h;e] arm (order settled: llama.cpp [e;h])\n");
+  } else if (!score_acceptance(false, &acc_he, &tot_he)) {
     std::fprintf(stderr, "concat-order runs: %s\n", err.c_str());
     return 1;
   }
@@ -587,8 +607,10 @@ int main(int argc, char **argv) {
               s_score.acceptance() * 100.0, s_score.drafted);
 
   // a per-draft-length view of the same measurement (the rate is per draft token,
-  // so it should be roughly flat in D while accepted-per-round grows)
-  for (int D : {1, 2, 4}) {
+  // so it should be roughly flat in D while accepted-per-round grows).
+  // MTP_QUICK=1 keeps only the D=3 arm (the production draft length).
+  const std::vector<int> d_spec = quick ? std::vector<int>{3} : std::vector<int>{1, 2, 4};
+  for (int D : d_spec) {
     rdna4::MtpGenStats st;
     std::vector<std::int32_t> ids;
     if (!run(true, false, D, st, ids)) {
@@ -612,7 +634,10 @@ int main(int argc, char **argv) {
   // loop ends on — must match bit for bit, not "closely".
   {
     std::printf("== batched verification vs serial (feat/noite-mtp) ==\n");
-    for (int D : {1, 2, 3}) {
+    // MTP_QUICK=1 keeps only the D=3 arm (it is the one that exercises the
+    // rollback path assertions below).
+    const std::vector<int> d_both = quick ? std::vector<int>{3} : std::vector<int>{1, 2, 3};
+    for (int D : d_both) {
       rdna4::MtpGenStats s_b, s_s;
       std::vector<std::int32_t> ids_b, ids_s;
       if (!run(true, false, D, s_b, ids_b, /*batch_verify=*/true)) {
@@ -793,7 +818,12 @@ int main(int argc, char **argv) {
   // host-side queueing. These two measure the block itself: 24 steps back to
   // back (throughput) and the same with a sync after each one (latency, which is
   // what the loop actually pays because it reads the drafted token back).
-  {
+  // MTP_QUICK=1 skips this whole block: it is timing-only (3x24 draft steps +
+  // batched-forward timings) and its two throughput ok()s need those timings to
+  // mean anything, so they are skipped with it behind the same env.
+  if (quick) {
+    std::printf("== draft step cost: SKIPPED in MTP_QUICK mode (timing-only block) ==\n");
+  } else {
     const int n_rep = 24;
     int p0 = (int)prompt.size();
     auto sync = [] { (void)hipDeviceSynchronize(); };
@@ -920,7 +950,7 @@ int main(int argc, char **argv) {
                 row_marginal, ms_token);
     ok(row_marginal < ms_token,
        "an extra verified row costs less than an extra per-token forward");
-  }
+  }  // end cost block (skipped wholesale under MTP_QUICK=1)
 
   std::printf("%s (%d failure%s)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail, g_fail == 1 ? "" : "s");
   return g_fail == 0 ? 0 : 1;

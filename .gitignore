@@ -5,6 +5,12 @@ __pycache__/
 compile_commands.json
 .cache/
 
+# golden-run G1 reuse files published for compare_llama_greedy.sh
+# (scripts/check_all.sh deletes them before each phase-B run)
+.tmp-golden-g1.out
+.tmp-golden-g1.err
+.tmp-golden-g1.ids
+
 # llama-eval-callback activation dumps (regenerate: scripts/capture_oracle.sh)
 reference/
 reference

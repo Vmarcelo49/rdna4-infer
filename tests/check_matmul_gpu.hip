@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -53,16 +54,24 @@ struct Timing {
 // state when idle (SCLK 9-16 MHz), and the first type measured in a process
 // otherwise reports a clock-ramp number instead of a kernel number (M2 "Passo 5";
 // re-confirmed in M6 when the very first case came out 15x too slow).
+// MATMUL_QUICK=1 trims the slow paths of this tool; with the variable unset
+// the default path below is unchanged.
+inline bool matmul_quick() {
+  const char *q = std::getenv("MATMUL_QUICK");
+  return q && q[0] == '1' && q[1] == '\0';
+}
+
 Timing timeit(const std::function<void()> &fn, int reps) {
   // Sync inside the warm-up loop: without it the command queue absorbs thousands
   // of iterations and the wall clock measures launch throughput instead of GPU
   // time. That mistake queued ~20 minutes of GPU work in the first M6 run.
+  const double warmup_ms = matmul_quick() ? 100.0 : 300.0;
   const auto w0 = std::chrono::steady_clock::now();
   do {
     fn();
     hipDeviceSynchronize();
   } while (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count() <
-           300.0);
+           warmup_ms);
   const auto t0 = std::chrono::steady_clock::now();
   for (int i = 0; i < reps; ++i) fn();
   hipDeviceSynchronize();
@@ -88,6 +97,15 @@ int main(int argc, char **argv) {
   std::vector<int> ns;
   for (int i = 2; i < argc; ++i) ns.push_back(std::atoi(argv[i]));
   if (ns.empty()) ns = {1, 2, 4, 8, 16};
+  const bool quick = matmul_quick();
+  if (quick) {
+    // Fast path: argv is still parsed normally, then filtered to the
+    // decode-dominant Ns only.
+    std::vector<int> filt;
+    for (int n : ns)
+      if (n == 1 || n == 4) filt.push_back(n);
+    ns = filt.empty() ? std::vector<int>{1, 4} : filt;
+  }
 
   rdna4::GgufLoader loader;
   std::string err;
@@ -112,6 +130,8 @@ int main(int argc, char **argv) {
                           DType::Q8_0,    DType::IQ4_NL};
   int failures = 0;
   for (const DType want : kTypes) {
+    // MATMUL_QUICK=1: only the decode-dominant types (subset of kTypes above).
+    if (quick && want != DType::IQ3_S && want != DType::IQ4_XS && want != DType::Q4_K) continue;
     // ALL tensors of that type with the same shape, so the timed loop streams more
     // than the L2 (64 MB on this part): timing one small tensor would let it live
     // in L2 across iterations and hide the DRAM traffic batching is meant to save.
@@ -126,7 +146,10 @@ int main(int argc, char **argv) {
         want_rows = t.dims[1];
       }
       if (t.dims[0] == want_cols && t.dims[1] == want_rows) idxs.push_back(i);
-      if (idxs.size() >= 16) break;
+      // MATMUL_QUICK=1: one tensor per type. L2-resident caveat: a single small
+      // tensor can live in L2 across iterations and hide the DRAM traffic that
+      // batching is meant to save, so quick-mode GB/s numbers read optimistic.
+      if (idxs.size() >= (quick ? 1u : 16u)) break;
     }
     if (idxs.empty()) {
       std::printf("%-9s (absent from this file)\n", rdna4::dtype_name(want));
@@ -183,6 +206,25 @@ int main(int argc, char **argv) {
                 nrows, human_bytes(wbytes).c_str());
     for (int n : ns) {
       if (n > rdna4::matvec_batch_cap()) continue;
+      // MATMUL_QUICK=1: bit-exact memcmp only at max N; smaller Ns only time.
+      const bool need_check = !quick || n == ns.back();
+      bool bitexact = true;
+      std::size_t exact = 0, total = 0;
+      double maxd = 0.0;
+      bool launched = true;
+      if (!need_check) {
+        // Still confirm the batched launch exists so the timing below is real
+        // (N=1 needs no launch: it is a device-to-device copy).
+        if (n != 1) {
+          launched = rdna4::matvec_launch_batch((int)want, ws.back(), d_act_q, d_bat, nrows,
+                                                ncols, act_blocks, n, nullptr);
+          hipDeviceSynchronize();
+        }
+        if (!launched) {
+          std::printf("  N=%-2d batched launch unsupported\n", n);
+          continue;
+        }
+      } else {
       // ---- correctness: batched vs N separate GEMV calls -------------------
       for (void *d_w : ws) {
         for (int t = 0; t < n; ++t) {
@@ -195,7 +237,6 @@ int main(int argc, char **argv) {
       }
       const void *d_w = ws[0];  // the comparison below uses the last written tensor
       hipDeviceSynchronize();
-      bool launched = true;
       if (n == 1) {
         hipMemcpy(d_bat, d_ref, (std::size_t)nrows * sizeof(float), hipMemcpyDeviceToDevice);
       } else {
@@ -210,16 +251,16 @@ int main(int argc, char **argv) {
       std::vector<float> ref((std::size_t)n * nrows), bat((std::size_t)n * nrows);
       hipMemcpy(ref.data(), d_ref, ref.size() * sizeof(float), hipMemcpyDeviceToHost);
       hipMemcpy(bat.data(), d_bat, bat.size() * sizeof(float), hipMemcpyDeviceToHost);
-      std::size_t exact = 0;
-      double maxd = 0.0;
       for (std::size_t i = 0; i < ref.size(); ++i) {
         if (ref[i] == bat[i]) ++exact;
         maxd = std::max(maxd, (double)std::fabs((double)ref[i] - (double)bat[i]));
       }
-      const bool bitexact = exact == ref.size();
+      total = ref.size();
+      bitexact = exact == ref.size();
+      }  // need_check
 
       // ---- timing ---------------------------------------------------------
-      const int reps = 20;
+      const int reps = quick ? 5 : 20;
       const Timing tg = timeit(
           [&] {
             for (void *d_w : ws) {
@@ -245,10 +286,10 @@ int main(int argc, char **argv) {
                   "(%6.1f tok/s, %6.1f GB/s) | %s speedup %.2fx\n",
                   n, tg.ms, gemv_tps, wgib * n / (tg.ms / 1000.0), tb.ms, bat_tps,
                   wgib / (tb.ms / 1000.0), bitexact ? "BIT-EXACT" : "MISMATCH", bat_tps / gemv_tps);
-      if (!bitexact) {
+      if (need_check && !bitexact) {
         std::fprintf(stderr, "  FAIL: N=%d batched output differs from N GEMV calls "
                              "(exact %zu/%zu, max|d|=%.3e)\n",
-                     n, exact, ref.size(), maxd);
+                     n, exact, total, maxd);
         ++failures;
       }
       if (n > 1 && bat_tps < gemv_tps) {

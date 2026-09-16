@@ -29,24 +29,295 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <numeric>
+#include <sstream>
 #include <string>
 #include <vector>
 
+// ---- M5: per-token NLL (the perplexity building block) ----------------------
+// Score one window of tokens, writing one line per predicted token to nll_path:
+//   <global index> <nll> <token id>
+// The sequence is decoded one token at a time with logits requested at every
+// step. A fresh context is created per call so scoring N windows in one
+// process (the --nll-batch mode below) is bit-identical to N separate
+// one-window processes: no KV state leaks across windows. Prints the same
+// "nll written to ..." line the historical single-window path printed.
+static int score_nll_window(llama_model *model, int n_vocab,
+                            const std::vector<llama_token> &tokens, std::size_t off,
+                            const char *nll_path) {
+  FILE *f = std::fopen(nll_path, "w");
+  if (!f) {
+    std::fprintf(stderr, "cannot write %s\n", nll_path);
+    return 1;
+  }
+  if (off >= tokens.size()) {
+    std::fprintf(stderr, "nll: offset %zu beyond the %zu tokens\n", off, tokens.size());
+    std::fclose(f);
+    return 1;
+  }
+  // Own context: the sequence to score can be longer than the default 512.
+  llama_context_params cp = llama_context_default_params();
+  cp.n_ctx = (uint32_t)(tokens.size() - off + 16);
+  cp.n_batch = cp.n_ctx;
+  cp.n_ubatch = cp.n_ctx;
+  cp.no_perf = true;
+  llama_context *ctx = llama_init_from_model(model, cp);
+  if (!ctx) {
+    std::fprintf(stderr, "nll: context failed\n");
+    std::fclose(f);
+    return 1;
+  }
+  const float *lg = nullptr;
+  int rc_out = 0;
+  for (std::size_t i = off; i < tokens.size(); ++i) {
+    llama_batch one = llama_batch_init(1, 0, 1);
+    one.n_tokens = 1;
+    one.token[0] = tokens[i];
+    one.pos[0] = (llama_pos)(i - off);
+    one.seq_id[0][0] = 0;
+    one.n_seq_id[0] = 1;
+    one.logits[0] = 1;
+    const int rc = llama_decode(ctx, one);
+    llama_batch_free(one);
+    if (rc != 0) {
+      std::fprintf(stderr, "nll: decode failed at %zu\n", i);
+      rc_out = 1;
+      break;
+    }
+    lg = llama_get_logits_ith(ctx, 0);
+    if (!lg) {
+      std::fprintf(stderr, "nll: no logits at %zu\n", i);
+      rc_out = 1;
+      break;
+    }
+    if (i + 1 >= tokens.size()) break;
+    const int target = tokens[i + 1];
+    float mx = lg[0];
+    for (int v = 1; v < n_vocab; ++v) mx = std::max(mx, lg[v]);
+    double sum = 0.0;
+    for (int v = 0; v < n_vocab; ++v) sum += std::exp((double)lg[v] - (double)mx);
+    const double nll = -(std::log(std::exp((double)lg[target] - (double)mx)) - std::log(sum));
+    std::fprintf(f, "%zu %.8f %d\n", i + 1, nll, target);
+  }
+  std::fclose(f);
+  if (rc_out == 0)
+    std::printf("nll written to %s from offset %zu (%zu tokens)\n", nll_path, off,
+                tokens.size() - off);
+  llama_free(ctx);
+  return rc_out;
+}
+
+static bool has_flag(int argc, char **argv, const char *flag) {
+  for (int i = 0; i < argc; ++i)
+    if (!std::strcmp(argv[i], flag)) return true;
+  return false;
+}
+
+static std::string trim_ws(const std::string &s) {
+  const char *ws = " \t\r\n";
+  const std::size_t a = s.find_first_not_of(ws);
+  if (a == std::string::npos) return "";
+  return s.substr(a, s.find_last_not_of(ws) - a + 1);
+}
+
+// Read one window file: whitespace-separated token ids (the format
+// compare_ppl.sh writes: space-joined ids on one line; newlines tolerated).
+static bool read_window_file(const std::string &path, std::vector<llama_token> &out) {
+  std::ifstream in(path);
+  if (!in) {
+    std::fprintf(stderr, "nll-batch: cannot read %s\n", path.c_str());
+    return false;
+  }
+  out.clear();
+  std::string tok;
+  while (in >> tok) out.push_back((llama_token)std::atoi(tok.c_str()));
+  if (out.empty()) {
+    std::fprintf(stderr, "nll-batch: no tokens in %s\n", path.c_str());
+    return false;
+  }
+  return true;
+}
+
+// Multi-window batch mode: load the model ONCE, then score each window file
+// in-process with score_nll_window (fresh context per window, so numerics
+// match one-process-per-window runs), writing <out-dir>/ref_nll_<c>.txt per
+// window, where <c> is the 0-based window order. Each window emits the same
+// "nll written to ..." stdout line the single-window mode emits, so callers
+// can grep one line per chunk.
+//
+// Accepted forms (all load the model once):
+//   oracle-next-token <model> --nll-batch <manifest> <out-dir>
+//     <manifest> lists one window file per line (blank lines / '#' comments
+//     skipped).
+//   oracle-next-token <model> --nll-batch <out-dir> <win0.ids> [win1.ids ...]
+//     window files given directly on the command line.
+//   oracle-next-token <model> --windows-from <dir>
+//     score every win*.ids file in <dir>, numerically ordered, into <dir>.
+//   ORACLE_NLL_BATCH=<win0,win1,...> ORACLE_NLL_BATCH_OUT=<out-dir>
+//     env form: comma-separated window files (ORACLE_NLL_OUT naming a
+//     directory is also accepted as the out dir).
+static int run_nll_batch(int argc, char **argv) {
+  std::vector<std::string> windows;
+  std::string out_dir;
+  const char *model_path = argc > 1 ? argv[1] : nullptr;
+
+  int batch_at = -1, from_at = -1;
+  for (int i = 0; i < argc; ++i) {
+    if (!std::strcmp(argv[i], "--nll-batch") && batch_at < 0) batch_at = i;
+    if (!std::strcmp(argv[i], "--windows-from") && from_at < 0) from_at = i;
+  }
+  if (from_at >= 0) {
+    if (from_at + 1 >= argc) {
+      std::fprintf(stderr, "usage: oracle-next-token <file.gguf> --windows-from <dir>\n");
+      return 2;
+    }
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::is_directory(argv[from_at + 1], ec)) {
+      std::fprintf(stderr, "nll-batch: not a directory: %s\n", argv[from_at + 1]);
+      return 1;
+    }
+    out_dir = argv[from_at + 1];
+    // Collect win*.ids, ordered by the numeric suffix (win0.ids, win1.ids...).
+    std::vector<std::pair<long, std::string>> found;
+    for (const auto &e : fs::directory_iterator(out_dir, ec)) {
+      const std::string name = e.path().filename().string();
+      if (name.size() > 7 && name.compare(0, 3, "win") == 0 &&
+          name.compare(name.size() - 4, 4, ".ids") == 0) {
+        char *end = nullptr;
+        const long n = std::strtol(name.c_str() + 3, &end, 10);
+        if (end && end != name.c_str() + 3) found.emplace_back(n, e.path().string());
+      }
+    }
+    if (ec || found.empty()) {
+      std::fprintf(stderr, "nll-batch: no win*.ids files in %s\n", out_dir.c_str());
+      return 1;
+    }
+    std::sort(found.begin(), found.end());
+    for (auto &p : found) windows.push_back(p.second);
+  } else if (batch_at >= 0) {
+    const int rest = argc - batch_at - 1;
+    if (rest < 2) {
+      std::fprintf(stderr,
+                   "usage: oracle-next-token <file.gguf> --nll-batch <manifest> <out-dir>\n"
+                   "   or: oracle-next-token <file.gguf> --nll-batch <out-dir> <win0.ids> [win1.ids ...]\n");
+      return 2;
+    }
+    if (rest == 2) {
+      // Spec-literal form: manifest file + out dir.
+      std::ifstream mf(argv[batch_at + 1]);
+      if (!mf) {
+        std::fprintf(stderr, "nll-batch: cannot read manifest %s\n", argv[batch_at + 1]);
+        return 1;
+      }
+      std::string line;
+      while (std::getline(mf, line)) {
+        line = trim_ws(line);
+        if (line.empty() || line[0] == '#') continue;
+        windows.push_back(line);
+      }
+      out_dir = argv[batch_at + 2];
+    } else {
+      out_dir = argv[batch_at + 1];
+      for (int i = batch_at + 2; i < argc; ++i) windows.push_back(argv[i]);
+    }
+    if (windows.empty()) {
+      std::fprintf(stderr, "nll-batch: no window files\n");
+      return 1;
+    }
+  } else {
+    // Env form: ORACLE_NLL_BATCH=<comma-separated window files>.
+    std::istringstream ss(getenv("ORACLE_NLL_BATCH"));
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+      item = trim_ws(item);
+      if (!item.empty()) windows.push_back(item);
+    }
+    if (windows.empty()) {
+      std::fprintf(stderr, "nll-batch: ORACLE_NLL_BATCH is empty\n");
+      return 1;
+    }
+    if (const char *o = std::getenv("ORACLE_NLL_BATCH_OUT"))
+      out_dir = o;
+    else if (const char *o = std::getenv("ORACLE_NLL_OUT"))
+      out_dir = o;
+    if (out_dir.empty()) {
+      std::fprintf(stderr, "nll-batch: set ORACLE_NLL_BATCH_OUT=<out-dir>\n");
+      return 1;
+    }
+  }
+
+  if (!model_path || !std::strcmp(model_path, "--nll-batch") ||
+      !std::strcmp(model_path, "--windows-from")) {
+    std::fprintf(stderr, "usage: oracle-next-token <file.gguf> --nll-batch <manifest> <out-dir>\n");
+    return 2;
+  }
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  fs::create_directories(out_dir, ec);
+  if (ec || !fs::is_directory(out_dir, ec)) {
+    std::fprintf(stderr, "nll-batch: cannot use out dir %s\n", out_dir.c_str());
+    return 1;
+  }
+
+  // Single model load for all windows (the 12GB-per-window cost this removes).
+  llama_backend_init();
+  const char *ngl = std::getenv("ORACLE_NGL");
+  llama_model_params mp = llama_model_default_params();
+  mp.n_gpu_layers = ngl ? std::atoi(ngl) : 0;
+  llama_model *model = llama_model_load_from_file(model_path, mp);
+  if (!model) {
+    std::fprintf(stderr, "nll: load failed\n");
+    return 1;
+  }
+  const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+  const char *off_env = std::getenv("ORACLE_NLL_OFFSET");
+  const std::size_t off = off_env ? (std::size_t)std::atoi(off_env) : 0;
+
+  int failed = 0;
+  std::vector<llama_token> tokens;
+  for (std::size_t c = 0; c < windows.size(); ++c) {
+    if (!read_window_file(windows[c], tokens)) {
+      failed = 1;
+      break;
+    }
+    char out[4096];
+    std::snprintf(out, sizeof(out), "%s/ref_nll_%zu.txt", out_dir.c_str(), c);
+    if (score_nll_window(model, n_vocab, tokens, off, out) != 0) {
+      failed = 1;
+      break;
+    }
+  }
+  llama_model_free(model);
+  llama_backend_free();
+  return failed;
+}
+
 int main(int argc, char **argv) {
+  // Batch mode is intercepted before anything else (and before any backend
+  // init), so even the usage probe needs no model or GPU.
+  if ((std::getenv("ORACLE_NLL_BATCH") && *std::getenv("ORACLE_NLL_BATCH")) ||
+      has_flag(argc, argv, "--nll-batch") || has_flag(argc, argv, "--windows-from"))
+    return run_nll_batch(argc, argv);
   if (argc < 3) {
-    std::fprintf(stderr, "usage: oracle-next-token <file.gguf> <token id> [token id...]\n");
+    std::fprintf(stderr,
+                 "usage: oracle-next-token <file.gguf> <token id> [token id...]\n"
+                 "   or: oracle-next-token <file.gguf> --nll-batch <manifest> <out-dir>\n"
+                 "   or: oracle-next-token <file.gguf> --windows-from <dir>\n"
+                 "   or: ORACLE_NLL_BATCH=<win0,win1,...> ORACLE_NLL_BATCH_OUT=<dir>"
+                 " oracle-next-token <file.gguf>\n");
     return 2;
   }
   std::vector<llama_token> tokens;
   for (int i = 2; i < argc; ++i) tokens.push_back((llama_token)std::atoi(argv[i]));
 
   // ---- M5: per-token NLL (the perplexity building block) ------------------
-  // ORACLE_NLL_OUT=<file> writes one line per predicted token:
-  //   <global index> <nll> <token id>
-  // The sequence is decoded one token at a time (the engine's own path) with
-  // logits requested at every step, so a perplexity difference can be localised
-  // to a single position. ORACLE_NLL_OFFSET=<k> starts the sequence at tokens[k]
+  // ORACLE_NLL_OUT=<file> writes one line per predicted token (see
+  // score_nll_window above). For many windows, prefer --nll-batch (see
+  // run_nll_batch): it loads the model once and scores each window file
+  // in-process, one fresh context per window. ORACLE_NLL_OFFSET=<k> starts the sequence at tokens[k]
   // so the reference conditions on exactly the same prefix a perplexity chunk
   // does.
   if (const char *nll_path = std::getenv("ORACLE_NLL_OUT")) {
@@ -60,68 +331,12 @@ int main(int argc, char **argv) {
       return 1;
     }
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
-    FILE *f = std::fopen(nll_path, "w");
-    if (!f) {
-      std::fprintf(stderr, "cannot write %s\n", nll_path);
-      return 1;
-    }
     const char *off_env = std::getenv("ORACLE_NLL_OFFSET");
     const std::size_t off = off_env ? (std::size_t)std::atoi(off_env) : 0;
-    if (off >= tokens.size()) {
-      std::fprintf(stderr, "nll: offset %zu beyond the %zu tokens\n", off, tokens.size());
-      std::fclose(f);
-      return 1;
-    }
-    // Own context: the sequence to score can be longer than the default 512.
-    llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = (uint32_t)(tokens.size() - off + 16);
-    cp.n_batch = cp.n_ctx;
-    cp.n_ubatch = cp.n_ctx;
-    cp.no_perf = true;
-    llama_context *ctx = llama_init_from_model(model, cp);
-    if (!ctx) {
-      std::fprintf(stderr, "nll: context failed\n");
-      std::fclose(f);
-      return 1;
-    }
-    const float *lg = nullptr;
-    for (std::size_t i = off; i < tokens.size(); ++i) {
-      llama_batch one = llama_batch_init(1, 0, 1);
-      one.n_tokens = 1;
-      one.token[0] = tokens[i];
-      one.pos[0] = (llama_pos)(i - off);
-      one.seq_id[0][0] = 0;
-      one.n_seq_id[0] = 1;
-      one.logits[0] = 1;
-      const int rc = llama_decode(ctx, one);
-      llama_batch_free(one);
-      if (rc != 0) {
-        std::fprintf(stderr, "nll: decode failed at %zu\n", i);
-        std::fclose(f);
-        return 1;
-      }
-      lg = llama_get_logits_ith(ctx, 0);
-      if (!lg) {
-        std::fprintf(stderr, "nll: no logits at %zu\n", i);
-        std::fclose(f);
-        return 1;
-      }
-      if (i + 1 >= tokens.size()) break;
-      const int target = tokens[i + 1];
-      float mx = lg[0];
-      for (int v = 1; v < n_vocab; ++v) mx = std::max(mx, lg[v]);
-      double sum = 0.0;
-      for (int v = 0; v < n_vocab; ++v) sum += std::exp((double)lg[v] - (double)mx);
-      const double nll = -(std::log(std::exp((double)lg[target] - (double)mx)) - std::log(sum));
-      std::fprintf(f, "%zu %.8f %d\n", i + 1, nll, target);
-    }
-    std::fclose(f);
-    std::printf("nll written to %s from offset %zu (%zu tokens)\n", nll_path, off,
-                tokens.size() - off);
-    llama_free(ctx);
+    const int rc = score_nll_window(model, n_vocab, tokens, off, nll_path);
     llama_model_free(model);
     llama_backend_free();
-    return 0;
+    return rc;
   }
 
   llama_backend_init();

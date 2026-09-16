@@ -75,6 +75,15 @@ int main(int argc, char **argv) {
     }
   }
 
+  // Quick smoke mode (KVCTX_QUICK=1): shrink the long-context section to
+  // min(ctx, 8192) and skip the duplicate splits-vs-unsplit comparison
+  // forwards. Attention is O(ctx), so this is ~8x cheaper. Unset = full
+  // default behavior (unchanged).
+  const bool kvctx_quick = [] {
+    const char *e = std::getenv("KVCTX_QUICK");
+    return e != nullptr && e[0] == '1';
+  }();
+
   rdna4::GgufLoader ld;
   std::string err;
   if (!ld.open(argv[1], err)) {
@@ -102,25 +111,27 @@ int main(int argc, char **argv) {
     std::vector<float> all_emb, h_whole, l_whole, h_split, l_split;
     for (const auto &e : emb) all_emb.insert(all_emb.end(), e.begin(), e.end());
 
+    // ONE graph for both runs: the weights are ~12 GiB, so only one graph may
+    // exist at a time, and a second init would re-upload all of them.
+    rdna4::Graph g(ld, cfg);
+    const double t0 = now_ms();
+    if (!g.init((int)prompt.size(), rdna4::KvType::F32, rdna4::KvType::F32, err)) {
+      std::fprintf(stderr, "graph init: %s\n", err.c_str());
+      return 1;
+    }
+    std::printf("graph init (weight upload + caches): %.1f ms\n", now_ms() - t0);
+    if (!g.forward(all_emb, h_whole, l_whole, err)) {
+      std::fprintf(stderr, "forward(whole): %s\n", err.c_str());
+      return 1;
+    }
+    // Re-run the same 8 tokens chunked on the SAME graph: reset_state() zeroes
+    // the recurrent (GDN) state and the 1+3+4 chunks rewrite KV rows 0..7
+    // identically, so this matches a fresh init without a second model load.
+    if (!g.reset_state(err)) {
+      std::fprintf(stderr, "reset_state: %s\n", err.c_str());
+      return 1;
+    }
     {
-      rdna4::Graph g(ld, cfg);
-      const double t0 = now_ms();
-      if (!g.init((int)prompt.size(), rdna4::KvType::F32, rdna4::KvType::F32, err)) {
-        std::fprintf(stderr, "graph init: %s\n", err.c_str());
-        return 1;
-      }
-      std::printf("graph init (weight upload + caches): %.1f ms\n", now_ms() - t0);
-      if (!g.forward(all_emb, h_whole, l_whole, err)) {
-        std::fprintf(stderr, "forward(whole): %s\n", err.c_str());
-        return 1;
-      }
-    }  // the weights are ~12 GiB: only one graph may exist at a time
-    {
-      rdna4::Graph g2(ld, cfg);
-      if (!g2.init((int)prompt.size(), rdna4::KvType::F32, rdna4::KvType::F32, err)) {
-        std::fprintf(stderr, "graph init 2: %s\n", err.c_str());
-        return 1;
-      }
       // 1 + 3 + 4 tokens, feeding each chunk at its own start position
       const int chunks[] = {1, 3, 4};
       int pos = 0;
@@ -129,7 +140,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n; ++i) {
           chunk.insert(chunk.end(), emb[pos + i].begin(), emb[pos + i].end());
         }
-        if (!g2.forward(chunk, pos, h_split, l_split, err)) {
+        if (!g.forward(chunk, pos, h_split, l_split, err)) {
           std::fprintf(stderr, "forward(chunk at %d): %s\n", pos, err.c_str());
           return 1;
         }
@@ -153,17 +164,23 @@ int main(int argc, char **argv) {
 
   // ---------------- 2. long context ----------------
   {
+    // QUICK: min(ctx, 8192) keeps forced splits = 8192/2048 = 4, so the
+    // split-KV path shape is preserved while attention (O(ctx)) gets ~8x cheaper.
+    const int ctx_eff = kvctx_quick ? (ctx < 8192 ? ctx : 8192) : ctx;
+    if (kvctx_quick) {
+      std::printf("KVCTX_QUICK=1: long section uses ctx=%d instead of %d\n", ctx_eff, ctx);
+    }
     rdna4::Graph g(ld, cfg);
     const double t0 = now_ms();
-    if (!g.init(ctx, kv, kv, err)) {
-      std::fprintf(stderr, "graph init at ctx=%d: %s\n", ctx, err.c_str());
+    if (!g.init(ctx_eff, kv, kv, err)) {
+      std::fprintf(stderr, "graph init at ctx=%d: %s\n", ctx_eff, err.c_str());
       return 1;
     }
     const double t_init = now_ms() - t0;
     const double layer_mib = (double)g.kv_layer_bytes() / (1024.0 * 1024.0);
     std::printf("ctx=%d kv=%s (%.2f B/elem): init %.1f ms, KV caches %.1f MiB "
                 "(%d layers x K+V %.1f MiB)\n",
-                ctx, rdna4::kv_type_name(kv), rdna4::kv_bytes_per_elem(kv), t_init,
+                ctx_eff, rdna4::kv_type_name(kv), rdna4::kv_bytes_per_elem(kv), t_init,
                 2.0 * layer_mib * g.n_full_attn(), g.n_full_attn(), 2.0 * layer_mib);
 
     // The embeddings are the same 8 rows; the cache/state are filled with a
@@ -179,7 +196,7 @@ int main(int argc, char **argv) {
     hipMemGetInfo(&free_before, &total);
     std::vector<float> h, logits;
     const double t1 = now_ms();
-    const int start = ctx - (int)prompt.size();
+    const int start = ctx_eff - (int)prompt.size();
     if (!g.forward(all_emb, start, h, logits, err)) {
       std::fprintf(stderr, "forward at %d: %s\n", start, err.c_str());
       return 1;
@@ -201,7 +218,7 @@ int main(int argc, char **argv) {
       if (logits[i] > logits[best]) best = i;
     }
     std::printf("decode %zu tokens at position %d..%d: %.1f ms (%.1f ms/token)\n", prompt.size(),
-                start, ctx - 1, t_fwd, t_fwd / (double)prompt.size());
+                start, ctx_eff - 1, t_fwd, t_fwd / (double)prompt.size());
     std::printf("logits finite=%s min=%.3f max=%.3f mean=%.4f argmax=%zu\n", finite ? "yes" : "NO",
                 lmin, lmax, lsum / (double)logits.size(), best);
     std::printf("VRAM in use after forward: %.2f GiB (free %.2f of %.2f GiB)\n",
@@ -214,12 +231,15 @@ int main(int argc, char **argv) {
     } else {
       std::printf("long-context decode: OK\n");
 
+    if (kvctx_quick) {
+      std::printf("attention split check: SKIPPED (KVCTX_QUICK=1; single long decode above only)\n");
+    } else {
     // M7: the split-KV attention sums the keys in a different order, so it is NOT
     // bit-identical -- but at the *same* context the logits must agree to fp32
     // rounding (measured ~1e-6 relative at the kernel level). Run the same step
     // twice, unsplit and split, and compare.
     {
-      const int forced = (int)(ctx / 2048) < 1 ? 1 : ((int)(ctx / 2048) > 16 ? 16 : (int)(ctx / 2048));
+      const int forced = (int)(ctx_eff / 2048) < 1 ? 1 : ((int)(ctx_eff / 2048) > 16 ? 16 : (int)(ctx_eff / 2048));
       std::vector<float> l_ref, l_split, h_tmp;
       // the recurrent (GDN) state advances with every forward call, so both runs
       // must start from the same state; the KV rows are rewritten identically
@@ -286,13 +306,14 @@ int main(int argc, char **argv) {
       const bool ok = rel < 5e-2 && am_ref == am_split;
       std::printf("attention splits (%d) vs unsplit at ctx %d: logits rel-L2 %.3e max|d| %.3e, "
                   "argmax %zu vs %zu  %s (synthetic cache: informative, see the comment)\n",
-                  forced, ctx, rel, maxd, am_ref, am_split, ok ? "OK" : "FAIL");
+                  forced, ctx_eff, rel, maxd, am_ref, am_split, ok ? "OK" : "FAIL");
       if (!ok) {
         std::printf("attention split check: FAILED\n");
         return 1;
       }
       std::printf("attention split check: OK\n");
     }
+    }  // else (!kvctx_quick)
     }
   }
 

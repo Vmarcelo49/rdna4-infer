@@ -96,7 +96,8 @@ struct ServerOptions {
   std::string host = "127.0.0.1";
   int port = 8080;
   int backlog = 16;
-  int recv_timeout_s = 30;   // one request's header+body, per recv() call
+  double recv_timeout_s = 30.0;  // one request's header+body, per recv() call
+                                   // (fractional allowed: 0.2 = 200 ms, used by tests)
   int send_timeout_s = 120;  // per send() call
   std::size_t max_body = 8u << 20;
   bool verbose = false;

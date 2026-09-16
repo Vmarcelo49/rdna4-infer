@@ -31,6 +31,11 @@
 //
 // usage: check-batch-gpu <file.gguf> [batch sizes...]   (default 2 3 4 8 16)
 //        [--kv-k T] [--kv-v T]     T in f32 f16 q8_0 q4_0 q5_0 q4_1  (default f16)
+//        [--pairs K1:V1,K2:V2,...] percorre varios pares de KV num unico
+//             processo (um unico upload dos pesos; so' o cache K/V e' realocado
+//             por par via Graph::reinit_kv). Precede --kv-k/--kv-v quando dado.
+//        BATCH_QUICK=1: modo rapido -- pula o caso longo com n=cap (mantem n=16)
+//             e reduz o por-tipo a 3 dtypes representativos. Default inalterado.
 //        (tamanhos > 16 exercitam a faixa tolerada; sem `RD_PREFILL_CHUNK` o teto
 //         ja' e' 128, entao `check-batch-gpu <modelo> 32 128` e' o gate do GEMM)
 #include <hip/hip_runtime.h>
@@ -116,6 +121,16 @@ constexpr PerTypeTol kTolPerType[] = {
                                        // rel-L2 e' a metrica que prende
     {6, "q6_K", 2.0e-06, 6.0e-05},     // medido 9.23e-07 / 3.05e-05
 };
+// Subtabela do BATCH_QUICK=1: 3 representantes em vez de 8 -- um IQ de cadeia
+// unica (familia iq3_s/iq3_xxs/iq4_xs), um K medio e o K de precisao maxima
+// (pior arredondamento medido). O caminho de decode continua coberto pelos
+// casos em lote x por token acima; aqui o que se cobra e' um solver de cada
+// familia, e um nibble/bit trocado daria rel ~1e-01 em qualquer um deles.
+constexpr PerTypeTol kTolPerTypeQuick[] = {
+    {12, "iq3_s", 1.0e-06, 1.0e-04},
+    {4, "q4_K", 2.0e-06, 6.0e-05},
+    {6, "q6_K", 2.0e-06, 6.0e-05},
+};
 
 const char *kPrompt =
     "The history of the Roman Empire spans more than a thousand years, from the "
@@ -180,10 +195,15 @@ const char *verdict_label(const Verdict &v) {
 // literais "rel-L2" e "max|d|" de proposito, para o filtro desse script
 // (`grep -v "max|d|"`) as excluir da exigencia de bit-exatidao (aqui ha'
 // tolerancia declarada, nao bit-exatidao).
-int check_per_type(const rdna4::GgufLoader &loader) {
+int check_per_type(const rdna4::GgufLoader &loader, bool quick) {
   int failures = 0;
   constexpr int M = 32;
-  for (const PerTypeTol &tol : kTolPerType) {
+  const PerTypeTol *tols = quick ? kTolPerTypeQuick : kTolPerType;
+  const std::size_t ntol =
+      quick ? sizeof(kTolPerTypeQuick) / sizeof(kTolPerTypeQuick[0])
+            : sizeof(kTolPerType) / sizeof(kTolPerType[0]);
+  for (std::size_t ti = 0; ti < ntol; ++ti) {
+    const PerTypeTol &tol = tols[ti];
     // um tensor medio do tipo: o maior ate' 64 MB fora de `token_embd` (o
     // oraculo de 32 GEMVs num tensor de 874 MB nao cabe num gate), com K
     // multiplo de 256 (o que o `gemm_launch` exige).
@@ -280,7 +300,9 @@ int check_per_type(const rdna4::GgufLoader &loader) {
 
 int main(int argc, char **argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: check-batch-gpu <file.gguf> [batch sizes...]\n");
+    std::fprintf(stderr,
+                 "usage: check-batch-gpu <file.gguf> [batch sizes...] [--kv-k T] [--kv-v T] "
+                 "[--pairs K1:V1,K2:V2,...]\n");
     return 2;
   }
   std::vector<int> ns;
@@ -298,16 +320,49 @@ int main(int argc, char **argv) {
     std::exit(2);
   };
   rdna4::KvType kt = rdna4::KvType::F16, vt = rdna4::KvType::F16;
+  std::string pairs_spec;
   for (int i = 2; i < argc; ++i) {
     if (std::strcmp(argv[i], "--kv-k") == 0 && i + 1 < argc) {
       kt = kv_from(argv[++i]);
     } else if (std::strcmp(argv[i], "--kv-v") == 0 && i + 1 < argc) {
       vt = kv_from(argv[++i]);
+    } else if (std::strcmp(argv[i], "--pairs") == 0 && i + 1 < argc) {
+      pairs_spec = argv[++i];
     } else {
       ns.push_back(std::atoi(argv[i]));
     }
   }
   if (ns.empty()) ns = {2, 3, 4, 8, 16};
+  // --pairs precede --kv-k/--kv-v quando dado: a lista e' percorrida num unico
+  // processo (abaixo), com um unico Graph e um unico upload dos pesos.
+  std::vector<std::pair<rdna4::KvType, rdna4::KvType>> kv_pairs;
+  if (!pairs_spec.empty()) {
+    std::size_t pos = 0;
+    while (pos <= pairs_spec.size()) {
+      const std::size_t comma = pairs_spec.find(',', pos);
+      const std::string tok =
+          pairs_spec.substr(pos, comma == std::string::npos ? comma : comma - pos);
+      const std::size_t colon = tok.find(':');
+      if (colon == std::string::npos) {
+        std::fprintf(stderr, "par de KV invalido (queria K:V): %s\n", tok.c_str());
+        return 2;
+      }
+      kv_pairs.emplace_back(kv_from(tok.substr(0, colon).c_str()),
+                            kv_from(tok.substr(colon + 1).c_str()));
+      if (comma == std::string::npos) break;
+      pos = comma + 1;
+    }
+    if (kv_pairs.empty()) {
+      std::fprintf(stderr, "--pairs vazio\n");
+      return 2;
+    }
+  } else {
+    kv_pairs.emplace_back(kt, vt);
+  }
+  // BATCH_QUICK=1: pula o caso longo com n=cap (128 passos seriais de tronco) e
+  // reduz o por-tipo a 3 dtypes. Default (unset) inalterado.
+  const char *quick_env = std::getenv("BATCH_QUICK");
+  const bool quick = quick_env != nullptr && std::strcmp(quick_env, "1") == 0;
 
   rdna4::GgufLoader loader;
   std::string err;
@@ -337,15 +392,36 @@ int main(int argc, char **argv) {
   // weights -- in this process.
   const int ctx_used = ctx > 1216 ? ctx : 1216;
   rdna4::Graph g(loader, cfg);
-  if (!g.init(ctx_used, kt, vt, err)) {
-    std::fprintf(stderr, "graph init failed: %s\n", err.c_str());
-    return 1;
-  }
-  g.set_want_hidden(false);
+  // Um unico Graph para todos os pares: os pesos sobem uma vez no primeiro
+  // init; cada par seguinte so' realoca o cache K/V (reinit_kv). Sem --pairs ha'
+  // um unico par e o comportamento e' o de antes.
+  int failures = 0;
+  // Contadores de CASOS (nao de linhas): quantos casos de cada faixa foram testados.
+  int chunked_cases = 0, exact_cases = 0;
+  bool first_pair = true;
+  for (std::size_t pi = 0; pi < kv_pairs.size(); ++pi) {
+    const rdna4::KvType pkt = kv_pairs[pi].first;
+    const rdna4::KvType pvt = kv_pairs[pi].second;
+    if (kv_pairs.size() > 1) {
+      std::printf("\n=== KV K=%s V=%s (par %zu/%zu) ===\n", rdna4::kv_type_name(pkt),
+                  rdna4::kv_type_name(pvt), pi + 1, kv_pairs.size());
+    }
+    if (first_pair) {
+      if (!g.init(ctx_used, pkt, pvt, err)) {
+        std::fprintf(stderr, "graph init failed: %s\n", err.c_str());
+        return 1;
+      }
+      first_pair = false;
+    } else if (!g.reinit_kv(pkt, pvt, err)) {
+      std::fprintf(stderr, "graph reinit_kv failed: %s\n", err.c_str());
+      return 1;
+    }
+    g.set_want_hidden(false);
   const int cap = g.batch_cap();
   const std::vector<int> policy = g.prefill_chunk_sizes();
-  std::printf("prompt: %zu tokens, ctx %d, KV K=%s V=%s\n", ids.size(), ctx_used,
-              rdna4::kv_type_name(kt), rdna4::kv_type_name(vt));
+  std::printf("prompt: %zu tokens, ctx %d, KV K=%s V=%s%s\n", ids.size(), ctx_used,
+              rdna4::kv_type_name(pkt), rdna4::kv_type_name(pvt),
+              quick ? " [BATCH_QUICK=1]" : "");
   // A politica de chunk e' UMA so' (Graph::prefill) e este gate imprime a que o
   // binario esta' usando: um gate que nao diz qual politica testou nao prova nada.
   std::printf("chunk cap: %d (RD_PREFILL_CHUNK%s); politica de prefill: ",
@@ -361,9 +437,6 @@ int main(int argc, char **argv) {
               "a qualidade e' protegida pelo PPL -- ver o comentario da tolerancia)\n\n",
               kTolChunkRelL2, kTolChunkMaxAbs);
 
-  int failures = 0;
-  // Contadores de CASOS (nao de linhas): quantos casos de cada faixa foram testados.
-  int chunked_cases = 0, exact_cases = 0;
   std::printf("%5s %12s %12s %12s %10s %10s  %s\n", "N", "per-token ms", "batched ms", "speedup",
               "rel-L2", "max|d|", "veredito");
   for (int n : ns) {
@@ -654,11 +727,18 @@ int main(int argc, char **argv) {
     (n > 16 ? chunked_cases : exact_cases) += 1;
   };
   long_ctx_case(16, 1088);
-  if (cap > 16) long_ctx_case(cap, 1088);
+  // BATCH_QUICK=1: o caso com n=cap (128 passos seriais de tronco) e' o mais
+  // pesado e o n=16 acima ja' cobre o caminho de decode em contexto longo.
+  if (cap > 16 && !quick) long_ctx_case(cap, 1088);
+  if (cap > 16 && quick) {
+    std::printf("(BATCH_QUICK=1: caso longo com n=cap=%d pulado; mantido n=16)\n", cap);
+  }
 
   // Checks por tipo da rota GEMM (sempre, independem do cap).
-  std::printf("\n-- por tipo (GEMM vs caminho por token, M = 32) --\n");
-  failures += check_per_type(loader);
+  std::printf("\n-- por tipo (GEMM vs caminho por token, M = 32%s) --\n",
+              quick ? ", BATCH_QUICK=1: 3 dtypes" : "");
+  failures += check_per_type(loader, quick);
+  }  // for (pares de KV)
 
   if (failures == 0) {
     std::printf("\ncheck-batch-gpu: OK (%d caso(s) bit-exato(s) <= 16 tokens, "
