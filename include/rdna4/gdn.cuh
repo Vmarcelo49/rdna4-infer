@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 
 #include "rdna4/nn.cuh"  // silu_f
 
@@ -476,8 +477,10 @@ inline bool delta_rule_batch_launch(const float *d_qk, const float *d_v, const f
 // traffic (3 x S + 2 floats read per thread vs 4 x S floats of state per pass
 // moved twice).
 // ---------------------------------------------------------------------------
+// RD_GDN_FUSED=0 restores this two-pass-per-token form (same contract, same
+// bit-exactness argument); it is the fallback when the fused path below is off.
 template <int ROWS, bool VEC>
-__global__ void delta_rule_batch_resident_kernel(const float *__restrict__ qk,
+__global__ void delta_rule_batch_resident_kernel_twopass(const float *__restrict__ qk,
                                                  const float *__restrict__ v,
                                                  const float *__restrict__ gate,
                                                  const float *__restrict__ beta,
@@ -557,6 +560,144 @@ __global__ void delta_rule_batch_resident_kernel(const float *__restrict__ qk,
 #undef RD_GDN_TROW
 }
 
+// ---------------------------------------------------------------------------
+// Fused within-token form of the kernel above (production path): the two passes
+// over each state row per token (scale+dot, then update+accumulate) are
+// software-pipelined ACROSS tokens, so each tile row is read ONCE per token
+// (amortised) instead of twice.
+//
+// Per (token, row) the operations and their order are unchanged, which is why
+// the gate stays bit-exact:
+//   prologue          token 0 scale+dot, line for line the old first pass;
+//   fused loop t      single i-ascending loop doing, per element i:
+//                       m     = fma(k[t][i], delta_t, tile[i])  (old pass 2, token t)
+//                       acc_t = fma(m, q[t][i], acc_t)          (old pass 2, token t)
+//                       s     = m * g_{t+1}                     (old pass 1 scale, token t+1)
+//                       tile  = s; sum_{t+1} = fma(s, k[t+1][i], sum_{t+1})
+//                                                             (old pass 1 dot, token t+1)
+//                     then out[t] and delta_{t+1} exactly as before;
+//   epilogue          last-token update+dot-q, line for line the old second pass.
+//
+// Elements are independent across i, so doing token t's update and token t+1's
+// scale+dot for the SAME i together changes no value: the carried quantity
+// moves through a register instead of an LDS round-trip, and loads/stores do
+// not round. Both accumulators (acc_t, sum_{t+1}) still run i-ascending with
+// one fma each, and the final tile writeback is the unscaled update, exactly
+// as before. n == 1 degenerates to prologue + epilogue, i.e. the old two
+// passes. All loads keep the default cache policy (no nontemporal builtins).
+//
+// What it buys: n+1 LDS row passes per chunk (1 prologue + (n-1) fused +
+// 1 epilogue) instead of 2n -- about half the LDS round-trips. k/q/v/gate/
+// beta/out streaming is untouched. Decode is unaffected (already IC-resident,
+// per-token path); this only changes the prefill/chunk scan.
+// ---------------------------------------------------------------------------
+template <int ROWS, bool VEC>
+__global__ void delta_rule_batch_resident_kernel(const float *__restrict__ qk,
+                                                 const float *__restrict__ v,
+                                                 const float *__restrict__ gate,
+                                                 const float *__restrict__ beta,
+                                                 float *__restrict__ state, float *__restrict__ out,
+                                                 int n_k_heads, int S, int n_vh, int key_dim,
+                                                 int d_inner, int n) {
+  const int h = blockIdx.x;              // value head
+  const int tx = threadIdx.x;
+  const int j = blockIdx.y * ROWS + tx;  // row index (value dim)
+  const bool active = j < S;
+  const int kh = h % n_k_heads;  // repeated key head
+
+  // Same transposed tile as the two-pass form (conflict-free by construction).
+  __shared__ __align__(16) float tile[128 * ROWS];
+#define RD_GDN_TROW(i) (tile[(i)*ROWS + tx])
+
+  // Stage the tile once (same float4 global move as the two-pass form).
+  if (active) {
+    const float *srow = state + ((std::int64_t)h * S + j) * S;
+    if (VEC) {
+      const float4 *sp = (const float4 *)srow;
+      for (int i4 = 0; i4 < S / 4; ++i4) {
+        const float4 g = sp[i4];
+        RD_GDN_TROW(4 * i4 + 0) = g.x;
+        RD_GDN_TROW(4 * i4 + 1) = g.y;
+        RD_GDN_TROW(4 * i4 + 2) = g.z;
+        RD_GDN_TROW(4 * i4 + 3) = g.w;
+      }
+      for (int i = (S & ~3); i < S; ++i) RD_GDN_TROW(i) = srow[i];
+    } else {
+      for (int i = 0; i < S; ++i) RD_GDN_TROW(i) = srow[i];
+    }
+  }
+  __syncthreads();
+
+  if (active) {
+    const float *kb = qk + key_dim + (std::int64_t)kh * S;
+    const float *qb = qk + (std::int64_t)kh * S;
+    const float rs = rsqrtf((float)S);
+
+    // Prologue: token 0 scale+dot (old first pass, verbatim).
+    float delta;
+    {
+      const float *kd = kb;
+      const float g0 = expf(gate[h]);
+      float sum = 0.0f;
+      for (int i = 0; i < S; ++i) {
+        const float x = RD_GDN_TROW(i) * g0;
+        RD_GDN_TROW(i) = x;
+        sum = fmaf(x, kd[i], sum);
+      }
+      delta = (v[(std::int64_t)h * S + j] - sum) * beta[h];
+    }
+
+    // Steady state: one i-ascending loop fuses token t's update+dot-q with
+    // token t+1's scale+dot-k. The row is read once and written once.
+    for (int t = 0; t < n - 1; ++t) {
+      const float *kd = kb + (std::int64_t)t * 2 * key_dim;
+      const float *qd = qb + (std::int64_t)t * 2 * key_dim;
+      const float *kdn = kd + 2 * key_dim;  // token t+1 keys
+      const float gn = expf(gate[(std::int64_t)(t + 1) * n_vh + h]);
+      float acc = 0.0f;
+      float sumn = 0.0f;
+      for (int i = 0; i < S; ++i) {
+        const float m = fmaf(kd[i], delta, RD_GDN_TROW(i));
+        acc = fmaf(m, qd[i], acc);
+        const float s = m * gn;
+        RD_GDN_TROW(i) = s;
+        sumn = fmaf(s, kdn[i], sumn);
+      }
+      out[(std::int64_t)t * d_inner + (std::int64_t)h * S + j] = acc * rs;
+      delta = (v[(std::int64_t)(t + 1) * d_inner + (std::int64_t)h * S + j] - sumn) *
+              beta[(std::int64_t)(t + 1) * n_vh + h];
+    }
+
+    // Epilogue: last-token update+dot-q (old second pass, verbatim).
+    {
+      const float *kd = kb + (std::int64_t)(n - 1) * 2 * key_dim;
+      const float *qd = qb + (std::int64_t)(n - 1) * 2 * key_dim;
+      float acc = 0.0f;
+      for (int i = 0; i < S; ++i) {
+        const float m = fmaf(kd[i], delta, RD_GDN_TROW(i));
+        RD_GDN_TROW(i) = m;
+        acc = fmaf(m, qd[i], acc);
+      }
+      out[(std::int64_t)(n - 1) * d_inner + (std::int64_t)h * S + j] = acc * rs;
+    }
+
+    // Write the tile back once (same layout, dtype and buffer as before).
+    float *srow = state + ((std::int64_t)h * S + j) * S;
+    if (VEC) {
+      float4 *dp = (float4 *)srow;
+      for (int i4 = 0; i4 < S / 4; ++i4) {
+        const float4 g = make_float4(RD_GDN_TROW(4 * i4 + 0), RD_GDN_TROW(4 * i4 + 1),
+                                     RD_GDN_TROW(4 * i4 + 2), RD_GDN_TROW(4 * i4 + 3));
+        dp[i4] = g;
+      }
+      for (int i = (S & ~3); i < S; ++i) srow[i] = RD_GDN_TROW(i);
+    } else {
+      for (int i = 0; i < S; ++i) srow[i] = RD_GDN_TROW(i);
+    }
+  }
+#undef RD_GDN_TROW
+}
+
 // rows per CTA: same 32 as delta_rule_batch_launch (same grid, so the only
 // variable the measurement moves is the storage tier of the tile; 16 was
 // measured identical, 314.6 vs 315.1 tok/s -- the scan sits on its serial
@@ -570,13 +711,29 @@ inline bool delta_rule_batch_resident_launch(const float *d_qk, const float *d_v
     return delta_rule_batch_launch(d_qk, d_v, d_gate, d_beta, d_state, d_out, n_v_heads, n_k_heads,
                                    S, n_vh, key_dim, d_inner, n, stream);
   }
+  // RD_GDN_FUSED=0 restores the two-pass-per-token resident kernel (same
+  // contract, same grid); default is the fused within-token form above.
+  static const bool gdn_fused = [] {
+    const char *e = std::getenv("RD_GDN_FUSED");
+    return !(e != nullptr && e[0] == '0');
+  }();
   const unsigned ny = (unsigned)((S + kRows - 1) / kRows);
   const dim3 grid((unsigned)n_v_heads, ny);
+  if (gdn_fused) {
+    if ((S & 3) == 0) {
+      delta_rule_batch_resident_kernel<kRows, true><<<grid, kRows, 0, stream>>>(
+          d_qk, d_v, d_gate, d_beta, d_state, d_out, n_k_heads, S, n_vh, key_dim, d_inner, n);
+    } else {
+      delta_rule_batch_resident_kernel<kRows, false><<<grid, kRows, 0, stream>>>(
+          d_qk, d_v, d_gate, d_beta, d_state, d_out, n_k_heads, S, n_vh, key_dim, d_inner, n);
+    }
+    return hipGetLastError() == hipSuccess;
+  }
   if ((S & 3) == 0) {
-    delta_rule_batch_resident_kernel<kRows, true><<<grid, kRows, 0, stream>>>(
+    delta_rule_batch_resident_kernel_twopass<kRows, true><<<grid, kRows, 0, stream>>>(
         d_qk, d_v, d_gate, d_beta, d_state, d_out, n_k_heads, S, n_vh, key_dim, d_inner, n);
   } else {
-    delta_rule_batch_resident_kernel<kRows, false><<<grid, kRows, 0, stream>>>(
+    delta_rule_batch_resident_kernel_twopass<kRows, false><<<grid, kRows, 0, stream>>>(
         d_qk, d_v, d_gate, d_beta, d_state, d_out, n_k_heads, S, n_vh, key_dim, d_inner, n);
   }
   return hipGetLastError() == hipSuccess;
