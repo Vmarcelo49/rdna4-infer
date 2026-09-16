@@ -80,7 +80,43 @@ struct MtpGenStats {
   long long rollback_tokens = 0;  // tokens re-forwarded by those replays
   double snapshot_ms = 0.0;  // SEGUNDOS: host time spent copying the recurrent state
   double acceptance() const { return drafted > 0 ? (double)accepted / (double)drafted : 0.0; }
+  // ---- acceptance governor: skip drafting when drafts mostly reject ---------
+  // A round below breakeven acceptance costs a full verify batch plus usually a
+  // replay and commits fewer tokens than plain greedy's one forward (measured:
+  // 49% acceptance ran 30.4 tok/s vs 37.1 plain). Spec rounds accumulate into
+  // epochs of RD_MTP_GOV_EPOCH (default 12); an epoch under RD_MTP_GOV_MIN
+  // (default 0.60) triggers RD_MTP_GOV_COOL (default 8) plain rounds, then a
+  // fresh epoch re-probes. Epochs (not an EMA) so early-sample noise cannot
+  // trip it: at 72% true acceptance a 12-round epoch fires with ~5% probability
+  // while at 49% it still fires ~9 times in 10.
+  double gov_acc_ema = -1.0;  // EMA of per-round accepted/drafted (<0 = no data)
+  long long gov_ep_acc = 0;   // accepted drafts in the current epoch
+  long long gov_ep_draft = 0;  // proposed drafts in the current epoch
+  int gov_ep_rounds = 0;      // scored spec rounds in the current epoch
+  int gov_plain_rounds = 0;   // rounds the governor forced plain
+  int gov_cooldown_left = 0;  // plain rounds remaining in this cooldown
+  int gov_cooldowns = 0;      // cooldowns triggered (report only)
 };
+
+// Acceptance governor observation: call once per scored speculative round with
+// the accepted/drafted counters from before the round. Cooldown rounds (forced
+// plain, no verify) carry no accept information and must not call this.
+inline void gov_observe(MtpGenStats &st, long long acc0, long long dr0, double min_acc,
+                        int cool, int epoch) {
+  const long long dd = st.drafted - dr0;
+  if (dd <= 0) return;
+  const double r = (double)(st.accepted - acc0) / (double)dd;
+  st.gov_acc_ema = (st.gov_acc_ema < 0.0) ? r : 0.75 * st.gov_acc_ema + 0.25 * r;
+  st.gov_ep_acc += st.accepted - acc0;
+  st.gov_ep_draft += dd;
+  if (++st.gov_ep_rounds < epoch || st.gov_cooldown_left != 0) return;
+  if ((double)st.gov_ep_acc < min_acc * (double)st.gov_ep_draft) {
+    st.gov_cooldown_left = cool;
+    ++st.gov_cooldowns;
+  }
+  st.gov_ep_acc = st.gov_ep_draft = 0;
+  st.gov_ep_rounds = 0;
+}
 
 // Runs the loop. `hidden`/`logits` must hold the prefill result for
 // `prompt_ids` (h at the prompt's last position and the logits for the next
@@ -170,6 +206,25 @@ inline bool mtp_generate(Graph &g, MtpHead *mtp, const std::function<bool(std::i
 
   const int D = (mtp != nullptr && !p.score_only) ? std::max(0, p.draft) : 0;
 
+  // Governor config, read once (env only affects the run path, never gates):
+  // RD_MTP_GOV=0 disables, RD_MTP_GOV_MIN sets the breakeven floor (default
+  // 0.60, measured), RD_MTP_GOV_EPOCH the scored rounds per decision (default
+  // 12), RD_MTP_GOV_COOL the plain rounds per cooldown (default 8).
+  const char *gov_e = std::getenv("RD_MTP_GOV");
+  const bool gov_on = (gov_e == nullptr || std::string(gov_e) != "0") && D > 0;
+  double gov_min = 0.60;
+  if (const char *v = std::getenv("RD_MTP_GOV_MIN")) {
+    gov_min = std::atof(v);
+  }
+  int gov_epoch = 12;
+  if (const char *v = std::getenv("RD_MTP_GOV_EPOCH")) {
+    gov_epoch = std::max(1, std::atoi(v));
+  }
+  int gov_cool = 8;
+  if (const char *v = std::getenv("RD_MTP_GOV_COOL")) {
+    gov_cool = std::max(1, std::atoi(v));
+  }
+
   while ((long long)gen.size() < (long long)p.n_predict) {
     // ---- the trunk decides the next token (identical to plain greedy) ------
     const std::int32_t id = sampler.sample(logits.data(), history);
@@ -226,8 +281,16 @@ inline bool mtp_generate(Graph &g, MtpHead *mtp, const std::function<bool(std::i
     // that covers every replay size, so the batched draft is capped at 3. A
     // larger D stays available on the serial path (MtpGenParams::batch_verify).
     const int D_max = p.batch_verify ? std::min(D, 3) : D;
-    const int D_eff =
+    int D_eff =
         std::min(D_max, std::min(std::max(0, room - 1), std::max(0, room_pred - 1)));
+    if (gov_on && D_eff > 0 && st.gov_cooldown_left > 0) {
+      // governor cooldown: run this round plain (the D_eff == 0 branch below:
+      // one draft step keeps the block cache in step, one trunk step advances
+      // -- token-identical to verifying, minus the batch and any replay).
+      --st.gov_cooldown_left;
+      ++st.gov_plain_rounds;
+      D_eff = 0;
+    }
     if (D_eff == 0) {
       // no room left to verify a draft: keep the block's cache in step and
       // advance exactly like plain decode
@@ -250,6 +313,7 @@ inline bool mtp_generate(Graph &g, MtpHead *mtp, const std::function<bool(std::i
       std::vector<float> draft_logits;
       std::vector<std::int32_t> draft((std::size_t)D_eff, 0);
       ++st.rounds;
+      const long long gov_acc0 = st.accepted, gov_dr0 = st.drafted;
       if (!draft_step_host(h_prev.data(), id, pos + 1, &draft_logits)) return false;
       draft[0] = propose(sampler, draft_logits, history);
       for (int k = 1; k < D_eff; ++k) {
@@ -310,6 +374,7 @@ inline bool mtp_generate(Graph &g, MtpHead *mtp, const std::function<bool(std::i
         history.push_back(draft[(std::size_t)k]);
         ++st.accepted;
       }
+      if (gov_on) gov_observe(st, gov_acc0, gov_dr0, gov_min, gov_cool, gov_epoch);
 
       // Every token in `committed` is one the trunk itself produced (an accepted
       // draft is by definition the trunk's own greedy token), so committing them
@@ -391,6 +456,7 @@ inline bool mtp_generate(Graph &g, MtpHead *mtp, const std::function<bool(std::i
     //     which is how llama.cpp drafts past the trunk (pending_h)
     std::vector<float> draft_logits;
     ++st.rounds;
+    const long long gov_s_acc0 = st.accepted, gov_s_dr0 = st.drafted;
     if (!draft_step_host(h_prev.data(), id, pos + 1, &draft_logits)) return false;
     draft[0] = propose(sampler, draft_logits, history);
     for (int k = 1; k < D_eff; ++k) {
@@ -450,6 +516,7 @@ inline bool mtp_generate(Graph &g, MtpHead *mtp, const std::function<bool(std::i
     ++at;
     if (!trunk_step(decisions.back(), at)) return false;
     hs.push_back(hidden);
+    if (gov_on) gov_observe(st, gov_s_acc0, gov_s_dr0, gov_min, gov_cool, gov_epoch);
 
     // (4) rebuild this block's KV rows for the positions just committed from the
     //     TRUNK's h rather than the chained one — llama.cpp's process() does the

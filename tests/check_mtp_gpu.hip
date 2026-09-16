@@ -695,8 +695,12 @@ int main(int argc, char **argv) {
         // behaviour (one draft step per proposal, not per token); the assertion was
         // wrong. It still catches the failure it was written for: a path that re-runs
         // a draft step per committed token would land far above this bound.
+        // Governor plain rounds (RD_MTP_GOV) each contribute exactly one draft step
+        // through the D_eff == 0 branch (keeps the block cache in step) without
+        // incrementing rounds/drafted, so they are budgeted explicitly here.
         ok(s_b.draft_steps >= D &&
-               s_b.draft_steps <= s_b.rounds * D + s_b.accepted + s_b.rollbacks,
+               s_b.draft_steps <=
+                   s_b.rounds * D + s_b.accepted + s_b.rollbacks + s_b.gov_plain_rounds,
            "one draft step per proposal plus one KV-rebuild row per accepted token");
         ok(s_b.verify_forwards == s_b.rounds && s_b.rollbacks <= s_b.rounds,
            "at most one batched verify and one rollback per round");

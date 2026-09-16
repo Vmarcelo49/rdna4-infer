@@ -362,6 +362,100 @@ bool launch_gqa_split(const float *q, const void *k, const void *v, float *out, 
   }
 }
 
+// Prototype D / E1 (tile de linhas): one CTA per (kv head, split), 6 warps, one
+// warp per query head of the group. Each key's K/V row is decoded ONCE into LDS
+// (warp 0 via kv_load8) and shared by all 6 warps; every warp keeps ONLY its own
+// head state (q:8, acc:8, m, l) -- the partitioned accumulator. This is the
+// structural difference vs prototype C: C splits KEYS across warps, so each warp
+// carries all HG heads' state (18x replication at HG=6 -> 68 VGPR + 400 B
+// spill); D splits HEADS across warps (~30 VGPR, no spill expected).
+// Same [h][s] partials layout + attn_merge_kernel as the split kernels, same
+// per-head op order as attn_kernel (per-lane fmaf chain, same shuffle tree),
+// so the numerics should be BIT-EXACT vs the unsplit kernel, not just close.
+// Bench-only (docs/plano-ninfer-pendente.md E1). Pre-registered targets: >=1.02x
+// vs the ship-policy split cell, i.e. 4K <= 0.0709, 16K <= 0.2381 ms/launch.
+template <rdna4::KvType KT, rdna4::KvType VT>
+__global__ void attn_gqa_rowtile_kernel(const float *__restrict__ q, const void *__restrict__ k,
+                                        const void *__restrict__ v, float *__restrict__ partial,
+                                        int t, int n_head, int n_head_kv, int head_dim,
+                                        float dscale, int n_splits) {
+  const int kvh = blockIdx.x;
+  const int s = blockIdx.y;
+  const int w = threadIdx.x >> 5;  // 0..5: query head inside the group
+  const int lane = threadIdx.x & 31;
+  const int grp = n_head / n_head_kv;
+  const int dpw = head_dim / 32;
+  if (dpw != 8 || grp != 6) return;  // prototype: this model's shape only
+  __shared__ float krow[256];
+  __shared__ float vrow[256];
+
+  const int h = kvh * grp + w;
+  float qv[8], acc[8];
+  {
+    const float *qp = q + (std::int64_t)h * head_dim + lane * dpw;
+    for (int i = 0; i < dpw; ++i) {
+      qv[i] = qp[i];
+      acc[i] = 0.0f;
+    }
+  }
+  float m = -INFINITY, l = 0.0f;
+  const std::uint64_t krowb = rdna4::kv_row_bytes(KT, head_dim);
+  const std::uint64_t vrowb = rdna4::kv_row_bytes(VT, head_dim);
+
+  for (int j = s; j <= t; j += n_splits) {
+    // warp 0 decodes this key's rows once for the whole group
+    if (w == 0) {
+      const char *kr = (const char *)k + ((std::int64_t)j * n_head_kv + kvh) * krowb;
+      const char *vr = (const char *)v + ((std::int64_t)j * n_head_kv + kvh) * vrowb;
+      float kk[8], vv[8];
+      rdna4::kv_load8<KT>(kr, lane, kk);
+      rdna4::kv_load8<VT>(vr, lane, vv);
+      for (int i = 0; i < dpw; ++i) {
+        krow[lane * dpw + i] = kk[i];
+        vrow[lane * dpw + i] = vv[i];
+      }
+    }
+    __syncthreads();
+    float dot = 0.0f;
+    for (int i = 0; i < dpw; ++i) dot = fmaf(qv[i], krow[lane * dpw + i], dot);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffffull, dot, off);
+    const float score = dot * dscale;
+    if (score > m) {
+      const float corr = (m == -INFINITY) ? 0.0f : expf(m - score);
+      l *= corr;
+      for (int i = 0; i < dpw; ++i) acc[i] *= corr;
+      m = score;
+    }
+    const float p = (m == -INFINITY) ? 0.0f : expf(score - m);
+    l += p;
+    for (int i = 0; i < dpw; ++i) acc[i] = fmaf(p, vrow[lane * dpw + i], acc[i]);
+  }
+
+  // disjoint heads per warp: no barrier needed, same [h][s] partials as C
+  float *out = partial + ((std::int64_t)h * n_splits + s) * (2 + head_dim);
+  if (lane == 0) {
+    out[0] = m;
+    out[1] = l;
+  }
+  for (int i = 0; i < dpw; ++i) out[2 + lane * dpw + i] = acc[i];
+}
+
+template <rdna4::KvType KT, rdna4::KvType VT>
+bool launch_gqa_rowtile(const float *q, const void *k, const void *v, float *out, float *partial,
+                        int t, int n_head, int n_head_kv, int head_dim, float scale, int n_splits,
+                        hipStream_t stream) {
+  if (head_dim != 256 || n_head / n_head_kv != 6 || n_splits < 1) return false;
+  constexpr int kRowtileWarps = 6;
+  dim3 grid((unsigned)n_head_kv, (unsigned)n_splits);
+  attn_gqa_rowtile_kernel<KT, VT>
+      <<<grid, kRowtileWarps * 32, 2 * 256 * sizeof(float), stream>>>(
+          q, k, v, partial, t, n_head, n_head_kv, head_dim, scale, n_splits);
+  if (hipGetLastError() != hipSuccess) return false;
+  rdna4::attn_merge_kernel<<<n_head, 32, 0, stream>>>(partial, out, n_head, head_dim, n_splits);
+  return hipGetLastError() == hipSuccess;
+}
+
 // Kernel resource report: registers and spill bytes decide whether a prototype is
 // slow because of its algorithm or because of its occupancy. (The M7 prototype's
 // 8-12x was attributed to the narrow grid without this number; measure it.)
@@ -470,6 +564,7 @@ int main(int argc, char **argv) {
     report_resources("gqa_split HG=6", attn_gqa_split_kernel<rdna4::KvType::F16, rdna4::KvType::F16, 6>);
     report_resources("gqa_split HG=3", attn_gqa_split_kernel<rdna4::KvType::F16, rdna4::KvType::F16, 3>);
     report_resources("gqa_split HG=1", attn_gqa_split_kernel<rdna4::KvType::F16, rdna4::KvType::F16, 1>);
+    report_resources("rowtile D", attn_gqa_rowtile_kernel<rdna4::KvType::F16, rdna4::KvType::F16>);
     report_resources("attn_merge_kernel", rdna4::attn_merge_kernel);
     int cu = 0;
     (void)hipDeviceGetAttribute(&cu, hipDeviceAttributeMultiprocessorCount, 0);
@@ -842,6 +937,63 @@ int main(int argc, char **argv) {
         std::printf("  HG=%d %.4f ms (%.3fx ship) rel-L2 %.1e%s", g.hg, g.ms,
                     ms_ship / g.ms, g.rel, g.ok ? "" : " LAUNCH_FAILED");
       }
+      std::printf("\n");
+    }
+    // ---- E1: prototype D (row tile), same grid/merges as C, same reference ----
+    {
+      double ms_d = -1.0, rel_d = 0.0;
+      bool ok_d = true;
+      EvPair evd;
+      for (int r = 0; r < 3; ++r) {
+        const double ms = evd([&] {
+          for (int k = 0; k < 3; ++k) {
+            switch (kt) {
+              case rdna4::KvType::F16:
+                ok_d = launch_gqa_rowtile<rdna4::KvType::F16, rdna4::KvType::F16>(
+                    d_q, d_k, d_v, d_out2, d_partial, t, kHeads, kHeadsKv, kHeadDim, kScale,
+                    gqa_splits_t, nullptr);
+                break;
+              case rdna4::KvType::Q4_0:
+                ok_d = launch_gqa_rowtile<rdna4::KvType::Q4_0, rdna4::KvType::Q4_0>(
+                    d_q, d_k, d_v, d_out2, d_partial, t, kHeads, kHeadsKv, kHeadDim, kScale,
+                    gqa_splits_t, nullptr);
+                break;
+              case rdna4::KvType::Q8_0:
+                ok_d = launch_gqa_rowtile<rdna4::KvType::Q8_0, rdna4::KvType::Q8_0>(
+                    d_q, d_k, d_v, d_out2, d_partial, t, kHeads, kHeadsKv, kHeadDim, kScale,
+                    gqa_splits_t, nullptr);
+                break;
+              default:
+                ok_d = launch_gqa_rowtile<rdna4::KvType::F32, rdna4::KvType::F32>(
+                    d_q, d_k, d_v, d_out2, d_partial, t, kHeads, kHeadsKv, kHeadDim, kScale,
+                    gqa_splits_t, nullptr);
+                break;
+            }
+          }
+        }) / 3.0;
+        if (ms_d < 0 || ms < ms_d) ms_d = ms;
+      }
+      hipDeviceSynchronize();
+      hipMemcpy(b.data(), d_out2, b.size() * sizeof(float), hipMemcpyDeviceToHost);
+      {
+        double n2 = 0, d2 = 0;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+          const double d = (double)a[i] - (double)b[i];
+          n2 += d * d;
+          d2 += (double)a[i] * a[i] + (double)b[i] * b[i];
+        }
+        rel_d = std::sqrt(n2 / d2);
+      }
+      // E1 pre-registered targets (docs/plano-ninfer-pendente.md E1): >=1.02x vs
+      // the ship-policy split cell at the same t.
+      const double e1_target = (t == 4096) ? 0.0709 : (t == 16384) ? 0.2381 : -1.0;
+      std::printf("             rowtile D (grid %dx%d, S=%d): %.4f ms (%.3fx ship, %.3fx split "
+                  "policy %.4f) rel-L2 %.1e%s",
+                  kHeadsKv, gqa_splits_t, gqa_splits_t, ms_d, ms_ship / ms_d,
+                  ms_split > 0 ? ms_split / ms_d : 0.0, ms_split, rel_d,
+                  ok_d ? "" : " LAUNCH_FAILED");
+      if (e1_target > 0 && ok_d)
+        std::printf("  E1 %s (target %.4f)", ms_d <= e1_target ? "PASS" : "FAIL", e1_target);
       std::printf("\n");
     }
     hipFree(d_partial);

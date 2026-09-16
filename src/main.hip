@@ -1480,6 +1480,12 @@ int cmd_run(int argc, char **argv) {
                                                     (double)gs.verify_forwards
                                               : 0.0,
                        gs.rollbacks, gs.replay_forwards, gs.rollback_tokens, gs.snapshot_ms * 1e3);
+          if (gs.gov_plain_rounds > 0 || gs.gov_acc_ema >= 0.0) {
+            std::fprintf(stderr,
+                         "rdna4-infer: MTP governor: %d plain rounds (EMA acceptance %.1f%%), "
+                         "env RD_MTP_GOV=0 disables\n",
+                         gs.gov_plain_rounds, gs.gov_acc_ema * 100.0);
+          }
         }
       }
       std::fprintf(stderr, "rdna4-infer: generated %zu tokens in %.2f s (%.2f tok/s)%s\n",
