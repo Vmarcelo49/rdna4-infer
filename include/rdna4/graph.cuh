@@ -900,13 +900,8 @@ inline bool Graph::add_residual(float *d_src, float *d_dst, int n, std::string &
 inline bool Graph::full_attn(int il, [[maybe_unused]] int t, int pos, std::string &err) {
   const int E = n_embd(), HD = head_dim(), NH = n_head(), NKV = n_head_kv();
   const LayerW &L = w_[il];
-  RD_PHASE(prof_, "attn_norm");  // RD_PHASE_PROF
-  if (!rms_norm_launch(d_x_, (const float *)L.attn_norm.ptr, d_xn_, 1, E,
-                       (float)cfg_.rms_norm_eps)) {
-    err = "attn_norm launch failed";
-    return false;
-  }
-  emit("attn_norm", il, d_xn_, E);
+  // A norma de entrada (attn_norm) mora no laco (forward_run: F4), fundida com
+  // o add da camada anterior -- este metodo recebe d_xn_ pronto.
   RD_PHASE(prof_, "qkv_proj");  // RD_PHASE_PROF
   if (!proj(L.attn_q, d_xn_, d_proj_, NH * 2 * HD, E, err)) return false;
   // k and v read the same activation as q: reuse its q8_1 blocks
@@ -987,7 +982,7 @@ inline bool Graph::full_attn(int il, [[maybe_unused]] int t, int pos, std::strin
 
   if (!proj(L.attn_output, d_attnout_, d_ffnout_, E, NH * HD, err)) return false;
   emit("attn_output", il, d_ffnout_, E);
-  if (!add_residual(d_ffnout_, d_x_, E, err)) return false;
+  // O add final mora no laco (F4, fundido com a post_norm); aqui fica d_ffnout_.
   return true;
 }
 
@@ -1055,13 +1050,7 @@ inline bool Graph::gdn_layer(int il, int t, std::string &err) {
   float *state = d_state_ + (std::size_t)slot * nvh * S * S;
   float *convst = d_convst_ + (std::size_t)slot * (K - 1) * chan;
 
-  RD_PHASE(prof_, "attn_norm");  // RD_PHASE_PROF
-  if (!rms_norm_launch(d_x_, (const float *)L.attn_norm.ptr, d_xn_, 1, E,
-                       (float)cfg_.rms_norm_eps)) {
-    err = "attn_norm launch failed";
-    return false;
-  }
-  emit("attn_norm", il, d_xn_, E);
+  // Norma de entrada: ver full_attn (F4, laco).
   RD_PHASE(prof_, "gdn_proj");  // RD_PHASE_PROF
   if (!proj(L.attn_qkv, d_xn_, d_qkv_, chan, E, err)) return false;
   // all four GDN projections read d_xn_ unchanged: one quantization serves all
@@ -1140,7 +1129,7 @@ inline bool Graph::gdn_layer(int il, int t, std::string &err) {
   RD_PHASE(prof_, "gdn_out_proj");  // RD_PHASE_PROF
   if (!proj(L.ssm_out, v_c, d_ffnout_, E, d_inner, err)) return false;
   emit("linear_attn_out", il, d_ffnout_, E);
-  if (!add_residual(d_ffnout_, d_x_, E, err)) return false;
+  // Add final: laco (F4). Aqui fica d_ffnout_.
   (void)t;
   return true;
 }
@@ -1162,7 +1151,7 @@ inline bool Graph::ffn(int il, std::string &err) {
   RD_PHASE(prof_, "ffn_down");  // RD_PHASE_PROF
   if (!proj(L.ffn_down, d_ffn_a_, d_ffnout_, E, F, err)) return false;
   emit("ffn_out", il, d_ffnout_, E);
-  if (!add_residual(d_ffnout_, d_x_, E, err)) return false;
+  // Add final: laco (F4). Aqui fica d_ffnout_.
   return true;
 }
 
@@ -2222,19 +2211,68 @@ inline bool Graph::forward_run(std::size_t n_tokens, int start_pos, const float 
     }
     emit("model.input_embed", -1, d_x_, E);
     const int l_end = debug_layer_limit();
+    const float eps_f = (float)cfg_.rms_norm_eps;
+    // F4: pares add+norm fundidos (bit-identicos). Sem ruido de diagnostico
+    // (o perturb mora no add) os emits leem buffers materializados de
+    // qualquer jeito, entao nao ha guarda de callback aqui.
+    const bool fuse_f4 = add_rms_fuse_enabled() && noise_rel_ == 0.0f;
     for (int il = 0; il < l_end; ++il) {
+      // Norma de entrada: il==0 nao tem add precedente; as outras fundem o
+      // add do ffn anterior com a attn_norm (F4b).
+      if (il == 0) {
+        RD_PHASE(prof_, "attn_norm");  // RD_PHASE_PROF
+        if (!rms_norm_launch(d_x_, (const float *)w_[il].attn_norm.ptr, d_xn_, 1, E, eps_f)) {
+          err = "attn_norm launch failed";
+          return false;
+        }
+      } else if (fuse_f4) {
+        RD_PHASE(prof_, "attn_norm");  // RD_PHASE_PROF
+        if (!add_rms_fused_launch(d_ffnout_, d_x_, (const float *)w_[il].attn_norm.ptr, d_xn_,
+                                  E, eps_f)) {
+          err = "fused add+attn_norm launch failed";
+          return false;
+        }
+      } else {
+        if (!add_residual(d_ffnout_, d_x_, E, err)) {
+          err = "layer " + std::to_string(il - 1) + ": " + err;
+          return false;
+        }
+        RD_PHASE(prof_, "attn_norm");  // RD_PHASE_PROF
+        if (!rms_norm_launch(d_x_, (const float *)w_[il].attn_norm.ptr, d_xn_, 1, E, eps_f)) {
+          err = "attn_norm launch failed";
+          return false;
+        }
+      }
+      // l_out da camada anterior: o add do ffn dela acaba de pousar em d_x_
+      // (aqui na F4b; na ultima iteracao, no add puro abaixo).
+      if (il > 0) emit("l_out", il - 1, d_x_, E);
+      emit("attn_norm", il, d_xn_, E);
       const bool ok = w_[il].recr ? gdn_layer(il, (int)t, err)
                                  : full_attn(il, (int)t, start_pos + (int)t, err);
       if (!ok) {
         err = "layer " + std::to_string(il) + ": " + err;
         return false;
       }
-      emit("attn_residual", il, d_x_, E);
+      // F4a: add do bloco + post_norm (ou o par separado). O emit de
+      // attn_residual le d_x_ depois do add nos dois caminhos.
       RD_PHASE(prof_, "post_norm");  // RD_PHASE_PROF
-      if (!rms_norm_launch(d_x_, (const float *)w_[il].attn_post_norm.ptr, d_xn_, 1, E,
-                           (float)cfg_.rms_norm_eps)) {
-        err = "attn_post_norm launch failed";
+      if (fuse_f4) {
+        if (!add_rms_fused_launch(d_ffnout_, d_x_, (const float *)w_[il].attn_post_norm.ptr,
+                                  d_xn_, E, eps_f)) {
+          err = "fused add+post_norm launch failed";
+          return false;
+        }
+      } else if (!add_residual(d_ffnout_, d_x_, E, err)) {
+        err = "layer " + std::to_string(il) + ": " + err;
         return false;
+      }
+      emit("attn_residual", il, d_x_, E);
+      if (!fuse_f4) {
+        if (!rms_norm_launch(d_x_, (const float *)w_[il].attn_post_norm.ptr, d_xn_, 1, E,
+                             eps_f)) {
+          err = "attn_post_norm launch failed";
+          return false;
+        }
       }
       emit("attn_post_norm", il, d_xn_, E);
       RD_PHASE(prof_, "ffn");  // RD_PHASE_PROF
@@ -2242,7 +2280,16 @@ inline bool Graph::forward_run(std::size_t n_tokens, int start_pos, const float 
         err = "layer " + std::to_string(il) + ": " + err;
         return false;
       }
-      emit("l_out", il, d_x_, E);
+      if (il + 1 == l_end) {
+        // Ultima camada: sem norma seguinte para fundir com a F4b; add puro
+        // (a output_norm abaixo e' unfused de proposito). O l_out dela sai
+        // aqui; os das outras sairam na F4b da iteracao seguinte.
+        if (!add_residual(d_ffnout_, d_x_, E, err)) {
+          err = "layer " + std::to_string(il) + ": " + err;
+          return false;
+        }
+        emit("l_out", il, d_x_, E);
+      }
     }
   }
 

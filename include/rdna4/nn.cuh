@@ -7,6 +7,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 
 #include "rdna4/fp16.h"
 
@@ -239,6 +240,81 @@ inline bool rms_norm_launch(const float *d_x, const float *d_w, float *d_y, std:
                             std::int64_t ncols, float eps, hipStream_t stream = nullptr) {
   rms_norm_kernel<<<(unsigned)nrows, kRmsNormThreads, 0, stream>>>(d_x, d_w, d_y, ncols, eps);
   return hipGetLastError() == hipSuccess;
+}
+
+// ---------------------------------------------------------------------------
+// F4: add_residual + rms_norm numa chamada (H3, medido 16/09).
+//
+// Replica a ordem exata dos dois kernels: a soma e' materializada em dst_io
+// (como o add separado) e a norma corre sobre os valores somados com os
+// MESMOS fma, mesma arvore e mesmo epilogo do rms_norm_kernel acima --
+// bit-identico (12/12 memcmp em tests/bench_fuse_gpu.hip).
+// Uma linha por CTA (caminho decode, nrows == 1); ncols <= 5120 (tmp em
+// registrador dimensionado para E). Fora disso o chamador usa o par.
+// ---------------------------------------------------------------------------
+__global__ void add_rms_fused_kernel(const float *__restrict__ src, float *__restrict__ dst_io,
+                                     const float *__restrict__ w, float *__restrict__ y,
+                                     std::int64_t ncols, float eps) {
+  __shared__ float partial[kRmsNormThreads];
+  constexpr int T = kRmsNormThreads;
+  float tmp[5120 / T];
+  float acc = 0.0f;
+  std::int64_t i = threadIdx.x;
+  int k = 0;
+  for (; i + 3 * T < ncols; i += 4 * T) {
+    const float t0 = src[i] + dst_io[i];
+    const float t1 = src[i + T] + dst_io[i + T];
+    const float t2 = src[i + 2 * T] + dst_io[i + 2 * T];
+    const float t3 = src[i + 3 * T] + dst_io[i + 3 * T];
+    dst_io[i] = t0;
+    dst_io[i + T] = t1;
+    dst_io[i + 2 * T] = t2;
+    dst_io[i + 3 * T] = t3;
+    tmp[k] = t0;
+    tmp[k + 1] = t1;
+    tmp[k + 2] = t2;
+    tmp[k + 3] = t3;
+    k += 4;
+    acc = fmaf(t0, t0, acc);
+    acc = fmaf(t1, t1, acc);
+    acc = fmaf(t2, t2, acc);
+    acc = fmaf(t3, t3, acc);
+  }
+  for (; i < ncols; i += T) {
+    const float t = src[i] + dst_io[i];
+    dst_io[i] = t;
+    tmp[k++] = t;
+    acc = fmaf(t, t, acc);
+  }
+  partial[threadIdx.x] = acc;
+  __syncthreads();
+  for (int stride = T / 2; stride > 0; stride >>= 1) {
+    if ((int)threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+    __syncthreads();
+  }
+  const float scale = rsqrtf(partial[0] / (float)ncols + eps);
+  i = threadIdx.x;
+  k = 0;
+  for (; i < ncols; i += T) y[i] = tmp[k++] * scale * w[i];
+}
+
+inline bool add_rms_fused_launch(const float *d_src, float *d_dst_io, const float *d_w, float *d_y,
+                                 int ncols, float eps, hipStream_t stream = nullptr) {
+  if (ncols <= 0 || ncols > 5120) return false;
+  add_rms_fused_kernel<<<1, kRmsNormThreads, 0, stream>>>(d_src, d_dst_io, d_w, d_y,
+                                                          (std::int64_t)ncols, eps);
+  return hipGetLastError() == hipSuccess;
+}
+
+// Porta da fusao add+norm (default ON, fuga `RD_GFX12_FUSE_ADD_NORM=0`):
+// bit-identica ao par, entao o default e' o caminho rapido. Precedente:
+// RD_GFX12_GDN_CONVFUSE.
+inline bool add_rms_fuse_enabled() {
+  static const int on = [] {
+    const char *e = std::getenv("RD_GFX12_FUSE_ADD_NORM");
+    return !(e && std::atoi(e) == 0);
+  }();
+  return on;
 }
 
 inline bool l2_norm_launch(const float *d_x, float *d_y, std::int64_t nrows, std::int64_t ncols,
