@@ -295,14 +295,20 @@ __device__ __forceinline__ void kv_load8<KvType::Q4_0>(const void *row, int lane
   const char *qp = (const char *)b->qs + (lane & 1) * 8;
   const std::uint32_t q0 = *(const std::uint32_t *)(qp + 0);
   const std::uint32_t q1 = *(const std::uint32_t *)(qp + 4);
-  const std::uint64_t q = (std::uint64_t)q0 | ((std::uint64_t)q1 << 32);
-  const bool high = (lane & 2) != 0;
+  // Nibble extraction hoisted out of the per-dim loop (unpack ALU was the
+  // issue-bound half of this path at 64K: 346 GB/s emitted): one variable
+  // shift (branchless over lane&2) + AND isolates all 8 nibbles at once.
+  // fma-fold below is BIT-EXACT: d*(nib-8) and fma(d,nib,-8*d) are both the
+  // single rounding of the same real number (-8*d itself is exact).
+  const std::uint32_t sh = ((lane & 2) != 0) ? 4u : 0u;
+  const std::uint32_t n0 = (q0 >> sh) & 0x0F0F0F0Fu;
+  const std::uint32_t n1 = (q1 >> sh) & 0x0F0F0F0Fu;
   const float d = fp16_to_float(b->d);
+  const float c = -8.0f * d;
 #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    const int byte = (int)((q >> (8 * i)) & 0xFF);
-    const int nib = high ? (byte >> 4) : (byte & 0x0F);
-    out[i] = d * (float)(nib - 8);
+  for (int i = 0; i < 4; ++i) {
+    out[i] = fmaf(d, (float)((n0 >> (8 * i)) & 0xFFu), c);
+    out[i + 4] = fmaf(d, (float)((n1 >> (8 * i)) & 0xFFu), c);
   }
 }
 
@@ -319,16 +325,20 @@ __device__ __forceinline__ void kv_load8<KvType::Q5_0>(const void *row, int lane
   const char *qp = (const char *)b->qs + (lane & 1) * 8;
   const std::uint32_t q0 = *(const std::uint32_t *)(qp + 0);
   const std::uint32_t q1 = *(const std::uint32_t *)(qp + 4);
-  const std::uint64_t q = (std::uint64_t)q0 | ((std::uint64_t)q1 << 32);
+  // Same hoisted nibbles as Q4_0 (branchless over lane&2). fma-fold is
+  // BIT-EXACT here too: d*(val-16) and fma(d,val,-16*d) single-round the same
+  // real number (-16*d exact). hi bit stays per-dim (one byte, no hoist).
+  const std::uint32_t sh = ((lane & 2) != 0) ? 4u : 0u;
+  const std::uint32_t n0 = (q0 >> sh) & 0x0F0F0F0Fu;
+  const std::uint32_t n1 = (q1 >> sh) & 0x0F0F0F0Fu;
   const std::uint8_t hb = b->qh[lane & 3];
-  const bool high = (lane & 2) != 0;
   const float d = fp16_to_float(b->d);
+  const float c = -16.0f * d;
 #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    const int byte = (int)((q >> (8 * i)) & 0xFF);
-    const int nib = high ? (byte >> 4) : (byte & 0x0F);
-    const int hi = (hb >> i) & 1;
-    out[i] = d * (float)((nib | (hi << 4)) - 16);
+  for (int i = 0; i < 4; ++i) {
+    out[i] = fmaf(d, (float)(((n0 >> (8 * i)) & 0xFFu) | (unsigned)(((hb >> i) & 1) << 4)), c);
+    out[i + 4] =
+        fmaf(d, (float)(((n1 >> (8 * i)) & 0xFFu) | (unsigned)(((hb >> (i + 4)) & 1) << 4)), c);
   }
 }
 
@@ -342,15 +352,18 @@ __device__ __forceinline__ void kv_load8<KvType::Q4_1>(const void *row, int lane
   const char *qp = (const char *)b->qs + (lane & 1) * 8;
   const std::uint32_t q0 = *(const std::uint32_t *)(qp + 0);
   const std::uint32_t q1 = *(const std::uint32_t *)(qp + 4);
-  const std::uint64_t q = (std::uint64_t)q0 | ((std::uint64_t)q1 << 32);
-  const bool high = (lane & 2) != 0;
+  // Same hoisted nibbles. NO fma-fold here: d*nib+m needs two roundings, an
+  // fma would single-round it (the GEMM-class change, not bit-exact) -- the
+  // win here is the extraction hoist alone.
+  const std::uint32_t sh = ((lane & 2) != 0) ? 4u : 0u;
+  const std::uint32_t n0 = (q0 >> sh) & 0x0F0F0F0Fu;
+  const std::uint32_t n1 = (q1 >> sh) & 0x0F0F0F0Fu;
   const float d = fp16_to_float(b->d);
   const float m = fp16_to_float(b->m);
 #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    const int byte = (int)((q >> (8 * i)) & 0xFF);
-    const int nib = high ? (byte >> 4) : (byte & 0x0F);
-    out[i] = d * (float)nib + m;
+  for (int i = 0; i < 4; ++i) {
+    out[i] = d * (float)((n0 >> (8 * i)) & 0xFFu) + m;
+    out[i + 4] = d * (float)((n1 >> (8 * i)) & 0xFFu) + m;
   }
 }
 
