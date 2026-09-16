@@ -576,3 +576,15 @@ add_custom_target(rdna4_gates DEPENDS
 add_executable(check-vision tests/check_vision.cpp src/backend/vision.cpp
                                 src/backend/gguf.cpp)
 target_include_directories(check-vision PRIVATE include)
+
+# H3 fusões de lançamentos (prototype-only): bancada A/B + memcmp de
+# bit-exatidão para F1/F3a/F3b/F3c/F4/F5 + fusões GDN + cadeias COMP.
+# Um arquivo, nenhum toque em produção (docs/plano-hipfire-gfx1201.md §4 H3).
+add_executable(bench-fuse-gpu tests/bench_fuse_gpu.hip)
+target_compile_options(bench-fuse-gpu PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=gfx1201>)
+target_link_options(bench-fuse-gpu PRIVATE --offload-arch=gfx1201)
+target_include_directories(bench-fuse-gpu PRIVATE include)
+if(EXISTS "/opt/rocm/include")
+  target_include_directories(bench-fuse-gpu PRIVATE /opt/rocm/include)
+endif()
+target_link_libraries(bench-fuse-gpu PRIVATE ${AMDHIP64})

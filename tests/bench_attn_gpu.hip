@@ -596,6 +596,417 @@ static int run_gqa_duel(rdna4::KvType kt, int t, int hg, int rounds) {
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// H6 step 1 — merge audit (hipfire PR #760 pattern).
+//
+// Their stable form (CK-style, new in #760): one LSE plane + normalized Oacc,
+//   m = max_s LSE_s;  w_s = isfinite(LSE_s) ? exp(LSE_s - m) : 0
+//   out = sum_s(w_s * Oacc_s) / sum_s(w_s)      (zeros if no finite split)
+// Our shipped form (attn_merge_kernel, plus the CTA-local WPB reduce inside
+// attn_split_kernel — same statements in attn_merge_batch_kernel):
+//   mm = max_s m_s;  w'_s = exp(m_s - mm)
+//   out = sum_s(w'_s * acc_s) / sum_s(w'_s * l_s)   (zeros if mm == -inf)
+// The two are the same max-subtracted reduction up to the l-folding
+// (LSE_s = m_s + log l_s in exact arithmetic). What killed THEIR first attempt
+// was not the formula but the partial O-write: lanes ml>=8 of the multi-query
+// group wrote partial O to the wrong record offset, i.e. SOME OUTPUT DIMS
+// WERE NEVER WRITTEN and the merge read stale VRAM. The analogue here is the
+// [h][s] partial layout + the strided O-write
+// `for (d = threadIdx.x; d < head_dim; d += blockDim.x)` (split kernel) and
+// the 32-lane dpw merge: with WPB=16/32 most threads write NO dim, with
+// head_dim > blockDim some write several, and an over-read past n_splits
+// would silently consume garbage. Coverage is checked with NaN poisoning:
+// out AND the unused partial tail are pre-filled with NaN, so any unwritten
+// dim or any over-read survives as NaN in the merge output.
+//
+// Shapes: tail/ragged (n_splits not dividing the keys), sentinel (splits with
+// zero keys: m=-inf, l=0 — the expf(-inf - -inf) = NaN trap; and ALL splits
+// empty, which must emit exact zeros), extremal LSE spread (+/-20, so only
+// max-subtraction avoids overflow), and the ml>=8-lane class as splits>=8
+// with WPB 8/16/32. Gate: all finite, zero NaN, rel-L2 vs host f64 <= 2e-6
+// (fp32 rounding over <= 16 terms), all-empty bit-exact zeros.
+// ---------------------------------------------------------------------------
+static int run_merge_audit(rdna4::KvType kt, const char *tname) {
+  int failures = 0, cases = 0;
+  auto check = [&](const char *name, bool ok, double rel, double maxd) {
+    ++cases;
+    char detail[128];
+    std::snprintf(detail, sizeof(detail), "rel-L2 %.2e max|d| %.2e", rel, maxd);
+    std::printf("  [%s] %-40s %s\n", ok ? "PASS" : "FAIL", name, detail);
+    if (!ok) ++failures;
+  };
+  std::printf("H6 merge audit vs max-LSE-stable form (hipfire PR #760 pattern)\n");
+  std::printf("  ours: mm=max m_s, out=sum(acc_s*e^(m_s-mm))/sum(l_s*e^(m_s-mm)); "
+              "theirs: m=max LSE_s, out=sum(Oacc_s*e^(LSE_s-m))/sum(e^(LSE_s-m))\n");
+
+  // ---- Part A: attn_merge_kernel vs host f64 on synthetic partials ----
+  const int n_head = 4, head_dim = 256, smax = 16;
+  float *d_partial = nullptr, *d_out = nullptr;
+  if (hipMalloc(&d_partial, rdna4::attn_partial_bytes(n_head, head_dim, smax)) != hipSuccess ||
+      hipMalloc(&d_out, (std::size_t)n_head * head_dim * sizeof(float)) != hipSuccess) {
+    std::fprintf(stderr, "merge-audit: hipMalloc failed\n");
+    return 1;
+  }
+  std::vector<float> h_partial((std::size_t)n_head * smax * (2 + head_dim));
+  std::vector<float> h_out((std::size_t)n_head * head_dim);
+  unsigned rng = 0x243F6A88u;
+  auto rnd = [&]() {
+    rng = rng * 1664525u + 1013904223u;
+    return (float)(rng >> 8) * (1.0f / 8388608.0f) - 1.0f;
+  };
+  const int splits_a[] = {1, 2, 4, 8, 16};
+  const char *modes_a[] = {"finite", "tail-empty", "all-empty", "extremal"};
+  for (int ns : splits_a) {
+    for (const char *mode : modes_a) {
+      if (ns == 1 && std::strcmp(mode, "tail-empty") == 0) continue;  // degenerate: == all-empty
+      for (int h = 0; h < n_head; ++h) {
+        for (int s = 0; s < smax; ++s) {
+          float *rec = h_partial.data() + ((std::size_t)h * smax + s) * (2 + head_dim);
+          const bool active = s < ns;
+          const bool empty =
+              active && (std::strcmp(mode, "all-empty") == 0 ||
+                         (std::strcmp(mode, "tail-empty") == 0 && s >= ns - ns / 2));
+          if (!active) {
+            for (int d = 0; d < 2 + head_dim; ++d) rec[d] = NAN;  // over-read tripwire
+            continue;
+          }
+          if (empty) {  // production-faithful: an empty CTA writes (m=-inf, l=0, acc=0)
+            rec[0] = -INFINITY;
+            rec[1] = 0.0f;
+            for (int d = 0; d < head_dim; ++d) rec[2 + d] = 0.0f;
+            continue;
+          }
+          rec[0] = (std::strcmp(mode, "extremal") == 0) ? ((s % 2) ? 20.0f + rnd() : -20.0f + rnd())
+                                                        : 4.0f * rnd();
+          rec[1] = 1.0f + std::fabs(rnd()) * 10.0f;
+          for (int d = 0; d < head_dim; ++d) rec[2 + d] = 2.0f * rnd();
+        }
+      }
+      hipMemcpy(d_partial, h_partial.data(), h_partial.size() * sizeof(float),
+                hipMemcpyHostToDevice);
+      hipMemset(d_out, 0xFF, h_out.size() * sizeof(float));  // NaN: unwritten dims survive
+      // The merge addresses partials with stride n_splits ([h][ns]), exactly
+      // like production (attn_partial_bytes(n_head, head_dim, n_splits)), so
+      // compact the active records; the NaN tail stays HOST-side as the
+      // over-read tripwire only if the kernel strayed past ns (it cannot be
+      // placed device-side at stride 16: the kernel would read it as data).
+      std::vector<float> compact((std::size_t)n_head * ns * (2 + head_dim));
+      for (int h = 0; h < n_head; ++h)
+        for (int s = 0; s < ns; ++s) {
+          const float *src = h_partial.data() + ((std::size_t)h * smax + s) * (2 + head_dim);
+          float *dst = compact.data() + ((std::size_t)h * ns + s) * (2 + head_dim);
+          for (int d = 0; d < 2 + head_dim; ++d) dst[d] = src[d];
+        }
+      hipMemcpy(d_partial, compact.data(), compact.size() * sizeof(float), hipMemcpyHostToDevice);
+      // Over-read tripwire: poison the slack past the [h][ns] image (only the
+      // last head's tail is unambiguously out-of-bounds, but any stray read
+      // past ns lands either here or in a neighbour head's records and shows
+      // up as NaN/rel failure downstream).
+      {
+        const std::size_t cbytes = compact.size() * sizeof(float);
+        const std::size_t tbytes =
+            rdna4::attn_partial_bytes(n_head, head_dim, smax) - cbytes;
+        if (tbytes > 0)
+          hipMemset((char *)d_partial + cbytes, 0xFF, tbytes);
+      }
+      rdna4::attn_merge_kernel<<<n_head, 32, 0, nullptr>>>(d_partial, d_out, n_head, head_dim,
+                                                           ns);
+      hipDeviceSynchronize();
+      if (hipGetLastError() != hipSuccess) {
+        char nm[96];
+        std::snprintf(nm, sizeof(nm), "A S=%d %s (launch)", ns, mode);
+        check(nm, false, -1.0, -1.0);
+        continue;
+      }
+      hipMemcpy(h_out.data(), d_out, h_out.size() * sizeof(float), hipMemcpyDeviceToHost);
+      // host f64 reference over the ACTIVE splits only
+      bool ok = true;
+      double worst_rel = 0, worst_maxd = 0;
+      for (int h = 0; h < n_head && ok; ++h) {
+        double mm = -INFINITY;
+        for (int s = 0; s < ns; ++s) {
+          const float *rec = h_partial.data() + ((std::size_t)h * smax + s) * (2 + head_dim);
+          mm = std::fmax(mm, (double)rec[0]);
+        }
+        const float *got = h_out.data() + (std::size_t)h * head_dim;
+        for (int d = 0; d < head_dim; ++d)
+          if (!std::isfinite(got[d])) ok = false;  // NaN = unwritten dim / over-read
+        if (mm == -INFINITY) {
+          for (int d = 0; d < head_dim; ++d) {
+            worst_maxd = std::fmax(worst_maxd, std::fabs((double)got[d]));
+            if (got[d] != 0.0f) ok = false;
+          }
+          continue;
+        }
+        double ll = 0;
+        for (int s = 0; s < ns; ++s) {
+          const float *rec = h_partial.data() + ((std::size_t)h * smax + s) * (2 + head_dim);
+          if (rec[0] == -INFINITY) continue;
+          ll += (double)rec[1] * std::exp((double)rec[0] - mm);
+        }
+        double num = 0, den = 0, md = 0;
+        for (int d = 0; d < head_dim; ++d) {
+          double a = 0;
+          for (int s = 0; s < ns; ++s) {
+            const float *rec = h_partial.data() + ((std::size_t)h * smax + s) * (2 + head_dim);
+            if (rec[0] == -INFINITY) continue;
+            a += (double)rec[2 + d] * std::exp((double)rec[0] - mm);
+          }
+          const double ref = (ll > 0) ? a / ll : 0.0;
+          const double df = (double)got[d] - ref;
+          num += df * df;
+          den += ref * ref + (double)got[d] * got[d];
+          md = std::fmax(md, std::fabs(df));
+        }
+        worst_rel = std::fmax(worst_rel, std::sqrt(num / den));
+        worst_maxd = std::fmax(worst_maxd, md);
+        if (worst_rel > 2e-6) ok = false;
+      }
+      char nm[96];
+      std::snprintf(nm, sizeof(nm), "A merge-S=%d %s vs f64", ns, mode);
+      check(nm, ok, worst_rel, worst_maxd);
+    }
+  }
+
+  // ---- Part B: split-vs-unsplit on ragged/tail/sentinel key counts ----
+  // (forced splits even where the engine would run unsplit < 512 keys: the
+  // merge must be right at every shape, not just the admitted ones.)
+  std::vector<std::pair<rdna4::KvType, const char *>> kb{{rdna4::KvType::F32, "f32"}};
+  if (kt != rdna4::KvType::F32) kb.push_back({kt, tname});
+  const int keys_b[] = {1, 2, 3, 5, 7, 8, 9, 15, 16, 17, 24, 25, 31, 33,
+                        100, 511, 512, 513, 520, 1023, 1025, 2048, 2050};
+  const int splits_b[] = {2, 4, 8, 16};
+  const int maxkeys = 2050;
+  float *b_q = nullptr, *b_o1 = nullptr, *b_o2 = nullptr;
+  void *b_k = nullptr, *b_v = nullptr;
+  float *b_partial = nullptr;
+  {
+    std::uint64_t maxb = 0;
+    for (auto &kv : kb) maxb = std::max<std::uint64_t>(maxb, rdna4::kv_row_bytes(kv.first, 256));
+    const std::size_t cb = (std::size_t)maxkeys * kHeadsKv * maxb;
+    if (hipMalloc(&b_q, (std::size_t)kHeads * 256 * sizeof(float)) != hipSuccess ||
+        hipMalloc(&b_o1, (std::size_t)kHeads * 256 * sizeof(float)) != hipSuccess ||
+        hipMalloc(&b_o2, (std::size_t)kHeads * 256 * sizeof(float)) != hipSuccess ||
+        hipMalloc(&b_k, cb) != hipSuccess || hipMalloc(&b_v, cb) != hipSuccess ||
+        hipMalloc(&b_partial, rdna4::attn_partial_bytes(kHeads, 256, 16)) != hipSuccess) {
+      std::fprintf(stderr, "merge-audit: hipMalloc (part B) failed\n");
+      return 1;
+    }
+  }
+  std::vector<float> qh;
+  fill_random(qh, (std::size_t)kHeads * 256, 3u);
+  hipMemcpy(b_q, qh.data(), qh.size() * sizeof(float), hipMemcpyHostToDevice);
+  std::vector<float> o1((std::size_t)kHeads * 256), o2((std::size_t)kHeads * 256);
+  for (auto &kv : kb) {
+    const std::uint64_t rowb = rdna4::kv_row_bytes(kv.first, 256);
+    const std::size_t cb = (std::size_t)maxkeys * kHeadsKv * rowb;
+    // separate fills per type would be ideal; kv_fill_launch is deterministic
+    // per (type, rows, seed), so re-fill per type keeps the comparison honest
+    double wrel = 0, wmaxd = 0;
+    bool ok = true;
+    int ncase = 0;
+    for (int keys : keys_b) {
+      const int t = keys - 1;
+      const std::int64_t rows = (std::int64_t)keys * kHeadsKv;
+      if (!rdna4::kv_fill_launch(kv.first, b_k, rows, 256, 11u) ||
+          !rdna4::kv_fill_launch(kv.first, b_v, rows, 256, 22u)) {
+        ok = false;
+        break;
+      }
+      hipDeviceSynchronize();
+      for (int ns : splits_b) {
+        ++ncase;
+        const int wpb = rdna4::attn_split_wpb(ns);
+        hipMemset(b_o1, 0xFF, o1.size() * sizeof(float));
+        hipMemset(b_o2, 0xFF, o2.size() * sizeof(float));
+        hipMemset(b_partial, 0xFF, rdna4::attn_partial_bytes(kHeads, 256, 16));
+        (void)rdna4::attn_launch(b_q, b_k, b_v, b_o1, t, kHeads, kHeadsKv, 256, kScale, kv.first,
+                                 kv.first, nullptr);
+        (void)rdna4::attn_launch_split_wpb(b_q, b_k, b_v, b_o2, b_partial, t, kHeads, kHeadsKv,
+                                           256, kScale, kv.first, kv.first, ns, wpb, nullptr);
+        hipDeviceSynchronize();
+        if (hipGetLastError() != hipSuccess) {
+          ok = false;
+          continue;
+        }
+        hipMemcpy(o1.data(), b_o1, o1.size() * sizeof(float), hipMemcpyDeviceToHost);
+        hipMemcpy(o2.data(), b_o2, o2.size() * sizeof(float), hipMemcpyDeviceToHost);
+        double num = 0, den = 0, md = 0;
+        for (std::size_t i = 0; i < o1.size(); ++i) {
+          if (!std::isfinite(o1[i]) || !std::isfinite(o2[i])) ok = false;
+          const double d = (double)o1[i] - (double)o2[i];
+          num += d * d;
+          den += (double)o1[i] * o1[i] + (double)o2[i] * o2[i];
+          md = std::fmax(md, std::fabs(d));
+        }
+        const double rel = std::sqrt(num / den);
+        wrel = std::fmax(wrel, rel);
+        wmaxd = std::fmax(wmaxd, md);
+        if (!(rel <= 1e-6)) ok = false;
+      }
+    }
+    char nm[96];
+    std::snprintf(nm, sizeof(nm), "B ragged/sentinel split-vs-unsplit kv=%s (%d shapes)", kv.second,
+                  ncase);
+    check(nm, ok, wrel, wmaxd);
+    (void)cb;
+  }
+  std::printf("  merge-audit: %d/%d cases passed (kv under test: %s + f32 anchor)\n", cases - failures,
+              cases, tname);
+  hipFree(d_partial);
+  hipFree(d_out);
+  hipFree(b_q);
+  hipFree(b_o1);
+  hipFree(b_o2);
+  hipFree(b_k);
+  hipFree(b_v);
+  hipFree(b_partial);
+  return failures ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------
+// H6 step 2 — split sweep {2,4,8} (+16 where asked) vs the ship policy, one
+// batched gpu-lock hold: every ctx row is an INTERLEAVED duel (rounds >= 8,
+// order alternated each round, 3 launches per measurement), reporting
+// best+mean+wins and the kernel->token stake (x16 layers). Reference per row
+// is attn_splits_for/attn_split_wpb mirrored from graph.cuh/attn.cuh (the
+// same mirror the sweep table uses), candidates are --splits x --wpb.
+// ---------------------------------------------------------------------------
+static int run_h6(rdna4::KvType kt, const char *tname, const std::vector<int> &ts,
+                  const std::vector<int> &split_list, const std::vector<int> &wpb_list,
+                  int rounds) {
+  constexpr int kReps = 3;
+  std::printf("H6 split sweep kv=%s, %d interleaved rounds x %d reps (order alternated)\n", tname,
+              rounds, kReps);
+  float *d_q = nullptr, *d_out = nullptr;
+  void *d_k = nullptr, *d_v = nullptr;
+  std::vector<float> qh;
+  fill_random(qh, (std::size_t)kHeads * kHeadDim, 3u);
+  hipMalloc(&d_q, qh.size() * sizeof(float));
+  hipMalloc(&d_out, (std::size_t)kHeads * kHeadDim * sizeof(float));
+  hipMemcpy(d_q, qh.data(), qh.size() * sizeof(float), hipMemcpyHostToDevice);
+  int maxt = ts.back();
+  for (int t : ts) maxt = std::max(maxt, t);
+  const std::uint64_t rowb = rdna4::kv_row_bytes(kt, kHeadDim);
+  const std::size_t max_bytes = (std::size_t)(maxt + 1) * kHeadsKv * rowb;
+  int smax = 16;
+  for (int sp : split_list) smax = std::max(smax, sp);
+  float *d_partial = nullptr;
+  if (hipMalloc(&d_k, max_bytes) != hipSuccess || hipMalloc(&d_v, max_bytes) != hipSuccess ||
+      hipMalloc(&d_partial, rdna4::attn_partial_bytes(kHeads, kHeadDim, smax)) != hipSuccess) {
+    std::fprintf(stderr, "H6: hipMalloc failed\n");
+    return 1;
+  }
+  struct Cell {
+    int sp, wpb;
+    bool ref;
+  };
+  for (int t : ts) {
+    const int keys = t + 1;
+    const std::int64_t rows = (std::int64_t)keys * kHeadsKv;
+    if (!rdna4::kv_fill_launch(kt, d_k, rows, kHeadDim, 11u) ||
+        !rdna4::kv_fill_launch(kt, d_v, rows, kHeadDim, 22u)) {
+      std::fprintf(stderr, "H6: kv_fill_launch failed at t=%d\n", t);
+      return 1;
+    }
+    const bool kv_dense = (kt == rdna4::KvType::F16 || kt == rdna4::KvType::F32);
+    int ship_sp;
+    if (keys < rdna4::tuned::kAttnSplitMin) ship_sp = 1;
+    else if (kv_dense) ship_sp = (rdna4::tuned::kAttnSplitCtasDense + kHeads - 1) / kHeads;
+    else ship_sp = keys / rdna4::tuned::kAttnSplitMin;
+    ship_sp = std::min(std::max(ship_sp, 1), rdna4::tuned::kAttnMaxSplits);
+    const int ship_wpb = rdna4::attn_split_wpb(ship_sp);
+    std::vector<Cell> cells{{ship_sp, ship_wpb, true}};
+    for (int sp : split_list)
+      for (int wpb : wpb_list) {
+        if (sp == ship_sp && wpb == ship_wpb) continue;
+        if (wpb != 8 && wpb != 16 && wpb != 32) continue;
+        cells.push_back({sp, wpb, false});
+      }
+    auto run_cell = [&](const Cell &c) {
+      if (c.sp <= 1)
+        (void)rdna4::attn_launch(d_q, d_k, d_v, d_out, t, kHeads, kHeadsKv, kHeadDim, kScale, kt,
+                                 kt, nullptr);
+      else
+        (void)rdna4::attn_launch_split_wpb(d_q, d_k, d_v, d_out, d_partial, t, kHeads, kHeadsKv,
+                                           kHeadDim, kScale, kt, kt, c.sp, c.wpb, nullptr);
+    };
+    {
+      const auto w0 = std::chrono::steady_clock::now();
+      do {
+        for (const Cell &c : cells) run_cell(c);
+        hipDeviceSynchronize();
+      } while (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0)
+                   .count() < 300.0);
+    }
+    EvPair ev;
+    std::vector<double> best(cells.size(), -1.0), sum(cells.size(), 0.0);
+    std::vector<int> wins(cells.size(), 0);
+    std::vector<std::vector<double>> hist(cells.size());
+    for (int r = 0; r < rounds; ++r) {
+      const bool fwd = (r % 2) == 0;
+      std::vector<double> got(cells.size(), -1.0);
+      for (std::size_t k = 0; k < cells.size(); ++k) {
+        const std::size_t idx = fwd ? k : cells.size() - 1 - k;
+        const double ms = ev([&] {
+          for (int j = 0; j < kReps; ++j) run_cell(cells[idx]);
+        }) / kReps;
+        got[idx] = ms;
+        hist[idx].push_back(ms);
+        if (best[idx] < 0 || ms < best[idx]) best[idx] = ms;
+        sum[idx] += ms;
+      }
+      for (std::size_t k = 1; k < cells.size(); ++k)
+        if (got[k] > 0 && got[0] > 0 && got[k] < got[0]) wins[k]++;
+    }
+    std::printf("t=%d (%d keys) kv=%s ship=%d:%d\n", t, keys, tname, ship_sp, ship_wpb);
+    std::printf("  %-8s %-8s %10s %10s %9s %9s %9s  %s\n", "splits", "warps", "best ms",
+                "mean ms", "best/ref", "mean/ref", "wins", "note");
+    for (std::size_t k = 0; k < cells.size(); ++k) {
+      const double mean = sum[k] / rounds;
+      std::printf("  %-8d %-8d %10.4f %10.4f %8.3fx %8.3fx %5d/%-4d  %s\n", cells[k].sp,
+                  cells[k].wpb, best[k], mean, best[0] / best[k], (sum[0] / rounds) / mean,
+                  wins[k], rounds, k == 0 ? "reference (ship policy)" : "candidate");
+    }
+    // numerics of every cell vs the unsplit output (one-shot, same convention
+    // as the sweep table: rel-L2 + max|d|)
+    std::vector<float> ref((std::size_t)kHeads * kHeadDim), gotv((std::size_t)kHeads * kHeadDim);
+    {
+      // unsplit reference even where the engine ships splits
+      (void)rdna4::attn_launch(d_q, d_k, d_v, d_out, t, kHeads, kHeadsKv, kHeadDim, kScale, kt, kt,
+                               nullptr);
+      hipDeviceSynchronize();
+      hipMemcpy(ref.data(), d_out, ref.size() * sizeof(float), hipMemcpyDeviceToHost);
+    }
+    for (std::size_t k = 0; k < cells.size(); ++k) {
+      run_cell(cells[k]);
+      hipDeviceSynchronize();
+      hipMemcpy(gotv.data(), d_out, gotv.size() * sizeof(float), hipMemcpyDeviceToHost);
+      double num = 0, den = 0, md = 0;
+      for (std::size_t i = 0; i < gotv.size(); ++i) {
+        const double d = (double)ref[i] - (double)gotv[i];
+        num += d * d;
+        den += (double)ref[i] * ref[i] + (double)gotv[i] * gotv[i];
+        md = std::max(md, std::fabs(d));
+      }
+      std::printf("    cell %d:%d numerics vs unsplit: rel-L2 %.2e max|d| %.2e%s\n", cells[k].sp,
+                  cells[k].wpb, std::sqrt(num / den), md,
+                  (k == 0 && ship_sp <= 1) ? " (identical path)" : "");
+    }
+    double best_cand = -1;
+    for (std::size_t k = 1; k < cells.size(); ++k)
+      if (best_cand < 0 || best[k] < best_cand) best_cand = best[k];
+    std::printf("  x%d layers: ref-best %.4f ms -> cand-best %.4f ms = %+.4f ms/token\n", kLayers,
+                best[0], best_cand, (best[0] - best_cand) * kLayers);
+  }
+  hipFree(d_q);
+  hipFree(d_out);
+  hipFree(d_k);
+  hipFree(d_v);
+  hipFree(d_partial);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -608,6 +1019,10 @@ int main(int argc, char **argv) {
   bool no_sweep = false;
   int gqa_duel_hg = 0;  // >0: kill-test duel only (HG fused vs production), then exit
   int duel_rounds = 8;
+  bool merge_audit = false;  // H6 step 1: merge reduction audit, then exit
+  bool h6_mode = false;      // H6 step 2: batched interleaved split sweep, then exit
+  int h6_rounds = 12;        // >= 8 per the H6 brief (64K decode variance +-10%)
+  bool have_ts = false, have_splits = false, have_wpb = false;
   int ab_sp = 0, ab_wpb = 0, ab_rounds = 15, ab_reps = 3;
   std::vector<std::pair<int, int>> cands;  // (splits, warps/CTA)
   std::vector<int> gqa_hg{6, 3, 1};        // heads per pass of the GQA-split prototype
@@ -631,9 +1046,11 @@ int main(int argc, char **argv) {
     } else if (std::strcmp(argv[i], "--splits") == 0 && i + 1 < argc) {
       split_list.clear();
       list(split_list);
+      have_splits = true;
     } else if (std::strcmp(argv[i], "--wpb") == 0 && i + 1 < argc) {
       wpb_list.clear();
       list(wpb_list);
+      have_wpb = true;
     } else if (std::strcmp(argv[i], "--ab") == 0 && i + 1 < argc) {
       cell_spec(argv[++i], &ab_sp, &ab_wpb);
       have_ab = true;
@@ -654,8 +1071,15 @@ int main(int argc, char **argv) {
       duel_rounds = std::atoi(argv[++i]);
     } else if (std::strcmp(argv[i], "--ab-rounds") == 0 && i + 1 < argc) {
       ab_rounds = std::atoi(argv[++i]);
+    } else if (std::strcmp(argv[i], "--merge-audit") == 0) {
+      merge_audit = true;
+    } else if (std::strcmp(argv[i], "--h6") == 0) {
+      h6_mode = true;
+    } else if (std::strcmp(argv[i], "--h6-rounds") == 0 && i + 1 < argc) {
+      h6_rounds = std::atoi(argv[++i]);
     } else {
       ts.push_back(std::atoi(argv[i]));
+      have_ts = true;
     }
   }
   if (ts.empty()) ts = {4096, 16384, 65536};
@@ -685,6 +1109,16 @@ int main(int argc, char **argv) {
       if (rc) return rc;
     }
     return 0;
+  }
+
+  if (merge_audit) return run_merge_audit(kt, tname);
+
+  if (h6_mode) {
+    if (!have_ts) ts = {8191, 16383, 32767, 65535};  // 8K/16K/32K/64K keys
+    if (!have_splits) split_list = {2, 4, 8};
+    if (!have_wpb) wpb_list = {8, 16};
+    if (h6_rounds < 8) h6_rounds = 8;
+    return run_h6(kt, tname, ts, split_list, wpb_list, h6_rounds);
   }
 
   hipDeviceProp_t prop{};

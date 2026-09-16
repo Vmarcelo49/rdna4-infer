@@ -611,6 +611,442 @@ __global__ void gdn_chunked_proto_kernel(const float *__restrict__ qk, const flo
 
 }  // namespace gdn_chunked
 
+// ---------------------------------------------------------------------------
+// H2 prototypes (plano-hipfire-gfx1201 §4 H2, steps 2-3). PROTOTYPE-ONLY: all
+// kernels below live in this bench file; include/ and src/ are untouched.
+//
+// H2.2 occupancy: the shipping decode kernel is T128/RPT1/float4, grid = 48
+//   CTAs x 128 threads (one CTA per value head, one thread per state row).
+//   48 CTAs on a 64-CU part = 16 CUs idle. The variants below keep the EXACT
+//   per-row summation order of the ship kernel (ascending-i single-accumulator
+//   fma chains, two passes) so the gate stays bit-exact via memcmp:
+//     rows16/32/64 : split each head's 128 rows over 8/4/2 CTAs (384/192/96
+//                    CTAs total). Same per-thread work as ship, only the CTA
+//                    grouping changes -> identical bytes by construction.
+//     4trow        : 4 threads cooperate per state row (32 rows x 4 lanes per
+//                    CTA of 128, grid 48x4 = 192 CTAs). Lanes stage their row
+//                    quarters (float4 loads) into a TRANSPOSED LDS mailbox
+//                    (mbox[i*32+rrow], conflict-free: simultaneous owner
+//                    threads hit banks rrow, distinct); lane 0 of each group
+//                    then issues the two fma passes in the SAME ascending-i
+//                    order as ship. Loads/stores/syncs do not round, and no
+//                    two threads share an element, so the result is bit-equal.
+//   Killing bar (triage): delta is 0.856 ms of 26.4 ms per token; >=1% E2E
+//   needs >=0.264 ms off delta => >=1.45x on us/launch. The pattern floor
+//   (5.72 us, no chains) caps the headroom at ~1.47x over ship (8.42 us).
+//
+// H2.3 fusion sketch: conv1d(4 taps, 10240 chan) + l2_norm Q + l2_norm K are
+//   3 launches/layer/token. The fused sketch does all three in ONE launch:
+//   32 row-CTAs (256 threads, one Q/K row each, conv body + l2 tree copied
+//   LINE FOR LINE incl. the 256-thread tree with its zero upper half) + 24
+//   V-passthrough CTAs. Bit-exact by construction (fmaf(v,v,0)==v*v, x+0==x
+//   for the +0 tree entries, lossless float store/load); proven by memcmp.
+//   Prize: 2 launches x 48 layers = 96 launches/token ≈ 0.2-0.3 ms.
+// ---------------------------------------------------------------------------
+namespace h2 {
+
+constexpr int HNVH = 48;
+constexpr int HNKH = 16;
+constexpr int HS = 128;
+
+// --- H2.2a: rows-split float4 kernel (identical per-row body to ship) ------
+template <int ROWS>
+__global__ void delta_rows_kernel(const float *__restrict__ q, const float *__restrict__ k,
+                                  const float *__restrict__ v, const float *__restrict__ gate,
+                                  const float *__restrict__ beta, float *__restrict__ state,
+                                  float *__restrict__ out, int n_k_heads, int S) {
+  const int h = blockIdx.x;                       // value head
+  const int j = blockIdx.y * ROWS + threadIdx.x;  // row index (value dim)
+  if (j >= S) return;
+  const int kh = h % n_k_heads;
+  const float *kd = k + (std::int64_t)kh * S;
+  const float *qd = q + (std::int64_t)kh * S;
+  float *row = state + ((std::int64_t)h * S + j) * S;
+  const float g = expf(gate[h]);
+  const float b = beta[h];
+  const float4 *kd4 = (const float4 *)kd;
+  float4 *p = (float4 *)row;
+  float sum = 0.0f;
+#pragma unroll 4
+  for (int i4 = 0; i4 < S / 4; ++i4) {
+    float4 x = p[i4];
+    x.x *= g;
+    x.y *= g;
+    x.z *= g;
+    x.w *= g;
+    p[i4] = x;
+    const float4 kk = kd4[i4];
+    sum = fmaf(x.x, kk.x, sum);
+    sum = fmaf(x.y, kk.y, sum);
+    sum = fmaf(x.z, kk.z, sum);
+    sum = fmaf(x.w, kk.w, sum);
+  }
+  const float delta = (v[(std::int64_t)h * S + j] - sum) * b;
+  const float4 *qd4 = (const float4 *)qd;
+  float acc = 0.0f;
+#pragma unroll 4
+  for (int i4 = 0; i4 < S / 4; ++i4) {
+    const float4 kk = kd4[i4];
+    const float4 qq = qd4[i4];
+    float4 x = p[i4];
+    x.x = fmaf(kk.x, delta, x.x);
+    x.y = fmaf(kk.y, delta, x.y);
+    x.z = fmaf(kk.z, delta, x.z);
+    x.w = fmaf(kk.w, delta, x.w);
+    p[i4] = x;
+    acc = fmaf(x.x, qq.x, acc);
+    acc = fmaf(x.y, qq.y, acc);
+    acc = fmaf(x.z, qq.z, acc);
+    acc = fmaf(x.w, qq.w, acc);
+  }
+  out[(std::int64_t)h * S + j] = acc * rsqrtf((float)S);
+}
+
+// --- H2.2b: 4-threads/row cooperative, owner-accumulates (bit-exact) -------
+__global__ void delta_4trow_kernel(const float *__restrict__ q, const float *__restrict__ k,
+                                   const float *__restrict__ v, const float *__restrict__ gate,
+                                   const float *__restrict__ beta, float *__restrict__ state,
+                                   float *__restrict__ out, int n_k_heads, int S) {
+  constexpr int ROWS = 32;
+  const int h = blockIdx.x;                 // value head
+  const int rrow = threadIdx.x >> 2;        // 0..31 row-in-CTA
+  const int lane = threadIdx.x & 3;         // 0..3 quarter-lane
+  const int j = blockIdx.y * ROWS + rrow;   // row index (value dim)
+  const int kh = h % n_k_heads;
+  __shared__ float mbox[ROWS * 128];        // transposed: TROW(i) = mbox[i*32+rrow]
+#define H2_TROW(i) (mbox[(i)*ROWS + rrow])
+  const float *srow = state + ((std::int64_t)h * S + j) * S;
+  // Stage: each lane float4-loads its quarter (8 vec4 = 32 floats).
+  {
+    const float4 *sp = (const float4 *)srow;
+#pragma unroll
+    for (int u = 0; u < 8; ++u) {
+      const float4 gv = sp[lane * 8 + u];
+      H2_TROW(lane * 32 + 4 * u + 0) = gv.x;
+      H2_TROW(lane * 32 + 4 * u + 1) = gv.y;
+      H2_TROW(lane * 32 + 4 * u + 2) = gv.z;
+      H2_TROW(lane * 32 + 4 * u + 3) = gv.w;
+    }
+  }
+  __syncthreads();
+  if (lane == 0) {
+    const float *kd = k + (std::int64_t)kh * S;
+    const float *qd = q + (std::int64_t)kh * S;
+    const float g = expf(gate[h]);
+    const float b = beta[h];
+    float sum = 0.0f;
+    for (int i = 0; i < S; ++i) {
+      const float x = H2_TROW(i) * g;  // same ascending-i order as ship
+      H2_TROW(i) = x;
+      sum = fmaf(x, kd[i], sum);
+    }
+    const float delta = (v[(std::int64_t)h * S + j] - sum) * b;
+    float acc = 0.0f;
+    for (int i = 0; i < S; ++i) {
+      const float x = fmaf(kd[i], delta, H2_TROW(i));
+      H2_TROW(i) = x;
+      acc = fmaf(x, qd[i], acc);
+    }
+    out[(std::int64_t)h * S + j] = acc * rsqrtf((float)S);
+    float4 *dp = (float4 *)(state + ((std::int64_t)h * S + j) * S);
+#pragma unroll
+    for (int i4 = 0; i4 < S / 4; ++i4)
+      dp[i4] = make_float4(H2_TROW(4 * i4 + 0), H2_TROW(4 * i4 + 1), H2_TROW(4 * i4 + 2),
+                           H2_TROW(4 * i4 + 3));
+  }
+#undef H2_TROW
+}
+
+// --- H2.3: fused conv(4tap)+SiLU+l2norm-Q/K, one launch --------------------
+// Production shapes: chan=10240, K=4, key_dim=2048, d_inner=6144, nkh=16,
+// S=128, eps=1e-6. Grid: 32 row-CTAs (one Q/K row each) + 24 V CTAs.
+constexpr int FCHAN = 10240, FK = 4, FKEYD = 2048, FDIN = 6144, FNKH = 16, FS = 128;
+constexpr float FEPS = 1e-6f;
+
+__global__ void conv_silu_l2_fused_kernel(const float *__restrict__ qkv, const float *__restrict__ w,
+                                          float *__restrict__ conv, float *__restrict__ cstate,
+                                          int channels, int K) {
+  constexpr int NROW = 2 * FNKH;  // 32 Q/K row CTAs
+  if (blockIdx.x < NROW) {
+    // One Q/K row: conv body verbatim, then the l2_norm_kernel body verbatim
+    // (256 threads, ncols=128: threads >=128 contribute +0.0f, same tree).
+    const int r = blockIdx.x;
+    const bool is_q = r < FNKH;
+    const int head = is_q ? r : r - FNKH;
+    const int base = (is_q ? 0 : FKEYD) + head * FS;
+    const int t = threadIdx.x;
+    float val = 0.0f;
+    if (t < FS) {
+      const int c = base + t;
+      float acc = 0.0f;
+      for (int k = 0; k < K - 1; ++k) acc += w[c * K + k] * cstate[k * channels + c];
+      acc += w[c * K + (K - 1)] * qkv[c];
+      val = rdna4::silu_f(acc);
+      for (int k = 0; k < K - 2; ++k) cstate[k * channels + c] = cstate[(k + 1) * channels + c];
+      cstate[(K - 2) * channels + c] = qkv[c];
+    }
+    __shared__ float partial[256];
+    float a = 0.0f;
+    for (long long i = t; i < FS; i += 256) {
+      const float vv = val;  // exactly one iter for t<128 (== xr[i] load, lossless)
+      a = fmaf(vv, vv, a);
+    }
+    partial[t] = a;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+      if (t < stride) partial[t] += partial[t + stride];
+      __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] + FEPS);
+    if (t < FS) conv[base + t] = val * scale;
+  } else {
+    // V passthrough: conv+SiLU verbatim, no norm.
+    const int t = threadIdx.x;
+    const long long vc = (long long)(blockIdx.x - NROW) * 256 + t;
+    if (vc < FDIN) {
+      const int c = 2 * FKEYD + (int)vc;
+      float acc = 0.0f;
+      for (int k = 0; k < K - 1; ++k) acc += w[c * K + k] * cstate[k * channels + c];
+      acc += w[c * K + (K - 1)] * qkv[c];
+      conv[c] = rdna4::silu_f(acc);
+      for (int k = 0; k < K - 2; ++k) cstate[k * channels + c] = cstate[(k + 1) * channels + c];
+      cstate[(K - 2) * channels + c] = qkv[c];
+    }
+  }
+}
+
+struct Timed {
+  double best = 1e30, mean = 0;
+};
+
+static int run_h2() {
+  int CUs = 64;
+  hipDeviceGetAttribute(&CUs, hipDeviceAttributeMultiprocessorCount, 0);
+  std::printf("H2 prototypes (gfx1201, %d CUs). Bar: >=1.45x on delta us/launch\n", CUs);
+  std::printf("(delta 0.856ms of 26.4ms; >=1%% E2E needs >=0.264ms off delta).\n");
+
+  // ================= H2.2 delta occupancy =================
+  const int dim = HNVH * HS;
+  const std::size_t fb = (std::size_t)dim * sizeof(float);
+  const std::size_t sb = (std::size_t)HNVH * HS * HS * sizeof(float);
+  float *dq = nullptr, *dk = nullptr, *dv = nullptr, *dg = nullptr, *db = nullptr, *dst = nullptr,
+        *dou = nullptr, *dref_s = nullptr, *dref_o = nullptr;
+  bool ok = hipMalloc(&dq, fb) == hipSuccess && hipMalloc(&dk, fb) == hipSuccess &&
+            hipMalloc(&dv, fb) == hipSuccess && hipMalloc(&dg, fb) == hipSuccess &&
+            hipMalloc(&db, fb) == hipSuccess && hipMalloc(&dst, sb) == hipSuccess &&
+            hipMalloc(&dou, fb) == hipSuccess && hipMalloc(&dref_s, sb) == hipSuccess &&
+            hipMalloc(&dref_o, fb) == hipSuccess;
+  if (!ok) {
+    std::fprintf(stderr, "hipMalloc failed\n");
+    return 1;
+  }
+  {
+    const unsigned bl = 256;
+    fill_kernel<<<(unsigned)((fb / 4 + bl - 1) / bl), bl>>>(dq, dim, 11u);
+    fill_kernel<<<(unsigned)((fb / 4 + bl - 1) / bl), bl>>>(dk, dim, 12u);
+    fill_kernel<<<(unsigned)((fb / 4 + bl - 1) / bl), bl>>>(dv, dim, 13u);
+    fill_kernel<<<(unsigned)((fb / 4 + bl - 1) / bl), bl>>>(dg, dim, 14u);
+    fill_kernel<<<(unsigned)((fb / 4 + bl - 1) / bl), bl>>>(db, dim, 15u);
+    fill_kernel<<<(unsigned)((sb / 4 + bl - 1) / bl), bl>>>((float *)dst, (long long)(sb / 4), 7u);
+    hipDeviceSynchronize();
+    hipMemcpy(dref_s, dst, sb, hipMemcpyDeviceToDevice);
+  }
+  auto ship = [&] {
+    (void)rdna4::delta_rule_launch(dq, dk, dv, dg, db, dst, dou, HNVH, HNKH, HS);
+  };
+  auto rows16 = [&] { delta_rows_kernel<16><<<dim3((unsigned)HNVH, 8), 16>>>(dq, dk, dv, dg, db, dst, dou, HNKH, HS); };
+  auto rows32 = [&] { delta_rows_kernel<32><<<dim3((unsigned)HNVH, 4), 32>>>(dq, dk, dv, dg, db, dst, dou, HNKH, HS); };
+  auto rows64 = [&] { delta_rows_kernel<64><<<dim3((unsigned)HNVH, 2), 64>>>(dq, dk, dv, dg, db, dst, dou, HNKH, HS); };
+  auto trow4 = [&] {
+    delta_4trow_kernel<<<dim3((unsigned)HNVH, 4), 128>>>(dq, dk, dv, dg, db, dst, dou, HNKH, HS);
+  };
+  struct V {
+    const char *name;
+    std::function<void()> fn;
+    int ctas, blk;
+  };
+  std::vector<V> vs = {{"ship T128/RPT1/float4", ship, 48, 128}, {"rows16 (384 CTA)", rows16, 384, 16},
+                       {"rows32 (192 CTA)", rows32, 192, 32},    {"rows64 (96 CTA)", rows64, 96, 64},
+                       {"4trow coop (192 CTA)", trow4, 192, 128}};
+
+  // 1. bit-exactness gate (memcmp state+out vs ship)
+  std::vector<float> ref_o(dim), got_o(dim), ref_s(sb / 4), got_s(sb / 4);
+  hipMemcpy(dst, dref_s, sb, hipMemcpyDeviceToDevice);
+  ship();
+  hipDeviceSynchronize();
+  if (hipGetLastError() != hipSuccess) {
+    std::printf("ship launch failed: %s\n", hipGetErrorString(hipGetLastError()));
+    return 1;
+  }
+  hipMemcpy(ref_o.data(), dou, fb, hipMemcpyDeviceToHost);
+  hipMemcpy(ref_s.data(), dst, sb, hipMemcpyDeviceToHost);
+  std::printf("\n[H2.2] bit-exatidao vs ship (memcmp %zu estado + %d saida):\n", ref_s.size(), dim);
+  int bad = 0;
+  for (std::size_t i = 1; i < vs.size(); ++i) {
+    hipMemcpy(dst, dref_s, sb, hipMemcpyDeviceToDevice);
+    vs[i].fn();
+    hipDeviceSynchronize();
+    if (hipGetLastError() != hipSuccess) {
+      std::printf("  %-22s LAUNCH FAILED: %s\n", vs[i].name, hipGetErrorString(hipGetLastError()));
+      ++bad;
+      continue;
+    }
+    hipMemcpy(got_o.data(), dou, fb, hipMemcpyDeviceToHost);
+    hipMemcpy(got_s.data(), dst, sb, hipMemcpyDeviceToHost);
+    const bool so = std::memcmp(got_o.data(), ref_o.data(), fb) == 0;
+    const bool ss = std::memcmp(got_s.data(), ref_s.data(), sb) == 0;
+    std::printf("  %-22s saida %s  estado %s\n", vs[i].name, so ? "IDENTICA" : "DIFERE",
+                ss ? "IDENTICO" : "DIFERE");
+    if (!so || !ss) ++bad;
+  }
+
+  // 2. occupancy (runtime API) per variant kernel
+  std::printf("\n[H2.2] ocupacao (hipOccupancyMaxActiveBlocksPerMultiprocessor):\n");
+  {
+    int n = 0;
+    hipOccupancyMaxActiveBlocksPerMultiprocessor(&n, rdna4::delta_rule_kernel_ilp<128, 1, true>, 128, 0);
+    std::printf("  ship T128/RPT1/float4 : %d blks/CU x 48 CTA = %d waves/CU-equiv\n", n, n * 48);
+    hipOccupancyMaxActiveBlocksPerMultiprocessor(&n, delta_rows_kernel<16>, 16, 0);
+    std::printf("  rows16                : %d blks/CU (384 CTA)\n", n);
+    hipOccupancyMaxActiveBlocksPerMultiprocessor(&n, delta_rows_kernel<32>, 32, 0);
+    std::printf("  rows32                : %d blks/CU (192 CTA)\n", n);
+    hipOccupancyMaxActiveBlocksPerMultiprocessor(&n, delta_rows_kernel<64>, 64, 0);
+    std::printf("  rows64                : %d blks/CU (96 CTA)\n", n);
+    hipOccupancyMaxActiveBlocksPerMultiprocessor(&n, delta_4trow_kernel, 128, 0);
+    std::printf("  4trow coop            : %d blks/CU (192 CTA, 16KB LDS)\n", n);
+  }
+
+  // 3. interleaved A/B timing: best+mean, chain-of-100, warmup>=300ms
+  hipEvent_t e0, e1;
+  hipEventCreate(&e0);
+  hipEventCreate(&e1);
+  constexpr int CHN = 100, ROUNDS = 12;
+  auto measure = [&](const std::function<void()> &fn) {
+    const double w0 = now_ms();
+    while (now_ms() - w0 < 320.0) {
+      for (int i = 0; i < CHN; ++i) fn();
+      hipDeviceSynchronize();
+    }
+    double best = 1e30, sum = 0;
+    for (int r = 0; r < ROUNDS; ++r) {
+      hipEventRecord(e0, nullptr);
+      for (int i = 0; i < CHN; ++i) fn();
+      hipEventRecord(e1, nullptr);
+      hipDeviceSynchronize();
+      float ms = 0;
+      hipEventElapsedTime(&ms, e0, e1);
+      const double us = (double)ms * 1000.0 / CHN;
+      best = std::min(best, us);
+      sum += us;
+    }
+    return Timed{best, sum / ROUNDS};
+  };
+  for (auto &v : vs)
+    for (int i = 0; i < 200; ++i) v.fn();
+  hipDeviceSynchronize();
+  std::vector<Timed> tm(vs.size());
+  for (int r = 0; r < 3; ++r)
+    for (std::size_t k = 0; k < vs.size(); ++k) {
+      const std::size_t idx = (k + r) % vs.size();
+      const Timed t = measure(vs[idx].fn);
+      if (t.best < tm[idx].best) tm[idx].best = t.best;
+      tm[idx].mean = tm[idx].mean == 0 ? t.mean : (tm[idx].mean + t.mean) / 2;
+    }
+  std::printf("\n[H2.2] us/launch (chain %d, %d rounds x 3 passadas rotacionadas, best+mean):\n",
+              CHN, ROUNDS);
+  for (std::size_t i = 0; i < vs.size(); ++i)
+    std::printf("  %-22s best %7.2f us  mean %7.2f us  %6.3fx  (x48 = %.3f ms/token)\n", vs[i].name,
+                tm[i].best, tm[i].mean, tm[0].best / tm[i].best, tm[i].best * 48.0 / 1000.0);
+  std::printf("  piso 1%% E2E = 0.264ms => precisa <= %.2f us/launch (%.2fx)\n",
+              tm[0].best - 264.0 / 48.0 * 1000.0, tm[0].best / (tm[0].best - 264.0 / 48.0 * 1000.0));
+
+  // ================= H2.3 conv+SiLU+norm fusion =================
+  std::printf("\n[H2.3] conv+SiLU+l2norm-Q/K fusion sketch (chan=%d K=%d, 3 launches -> 1):\n",
+              FCHAN, FK);
+  float *fq = nullptr, *fw = nullptr, *fc = nullptr, *fcs = nullptr, *frs = nullptr, *frc = nullptr;
+  const std::size_t qb = (std::size_t)FCHAN * 4, wb = (std::size_t)FCHAN * FK * 4,
+                    csb = (std::size_t)(FK - 1) * FCHAN * 4;
+  ok = hipMalloc(&fq, qb) == hipSuccess && hipMalloc(&fw, wb) == hipSuccess &&
+       hipMalloc(&fc, qb) == hipSuccess && hipMalloc(&fcs, csb) == hipSuccess &&
+       hipMalloc(&frs, csb) == hipSuccess && hipMalloc(&frc, qb) == hipSuccess;
+  if (!ok) {
+    std::fprintf(stderr, "hipMalloc failed (fusion)\n");
+    return 1;
+  }
+  {
+    const unsigned bl = 256;
+    fill_kernel<<<(unsigned)((qb / 4 + bl - 1) / bl), bl>>>(fq, FCHAN, 21u);
+    fill_kernel<<<(unsigned)((wb / 4 + bl - 1) / bl), bl>>>(fw, (long long)(wb / 4), 22u);
+    fill_kernel<<<(unsigned)((csb / 4 + bl - 1) / bl), bl>>>((float *)fcs, (long long)(csb / 4),
+                                                            23u);
+    hipDeviceSynchronize();
+    hipMemcpy(frs, fcs, csb, hipMemcpyDeviceToDevice);
+  }
+  auto unfused = [&] {
+    (void)rdna4::conv1d_state_launch(fq, fw, fc, fcs, FCHAN, FK);
+    (void)rdna4::l2_norm_launch(fc, fc, FNKH, FS, FEPS);
+    (void)rdna4::l2_norm_launch(fc + FKEYD, fc + FKEYD, FNKH, FS, FEPS);
+  };
+  auto fused = [&] {
+    conv_silu_l2_fused_kernel<<<2 * FNKH + (FDIN + 255) / 256, 256>>>(fq, fw, fc, fcs, FCHAN, FK);
+  };
+  hipMemcpy(fcs, frs, csb, hipMemcpyDeviceToDevice);
+  unfused();
+  hipDeviceSynchronize();
+  std::vector<float> fref(qb / 4), fgot(qb / 4), frefs(csb / 4), fgots(csb / 4);
+  hipMemcpy(fref.data(), fc, qb, hipMemcpyDeviceToHost);
+  hipMemcpy(frefs.data(), fcs, csb, hipMemcpyDeviceToHost);
+  hipMemcpy(fcs, frs, csb, hipMemcpyDeviceToDevice);
+  fused();
+  hipDeviceSynchronize();
+  if (hipGetLastError() != hipSuccess) {
+    std::printf("  fused LAUNCH FAILED: %s\n", hipGetErrorString(hipGetLastError()));
+    return 1;
+  }
+  hipMemcpy(fgot.data(), fc, qb, hipMemcpyDeviceToHost);
+  hipMemcpy(fgots.data(), fcs, csb, hipMemcpyDeviceToHost);
+  const bool fo = std::memcmp(fgot.data(), fref.data(), qb) == 0;
+  const bool fs = std::memcmp(fgots.data(), frefs.data(), csb) == 0;
+  std::printf("  bit-identidade vs unfused: conv-out %s  conv-state %s\n", fo ? "IDENTICO" : "DIFERE",
+              fs ? "IDENTICO" : "DIFERE");
+  for (int i = 0; i < 200; ++i) {
+    unfused();
+    fused();
+  }
+  hipDeviceSynchronize();
+  // interleave A/B at the CHAIN level for launch-amortized honesty
+  Timed tu{1e30, 0}, tf{1e30, 0};
+  for (int r = 0; r < 3; ++r) {
+    Timed a = measure([&] {
+      for (int i = 0; i < CHN; ++i) unfused();
+    });
+    Timed b = measure([&] {
+      for (int i = 0; i < CHN; ++i) fused();
+    });
+    tu.best = std::min(tu.best, a.best);
+    tf.best = std::min(tf.best, b.best);
+    tu.mean = tu.mean == 0 ? a.mean : (tu.mean + a.mean) / 2;
+    tf.mean = tf.mean == 0 ? b.mean : (tf.mean + b.mean) / 2;
+  }
+  // each chain iter ran CHN trios; per-trio = /CHN already in measure? No:
+  // measure() divides by CHN (launches). Here one fn() = CHN trios, so the
+  // reported "us/launch" is us per CHN-trios; divide once more by CHN.
+  std::printf("  unfused-trio best %.2f us  mean %.2f us | fused best %.2f us  mean %.2f us\n",
+              tu.best / CHN, tu.mean / CHN, tf.best / CHN, tf.mean / CHN);
+  std::printf("  diff/layer-trio best %+.2f us (x48 = %+.3f ms/token) | speedup %.3fx\n",
+              tu.best / CHN - tf.best / CHN, (tu.best / CHN - tf.best / CHN) * 48.0 / 1000.0,
+              tu.best / tf.best);
+  std::printf("  launches/layer/token: 3 -> 1 (saves 96 launches/token)\n");
+
+  for (auto *p : {dq, dk, dv, dg, db, dst, dou, dref_s, dref_o, fq, fw, fc, fcs, frs, frc})
+    if (p) hipFree(p);
+  hipEventDestroy(e0);
+  hipEventDestroy(e1);
+  return bad ? 1 : 0;
+}
+
+}  // namespace h2
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -618,14 +1054,17 @@ int main(int argc, char **argv) {
   int chain = CH;
   bool noise = true;
   bool chunked = false;
+  bool h2flag = false;
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--rounds") && i + 1 < argc) rounds = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--chain") && i + 1 < argc) chain = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--no-noise")) noise = false;
     else if (!std::strcmp(argv[i], "--chunked")) chunked = true;
+    else if (!std::strcmp(argv[i], "--h2")) h2flag = true;
     else { std::fprintf(stderr, "unknown %s\n", argv[i]); return 1; }
   }
   if (chunked) return gdn_chunked::run_chunked_check();
+  if (h2flag) return h2::run_h2();
 
   const int dim = NVH * S;
   const std::size_t fb = (std::size_t)dim * sizeof(float);

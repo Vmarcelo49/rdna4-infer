@@ -1087,7 +1087,18 @@ inline bool Graph::gdn_layer(int il, int t, std::string &err) {
   emit("gate", il, d_gate_, nvh);
 
   RD_PHASE(prof_, "gdn_conv");  // RD_PHASE_PROF
-  if (!conv1d_state_launch(d_qkv_, (const float *)L.ssm_conv1d.ptr, d_conv_, convst, chan, K)) {
+  // Fusao conv+SiLU+l2-Q/K (H2.3, bit-identica): so' sem callback, porque os
+  // emits abaixo leem os valores PRE-norma, que a fusao nao materializa.
+  // Com cb_ (oraculo) o trio original preserva os dumps byte a byte.
+  const bool want_fused = gdn_conv_fuse_enabled() && !cb_;
+  if (want_fused) {
+    if (!gdn_conv_fuse_launch(d_qkv_, (const float *)L.ssm_conv1d.ptr, d_conv_, convst, chan, K,
+                              key_dim, d_inner, nkh, S, (float)cfg_.rms_norm_eps)) {
+      err = "conv fused launch failed";
+      return false;
+    }
+  } else if (!conv1d_state_launch(d_qkv_, (const float *)L.ssm_conv1d.ptr, d_conv_, convst, chan,
+                                  K)) {
     err = "conv1d launch failed";
     return false;
   }
@@ -1101,8 +1112,10 @@ inline bool Graph::gdn_layer(int il, int t, std::string &err) {
   // last one, so the dump only has `v_conv_predelta`
   emit("v_conv_predelta", il, v_c, d_inner);
   RD_PHASE(prof_, "gdn_l2norm");  // RD_PHASE_PROF
-  if (!l2_norm_launch(q_c, q_c, nkh, S, (float)cfg_.rms_norm_eps)) return false;
-  if (!l2_norm_launch(k_c, k_c, nkh, S, (float)cfg_.rms_norm_eps)) return false;
+  if (!want_fused) {
+    if (!l2_norm_launch(q_c, q_c, nkh, S, (float)cfg_.rms_norm_eps)) return false;
+    if (!l2_norm_launch(k_c, k_c, nkh, S, (float)cfg_.rms_norm_eps)) return false;
+  }
 
   if (cb_) emit("state_predelta", il, state, (std::int64_t)nvh * S * S);
   RD_PHASE(prof_, "gdn_delta");  // RD_PHASE_PROF
@@ -1676,14 +1689,25 @@ inline bool Graph::forward_batch_layer(int il, int n, int pos0, std::string &err
       if (!add_launch(alpha, (const float *)L.ssm_dt.ptr, alpha, nvh)) return false;
       if (!unary_launch(alpha, g, nvh, UnOp::Softplus)) return false;
       if (!mul_launch(g, (const float *)L.ssm_a.ptr, g, nvh)) return false;
-      if (!conv1d_state_launch(qkv, (const float *)L.ssm_conv1d.ptr, conv, convst, chan, K)) {
+      // Fusao conv+SiLU+l2-Q/K (H2.3, bit-identica): so' sem callback, como no
+      // caminho por token (os emits do oraculo leem valores PRE-norma).
+      const bool conv_fused_b = gdn_conv_fuse_enabled() && !cb_;
+      if (conv_fused_b) {
+        if (!gdn_conv_fuse_launch(qkv, (const float *)L.ssm_conv1d.ptr, conv, convst, chan, K,
+                                  key_dim, d_inner, nkh, S, eps)) {
+          err = "batch conv fused launch failed";
+          return false;
+        }
+      } else if (!conv1d_state_launch(qkv, (const float *)L.ssm_conv1d.ptr, conv, convst, chan,
+                                      K)) {
         err = "batch conv1d launch failed";
         return false;
       }
       float *q_c = conv;
       float *k_c = conv + key_dim;
       float *v_c = conv + 2 * key_dim;
-      if (!l2_norm_launch(q_c, q_c, nkh, S, eps) || !l2_norm_launch(k_c, k_c, nkh, S, eps)) {
+      if (!conv_fused_b &&
+          (!l2_norm_launch(q_c, q_c, nkh, S, eps) || !l2_norm_launch(k_c, k_c, nkh, S, eps))) {
         err = "batch l2 norm launch failed";
         return false;
       }

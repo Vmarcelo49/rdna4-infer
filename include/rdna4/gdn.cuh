@@ -47,6 +47,100 @@ inline bool conv1d_state_launch(const float *d_qkv, const float *d_w, float *d_o
 }
 
 // ---------------------------------------------------------------------------
+// Fused conv(4tap)+SiLU+l2norm-Q/K, one launch (H2.3, medido 16/09).
+//
+// Substitui 3 launches por camada/token (conv1d_state + 2x l2_norm): 32
+// row-CTAs (uma linha Q/K cada: corpo do conv verbatim + arvore do l2_norm
+// verbatim, 256 threads, threads >= S contribuem +0.0f, mesma arvore) + CTAs
+// de passthrough do V (conv+SiLU verbatim, sem norm). Bit-identico ao trio:
+// fmaf(v,v,0)==v*v, +0 nas entradas mortas da arvore, trafego float sem
+// perda (provado por memcmp em tests/bench_delta_gpu.hip --h2).
+// Medido: 9,80 -> 3,91 us/trio de camada (2,506x); 5,89 us x48 camadas =
+// 0,283 ms/token = 1,07% do token de 26,4 ms.
+//
+// Escreve in-place em d_conv_ (Q em [0,key_dim), K em [key_dim,2*key_dim),
+// V-SiLU em [2*key_dim, ...)), como o trio; atualiza o cstate igual.
+// Os valores PRE-norma (que os emits do oraculo leem) deixam de existir --
+// por isso o chamador so' usa este caminho com cb_ == nullptr (producao);
+// com callback o trio original preserva os dumps byte a byte.
+// ---------------------------------------------------------------------------
+__global__ void gdn_conv_silu_l2_fused_kernel(const float *__restrict__ qkv,
+                                              const float *__restrict__ w, float *__restrict__ conv,
+                                              float *__restrict__ cstate, int channels, int K,
+                                              int key_dim, int d_inner, int nkh, int S,
+                                              float eps) {
+  const int nrow = 2 * nkh;  // CTAs de linhas Q/K
+  if ((int)blockIdx.x < nrow) {
+    // Uma linha Q/K: corpo do conv verbatim, depois l2_norm verbatim.
+    const int r = blockIdx.x;
+    const bool is_q = r < nkh;
+    const int head = is_q ? r : r - nkh;
+    const int base = (is_q ? 0 : key_dim) + head * S;
+    const int t = threadIdx.x;
+    float val = 0.0f;
+    if (t < S) {
+      const int c = base + t;
+      float acc = 0.0f;
+      for (int k = 0; k < K - 1; ++k) acc += w[c * K + k] * cstate[k * channels + c];
+      acc += w[c * K + (K - 1)] * qkv[c];
+      val = silu_f(acc);
+      for (int k = 0; k < K - 2; ++k) cstate[k * channels + c] = cstate[(k + 1) * channels + c];
+      cstate[(K - 2) * channels + c] = qkv[c];
+    }
+    __shared__ float partial[256];
+    float a = 0.0f;
+    for (int i = t; i < S; i += 256) {
+      const float vv = val;  // uma iteracao para t<S (== load xr[i], sem perda)
+      a = fmaf(vv, vv, a);
+    }
+    partial[t] = a;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+      if (t < stride) partial[t] += partial[t + stride];
+      __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] + eps);
+    if (t < S) conv[base + t] = val * scale;
+  } else {
+    // V passthrough: conv+SiLU verbatim, sem norm.
+    const int t = threadIdx.x;
+    const long long vc = (long long)(blockIdx.x - nrow) * 256 + t;
+    if (vc < d_inner) {
+      const int c = 2 * key_dim + (int)vc;
+      float acc = 0.0f;
+      for (int k = 0; k < K - 1; ++k) acc += w[c * K + k] * cstate[k * channels + c];
+      acc += w[c * K + (K - 1)] * qkv[c];
+      conv[c] = silu_f(acc);
+      for (int k = 0; k < K - 2; ++k) cstate[k * channels + c] = cstate[(k + 1) * channels + c];
+      cstate[(K - 2) * channels + c] = qkv[c];
+    }
+  }
+}
+
+inline bool gdn_conv_fuse_launch(const float *d_qkv, const float *d_w, float *d_conv,
+                                 float *d_state, int channels, int K, int key_dim, int d_inner,
+                                 int nkh, int S, float eps, hipStream_t stream = nullptr) {
+  if (S <= 0 || S > 256 || K < 2 || nkh <= 0 || d_inner < 0) return false;
+  const int nrow = 2 * nkh;
+  const int nv = (d_inner + 255) / 256;
+  gdn_conv_silu_l2_fused_kernel<<<nrow + nv, 256, 0, stream>>>(d_qkv, d_w, d_conv, d_state,
+                                                               channels, K, key_dim, d_inner,
+                                                               nkh, S, eps);
+  return hipGetLastError() == hipSuccess;
+}
+
+// Porta da fusao conv (default ON, fuga `RD_GFX12_GDN_CONVFUSE=0`): bit-identica
+// ao trio (memcmp), entao o default e' o caminho rapido; a fuga restaura o trio
+// para A/B e diagnostico. Precedente: RD_GEMM_WMMA.
+inline bool gdn_conv_fuse_enabled() {
+  static const int on = [] {
+    const char *e = std::getenv("RD_GFX12_GDN_CONVFUSE");
+    return !(e && std::atoi(e) == 0);
+  }();
+  return on;
+}
+
+// ---------------------------------------------------------------------------
 // Gated delta rule for one token, one block per value head, one thread per row j
 // of the transposed state. q/k heads are the GQA-repeated ones (head h reads
 // k head h % n_k_heads).
