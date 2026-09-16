@@ -693,6 +693,26 @@ template <> struct MtUnroll<12> { static constexpr int value = tuned::kMtUnroll[
 template <> struct MtUnroll<13> { static constexpr int value = tuned::kMtUnroll[12]; };  // iq2_s
 template <> struct MtUnroll<14> { static constexpr int value = tuned::kMtUnroll[13]; };  // iq4_xs
 
+// MINB (blocos minimos por multiprocessador no __launch_bounds__) por tipo: o
+// cap de registradores bit-exato (so muda ocupacao/spills, nunca a aritmetica).
+// 0 = comportamento atual (sem cap). Valores >0 precisam de sonda de spill
+// limpa (localSizeBytes==0) + gate do oraculo -- ver tuning.h (kMtMinb).
+template <int Dt> struct MtMinb { static constexpr int value = 0; };
+template <> struct MtMinb<1>  { static constexpr int value = tuned::kMtMinb[0]; };   // q8_0
+template <> struct MtMinb<2>  { static constexpr int value = tuned::kMtMinb[1]; };   // q2_K
+template <> struct MtMinb<3>  { static constexpr int value = tuned::kMtMinb[2]; };   // q3_K
+template <> struct MtMinb<4>  { static constexpr int value = tuned::kMtMinb[3]; };   // q4_K
+template <> struct MtMinb<5>  { static constexpr int value = tuned::kMtMinb[4]; };   // q5_K
+template <> struct MtMinb<6>  { static constexpr int value = tuned::kMtMinb[5]; };   // q6_K
+template <> struct MtMinb<7>  { static constexpr int value = tuned::kMtMinb[6]; };   // iq2_xxs
+template <> struct MtMinb<8>  { static constexpr int value = tuned::kMtMinb[7]; };   // iq2_xs
+template <> struct MtMinb<9>  { static constexpr int value = tuned::kMtMinb[8]; };   // iq3_xxs
+template <> struct MtMinb<10> { static constexpr int value = tuned::kMtMinb[9]; };   // iq1_s
+template <> struct MtMinb<11> { static constexpr int value = tuned::kMtMinb[10]; };  // iq4_nl
+template <> struct MtMinb<12> { static constexpr int value = tuned::kMtMinb[11]; };  // iq3_s
+template <> struct MtMinb<13> { static constexpr int value = tuned::kMtMinb[12]; };  // iq2_s
+template <> struct MtMinb<14> { static constexpr int value = tuned::kMtMinb[13]; };  // iq4_xs
+
 inline MatvecConfig matvec_default_config(int dt) {
   // Derived from the compile-time tables so the reported/shipping shape and the
   // instantiated kernel can never disagree (review finding L7).
@@ -758,7 +778,7 @@ inline bool matvec_launch(int dt, const void *d_w, const block_q8_1 *d_a, float 
 #define RD_SHIP(Traits, Dt, QK)                                                            \
   case Dt:                                                                                 \
     return launch_gen<Traits, MtShape<Dt>::rows, MtShape<Dt>::wpr, MtIlp<Dt>::value, false, \
-                      0, MtUnroll<Dt>::value>(d_w, d_a, d_o, nrows, ncols / QK, stream);
+                      MtMinb<Dt>::value, MtUnroll<Dt>::value>(d_w, d_a, d_o, nrows, ncols / QK, stream);
   switch (dt) {
     RD_SHIP(TQ8_0, 1, 32)
     RD_SHIP(TQ2K, 2, 256)
@@ -831,8 +851,8 @@ inline bool matvec_launch_lut_lds(int dt, const void *d_w, const block_q8_1 *d_a
   case Dt: {                                                                                    \
     constexpr int R = MtShape<Dt>::rows, W = MtShape<Dt>::wpr, I = MtIlp<Dt>::value,            \
                   U = MtUnroll<Dt>::value;                                                      \
-    return launch_gen<TraitsLds, R, W, I, false, 0, U, LutT>(d_w, d_a, d_o, nrows, ncols / QK,   \
-                                                             stream);                           \
+    return launch_gen<TraitsLds, R, W, I, false, MtMinb<Dt>::value, U, LutT>(                   \
+        d_w, d_a, d_o, nrows, ncols / QK, stream);                                               \
   }
   switch (dt) {
     RD_LDS(TIQ2XXS_LDS, 7, 256, LutIq2XXS)

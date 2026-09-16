@@ -269,9 +269,15 @@ __device__ __forceinline__ void kv_load8<KvType::F16>(const void *row, int lane,
 
 template <>
 __device__ __forceinline__ void kv_load8<KvType::Q8_0>(const void *row, int lane, float out[8]) {
-  // 8 dims sit inside one 32-element block: qs[(lane%4)*8 .. +8), scale shared
+  // 8 dims sit inside one 32-element block: qs[(lane%4)*8 .. +8), scale shared.
+  // qs sits at block+2, so a b64 load here is misaligned and splits on RDNA
+  // (often across a 32 B sector too). Two b32 loads fetch the same 8 bytes,
+  // combined bit-identically (little-endian) below.
   const block_q8_0 *b = (const block_q8_0 *)row + (lane >> 2);
-  const std::uint64_t q = *(const std::uint64_t *)(b->qs + (lane & 3) * 8);
+  const char *qp = (const char *)b->qs + (lane & 3) * 8;
+  const std::uint32_t q0 = *(const std::uint32_t *)(qp + 0);
+  const std::uint32_t q1 = *(const std::uint32_t *)(qp + 4);
+  const std::uint64_t q = (std::uint64_t)q0 | ((std::uint64_t)q1 << 32);
   const float d = fp16_to_float(b->d);
 #pragma unroll
   for (int i = 0; i < 8; ++i) out[i] = d * (float)(std::int8_t)((q >> (8 * i)) & 0xFF);
@@ -284,7 +290,12 @@ __device__ __forceinline__ void kv_load8<KvType::Q4_0>(const void *row, int lane
   // lane L covers dims [L*8, L*8+8): L&1 selects the low-nibble half (dims 0-15)
   // or the high-nibble half (dims 16-31) of the same 16 qs bytes, L&2 the half
   const block_q4_0 *b = (const block_q4_0 *)row + (lane >> 2);
-  const std::uint64_t q = *(const std::uint64_t *)(b->qs + (lane & 1) * 8);
+  // qs sits at block+2: the b64 load misaligns and splits; two b32 loads fetch
+  // the same 8 bytes, combined bit-identically (little-endian) below.
+  const char *qp = (const char *)b->qs + (lane & 1) * 8;
+  const std::uint32_t q0 = *(const std::uint32_t *)(qp + 0);
+  const std::uint32_t q1 = *(const std::uint32_t *)(qp + 4);
+  const std::uint64_t q = (std::uint64_t)q0 | ((std::uint64_t)q1 << 32);
   const bool high = (lane & 2) != 0;
   const float d = fp16_to_float(b->d);
 #pragma unroll
@@ -303,7 +314,12 @@ __device__ __forceinline__ void kv_load8<KvType::Q5_0>(const void *row, int lane
   // exactly qh[lane&3] -- so one byte load, no shift gymnastics, and the whole
   // warp still touches each 22-byte block from 4 lanes only.
   const block_q5_0 *b = (const block_q5_0 *)row + (lane >> 2);
-  const std::uint64_t q = *(const std::uint64_t *)(b->qs + (lane & 1) * 8);
+  // qs sits at block+6: the b64 load misaligns and splits; two b32 loads fetch
+  // the same 8 bytes, combined bit-identically (little-endian) below.
+  const char *qp = (const char *)b->qs + (lane & 1) * 8;
+  const std::uint32_t q0 = *(const std::uint32_t *)(qp + 0);
+  const std::uint32_t q1 = *(const std::uint32_t *)(qp + 4);
+  const std::uint64_t q = (std::uint64_t)q0 | ((std::uint64_t)q1 << 32);
   const std::uint8_t hb = b->qh[lane & 3];
   const bool high = (lane & 2) != 0;
   const float d = fp16_to_float(b->d);
@@ -321,7 +337,12 @@ __device__ __forceinline__ void kv_load8<KvType::Q4_1>(const void *row, int lane
   // Identical nibble addressing to Q4_0; the only difference is the affine
   // reconstruction q*d + m, with both d and m read once per lane.
   const block_q4_1 *b = (const block_q4_1 *)row + (lane >> 2);
-  const std::uint64_t q = *(const std::uint64_t *)(b->qs + (lane & 1) * 8);
+  // qs sits at block+4: the b64 load misaligns and splits; two b32 loads fetch
+  // the same 8 bytes, combined bit-identically (little-endian) below.
+  const char *qp = (const char *)b->qs + (lane & 1) * 8;
+  const std::uint32_t q0 = *(const std::uint32_t *)(qp + 0);
+  const std::uint32_t q1 = *(const std::uint32_t *)(qp + 4);
+  const std::uint64_t q = (std::uint64_t)q0 | ((std::uint64_t)q1 << 32);
   const bool high = (lane & 2) != 0;
   const float d = fp16_to_float(b->d);
   const float m = fp16_to_float(b->m);

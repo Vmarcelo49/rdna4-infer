@@ -59,6 +59,29 @@ inline constexpr int kMtWpr[kMtTypes] = {1, 1, 8, 1, 1, 4, 1, 2, 1, 4, 1, 1, 1, 
 inline constexpr int kMtIlp[kMtTypes] = {4, 2, 2, 2, 2, 2, 2, 4, 1, 1, 1, 1, 1, 2};
 inline constexpr int kMtUnroll[kMtTypes] = {1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 2, 2, 2, 1};
 
+// 1b. Cap de registradores (MINB) por tipo: vira `__launch_bounds__(threads,
+// MINB)` no kernel de producao (matvec.cuh, MtMinb). 0 = comportamento atual
+// (sem cap). >0 limita os VGPR por thread para caberem MINB blocos por
+// multiprocessador, subindo a ocupacao nos tipos latency-bound.
+//
+// Bit-exato por construcao (launch_bounds so muda ocupacao/spills, nunca a
+// aritmetica), mas qualquer valor que derrame para scratch (localSizeBytes>0
+// em hipFuncGetAttributes) e REJEITADO e volta a 0: o spill anula o ganho.
+//
+// Medido (sonda de atributos nos kernels de producao exatos, gfx1201, -O3):
+//   - iq4_xs usa 40 VGPR naturais (bloco de 256 threads) -> MINB=8 codifica o
+//     teto de 96 VGPR (196608/8/256) sem mudar a alocacao (40, spill 0).
+//   - iq2_s usa 71 VGPR no caminho puro / 77 via LDS -> ja <=96; nenhum MINB em
+//     2..32 altera a alocacao (todos no-op verificados), entao fica em 0.
+//   - iq2_xs usa 99 VGPR (unico tipo >96), mas forcar <=96 derrama (MINB=16 ->
+//     96 regs + 20 B de spill) -> REJEITADO, fica em 0.
+//   - todos os outros tipos usam <=82 VGPR naturais -> 0 (nada a capar).
+//
+// NOTA de gate: `check-tuning` nao imprime esta tabela (so rows/wpr/ilp/unroll
+// entram em tests/golden/ml_tuning.txt), entao mexer aqui nao quebra aquele
+// gate; a cobertura e `check-matvec-gpu` (oraculo por tipo) + a sonda de spill.
+inline constexpr int kMtMinb[kMtTypes] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8};
+
 constexpr bool mt_tables_valid() {
   for (int i = 0; i < kMtTypes; ++i) {
     if (kMtRows[i] < 1 || kMtRows[i] > 16) return false;
@@ -67,6 +90,7 @@ constexpr bool mt_tables_valid() {
     if (kMtIlp[i] < 1 || kMtIlp[i] > 4) return false;
     if (kMtUnroll[i] < 1 || kMtUnroll[i] > 4) return false;
     if (kMtIlp[i] > 1 && kMtUnroll[i] > 1) return false;  // static_assert do kernel
+    if (kMtMinb[i] < 0 || kMtMinb[i] > 32) return false;  // launch_bounds: 0 = sem cap
   }
   return true;
 }
