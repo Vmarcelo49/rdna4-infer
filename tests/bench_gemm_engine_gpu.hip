@@ -747,6 +747,203 @@ void gemv_batch(const int dt, const void *d_w, const block_q8_1 *d_a, float *d_o
   }
 }
 
+// ---------------------------------------------------------------------------
+// R1 PROTOTYPE (BENCH-ONLY): staging coalescido do iq3_s via W com campos
+// intercalados / bloqueado por janela (brief §8 R1). NAO TOCA gemm.cuh/loader/
+// engine: o repack e' host-side nesta bancada e o load path prototipo vive SÓ
+// aqui. Se FAIL (<1,3x ou sniff de bits), fica como negativo documentado.
+// Layout (repack offline, uma vez): 16 B por (linha, sub-bloco de 32 pesos):
+//   bytes 0-7: qs[8] | 8-11: signs[4] | 12: qh | 13-14: d (bits fp16) | 15: scales.
+//   = 8+4+1+2+1 = 16 B = 1x b128 alinhado. Por janela BK=64: 2x16 B = 32 B contiguos.
+// Ordem window-major (bloqueada por janela): idx = (w*N + n)*2 + kb,
+//   w = k/64 (0..K/64-1), kb = (k/32)%2. Para w fixo, linhas consecutivas sao
+//   contiguas em 32 B: a warp (16 linhas) le 512 B contiguos = 4 linhas de 128 B
+//   a ~100% de utilizacao (contra ~23% do shipping, brief §8.2.2).
+// Load path: 1x b128 sequencial por tarefa (default cache policy, sem TH_NT) +
+//   o MESMO SolverIq3S::store/consume do shipping -> bit-identico por construcao.
+// Grade/memoria/computo IDENTICOS ao shipping BM64 BN128 BK64 RM4 RN8 DBUF
+// (producao em M>=64): a razao mede SÓ o staging coalescido.
+// Caminhos proibidos NAO tentados aqui (medidos mortos): raw-staging transplant,
+// familia f16-dot2, sem-Dbuf em BM64, BK128, BN136, TH_NT.
+// ---------------------------------------------------------------------------
+__global__ void __launch_bounds__(256, 1) gemm_iq3s_coal_kernel(
+    const int4 *__restrict__ Wp, const block_q8_1 *__restrict__ A, float *__restrict__ C,
+    const int M, const int N, const int K, const int act_stride) {
+  constexpr int WSB = 80;
+  __shared__ __align__(16) unsigned char s_w[2 * 128 * 80];
+  __shared__ __align__(16) int2 s_dwsc[2 * 2 * 128];
+  const int tid = threadIdx.x;
+  const int tr = tid / 16;
+  const int tc = tid % 16;
+  const int m0 = blockIdx.y * 64;
+  const int n0 = blockIdx.x * 128;
+  const int prow = tid / 2;
+  const int pkb = tid % 2;
+  const int nloc = tc;
+  int mrow[4];
+#pragma unroll
+  for (int r = 0; r < 4; ++r) {
+    const int m = m0 + tr + r * 16;
+    mrow[r] = (m < M) ? m : (M - 1);
+  }
+  float F[4][8];
+#pragma unroll
+  for (int r = 0; r < 4; ++r)
+#pragma unroll
+    for (int c = 0; c < 8; ++c) F[r][c] = 0.0f;
+  rdna4::SolverIq3S::Pf pf;
+  // prologo: load(k0=0) + store(buf0)
+  {
+    int n = n0 + prow;
+    if (n >= N) n = N - 1;
+    const int kk = 0 + 32 * pkb;
+    const int w = 0;
+    const int idx = (w * N + n) * 2 + pkb;
+    const int4 rec = Wp[idx];
+    const unsigned w3 = (unsigned)rec.w;
+    pf.qs0 = rec.x;
+    pf.qs1 = rec.y;
+    pf.sg = (unsigned)rec.z;
+    pf.qh = w3 & 0xFFu;
+    pf.dsc = w3 >> 8;
+    float dw;
+    int scf;
+    rdna4::SolverIq3S::store(pf, (kk >> 5) & 7,
+                             (int *)(void *)(s_w + prow * WSB + pkb * 32), &dw, &scf);
+    s_dwsc[pkb * 128 + prow] = make_int2(__float_as_int(dw), scf);
+  }
+  __syncthreads();
+  for (int k0 = 0, cur = 0; k0 < K; k0 += 64, cur ^= 1) {
+    const int cb = cur;
+    if (k0 + 64 < K) {
+      int n = n0 + prow;
+      if (n >= N) n = N - 1;
+      const int kk = (k0 + 64) + 32 * pkb;
+      const int w = (k0 + 64) >> 6;
+      const int idx = (w * N + n) * 2 + pkb;
+      const int4 rec = Wp[idx];
+      const unsigned w3 = (unsigned)rec.w;
+      pf.qs0 = rec.x;
+      pf.qs1 = rec.y;
+      pf.sg = (unsigned)rec.z;
+      pf.qh = w3 & 0xFFu;
+      pf.dsc = w3 >> 8;
+    }
+    // conta: copia verbatim do caminho WHOLD/cadeia-unica do shipping
+    // (BM64 BN128 BK64 RM4 RN8), mesmos dp4a e mesma correcao.
+#pragma unroll 1
+    for (int kb = 0; kb < 2; ++kb) {
+      const int ka = (k0 >> 5) + kb;
+      int I[4][8];
+#pragma unroll
+      for (int r = 0; r < 4; ++r)
+#pragma unroll
+        for (int c = 0; c < 8; ++c) I[r][c] = 0;
+      int ww[8][8];
+#pragma unroll
+      for (int c = 0; c < 8; ++c) {
+        const int *wp =
+            (const int *)(const void *)(s_w + cb * (128 * WSB) + (nloc + c * 16) * WSB + kb * 32);
+#pragma unroll
+        for (int g = 0; g < 8; ++g) ww[c][g] = wp[g];
+      }
+#pragma unroll
+      for (int g = 0; g < 8; ++g) {
+        int ar[4];
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+          const block_q8_1 *q = A + (std::int64_t)mrow[r] * act_stride + ka;
+          ar[r] = ((const int *)(const void *)q->qs)[g];
+        }
+#pragma unroll
+        for (int r = 0; r < 4; ++r)
+#pragma unroll
+          for (int c = 0; c < 8; ++c) I[r][c] = rdna4::ggml_cuda_dp4a(ww[c][g], ar[r], I[r][c]);
+      }
+      float da[4];
+#pragma unroll
+      for (int r = 0; r < 4; ++r) {
+        const block_q8_1 *q = A + (std::int64_t)mrow[r] * act_stride + ka;
+        da[r] = rdna4::fp16_to_float((uint16_t)(q->ds & 0xFFFFu));
+      }
+      const int2 *wsc = s_dwsc + cb * (2 * 128) + kb * 128;
+#pragma unroll
+      for (int c = 0; c < 8; ++c) {
+        const int2 ws = wsc[nloc + c * 16];
+        const float dw = __int_as_float(ws.x);
+        const int scf = ws.y;
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+          const float d = dw * da[r];
+          F[r][c] = __fmaf_rn(d, rdna4::SolverIq3S::corr(I[r][c], scf), F[r][c]);
+        }
+      }
+    }
+    if (k0 + 64 < K) {
+      float dw;
+      int scf;
+      const int kk2 = (k0 + 64) + 32 * pkb;
+      rdna4::SolverIq3S::store(pf, (kk2 >> 5) & 7,
+                               (int *)(void *)(s_w + (cb ^ 1) * (128 * WSB) + prow * WSB + pkb * 32),
+                               &dw, &scf);
+      s_dwsc[(cb ^ 1) * (2 * 128) + pkb * 128 + prow] = make_int2(__float_as_int(dw), scf);
+    }
+    __syncthreads();
+  }
+  // epilogo: C[m][n] token-major, igual ao shipping.
+#pragma unroll
+  for (int r = 0; r < 4; ++r) {
+    const int m = m0 + tr + r * 16;
+    if (m < M) {
+#pragma unroll
+      for (int c = 0; c < 8; ++c) {
+        const int n = n0 + nloc + c * 16;
+        if (n < N) C[(std::int64_t)m * N + n] = F[r][c];
+      }
+    }
+  }
+}
+
+// Repack host-side (offline, uma vez): iq3_s cru -> window-major 16 B/sub.
+// w_raw: N linhas x bpr super-blocos x 110 B. packed: N*NSUB int4 (16 B cada).
+void repack_iq3s_coal(const std::vector<std::uint8_t> &w_raw, std::vector<int> &packed, const int N,
+                      const int K) {
+  const int bpr = K / 256;
+  const int nsub = K / 32;
+  packed.resize((std::size_t)N * (std::size_t)nsub * 4);
+  for (int n = 0; n < N; ++n) {
+    for (int ib = 0; ib < bpr; ++ib) {
+      const unsigned char *blk = w_raw.data() + ((std::size_t)n * bpr + ib) * 110;
+      const unsigned d = (unsigned)blk[0] | ((unsigned)blk[1] << 8);
+      const unsigned char *qs = blk + 2;
+      const unsigned char *qh = blk + 2 + 64;
+      const unsigned char *sg = blk + 2 + 72;
+      const unsigned char *sc = blk + 2 + 104;
+      for (int sub = 0; sub < 8; ++sub) {
+        int qs0 = 0, qs1 = 0, sgw = 0;
+        std::memcpy(&qs0, qs + 8 * sub, 4);
+        std::memcpy(&qs1, qs + 8 * sub + 4, 4);
+        std::memcpy(&sgw, sg + 4 * sub, 4);
+        const unsigned w3 = (unsigned)qh[sub] | (d << 8) | ((unsigned)sc[sub >> 1] << 24);
+        const int w = ib * 4 + (sub >> 1);
+        const int kb = sub & 1;
+        const std::size_t idx = ((std::size_t)w * (std::size_t)N + (std::size_t)n) * 2 + kb;
+        packed[idx * 4 + 0] = qs0;
+        packed[idx * 4 + 1] = qs1;
+        packed[idx * 4 + 2] = sgw;
+        packed[idx * 4 + 3] = (int)w3;
+      }
+    }
+  }
+}
+
+bool launch_iq3s_coal(const int4 *dWp, const block_q8_1 *dA, float *dC, const int N, const int K,
+                      const int act_stride, const int M) {
+  const dim3 grid((unsigned)((N + 127) / 128), (unsigned)((M + 63) / 64), 1u);
+  gemm_iq3s_coal_kernel<<<grid, 256, 0, nullptr>>>(dWp, dA, dC, M, N, (int)K, (int)act_stride);
+  return hipGetLastError() == hipSuccess;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -1294,6 +1491,134 @@ int main(int argc, char **argv) {
         "  piso de ruido (a MESMA medicao do GEMM duas vezes, M=%.0f): %.3f ms e %.3f ms -> "
         "%.3fx\n",
         noise_m, noise_a, noise_b, noise_b / std::max(noise_a, 1e-9));
+
+    // ---- R1 prototipo coalescido (BENCH-ONLY, iq3_s) ------------------------
+    // Regra pre-registrada: PASS = staging+consume prototipo >= 1,3x o tempo do
+    // shipping em tensor iq3_s real (classe blk.3.ffn_up, M=128) com saidas
+    // BIT-IDENTICAS linha-a-linha (tolerancia NAO se aplica: le os mesmos valores).
+    // FAIL abaixo disso -> negativo documentado, sem proposta de producao.
+    // Protocolo: burner DPM >= 300 ms primeiro, A/B intercalado vs celula ship,
+    // min-of-reps event-pair, mais piso ship-vs-ship. Baseline = tabela acima.
+    if (dt == kIq3S && Nr == N && Kr == K) {
+      const int Mp = 128;
+      std::printf("\n  -- R1 prototipo coalescido iq3_s (BENCH-ONLY, M=%d) --\n", Mp);
+      std::printf(
+          "  layout: window-major 16 B/sub (qs8+sg4+qh1+d2+sc1), 32 B/(linha,janela BK64),\n"
+          "    idx=(w*N+n)*2+kb, 1x b128 sequencial, default cache policy (sem TH_NT).\n"
+          "    grade/memoria/computo = shipping BM64 BN128 BK64 RM4 RN8 DBUF.\n");
+      hipFuncAttributes attr_s{}, attr_p{};
+      int lds_s = 0, lds_p = 0;
+      const bool ok_s = rdna4::gemm_attrs(dt, Mp, attr_s, lds_s);
+      auto *fn_p = &gemm_iq3s_coal_kernel;
+      const bool ok_p = hipFuncGetAttributes(&attr_p, (const void *)fn_p) == hipSuccess;
+      lds_p = 2 * (128 * 80 + 2 * 128 * 8);
+      if (ok_s && ok_p) {
+        std::printf("  attrs ship: VGPR=%d LDS=%d spill=%d | proto: VGPR=%d LDS=%d spill=%d\n",
+                    attr_s.numRegs, lds_s, (int)attr_s.localSizeBytes, attr_p.numRegs, lds_p,
+                    (int)attr_p.localSizeBytes);
+      }
+      std::vector<int> hP;
+      repack_iq3s_coal(w_raw, hP, (int)N, (int)K);
+      const std::size_t nsub = (std::size_t)(K / 32);
+      std::printf("  repack host (offline, 1x): %.1f MB -> %.1f MB (+%.1f %%)\n",
+                  (double)w_raw.size() / 1e6, (double)hP.size() * sizeof(int) / 1e6,
+                  100.0 * ((double)hP.size() * sizeof(int) / (double)w_raw.size() - 1.0));
+      int4 *dWp = nullptr;
+      const bool ok_alloc =
+          hipMalloc(&dWp, hP.size() * sizeof(int)) == hipSuccess && (std::size_t)N * nsub * 4 == hP.size();
+      if (!ok_alloc) {
+        std::printf("  R1: hipMalloc(dWp) falhou -- prototipo pulado\n");
+      } else {
+        (void)hipMemcpy(dWp, hP.data(), hP.size() * sizeof(int), hipMemcpyHostToDevice);
+        (void)hipDeviceSynchronize();
+        bool warned_s = false, warned_p = false;
+        auto fn_ship = [&] {
+          if (!rdna4::gemm_launch(dt, dW, dAQ, dC, N, K, act_full, Mp, nullptr) && !warned_s) {
+            warned_s = true;
+            std::printf("  R1: gemm_launch(ship) retornou false\n");
+          }
+        };
+        auto fn_proto = [&] {
+          if (!launch_iq3s_coal(dWp, dAQ, dC2, (int)N, (int)K, (int)act_full, Mp) && !warned_p) {
+            warned_p = true;
+            std::printf("  R1: launch_iq3s_coal retornou false\n");
+          }
+        };
+        if (!launch_ok("R1 alloc")) {
+        }
+        // prova de match exato: ship vs proto nas MESMAS entradas, M=128 cheio.
+        fn_ship();
+        (void)hipDeviceSynchronize();
+        if (!launch_ok("R1 ship (match)")) {
+        }
+        fn_proto();
+        (void)hipDeviceSynchronize();
+        if (!launch_ok("R1 proto (match)")) {
+        } else {
+          const std::size_t n_el = (std::size_t)Mp * (std::size_t)N;
+          std::vector<float> a(n_el), b(n_el);
+          // re-roda ordenado para comparar: ship->a, proto->b.
+          fn_ship();
+          (void)hipDeviceSynchronize();
+          (void)hipMemcpy(a.data(), dC, n_el * sizeof(float), hipMemcpyDeviceToHost);
+          fn_proto();
+          (void)hipDeviceSynchronize();
+          (void)hipMemcpy(b.data(), dC2, n_el * sizeof(float), hipMemcpyDeviceToHost);
+          const Diff dd = diff_bits(b, a, n_el);
+          std::size_t nnf = 0;
+          for (float v : b)
+            if (!std::isfinite(v)) ++nnf;
+          std::printf(
+              "  MATCH EXATO vs shipping (M=%d N=%lld cheio, linha-a-linha): BITS diferentes %zu de "
+              "%zu ; max ulp %.0f ; max|d| %.3g ; nao-finitos %zu%s\n",
+              Mp, (long long)N, dd.n_diff, n_el, dd.max_ulps, dd.max_abs, nnf,
+              (dd.n_diff == 0 && nnf == 0) ? "   (bit-identico)" : "   <-- DIVERGE");
+          // burner DPM >= 300 ms primeiro (protocolo), depois A/B intercalado.
+          EvPair ev;
+          double burner = 0;
+          for (int i = 0; i < 20000 && burner < 300.0; ++i) burner += ev(fn_ship);
+          std::printf("  burner DPM: %.1f ms de ship antes do A/B\n", burner);
+          const int Rp = std::max(reps, 10);
+          double best_s = 1e9, best_p = 1e9;
+          double sum_s = 0, sum_p = 0;
+          for (int r = 0; r < Rp; ++r) {
+            const double ts = ev(fn_ship);
+            const double tp = ev(fn_proto);
+            best_s = std::min(best_s, ts);
+            best_p = std::min(best_p, tp);
+            sum_s += ts;
+            sum_p += tp;
+          }
+          if (!launch_ok("R1 A/B intercalado")) {
+          }
+          // piso ship-vs-ship intercalado (mesmo padrao, sem proto no meio).
+          double best_s1 = 1e9, best_s2 = 1e9;
+          for (int r = 0; r < Rp; ++r) {
+            const double t1 = ev(fn_ship);
+            const double t2 = ev(fn_ship);
+            best_s1 = std::min(best_s1, t1);
+            best_s2 = std::min(best_s2, t2);
+          }
+          const double macs = (double)N * (double)K * (double)Mp;
+          const double rate_s = macs / (best_s * 1e-3) / 1e12;
+          const double rate_p = macs / (best_p * 1e-3) / 1e12;
+          const double ratio = best_s / std::max(best_p, 1e-9);
+          const double noise = best_s2 / std::max(best_s1, 1e-9);
+          std::printf(
+              "  A/B intercalado ship-vs-proto (min de %d, M=%d): ship %.3f ms (%.2f T-MAC/s) vs "
+              "proto %.3f ms (%.2f T-MAC/s) -> proto/ship = %.3fx (tempo ship/proto)\n"
+              "    medias: ship %.3f ms proto %.3f ms\n"
+              "  piso ship-vs-ship intercalado (min de %d): %.3f ms e %.3f ms -> %.3fx\n",
+              Rp, Mp, best_s, rate_s, best_p, rate_p, ratio, sum_s / Rp, sum_p / Rp, Rp, best_s1,
+              best_s2, noise);
+          const bool pass = (dd.n_diff == 0) && (ratio >= 1.3);
+          std::printf("  VEREDITO R1 vs regra 1,3x: %s (ratio %.3fx, bits %zu)%s\n", pass ? "PASS" : "FAIL",
+                      ratio, dd.n_diff,
+                      pass ? "" : " -- negativo documentado, sem proposta de producao");
+        }
+        (void)hipFree(dWp);
+      }
+    }
 
     // ---- A/B de configuracao ----------------------------------------------
     // cfg 1-8 existem so' para iq3_s (limite de instanciacoes); cfg 9-12
