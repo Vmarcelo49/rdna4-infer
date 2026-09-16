@@ -896,4 +896,9 @@ inline bool gdn_scalars_launch(float *d_beta_io, float *d_alpha_sp, float *d_gat
   return hipGetLastError() == hipSuccess;
 }
 
+// NOTA (H3, 3in1 NAO embarcado): rms+silu_gate+quant fundidos medem 0,86%
+// projetado e ~0,9% sem direcao consistente no A/B em motor (1 vitoria em 3
+// pares, variancia cobrindo o delta) -- abaixo da barra de 1%. Prototipo
+// guardado em tests/bench_fuse_gpu.hip. Nao ressuscitar sem numero novo.
+
 }  // namespace rdna4
