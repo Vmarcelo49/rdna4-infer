@@ -43,6 +43,19 @@
 #include <functional>
 #include <vector>
 
+// H7 (prototipo WMMA-int8 para iq2_s/iq2_xs/iq2_xxs): os mesmos headers que a
+// bench-mmq-wmma-gpu usa (referencia, de so'-leitura). O alvo bench-wmma-gpu
+// linka so' a libamdhip64, entao as fontes do loader entram por include direto.
+#include "rdna4/fp16.h"
+#include "rdna4/loader.h"
+#include "rdna4/matvec.cuh"  // quantize_q8_1_batch_launch + matvec_launch_batch (GEMV)
+#include "rdna4/quants.h"
+#include "rdna4/quant_tables.h"
+#include "rdna4/gemm.cuh"  // SolverIq2S/XS/XXS verbatim + gemm_launch/gemm_attrs (dp4a)
+#include "rdna4/vecdotq.cuh"  // vec_dot_iq2_*_q8_1: a referencia bit a bit
+#include "../src/backend/gguf.cpp"
+#include "../src/backend/loader.cpp"
+
 // ---------------------------------------------------------------------------
 // Fragmentos. gfx12 wave32: o WMMA int8 16x16x16 toma int32x2 (8 int8) por lane
 // em cada operando e devolve int32x8; o f16 16x16x16 toma 8 halves (16 B) por
@@ -678,6 +691,245 @@ __global__ void gemm_kernel(const int8_t *__restrict__ A, const float *__restric
   }  // if constexpr (MODE == 0)
 }
 
+// ===========================================================================
+// 7. H7 PROTOTIPO WMMA-int8 para iq2_s (dt 13), iq2_xs (dt 8), iq2_xxs (dt 7)
+// ---------------------------------------------------------------------------
+// Transcricao do precedente iq3_s provado (gemm_wmma_iq3s_kernel em
+// include/rdna4/gemm.cuh + secao 8 de tests/bench_mmq_wmma_gpu.hip, de
+// so'-leitura): MESMA grade (BM64/BN128/BK64, 8 warps W4xW2, 256 threads),
+// MESMO staging VERBATIM (Solver::load/store, s_w[BN][80] + s_dwsc int2,
+// duplo buffer SO do W, prefetch em registrador), MESMA ativacao direto da
+// global, MESMO s_da transposto, MESMO epilogo no layout D. A unica diferenca
+// e' o trait (TR) e a correcao:
+//
+//   * iq2_xxs (cadeia unica, corr=(sumi*scf)/8 em inteiro): porte direto --
+//     8 WMMA por bloco de 32 por warp, 1 acumulador D[4] por tile de N.
+//   * iq2_s/iq2_xs (dual_scale, ls0 em k=0..15, ls1 em k=16..31): a correcao
+//     de dois acumuladores REDESENHADA para o WMMA sem custo extra. As metades
+//     k16 do WMMA alinham EXATAMENTE com o corte ls0/ls1, entao h=0 acumula em
+//     D0 e h=1 em D1 (os mesmos 8 WMMAs por bloco) e a correcao por slot e'
+//     corr2=(i0*ls0+i1*ls1+(i0+i1)/2)/4 em INTEIRO, depois d=d_w*d_a em fp32 e
+//     acc=fma(d,(float)corr,F) com __fmaf_rn -- a sequencia do motor
+//     (gemm.cuh, ramo WHOLD dual_scale). O int32 por metade e' soma EXATA, logo
+//     a bit-exatidao contra o vec_dot se mantem por construcao nos 3 tipos.
+// ===========================================================================
+template <class TR, int BM, int WSB = 80, int MINB = 1>
+__global__ void __launch_bounds__((BM / 8) * 32, MINB) h7_wmma_iq2_kernel(
+    const void *__restrict__ Wblk, const rdna4::block_q8_1 *__restrict__ AQ,
+    float *__restrict__ C, const int M, const int N, const int K, const int act_stride) {
+  constexpr int BN = 128, BK = 64;
+  constexpr int NKB = BK / 32;  // 2 blocos de 32 por janela
+  // WSB: 80 = identico a producao (passo 20 mod 32 -> conflito 2-vias nos loads
+  // de 8 B); 72 = BK+8 da frente H (passo 18, impar -> sem conflito).
+  // (os loads de fragmento sao de 8 B: basta multiplo de 8 para o alinhamento).
+  constexpr int WMW = BM / 16;  // warps em M (BM64 -> 4, BM128 -> 8)
+  static_assert(BM == 64 || BM == 128, "");
+  static_assert(WSB % 8 == 0, "");
+  __shared__ __align__(16) unsigned char s_w[2 * 128 * WSB];
+  __shared__ __align__(16) int2 s_dwsc[2 * 2 * 128];
+  // d_a TRANSPOSTO (kb maior, linha menor): 8 floats consecutivos = 2 LDS.128
+  // por lane por bloco.
+  __shared__ __align__(16) float s_da[2 * 2 * BM];
+
+  const int tid = threadIdx.x;
+  const int L = tid & 31;
+  const int warp = tid >> 5;  // 0..WMW*2-1
+  const int wm = (warp % WMW) * 16;
+  const int wn = (warp / WMW) * 64;
+  const int m0 = blockIdx.y * BM;
+  const int n0 = blockIdx.x * BN;
+  const int lo = L & 15, hi = L >> 4;
+  const int bpr = K / 256;
+  constexpr int BB = TR::block_bytes;
+
+  // 256 tarefas de staging (BN*NKB) sobre blockDim.x threads (256 com BM64,
+  // 512 com BM128: as excedentes ficam ociosas).
+  const int task = tid;
+  const int srow = task / NKB;
+  const int skb = task - srow * NKB;
+
+  typename TR::Pf pf;
+  auto stage_load = [&](const int k0) {
+    if (task >= BN * NKB) return;
+    int n = n0 + srow;
+    if (n >= N) n = N - 1;
+    const int kk = k0 + 32 * skb;
+    pf = TR::load((const char *)(const void *)Wblk +
+                      ((std::int64_t)n * bpr + (kk >> 8)) * BB,
+                  (kk >> 5) & 7);
+  };
+  auto stage_store = [&](const int buf, const int k0) {
+    if (task >= BN * NKB) return;
+    const int kk = k0 + 32 * skb;
+    float dw;
+    int scf;
+    TR::store(pf, (kk >> 5) & 7, (int *)(void *)(s_w + buf * (128 * WSB) + srow * WSB + skb * 32),
+              &dw, &scf);
+    s_dwsc[buf * (2 * 128) + skb * 128 + srow] = make_int2(__float_as_int(dw), scf);
+  };
+  // Staging cooperativo do d_a transposto: 1 float por tarefa (BM*NKB tarefas
+  // em blockDim.x threads).
+  auto stage_da = [&](const int buf, const int k0) {
+    for (int t2 = tid; t2 < BM * NKB; t2 += blockDim.x) {
+      const int row = t2 / NKB;
+      const int kb = t2 - row * NKB;
+      int m = m0 + row;
+      if (m >= M) m = M - 1;
+      const rdna4::block_q8_1 *q = AQ + (std::int64_t)m * act_stride + (k0 >> 5) + kb;
+      s_da[buf * (2 * BM) + kb * BM + row] = rdna4::fp16_to_float((uint16_t)(q->ds & 0xFFFFu));
+    }
+  };
+
+  float F[4][8];  // [t][j]: t = tile de N (NT=4), j = slot do D (8)
+#pragma unroll
+  for (int t = 0; t < 4; ++t)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) F[t][j] = 0.0f;
+
+  stage_load(0);
+  stage_store(0, 0);
+  stage_da(0, 0);
+  __syncthreads();
+
+  for (int k0 = 0, cur = 0; k0 < K; k0 += BK, cur ^= 1) {
+    const int cb = cur;
+    if (k0 + BK < K) stage_load(k0 + BK);  // em voo durante a conta
+#pragma unroll 1
+    for (int kb = 0; kb < NKB; ++kb) {
+      const int ka = (k0 >> 5) + kb;
+      rdna4::i32x8_t D0[4], D1[4];
+#pragma unroll
+      for (int t = 0; t < 4; ++t) {
+        D0[t] = rdna4::zero_i32x8();
+        D1[t] = rdna4::zero_i32x8();
+      }
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        // Fragmento A direto da global: linha m0+wm+lo, 8 B em ka[32*h..+16).
+        int m = m0 + wm + lo;
+        if (m >= M) m = M - 1;
+        const rdna4::block_q8_1 *q = AQ + (std::int64_t)m * act_stride + ka;
+        const int *qp = (const int *)(const void *)q->qs;
+        rdna4::i32x2_t af;
+        af[0] = qp[h * 4 + hi * 2];
+        af[1] = qp[h * 4 + hi * 2 + 1];
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+          // B = Bn[n][k] com n = linha da LDS (TRANSPOSTA do "B[k][n]").
+          const void *bp =
+              s_w + cb * (128 * WSB) + (wn + 16 * t + lo) * WSB + kb * 32 + h * 16 + hi * 8;
+          if constexpr (TR::dual_scale) {
+            // h=0 (k 0..15, ls0) -> D0; h=1 (k 16..31, ls1) -> D1. Desenrolado,
+            // o `h` e' constante por copia: sem custo extra de WMMA.
+            if (h == 0) D0[t] = rdna4::wmma_i8(af, rdna4::lds_frag(bp), D0[t]);
+            else D1[t] = rdna4::wmma_i8(af, rdna4::lds_frag(bp), D1[t]);
+          } else {
+            D0[t] = rdna4::wmma_i8(af, rdna4::lds_frag(bp), D0[t]);
+          }
+        }
+      }
+      // Correcao TRANSPOSTA: d_a = 8 floats consecutivos da metade-hi do lane
+      // = 2 LDS.128; d_w/scf = 1 int2 por tile de N.
+      float da[8];
+      {
+        // linhas do warp: m0+wm+hi*8+j -> indice wm+hi*8 na LDS transposta.
+        const float *p = s_da + cb * (2 * BM) + kb * BM + wm + hi * 8;
+        const float4 v0 = *(const float4 *)p;
+        const float4 v1 = *(const float4 *)(p + 4);
+        da[0] = v0.x;
+        da[1] = v0.y;
+        da[2] = v0.z;
+        da[3] = v0.w;
+        da[4] = v1.x;
+        da[5] = v1.y;
+        da[6] = v1.z;
+        da[7] = v1.w;
+      }
+#pragma unroll
+      for (int t = 0; t < 4; ++t) {
+        const int2 ws = s_dwsc[cb * (2 * 128) + kb * 128 + wn + 16 * t + lo];
+        const float dw = __int_as_float(ws.x);
+        const int scf = ws.y;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const float d = dw * da[j];
+          if constexpr (TR::dual_scale) {
+            F[t][j] = __fmaf_rn(d, TR::corr2(D0[t][j], D1[t][j], scf), F[t][j]);
+          } else {
+            F[t][j] = __fmaf_rn(d, TR::corr(D0[t][j], scf), F[t][j]);
+          }
+        }
+      }
+    }
+    if (k0 + BK < K) {
+      stage_store(cb ^ 1, k0 + BK);
+      stage_da(cb ^ 1, k0 + BK);
+    }
+    __syncthreads();
+  }
+
+  // Epilogo no layout de D (TRANSPOSTO): slot j do lane L -> (8*hi+j, lo).
+#pragma unroll
+  for (int t = 0; t < 4; ++t)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int m = m0 + wm + hi * 8 + j;
+      const int n = n0 + wn + 16 * t + lo;
+      if (m < M && n < N) C[(std::int64_t)m * N + n] = F[t][j];
+    }
+}
+
+// Referencias do MOTOR (um thread por saida, ordem de k crescente): os
+// `vec_dot_iq2_*_q8_1` de verdade, com kbx=ib e iqs=2*s (a convencao de quem
+// chama dentro do motor).
+__global__ void h7_ref_iq2s_kernel(const rdna4::block_iq2_s *__restrict__ W,
+                                   const rdna4::block_q8_1 *__restrict__ AQ,
+                                   float *__restrict__ C, const int M, const int N, const int K) {
+  const std::int64_t out = (std::int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (out >= (std::int64_t)M * N) return;
+  const int m = (int)(out / N), n = (int)(out % N);
+  const int bpr = K / 256;
+  const rdna4::block_iq2_s *row = W + (std::int64_t)n * bpr;
+  const rdna4::block_q8_1 *q = AQ + (std::int64_t)m * (K / 32);
+  float acc = 0.0f;
+  for (int ib = 0; ib < bpr; ++ib)
+#pragma unroll
+    for (int s = 0; s < 8; ++s) acc += rdna4::vec_dot_iq2_s_q8_1((const void *)row, q + ib * 8, ib, 2 * s);
+  C[out] = acc;
+}
+
+__global__ void h7_ref_iq2xs_kernel(const rdna4::block_iq2_xs *__restrict__ W,
+                                    const rdna4::block_q8_1 *__restrict__ AQ,
+                                    float *__restrict__ C, const int M, const int N, const int K) {
+  const std::int64_t out = (std::int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (out >= (std::int64_t)M * N) return;
+  const int m = (int)(out / N), n = (int)(out % N);
+  const int bpr = K / 256;
+  const rdna4::block_iq2_xs *row = W + (std::int64_t)n * bpr;
+  const rdna4::block_q8_1 *q = AQ + (std::int64_t)m * (K / 32);
+  float acc = 0.0f;
+  for (int ib = 0; ib < bpr; ++ib)
+#pragma unroll
+    for (int s = 0; s < 8; ++s) acc += rdna4::vec_dot_iq2_xs_q8_1((const void *)row, q + ib * 8, ib, 2 * s);
+  C[out] = acc;
+}
+
+__global__ void h7_ref_iq2xxs_kernel(const rdna4::block_iq2_xxs *__restrict__ W,
+                                     const rdna4::block_q8_1 *__restrict__ AQ,
+                                     float *__restrict__ C, const int M, const int N, const int K) {
+  const std::int64_t out = (std::int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (out >= (std::int64_t)M * N) return;
+  const int m = (int)(out / N), n = (int)(out % N);
+  const int bpr = K / 256;
+  const rdna4::block_iq2_xxs *row = W + (std::int64_t)n * bpr;
+  const rdna4::block_q8_1 *q = AQ + (std::int64_t)m * (K / 32);
+  float acc = 0.0f;
+  for (int ib = 0; ib < bpr; ++ib)
+#pragma unroll
+    for (int s = 0; s < 8; ++s) acc += rdna4::vec_dot_iq2_xxs_q8_1((const void *)row, q + ib * 8, ib, 2 * s);
+  C[out] = acc;
+}
+
 __global__ void empty_kernel() {}
 
 // ===========================================================================
@@ -860,13 +1112,394 @@ double rel_l2(const std::vector<float> &a, const std::vector<float> &b) {
   return std::sqrt(num / std::max(1e-300, den));
 }
 
+// ---------------------------------------------------------------------------
+// H7: veredito do prototipo WMMA-int8 por tipo iq2.
+// (a) BIT-EXATO vs o vec_dot do motor (M=16, N=256: 0/4096, ulp 0);
+// (b) velocidade >=1,5x vs gemm_launch dp4a de producao (mesmo binario,
+//     A/B intercalado, R>=5, burner>=300ms, piso de ruido 1%) em M=64/128/512,
+//     uma forma N-large + uma K-large por tipo;
+// (c) VGPR/LDS/spill do prototipo e da base dp4a; (d) Amdahl com a fracao de
+//     trafego do tipo. Abaixo da barra = DEAD com o numero que matou.
+// ---------------------------------------------------------------------------
+struct H7Diff {
+  std::size_t n_diff = 0, n = 0;
+  double max_abs = 0, rel_l2 = 0, max_ulps = 0;
+};
+
+uint32_t h7_f2u(const float f) {
+  uint32_t u = 0;
+  std::memcpy(&u, &f, 4);
+  return u;
+}
+
+H7Diff h7_diff_bits(const std::vector<float> &a, const std::vector<float> &b, const std::size_t n) {
+  H7Diff d;
+  d.n = n;
+  double sum_d = 0, sum_r = 0;
+  for (std::size_t i = 0; i < n; ++i) {
+    const uint32_t ua = h7_f2u(a[i]), ub = h7_f2u(b[i]);
+    if (ua != ub) {
+      ++d.n_diff;
+      const long long ia = (long long)(ua ^ ((ua >> 31) ? 0x80000000u : 0u));
+      const long long ib = (long long)(ub ^ ((ub >> 31) ? 0x80000000u : 0u));
+      const double u = (double)std::llabs(ia - ib);
+      if (u > d.max_ulps) d.max_ulps = u;
+    }
+    const double dd = (double)a[i] - (double)b[i];
+    if (std::fabs(dd) > d.max_abs) d.max_abs = std::fabs(dd);
+    sum_d += dd * dd;
+    sum_r += (double)b[i] * (double)b[i];
+  }
+  d.rel_l2 = sum_r > 0 ? std::sqrt(sum_d / sum_r) : 0;
+  return d;
+}
+
+// Ativacao float pseudoaleatoria (rms ~1,9, ordem das ativacoes reais).
+void h7_fill_a(std::vector<float> &h, const std::size_t n, unsigned seed) {
+  h.resize(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    seed = seed * 1664525u + 1013904223u;
+    const float u = (float)(seed >> 8) / (float)(1u << 24);
+    h[i] = (u - 0.5f) * 6.0f;
+  }
+}
+
+template <class TR>
+bool h7_launch_proto(const void *dW, const rdna4::block_q8_1 *dAQ, float *dC, const int M,
+                     const std::int64_t N, const std::int64_t K, const std::int64_t ast,
+                     const int bm, const int wsb, const int minb) {
+#define H7_LAUNCH(BM, WSB, MINB)                                                   \
+  {                                                                                \
+    const dim3 grid((unsigned)((N + 127) / 128), (unsigned)((M + BM - 1) / BM), 1u); \
+    h7_wmma_iq2_kernel<TR, BM, WSB, MINB>                                          \
+        <<<grid, (BM / 8) * 32>>>((const void *)dW, dAQ, dC, M, (int)N, (int)K, (int)ast); \
+  }
+  if (bm == 128 && wsb == 72 && minb == 2) H7_LAUNCH(128, 72, 2)
+  else if (bm == 128 && wsb == 72) H7_LAUNCH(128, 72, 1)
+  else if (bm == 128 && minb == 2) H7_LAUNCH(128, 80, 2)
+  else if (bm == 128) H7_LAUNCH(128, 80, 1)
+  else if (wsb == 72 && minb == 2) H7_LAUNCH(64, 72, 2)
+  else if (wsb == 72) H7_LAUNCH(64, 72, 1)
+  else if (minb == 2) H7_LAUNCH(64, 80, 2)
+  else H7_LAUNCH(64, 80, 1);
+#undef H7_LAUNCH
+  return hipGetLastError() == hipSuccess;
+}
+
+template <class TR>
+bool h7_proto_attrs(hipFuncAttributes &ap, const int bm, const int wsb, const int minb) {
+#define H7_ATTRS(BM, WSB, MINB) \
+  hipFuncGetAttributes(&ap, (const void *)h7_wmma_iq2_kernel<TR, BM, WSB, MINB>) == hipSuccess
+  if (bm == 128 && wsb == 72 && minb == 2) return H7_ATTRS(128, 72, 2);
+  if (bm == 128 && wsb == 72) return H7_ATTRS(128, 72, 1);
+  if (bm == 128 && minb == 2) return H7_ATTRS(128, 80, 2);
+  if (bm == 128) return H7_ATTRS(128, 80, 1);
+  if (wsb == 72 && minb == 2) return H7_ATTRS(64, 72, 2);
+  if (wsb == 72) return H7_ATTRS(64, 72, 1);
+  if (minb == 2) return H7_ATTRS(64, 80, 2);
+  return H7_ATTRS(64, 80, 1);
+#undef H7_ATTRS
+}
+
+bool h7_launch_ref(const int dt, const void *dW, const rdna4::block_q8_1 *dAQ, float *dC,
+                   const int M, const std::int64_t N, const std::int64_t K) {
+  const unsigned n = (unsigned)(((std::int64_t)M * N + 127) / 128);
+  if (dt == 13)
+    h7_ref_iq2s_kernel<<<n, 128>>>((const rdna4::block_iq2_s *)dW, dAQ, dC, M, (int)N, (int)K);
+  else if (dt == 8)
+    h7_ref_iq2xs_kernel<<<n, 128>>>((const rdna4::block_iq2_xs *)dW, dAQ, dC, M, (int)N, (int)K);
+  else if (dt == 7)
+    h7_ref_iq2xxs_kernel<<<n, 128>>>((const rdna4::block_iq2_xxs *)dW, dAQ, dC, M, (int)N, (int)K);
+  else return false;
+  return hipGetLastError() == hipSuccess;
+}
+
+// GEMV em lote (o que embarca hoje): sub-lotes de 64 via matvec_launch_batch.
+bool h7_gemv_batch(const int dt, const void *dW, const rdna4::block_q8_1 *dA, float *dO,
+                   const std::int64_t nrows, const std::int64_t ncols,
+                   const std::int64_t act_stride, const int M) {
+  for (int t0 = 0; t0 < M; t0 += 64) {
+    const int n = std::min(64, M - t0);
+    if (!rdna4::matvec_launch_batch(dt, dW, dA + (std::int64_t)t0 * act_stride,
+                                    dO + (std::int64_t)t0 * nrows, nrows, ncols, act_stride, n,
+                                    nullptr))
+      return false;
+    if (hipGetLastError() != hipSuccess) return false;
+  }
+  return true;
+}
+
+template <class TR>
+void h7_print_attrs(const int dt, const int M, const int bm, const int wsb, const int minb) {
+  hipFuncAttributes ap{}, as{};
+  const bool okp = h7_proto_attrs<TR>(ap, bm, wsb, minb);
+  int lds_s = 0;
+  const bool oks = rdna4::gemm_attrs(dt, M, as, lds_s);
+  const int lds_p = 2 * (128 * wsb + 2 * 128 * 8) + 2 * 2 * bm * 4;
+  std::printf("  attrs M=%d (proto BM=%d WSB=%d MINB=%d):\n", M, bm, wsb, minb);
+  if (okp)
+    std::printf("    proto WMMA: VGPR=%3d LDS=%5d B (pedido %d, attr %zu) spill/lane=%d B\n",
+                ap.numRegs, lds_p, lds_p, (size_t)ap.sharedSizeBytes, (int)ap.localSizeBytes);
+  else
+    std::printf("    proto WMMA: attrs indisponiveis\n");
+  if (oks)
+    std::printf("    prod dp4a (dt=%d): VGPR=%3d LDS=%5d B (pedido %d, attr %zu) spill/lane=%d B\n",
+                dt, as.numRegs, lds_s, lds_s, (size_t)as.sharedSizeBytes, (int)as.localSizeBytes);
+  else
+    std::printf("    prod dp4a: attrs indisponiveis\n");
+}
+
+template <class TR>
+int h7_run_one(rdna4::GgufLoader &ld, const std::size_t ti, const std::vector<int> &ms_list,
+               const int reps, const char *tag, const int dt, const double traffic, const int bm, const int wsb, const int minb) {
+  const auto &info = ld.meta().tensors[ti];
+  const std::int64_t K = (std::int64_t)info.dims[0];
+  const std::int64_t N = (std::int64_t)info.dims[1];
+  const std::int64_t bpr = K / 256;
+  constexpr int BB = TR::block_bytes;
+  std::printf("\n== %s [BM=%d WSB=%d MINB=%d]: %s [%lld x %lld] (K=%lld N=%lld, dt=%d, bloco %d B) ==\n",
+              tag, bm, wsb, minb,
+              info.name.c_str(), (long long)info.dims[0], (long long)info.dims[1], (long long)K,
+              (long long)N, dt, BB);
+  if ((int)ld.dtype(ti) != dt || K % 256 != 0 || N % 128 != 0) {
+    std::printf("  forma inesperada (dtype=%d): pulada\n", (int)ld.dtype(ti));
+    return 1;
+  }
+  const std::uint64_t want = (std::uint64_t)N * (std::uint64_t)bpr * (std::uint64_t)BB;
+  std::vector<std::uint8_t> w_raw;
+  std::string err;
+  if (!ld.load_tensor_range(ti, 0, want, w_raw, err)) {
+    std::fprintf(stderr, "load_tensor_range: %s\n", err.c_str());
+    return 1;
+  }
+  const int MMAX = *std::max_element(ms_list.begin(), ms_list.end());
+  const int MPAD = ((std::max(MMAX, bm) + 63) / 64) * 64;
+  const std::int64_t ast = K / 32;
+  std::vector<float> hA;
+  h7_fill_a(hA, (std::size_t)MPAD * (std::size_t)K, 7u);
+
+  void *dW = nullptr;
+  float *dAf = nullptr;
+  rdna4::block_q8_1 *dAQ = nullptr;
+  float *dC = nullptr, *dC2 = nullptr, *dC3 = nullptr;
+  if (hipMalloc(&dW, w_raw.size()) != hipSuccess ||
+      hipMalloc(&dAf, hA.size() * sizeof(float)) != hipSuccess ||
+      hipMalloc(&dAQ, (std::size_t)MPAD * (std::size_t)ast * sizeof(rdna4::block_q8_1)) !=
+          hipSuccess ||
+      hipMalloc(&dC, (std::size_t)MPAD * (std::size_t)N * sizeof(float)) != hipSuccess ||
+      hipMalloc(&dC2, (std::size_t)MPAD * (std::size_t)N * sizeof(float)) != hipSuccess ||
+      hipMalloc(&dC3, (std::size_t)MPAD * (std::size_t)N * sizeof(float)) != hipSuccess) {
+    std::fprintf(stderr, "hipMalloc falhou\n");
+    return 1;
+  }
+  (void)hipMemcpy(dW, w_raw.data(), w_raw.size(), hipMemcpyHostToDevice);
+  (void)hipMemcpy(dAf, hA.data(), hA.size() * sizeof(float), hipMemcpyHostToDevice);
+  if (!rdna4::quantize_q8_1_batch_launch(dAf, dAQ, (int)ast, MPAD, (int)K, nullptr) ||
+      hipGetLastError() != hipSuccess) {
+    std::printf("  quantize_q8_1_batch falhou\n");
+    return 1;
+  }
+  (void)hipDeviceSynchronize();
+
+  h7_print_attrs<TR>(dt, MMAX, bm, wsb, minb);
+  EvPair ev;
+
+  // ---- (a) BIT-EXATO vs o vec_dot de producao: M=16 N=256 (4096 saidas) ----
+  {
+    const int Me = 16, Ne = 256;
+    std::vector<float> eng((std::size_t)Me * Ne), got((std::size_t)Me * Ne);
+    if (!h7_launch_ref(dt, dW, dAQ, dC2, Me, Ne, K)) {
+      std::printf("  ref engine: launch falhou\n");
+      return 1;
+    }
+    (void)hipDeviceSynchronize();
+    (void)hipMemcpy(eng.data(), dC2, eng.size() * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemset(dC, 0, (std::size_t)MPAD * N * sizeof(float));
+    if (!h7_launch_proto<TR>(dW, dAQ, dC, Me, Ne, K, ast, bm, wsb, minb)) {
+      std::printf("  proto: launch falhou\n");
+      return 1;
+    }
+    (void)hipDeviceSynchronize();
+    (void)hipMemcpy(got.data(), dC, got.size() * sizeof(float), hipMemcpyDeviceToHost);
+    const H7Diff d = h7_diff_bits(got, eng, got.size());
+    std::printf("  (a) BIT-EXATO vs vec_dot (M=%d N=%d): %zu de %zu bits diferentes, max ulp "
+                "%.0f, max|d| %.3g, rel-L2 %.3g%s\n",
+                Me, Ne, d.n_diff, d.n, d.max_ulps, d.max_abs, d.rel_l2,
+                d.n_diff == 0 ? "  <-- declaracao (a)" : "");
+  }
+
+  // ---- tabela de velocidade A/B intercalada + (b) + proto-vs-prod bits ----
+  std::printf("  -- velocidade A/B intercalada (R=%d, burner>=300ms, mesma janela) --\n", reps);
+  std::printf("  %5s %10s %10s %10s %10s %8s %9s\n", "M", "proto ms", "T-MAC/s", "prod ms",
+              "T-MAC/s", "proto/x", "piso");
+  double speed_m128 = 0.0;
+  for (const int M : ms_list) {
+    const double macs = (double)M * (double)N * (double)K;
+    bool warned = false;
+    auto fn_p = [&] {
+      if (!h7_launch_proto<TR>(dW, dAQ, dC, M, N, K, ast, bm, wsb, minb) && !warned) {
+        warned = true;
+        std::printf("  proto(M=%d) retornou false\n", M);
+      }
+    };
+    auto fn_s = [&] {
+      if (!rdna4::gemm_launch(dt, dW, dAQ, dC2, N, K, ast, M, nullptr) && !warned) {
+        warned = true;
+        std::printf("  gemm_launch(M=%d) retornou false\n", M);
+      }
+    };
+    // burner DPM >= 300 ms, alternando A/B (aquece os dois caminhos)
+    double burner = 0;
+    for (int i = 0; i < 20000 && burner < 300.0; ++i) {
+      burner += ev(fn_p);
+      burner += ev(fn_s);
+    }
+    (void)hipDeviceSynchronize();
+    if (hipGetLastError() != hipSuccess) {
+      std::printf("  burner: erro HIP\n");
+      return 1;
+    }
+    double best_p = 1e9, best_s = 1e9;
+    for (int r = 0; r < reps; ++r) {
+      best_p = std::min(best_p, ev(fn_p));  // intercalado: A,B,A,B...
+      best_s = std::min(best_s, ev(fn_s));
+    }
+    if (hipGetLastError() != hipSuccess) {
+      std::printf("  A/B: erro HIP\n");
+      return 1;
+    }
+    // piso de ruido: a MESMA celula do proto, segunda vez
+    double n1 = 1e9, n2 = 1e9;
+    for (int r = 0; r < reps; ++r) {
+      n1 = std::min(n1, ev(fn_p));
+      n2 = std::min(n2, ev(fn_p));
+    }
+    const double rp = macs / (best_p * 1e-3) / 1e12;
+    const double rs = macs / (best_s * 1e-3) / 1e12;
+    const double ratio = best_s / std::max(best_p, 1e-9);
+    if (M == 128) speed_m128 = ratio;
+    std::printf("  %5d %10.3f %10.2f %10.3f %10.2f %8.2fx %9.3fx%s\n", M, best_p, rp, best_s, rs,
+                ratio, n2 / std::max(n1, 1e-9),
+                (n2 / std::max(n1, 1e-9) > 1.01 ? "  RUIDO>1%!" : ""));
+    if (M >= 64)
+      std::printf("        porta M=%d: %s (barra 1.50x)\n", M, ratio >= 1.5 ? "PASS" : "FAIL");
+
+    // proto vs prod, tensor-a-tensor + (b) TOLERANCIA vs GEMV em lote
+    (void)hipMemset(dC, 0, (std::size_t)M * N * sizeof(float));
+    (void)hipMemset(dC2, 0, (std::size_t)M * N * sizeof(float));
+    (void)hipMemset(dC3, 0, (std::size_t)M * N * sizeof(float));
+    fn_p();
+    (void)hipDeviceSynchronize();
+    fn_s();
+    (void)hipDeviceSynchronize();
+    if (!h7_gemv_batch(dt, dW, dAQ, dC3, N, K, ast, M)) {
+      std::printf("  M=%d: matvec_launch_batch falhou\n", M);
+      return 1;
+    }
+    (void)hipDeviceSynchronize();
+    const std::size_t n_el = (std::size_t)M * (std::size_t)N;
+    std::vector<float> a(n_el), b(n_el), g(n_el);
+    (void)hipMemcpy(a.data(), dC, n_el * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(b.data(), dC2, n_el * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(g.data(), dC3, n_el * sizeof(float), hipMemcpyDeviceToHost);
+    const H7Diff dp = h7_diff_bits(a, b, n_el);
+    const H7Diff dg = h7_diff_bits(a, g, n_el);
+    std::size_t nz = 0;
+    for (std::size_t i = 0; i < n_el; ++i) {
+      if (!std::isfinite(a[i])) {
+        std::printf("  M=%d: SAIDA NAO-FINITA -- reprovado\n", M);
+        return 1;
+      }
+      if (a[i] == 0.f) ++nz;
+    }
+    if (nz == n_el) {
+      std::printf("  M=%d: C TODA ZERO -- reprovado\n", M);
+      return 1;
+    }
+    std::printf("        proto x prod dp4a: %zu de %zu bits diferentes (max ulp %.0f)%s\n", dp.n_diff,
+                n_el, dp.max_ulps, dp.n_diff == 0 ? "  BIT-EXATO" : "");
+    std::printf("        (b) proto x GEMV-lote: rel-L2 %.3e (lim 1.0e-06) max|d| %.3e (lim 1.0e-04) "
+                "%s\n",
+                dg.rel_l2, dg.max_abs,
+                (dg.rel_l2 <= 1e-6 && dg.max_abs <= 1e-4) ? "PASS" : "FAIL");
+  }
+  // ---- (d) Amdahl: fracao de trafego do tipo, ganho medido em M=128 ----
+  if (speed_m128 > 0) {
+    const double S = 1.0 / (1.0 - traffic + traffic / speed_m128);
+    std::printf("  (d) Amdahl (f=%.2f%%, s=%.2fx em M=128): prefill x%.4f (+%.2f%%)\n", 100 * traffic,
+                speed_m128, S, 100 * (S - 1.0));
+  }
+  (void)hipFree(dW);
+  (void)hipFree(dAf);
+  (void)hipFree(dAQ);
+  (void)hipFree(dC);
+  (void)hipFree(dC2);
+  (void)hipFree(dC3);
+  return 0;
+}
+
+int h7_run_all(const char *model, const std::vector<int> &ms_list, const int reps,
+               const std::string &type_sel, const int bm, const int wsb, const int minb) {
+  rdna4::GgufLoader ld;
+  std::string err;
+  if (!ld.open(model, err)) {
+    std::fprintf(stderr, "open: %s\n", err.c_str());
+    return 1;
+  }
+  struct Spec {
+    const char *key, *t_nlarge, *t_klarge, *tag_n, *tag_k;
+    int dt;
+    double traffic;
+  };
+  // Fracoes de trafego/token (cabecalhos dos solvers em gemm.cuh): iq2_s 5,22%,
+  // iq2_xs 2,63%, iq2_xxs 2,42% (soma 10,27% vs ~9% combinado do brief -- a (d)
+  // usa a fracao do proprio tipo, sem inflar).
+  const Spec specs[3] = {
+      {"iq2_s", "blk.2.ffn_up.weight", "blk.4.ffn_down.weight", "N-large (ffn_up 5120x17408)",
+       "K-large (ffn_down 17408x5120)", 13, 0.0522},
+      {"iq2_xs", "blk.16.ffn_up.weight", "blk.16.ffn_down.weight", "N-large (ffn_up 5120x17408)",
+       "K-large (ffn_down 17408x5120)", 8, 0.0263},
+      {"iq2_xxs", "blk.1.ffn_up.weight", "blk.14.ffn_down.weight", "N-large (ffn_up 5120x17408)",
+       "K-large (ffn_down 17408x5120)", 7, 0.0242},
+  };
+  int rc = 0;
+  for (const Spec &sp : specs) {
+    if (type_sel != "all" && type_sel != sp.key) continue;
+    std::printf("\n########## H7 %s (dt %d) ##########\n", sp.key, sp.dt);
+    const auto *fn = ld.find(sp.t_nlarge);
+    const auto *fk = ld.find(sp.t_klarge);
+    if (!fn || !fk) {
+      std::fprintf(stderr, "tensor H7 %s/%s nao existe\n", sp.t_nlarge, sp.t_klarge);
+      return 1;
+    }
+    const std::size_t tin = (std::size_t)(fn - ld.meta().tensors.data());
+    const std::size_t tik = (std::size_t)(fk - ld.meta().tensors.data());
+    if (sp.dt == 13) {
+      rc |= h7_run_one<rdna4::SolverIq2S>(ld, tin, ms_list, reps, sp.tag_n, sp.dt, sp.traffic, bm, wsb, minb);
+      rc |= h7_run_one<rdna4::SolverIq2S>(ld, tik, ms_list, reps, sp.tag_k, sp.dt, sp.traffic, bm, wsb, minb);
+    } else if (sp.dt == 8) {
+      rc |= h7_run_one<rdna4::SolverIq2XS>(ld, tin, ms_list, reps, sp.tag_n, sp.dt, sp.traffic, bm, wsb, minb);
+      rc |= h7_run_one<rdna4::SolverIq2XS>(ld, tik, ms_list, reps, sp.tag_k, sp.dt, sp.traffic, bm, wsb, minb);
+    } else {
+      rc |= h7_run_one<rdna4::SolverIq2XXS>(ld, tin, ms_list, reps, sp.tag_n, sp.dt, sp.traffic, bm, wsb, minb);
+      rc |= h7_run_one<rdna4::SolverIq2XXS>(ld, tik, ms_list, reps, sp.tag_k, sp.dt, sp.traffic, bm, wsb, minb);
+    }
+  }
+  return rc;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
   int reps = 5, rounds = 3, iters_override = 0;
   bool do_layout = true, do_probe = true, do_peak = true, do_lds = true, do_exact = true,
-       do_gemm = true;
+       do_gemm = true, do_h7 = false;
   std::vector<int> gm{16, 64}, gn{1024, 4096}, gk{5120};
+  const char *h7_model =
+      "/mnt/raid0/GGUF/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_S.gguf";
+  std::vector<int> hm{64, 128, 512};
+  int h7_reps = 8, h7_bm = 64, h7_wsb = 80, h7_minb = 1;
+  std::string h7_type = "all";
 
   auto parse_list = [](const char *s, std::vector<int> &out) {
     out.clear();
@@ -887,11 +1520,18 @@ int main(int argc, char **argv) {
       else if (!std::strcmp(s, "lds")) do_lds = true;
       else if (!std::strcmp(s, "exact")) do_exact = true;
       else if (!std::strcmp(s, "gemm")) do_gemm = true;
+      else if (!std::strcmp(s, "h7")) do_h7 = true;
       else {
         std::fprintf(stderr, "secao desconhecida: %s\n", s);
         return 2;
       }
-    } else if (!std::strcmp(argv[i], "--reps") && i + 1 < argc) reps = std::atoi(argv[++i]);
+    } else if (!std::strcmp(argv[i], "--h7-model") && i + 1 < argc) h7_model = argv[++i];
+    else if (!std::strcmp(argv[i], "--h7-type") && i + 1 < argc) h7_type = argv[++i];
+    else if (!std::strcmp(argv[i], "--h7-reps") && i + 1 < argc) h7_reps = std::atoi(argv[++i]);
+    else if (!std::strcmp(argv[i], "--h7-bm") && i + 1 < argc) h7_bm = std::atoi(argv[++i]);
+    else if (!std::strcmp(argv[i], "--h7-wsb") && i + 1 < argc) h7_wsb = std::atoi(argv[++i]);
+    else if (!std::strcmp(argv[i], "--h7-minb") && i + 1 < argc) h7_minb = std::atoi(argv[++i]);
+    else if (!std::strcmp(argv[i], "--hm") && i + 1 < argc) parse_list(argv[++i], hm); else if (!std::strcmp(argv[i], "--reps") && i + 1 < argc) reps = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--rounds") && i + 1 < argc) rounds = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--iters") && i + 1 < argc) iters_override = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--gm") && i + 1 < argc) parse_list(argv[++i], gm);
@@ -912,9 +1552,21 @@ int main(int argc, char **argv) {
   HIPCHECK(hipDeviceGetAttribute(&clk_khz, hipDeviceAttributeClockRate, 0));
   std::printf("device: %s | %d CU | clock reportado pelo driver %d MHz\n", prop.name, cu,
               clk_khz / 1000);
-  std::printf("secoes: layout=%d probe=%d peak=%d lds=%d exact=%d gemm=%d (reps=%d rounds=%d)\n\n",
+  std::printf("secoes: layout=%d probe=%d peak=%d lds=%d exact=%d gemm=%d h7=%d (reps=%d rounds=%d)\n\n",
               (int)do_layout, (int)do_probe, (int)do_peak, (int)do_lds, (int)do_exact, (int)do_gemm,
-              reps, rounds);
+              (int)do_h7, reps, rounds);
+
+  if (do_h7) {
+    if (h7_bm != 64 && h7_bm != 128) {
+      std::fprintf(stderr, "--h7-bm so' aceita 64 ou 128\n");
+      return 2;
+    }
+    if (h7_wsb != 80 && h7_wsb != 72) {
+      std::fprintf(stderr, "--h7-wsb so' aceita 80 ou 72\n");
+      return 2;
+    }
+    return h7_run_all(h7_model, hm, std::max(5, h7_reps), h7_type, h7_bm, h7_wsb, h7_minb);
+  }
 
   // -----------------------------------------------------------------------
   // 1. LAYOUT

@@ -1494,9 +1494,10 @@ inline bool gemm_attrs_t(hipFuncAttributes &attr, int &lds_bytes) {
 }
 
 // ===========================================================================
-// WMMA-int8 do iq3_s (BM64/BN128/BK64) -- o caminho rapido do prefill.
-//
-// MEDIDO 16/09 (mesmo binario, A/B intercalado, R=8+12, ruido <= 1,005x;
+// WMMA-int8 de cadeia unica (BM64/BN128/BK64) -- o caminho rapido do prefill.
+// Template em TR (load/store/corr): instancia em iq3_s e iq4_xs (os dois com
+// corr inteira de escala unica). MEDIDO iq3_s 16/09 (mesmo binario, A/B
+// intercalado, R=8+12, ruido <= 1,005x;
 // blk.3.ffn_up 5120x17408 e blk.2.ffn_down 17408x5120): 1.73-1.78x do dp4a
 // em M=64/128/512 nas duas formas (N-large 27,06 vs 15,29 T-MAC/s a M=128;
 // K-large 22,16 vs 12,73). Bit-exato contra o `vec_dot_iq3_s_q8_1` (0/4096,
@@ -1519,10 +1520,11 @@ inline bool gemm_attrs_t(hipFuncAttributes &attr, int &lds_bytes) {
 //     correcao/metadados transpostos junto (s_da[2][2][64]: 2xLDS.128 por
 //     lane por bloco em vez de 8 gathers; so' esta mudanca valeu
 //     1,49x -> 1,77x). d_a consecutivo em m na metade do lane.
-//   * correcao na SEQUENCIA do motor: sumi *= 1+2*sc (INTEIRO), d = d_w*d_a,
-//     acc = fma(d, (float)sumi, acc) com __fmaf_rn fixado.
-// So' iq3_s: k-quants precisariam de correcao de cadeia dupla redesenhada --
-// NAO portar para outros tipos sem re-medir.
+//   * correcao na SEQUENCIA do motor: TR::corr (inteira) sobre o int32 exato,
+//     d = d_w*d_a, acc = fma(d, corr, acc) com __fmaf_rn fixado.
+// Tipos com corr de cadeia dupla (k-quants, iq2_s/iq2_xs) precisariam da
+// correcao redesenhada -- NAO instanciar este template para eles sem re-medir
+// (iq4_xs entrou 16/09: 1.65-1.73x, bit-exato; iq3_xxs morreu a 1.29-1.41x).
 // ===========================================================================
 typedef int i32x2_t __attribute__((ext_vector_type(2)));
 typedef int i32x8_t __attribute__((ext_vector_type(8)));
@@ -1541,8 +1543,9 @@ __device__ __forceinline__ i32x2_t lds_frag(const void *p) {
   return *reinterpret_cast<const i32x2_t *>(p);
 }
 
-__global__ void __launch_bounds__(256, 1) gemm_wmma_iq3s_kernel(
-    const block_iq3_s *__restrict__ W, const block_q8_1 *__restrict__ AQ, float *__restrict__ C,
+template <class TR>
+__global__ void __launch_bounds__(256, 1) gemm_wmma_kernel(
+    const void *__restrict__ W, const block_q8_1 *__restrict__ AQ, float *__restrict__ C,
     const int M, const int N, const int K, const int act_stride) {
   constexpr int BM = 64, BN = 128, BK = 64;
   constexpr int NKB = BK / 32;  // 2 blocos de 32 por janela
@@ -1565,20 +1568,18 @@ __global__ void __launch_bounds__(256, 1) gemm_wmma_iq3s_kernel(
   const int lo = L & 15, hi = L >> 4;
   const int bpr = K / 256;
 
-  using TR = SolverIq3S;
-  constexpr int BB = TR::block_bytes;  // 110
-  (void)BB;
   // 256 tarefas de staging (BN*NKB) em 256 threads: 1 por thread.
   const int task = tid;
   const int srow = task / NKB;
   const int skb = task - srow * NKB;
 
-  TR::Pf pf;
+  typename TR::Pf pf;
   auto stage_load = [&](const int k0) {
     int n = n0 + srow;
     if (n >= N) n = N - 1;
     const int kk = k0 + 32 * skb;
-    pf = TR::load((const char *)(const void *)(W + (std::int64_t)n * bpr + (kk >> 8)), (kk >> 5) & 7);
+    pf = TR::load((const char *)W + ((std::int64_t)n * bpr + (kk >> 8)) * TR::block_bytes,
+                  (kk >> 5) & 7);
   };
   auto stage_store = [&](const int buf, const int k0) {
     const int kk = k0 + 32 * skb;
@@ -1665,7 +1666,7 @@ __global__ void __launch_bounds__(256, 1) gemm_wmma_iq3s_kernel(
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
           const float d = dw * da[j];
-          F[t][j] = __fmaf_rn(d, (float)(D[t][j] * scf), F[t][j]);
+          F[t][j] = __fmaf_rn(d, TR::corr(D[t][j], scf), F[t][j]);
         }
       }
     }
@@ -1691,8 +1692,17 @@ inline bool gemm_wmma_iq3s_launch(const void *d_w, const block_q8_1 *d_a, float 
                                   std::int64_t nrows, std::int64_t ncols, std::int64_t act_stride,
                                   int n_tokens, hipStream_t stream) {
   const dim3 grid((unsigned)((nrows + 127) / 128), (unsigned)((n_tokens + 63) / 64), 1u);
-  gemm_wmma_iq3s_kernel<<<grid, 256, 0, stream>>>((const block_iq3_s *)d_w, d_a, d_o, n_tokens,
-                                                  (int)nrows, (int)ncols, (int)act_stride);
+  gemm_wmma_kernel<SolverIq3S><<<grid, 256, 0, stream>>>(d_w, d_a, d_o, n_tokens, (int)nrows,
+                                                         (int)ncols, (int)act_stride);
+  return hipGetLastError() == hipSuccess;
+}
+
+inline bool gemm_wmma_iq4xs_launch(const void *d_w, const block_q8_1 *d_a, float *d_o,
+                                   std::int64_t nrows, std::int64_t ncols, std::int64_t act_stride,
+                                   int n_tokens, hipStream_t stream) {
+  const dim3 grid((unsigned)((nrows + 127) / 128), (unsigned)((n_tokens + 63) / 64), 1u);
+  gemm_wmma_kernel<SolverIq4XS><<<grid, 256, 0, stream>>>(d_w, d_a, d_o, n_tokens, (int)nrows,
+                                                          (int)ncols, (int)act_stride);
   return hipGetLastError() == hipSuccess;
 }
 
@@ -1709,7 +1719,22 @@ inline bool gemm_use_wmma_iq3s(int n_tokens) {
 
 inline bool gemm_wmma_iq3s_attrs(hipFuncAttributes &attr, int &lds_bytes) {
   lds_bytes = 2 * (128 * 80 + 2 * 128 * 8) + 2 * 2 * 64 * 4;  // 25600
-  return hipFuncGetAttributes(&attr, (const void *)gemm_wmma_iq3s_kernel) == hipSuccess;
+  return hipFuncGetAttributes(&attr, (const void *)gemm_wmma_kernel<SolverIq3S>) == hipSuccess;
+}
+
+inline bool gemm_wmma_iq4xs_attrs(hipFuncAttributes &attr, int &lds_bytes) {
+  lds_bytes = 2 * (128 * 80 + 2 * 128 * 8) + 2 * 2 * 64 * 4;  // 25600
+  return hipFuncGetAttributes(&attr, (const void *)gemm_wmma_kernel<SolverIq4XS>) == hipSuccess;
+}
+
+// Porta do WMMA no iq4_xs (mesma regra do iq3_s; medida 1.65-1.73x em
+// M=64/128/512 nas duas formas, bit-exato vs vec_dot). Kill-switch proprio.
+inline bool gemm_use_wmma_iq4xs(int n_tokens) {
+  static const int on = [] {
+    const char *e = std::getenv("RD_GFX12_WMMA_IQ4XS");
+    return !(e && std::atoi(e) == 0);
+  }();
+  return on && n_tokens >= 64;
 }
 
 // Escolha de tile por M. MEDIDA nesta frente (`bench-gemm-engine-gpu --cfg`):
@@ -1759,7 +1784,22 @@ inline bool gemm_launch(int dt, const void *d_w, const block_q8_1 *d_a, float *d
     RD_GEMM(SolverIq2S, 13, 256)
     RD_GEMM(SolverIq2XS, 8, 256)
     RD_GEMM(SolverIq3XXS, 9, 256)
-    RD_GEMM(SolverIq4XS, 14, 256)
+    // iq4_xs via WMMA (n >= 64) ou dp4a (abaixo): mesma receita do iq3_s
+    // (staging verbatim + consume WMMA + correcao transposta); medido
+    // 1.65-1.73x do dp4a em M=64/128/512 nas duas formas, bit-exato contra
+    // o vec_dot (coberta pela linha iq4_xs-wmma da tabela por tipo).
+    // `RD_GFX12_WMMA_IQ4XS=0` volta ao dp4a. Escrito a mao como o caso 12.
+    case 14: {
+      if (ncols % 256 != 0 || ncols % 64 != 0) return false;
+      if (gemm_use_wmma_iq4xs(n_tokens))
+        return gemm_wmma_iq4xs_launch(d_w, d_a, d_o, nrows, ncols, act_stride, n_tokens, stream);
+      if (bm == 64)
+        return gemm_launch_t<SolverIq4XS, 64, 128, 64, 4, 8, true, true, 1>(d_w, d_a, d_o, nrows,
+                                                                    ncols, act_stride,
+                                                                    n_tokens, stream);
+      return gemm_launch_t<SolverIq4XS, 16, 128, 64, 1, 8, true, true, 1>(d_w, d_a, d_o, nrows, ncols,
+                                                                  act_stride, n_tokens, stream);
+    }
     // k-quants REABILITADOS (item KQ de docs/plano-ninfer-pendente.md, 14/09):
     // velocidade re-medida de forma independente (`bench-gemm-engine-gpu --kq`,
     // min de 5, piso de ruido <= 1,006x) e CONFERE com a tabela do cabecalho
@@ -1814,7 +1854,11 @@ inline bool gemm_attrs(int dt, int n_tokens, hipFuncAttributes &attr, int &lds_b
     RD_ATTR(SolverIq2S, 13)
     RD_ATTR(SolverIq2XS, 8)
     RD_ATTR(SolverIq3XXS, 9)
-    RD_ATTR(SolverIq4XS, 14)
+    // iq4_xs: espelha o despacho (WMMA em n >= 64, dp4a abaixo).
+    case 14:
+      if (gemm_use_wmma_iq4xs(n_tokens)) return gemm_wmma_iq4xs_attrs(attr, lds_bytes);
+      if (bm == 64) return gemm_attrs_t<SolverIq4XS, 64, 128, 64, 4, 8, true, true, 1>(attr, lds_bytes);
+      return gemm_attrs_t<SolverIq4XS, 16, 128, 64, 1, 8, true, true, 1>(attr, lds_bytes);
     RD_ATTR(SolverQ2K, 2)
     RD_ATTR(SolverQ3K, 3)
     RD_ATTR(SolverQ4K, 4)

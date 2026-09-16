@@ -66,6 +66,8 @@ namespace {
 
 using rdna4::block_q8_1;
 using rdna4::block_iq3_s;
+using rdna4::block_iq3_xxs;
+using rdna4::block_iq4_xs;
 
 constexpr int kQK = 256;   // pesos por super-bloco iq3_s
 constexpr int kQ8 = 32;    // QK8_1: valores por bloco q8_1
@@ -1224,6 +1226,501 @@ int run_one_shape(rdna4::GgufLoader &ld, const std::size_t ti, const std::vector
   return 0;
 }
 
+// ===========================================================================
+// 9. H7: WMMA-int8 com STAGING DE PRODUCAO para iq3_xxs (dt 9) e iq4_xs (dt 14)
+// ---------------------------------------------------------------------------
+// Transcricao do prototipo da secao 8 (gemm_wmma_prod_kernel) com o TR
+// trocado: SolverIq3XXS / SolverIq4XS VERBATIM (load/store de gemm.cuh:271-420,
+// que por sua vez transcrevem vecdotq.cuh:680-713 e :806-829 termo a termo).
+// Todo o resto e' identico a secao 8: W-only double buffer, prefetch do Pf em
+// registrador, ativacao direto da global, consumo SO WMMA, s_da transposto
+// (2 LDS.128 por lane por bloco), correcao na sequencia do motor via
+// TR::corr (inteiro primeiro, __fmaf_rn fixado), epilogo no layout D.
+//
+// Por que um so' template serve aos dois tipos: ambos sao cadeia unica com UM
+// fator inteiro por bloco de 32 (dual_scale=false), entao a correcao e'
+// `F = fma(dw*da, corr(D, scf), F)` com corr em INTEIRO:
+//   iq3_xxs: corr = (ls*sumi + sumi/2)/2  (divisoes truncam para zero, como no
+//            motor -- soma int32 EXATA, ordem irrelevante -> bit-exato);
+//   iq4_xs:  corr = sumi*(ls-32)          (idem, scf com sinal).
+// O WMMA acumula o int32 do bloco em 2 instrucoes (h=0,1); inteiro comuta, logo
+// a bit-exatidao contra o vec_dot se mantem por construcao, como no iq3_s.
+// ===========================================================================
+template <class TR>
+__global__ void __launch_bounds__(256, 1) gemm_wmma_h7_kernel(
+    const char *__restrict__ W, const block_q8_1 *__restrict__ AQ, float *__restrict__ C,
+    const int M, const int N, const int K, const int act_stride) {
+  constexpr int BM = 64, BN = 128, BK = 64;
+  constexpr int NKB = BK / 32;  // 2 blocos de 32 por janela
+  constexpr int WSB = BK + 16;  // 80 B, identico a producao (gemm.cuh)
+  constexpr int BB = TR::block_bytes;
+  static_assert(WSB % 16 == 0, "");
+  __shared__ __align__(16) unsigned char s_w[2 * 128 * 80];
+  __shared__ __align__(16) int2 s_dwsc[2 * 2 * 128];
+  __shared__ __align__(16) float s_da[2 * 2 * 64];
+
+  const int tid = threadIdx.x;
+  const int L = tid & 31;
+  const int warp = tid >> 5;  // 0..7
+  const int wm = (warp & 3) * 16;
+  const int wn = (warp >> 2) * 64;
+  const int m0 = blockIdx.y * BM;
+  const int n0 = blockIdx.x * BN;
+  const int lo = L & 15, hi = L >> 4;
+  const int bpr = K / TR::qk;
+
+  // 256 tarefas de staging (BN*NKB) em 256 threads: 1 por thread.
+  const int task = tid;
+  const int srow = task / NKB;
+  const int skb = task - srow * NKB;
+
+  typename TR::Pf pf;
+  auto stage_load = [&](const int k0) {
+    int n = n0 + srow;
+    if (n >= N) n = N - 1;
+    const int kk = k0 + 32 * skb;
+    pf = TR::load(W + ((std::int64_t)n * bpr + (kk >> 8)) * BB, (kk >> 5) & 7);
+  };
+  auto stage_store = [&](const int buf, const int k0) {
+    const int kk = k0 + 32 * skb;
+    float dw;
+    int scf;
+    TR::store(pf, (kk >> 5) & 7, (int *)(void *)(s_w + buf * (128 * WSB) + srow * WSB + skb * 32),
+              &dw, &scf);
+    s_dwsc[buf * (2 * 128) + skb * 128 + srow] = make_int2(__float_as_int(dw), scf);
+  };
+  auto stage_da = [&](const int buf, const int k0) {
+    for (int task = tid; task < BM * NKB; task += 256) {
+      const int row = task / NKB;
+      const int kb = task - row * NKB;
+      int m = m0 + row;
+      if (m >= M) m = M - 1;
+      const block_q8_1 *q = AQ + (std::int64_t)m * act_stride + (k0 >> 5) + kb;
+      s_da[buf * (2 * 64) + kb * 64 + row] = rdna4::fp16_to_float((uint16_t)(q->ds & 0xFFFFu));
+    }
+  };
+
+  float F[4][8];  // [t][j]: t = tile de N (NT=4), j = slot do D (8)
+#pragma unroll
+  for (int t = 0; t < 4; ++t)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) F[t][j] = 0.0f;
+
+  stage_load(0);
+  stage_store(0, 0);
+  stage_da(0, 0);
+  __syncthreads();
+
+  for (int k0 = 0, cur = 0; k0 < K; k0 += BK, cur ^= 1) {
+    const int cb = cur;
+    if (k0 + BK < K) stage_load(k0 + BK);  // em voo durante a conta
+#pragma unroll 1
+    for (int kb = 0; kb < NKB; ++kb) {
+      const int ka = (k0 >> 5) + kb;
+      i32x8_t D[4];
+#pragma unroll
+      for (int t = 0; t < 4; ++t) D[t] = zero_i32x8();
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        // Fragmento A direto da global: linha m0+wm+lo, 8 B em ka[32*h..+16).
+        int m = m0 + wm + lo;
+        if (m >= M) m = M - 1;
+        const block_q8_1 *q = AQ + (std::int64_t)m * act_stride + ka;
+        const int *qp = (const int *)(const void *)q->qs;
+        i32x2_t af;
+        af[0] = qp[h * 4 + hi * 2];
+        af[1] = qp[h * 4 + hi * 2 + 1];
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+          // B = Bn[n][k] com n = linha da LDS (TRANSPOSTA do "B[k][n]").
+          const void *bp =
+              s_w + cb * (128 * WSB) + (wn + 16 * t + lo) * WSB + kb * 32 + h * 16 + hi * 8;
+          D[t] = wmma_i8(af, lds_frag(bp), D[t]);
+        }
+      }
+      // Correcao TRANSPOSTA (doc H secao 5): d_a = 8 floats consecutivos da
+      // metade-hi do lane = 2 LDS.128; d_w/scf = 1 int2 por tile de N. A
+      // diferenca para a secao 8 e' SO' o `TR::corr` (motor order, inteiro).
+      float da[8];
+      {
+        const float *p = s_da + cb * (2 * 64) + kb * 64 + wm + hi * 8;
+        const float4 v0 = *(const float4 *)p;
+        const float4 v1 = *(const float4 *)(p + 4);
+        da[0] = v0.x;
+        da[1] = v0.y;
+        da[2] = v0.z;
+        da[3] = v0.w;
+        da[4] = v1.x;
+        da[5] = v1.y;
+        da[6] = v1.z;
+        da[7] = v1.w;
+      }
+#pragma unroll
+      for (int t = 0; t < 4; ++t) {
+        const int2 ws = s_dwsc[cb * (2 * 128) + kb * 128 + wn + 16 * t + lo];
+        const float dw = __int_as_float(ws.x);
+        const int scf = ws.y;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const float d = dw * da[j];
+          F[t][j] = __fmaf_rn(d, TR::corr(D[t][j], scf), F[t][j]);
+        }
+      }
+    }
+    if (k0 + BK < K) {
+      stage_store(cb ^ 1, k0 + BK);
+      stage_da(cb ^ 1, k0 + BK);
+    }
+    __syncthreads();
+  }
+
+  // Epilogo no layout de D (TRANSPOSTO): slot j do lane L -> (8*hi+j, lo).
+#pragma unroll
+  for (int t = 0; t < 4; ++t)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int m = m0 + wm + hi * 8 + j;
+      const int n = n0 + wn + 16 * t + lo;
+      if (m < M && n < N) C[(std::int64_t)m * N + n] = F[t][j];
+    }
+}
+
+using H7Launch =
+    bool (*)(const void *, const block_q8_1 *, float *, int, std::int64_t, std::int64_t, std::int64_t);
+using H7Attrs = bool (*)(hipFuncAttributes &, int &);
+
+bool launch_wmma_xxs(const void *W, const block_q8_1 *AQ, float *C, const int M,
+                     const std::int64_t N, const std::int64_t K, const std::int64_t ast) {
+  const dim3 grid((unsigned)((N + 127) / 128), (unsigned)((M + 63) / 64), 1u);
+  gemm_wmma_h7_kernel<rdna4::SolverIq3XXS>
+      <<<grid, 256>>>((const char *)W, AQ, C, M, (int)N, (int)K, (int)ast);
+  return launch_ok("gemm_wmma_xxs");
+}
+
+bool launch_wmma_4xs(const void *W, const block_q8_1 *AQ, float *C, const int M,
+                     const std::int64_t N, const std::int64_t K, const std::int64_t ast) {
+  const dim3 grid((unsigned)((N + 127) / 128), (unsigned)((M + 63) / 64), 1u);
+  gemm_wmma_h7_kernel<rdna4::SolverIq4XS>
+      <<<grid, 256>>>((const char *)W, AQ, C, M, (int)N, (int)K, (int)ast);
+  return launch_ok("gemm_wmma_4xs");
+}
+
+template <class TR>
+bool h7_attrs(hipFuncAttributes &a, int &lds) {
+  lds = 2 * (128 * 80 + 2 * 128 * 8) + 2 * 2 * 64 * 4;  // 25600, como a secao 8
+  return hipFuncGetAttributes(&a, (const void *)gemm_wmma_h7_kernel<TR>) == hipSuccess;
+}
+
+// Referencias do MOTOR (vec_dot de verdade, um thread por saida, ordem de k
+// crescente -- a mesma convencao da secao 5: kbx = super-bloco; iqs = 2*s no
+// xxs -- matvec.cuh: kqs = vdr*(tg%(qi/vdr)), vdr=2 -- e 4*s no 4xs, vdr=4).
+__global__ void ref_xxs_kernel(const block_iq3_xxs *__restrict__ W,
+                               const block_q8_1 *__restrict__ AQ, float *__restrict__ C,
+                               const int M, const int N, const int K) {
+  const std::int64_t out = (std::int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (out >= (std::int64_t)M * N) return;
+  const int m = (int)(out / N), n = (int)(out % N);
+  const int bpr = K / 256;
+  const block_iq3_xxs *row = W + (std::int64_t)n * bpr;
+  const block_q8_1 *q = AQ + (std::int64_t)m * (K / 32);
+  float acc = 0.0f;
+  for (int ib = 0; ib < bpr; ++ib) {
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+      acc += rdna4::vec_dot_iq3_xxs_q8_1((const void *)row, q + ib * 8, ib, 2 * s);
+    }
+  }
+  C[out] = acc;
+}
+
+__global__ void ref_4xs_kernel(const block_iq4_xs *__restrict__ W,
+                               const block_q8_1 *__restrict__ AQ, float *__restrict__ C,
+                               const int M, const int N, const int K) {
+  const std::int64_t out = (std::int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (out >= (std::int64_t)M * N) return;
+  const int m = (int)(out / N), n = (int)(out % N);
+  const int bpr = K / 256;
+  const block_iq4_xs *row = W + (std::int64_t)n * bpr;
+  const block_q8_1 *q = AQ + (std::int64_t)m * (K / 32);
+  float acc = 0.0f;
+  for (int ib = 0; ib < bpr; ++ib) {
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+      acc += rdna4::vec_dot_iq4_xs_q8_1((const void *)row, q + ib * 8, ib, 4 * s);
+    }
+  }
+  C[out] = acc;
+}
+
+bool launch_ref_xxs(const void *W, const block_q8_1 *AQ, float *C, const int M,
+                    const std::int64_t N, const std::int64_t K, const std::int64_t) {
+  ref_xxs_kernel<<<(unsigned)(((std::int64_t)M * N + 127) / 128), 128>>>(
+      (const block_iq3_xxs *)W, AQ, C, M, (int)N, (int)K);
+  return launch_ok("ref_xxs_kernel");
+}
+
+bool launch_ref_4xs(const void *W, const block_q8_1 *AQ, float *C, const int M,
+                    const std::int64_t N, const std::int64_t K, const std::int64_t) {
+  ref_4xs_kernel<<<(unsigned)(((std::int64_t)M * N + 127) / 128), 128>>>(
+      (const block_iq4_xs *)W, AQ, C, M, (int)N, (int)K);
+  return launch_ok("ref_4xs_kernel");
+}
+
+void print_h7_attrs(const char *tag, const int M, const int dt, H7Attrs pa) {
+  hipFuncAttributes ap{}, as{};
+  int lds_s = 0;
+  const bool okp = pa(ap, lds_s);
+  const bool oks = rdna4::gemm_attrs(dt, M, as, lds_s);
+  (void)lds_s;
+  const int lds_p = 2 * (128 * 80 + 2 * 128 * 8) + 2 * 2 * 64 * 4;
+  std::printf("  attrs %s M=%d:\n", tag, M);
+  if (okp)
+    std::printf("    proto WMMA BM64 BN128 BK64 W4x2 : VGPR=%3d LDS=%5d B (pedido %d, attr %zu) spill/lane=%d B\n",
+                ap.numRegs, lds_p, lds_p, (size_t)ap.sharedSizeBytes, (int)ap.localSizeBytes);
+  else
+    std::printf("    proto WMMA: attrs indisponiveis\n");
+  if (oks) {
+    int lds_need = 0;
+    hipFuncAttributes ax{};
+    (void)rdna4::gemm_attrs(dt, M, ax, lds_need);
+    std::printf("    prod dp4a BM64 BN128 BK64 RM4RN8: VGPR=%3d LDS=%5d B (pedido %d, attr %zu) spill/lane=%d B\n",
+                as.numRegs, lds_need, lds_need, (size_t)as.sharedSizeBytes, (int)as.localSizeBytes);
+  } else {
+    std::printf("    prod dp4a: attrs indisponiveis\n");
+  }
+}
+
+// Uma forma (N-large ou K-large) de UM tipo H7: verifica (a)+(b) e cronometra
+// A/B. Copia fiel de run_one_shape (secao 8) com dt/bytes/ref parametrizados;
+// `s128` sai com o speedup proto/prod em M=128 (0 se M=128 nao rodou).
+int run_one_shape_h7(rdna4::GgufLoader &ld, const std::size_t ti, const std::vector<int> &ms_list,
+                     const int reps, const char *tag, const char *tname, const int dt,
+                     const int block_bytes, H7Launch proto, H7Launch ref, H7Attrs pa,
+                     double &s128) {
+  s128 = 0.0;
+  const auto &info = ld.meta().tensors[ti];
+  const std::int64_t K = (std::int64_t)info.dims[0];
+  const std::int64_t N = (std::int64_t)info.dims[1];
+  const std::int64_t bpr = K / 256;
+  std::printf("\n== %s: %s [%lld x %lld] (K=%lld N=%lld, %s dt=%d %d B/blk) ==\n", tag,
+              info.name.c_str(), (long long)info.dims[0], (long long)info.dims[1], (long long)K,
+              (long long)N, tname, dt, block_bytes);
+  if ((int)ld.dtype(ti) != dt || K % 256 != 0 || N % 128 != 0) {
+    std::printf("  forma inesperada (dtype=%d): pulada\n", (int)ld.dtype(ti));
+    return 1;
+  }
+  const std::uint64_t want = (std::uint64_t)N * (std::uint64_t)bpr * (std::uint64_t)block_bytes;
+  std::vector<std::uint8_t> w_raw;
+  std::string err;
+  if (!ld.load_tensor_range(ti, 0, want, w_raw, err)) {
+    std::fprintf(stderr, "load_tensor_range: %s\n", err.c_str());
+    return 1;
+  }
+  const int MMAX = *std::max_element(ms_list.begin(), ms_list.end());
+  const int MPAD = ((std::max(MMAX, 64) + 63) / 64) * 64;
+  const std::int64_t ast = K / 32;
+  std::vector<float> hA;
+  fill_a(hA, (std::size_t)MPAD * (std::size_t)K, 7u);
+
+  void *dW = nullptr;
+  float *dAf = nullptr;
+  block_q8_1 *dAQ = nullptr;
+  float *dC = nullptr, *dC2 = nullptr, *dC3 = nullptr;
+  if (hipMalloc(&dW, w_raw.size()) != hipSuccess ||
+      hipMalloc(&dAf, hA.size() * sizeof(float)) != hipSuccess ||
+      hipMalloc(&dAQ, (std::size_t)MPAD * (std::size_t)ast * sizeof(block_q8_1)) != hipSuccess ||
+      hipMalloc(&dC, (std::size_t)MPAD * (std::size_t)N * sizeof(float)) != hipSuccess ||
+      hipMalloc(&dC2, (std::size_t)MPAD * (std::size_t)N * sizeof(float)) != hipSuccess ||
+      hipMalloc(&dC3, (std::size_t)MPAD * (std::size_t)N * sizeof(float)) != hipSuccess) {
+    std::fprintf(stderr, "hipMalloc falhou\n");
+    return 1;
+  }
+  (void)hipMemcpy(dW, w_raw.data(), w_raw.size(), hipMemcpyHostToDevice);
+  (void)hipMemcpy(dAf, hA.data(), hA.size() * sizeof(float), hipMemcpyHostToDevice);
+  if (!rdna4::quantize_q8_1_batch_launch(dAf, dAQ, (int)ast, MPAD, (int)K, nullptr) ||
+      !launch_ok("quantize_q8_1_batch")) {
+    return 1;
+  }
+  (void)hipDeviceSynchronize();
+
+  print_h7_attrs(tname, MMAX, dt, pa);
+  EvPair ev;
+
+  // ---- (a) BIT-EXATO vs o vec_dot de producao: M=16 N=256 (4096 saidas) ----
+  {
+    const int Me = 16, Ne = 256;
+    std::vector<float> eng((std::size_t)Me * Ne), got((std::size_t)Me * Ne);
+    if (!ref(dW, dAQ, dC2, Me, Ne, K, ast)) return 1;
+    (void)hipDeviceSynchronize();
+    (void)hipMemcpy(eng.data(), dC2, eng.size() * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemset(dC, 0, (std::size_t)MPAD * N * sizeof(float));
+    if (!proto(dW, dAQ, dC, Me, Ne, K, ast)) return 1;
+    (void)hipDeviceSynchronize();
+    (void)hipMemcpy(got.data(), dC, got.size() * sizeof(float), hipMemcpyDeviceToHost);
+    const Diff d = diff_bits(got, eng, got.size());
+    std::printf("  (a) BIT-EXATO vs vec_dot %s (M=%d N=%d): %zu de %zu bits diferentes, max ulp "
+                "%.0f, max|d| %.3g, rel-L2 %.3g%s\n",
+                tname, Me, Ne, d.n_diff, d.n, d.max_ulps, d.max_abs, d.rel_l2,
+                d.n_diff == 0 ? "  <-- declaracao (a)" : "");
+  }
+
+  // ---- tabela de velocidade A/B intercalada + (b) + proto-vs-prod bits ----
+  std::printf("  -- velocidade A/B intercalada (R=%d, burner>=300ms, mesma janela) --\n", reps);
+  std::printf("  %5s %10s %10s %10s %10s %8s %9s\n", "M", "proto ms", "T-MAC/s", "prod ms",
+              "T-MAC/s", "proto/x", "piso");
+  for (const int M : ms_list) {
+    const double macs = (double)M * (double)N * (double)K;
+    bool warned = false;
+    auto fn_p = [&] {
+      if (!proto(dW, dAQ, dC, M, N, K, ast) && !warned) {
+        warned = true;
+        std::printf("  proto(M=%d) retornou false\n", M);
+      }
+    };
+    auto fn_s = [&] {
+      if (!rdna4::gemm_launch(dt, dW, dAQ, dC2, N, K, ast, M, nullptr) && !warned) {
+        warned = true;
+        std::printf("  gemm_launch(M=%d) retornou false\n", M);
+      }
+    };
+    // burner DPM >= 300 ms, alternando A/B (aquece os dois caminhos)
+    double burner = 0;
+    for (int i = 0; i < 20000 && burner < 300.0; ++i) {
+      burner += ev(fn_p);
+      burner += ev(fn_s);
+    }
+    (void)hipDeviceSynchronize();
+    if (!launch_ok("verdict burner")) return 1;
+    double best_p = 1e9, best_s = 1e9;
+    for (int r = 0; r < reps; ++r) {
+      best_p = std::min(best_p, ev(fn_p));  // intercalado: A,B,A,B...
+      best_s = std::min(best_s, ev(fn_s));
+    }
+    if (!launch_ok("verdict A/B")) return 1;
+    // piso de ruido: a MESMA celula do proto, segunda vez
+    double n1 = 1e9, n2 = 1e9;
+    for (int r = 0; r < reps; ++r) {
+      n1 = std::min(n1, ev(fn_p));
+      n2 = std::min(n2, ev(fn_p));
+    }
+    const double rp = macs / (best_p * 1e-3) / 1e12;
+    const double rs = macs / (best_s * 1e-3) / 1e12;
+    std::printf("  %5d %10.3f %10.2f %10.3f %10.2f %8.2fx %9.3fx%s\n", M, best_p, rp, best_s, rs,
+                best_s / std::max(best_p, 1e-9), n2 / std::max(n1, 1e-9),
+                (n2 / std::max(n1, 1e-9) > 1.01 ? "  RUIDO>1%!" : ""));
+    if (M == 128) s128 = best_s / std::max(best_p, 1e-9);
+
+    // proto vs prod, tensor-a-tensor (bit-exatidao esperada: mesma ordem de k)
+    // + (b) TOLERANCIA vs GEMV em lote (gate kTolPerType: 1e-6 / 1e-4)
+    (void)hipMemset(dC, 0, (std::size_t)M * N * sizeof(float));
+    (void)hipMemset(dC2, 0, (std::size_t)M * N * sizeof(float));
+    (void)hipMemset(dC3, 0, (std::size_t)M * N * sizeof(float));
+    fn_p();
+    (void)hipDeviceSynchronize();
+    fn_s();
+    (void)hipDeviceSynchronize();
+    gemv_batch_proto(dt, dW, dAQ, dC3, N, K, ast, M, true);
+    (void)hipDeviceSynchronize();
+    const std::size_t n_el = (std::size_t)M * (std::size_t)N;
+    std::vector<float> a(n_el), b(n_el), g(n_el);
+    (void)hipMemcpy(a.data(), dC, n_el * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(b.data(), dC2, n_el * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(g.data(), dC3, n_el * sizeof(float), hipMemcpyDeviceToHost);
+    const Diff dp = diff_bits(a, b, n_el);
+    const Diff dg = diff_bits(a, g, n_el);
+    std::size_t nz = 0;
+    for (std::size_t i = 0; i < n_el; ++i) {
+      if (!std::isfinite(a[i])) {
+        std::printf("  M=%d: SAIDA NAO-FINITA -- reprovado\n", M);
+        return 1;
+      }
+      if (a[i] == 0.f) ++nz;
+    }
+    if (nz == n_el) {
+      std::printf("  M=%d: C TODA ZERO -- reprovado\n", M);
+      return 1;
+    }
+    std::printf("        proto x prod dp4a: %zu de %zu bits diferentes (max ulp %.0f)%s\n", dp.n_diff,
+                n_el, dp.max_ulps, dp.n_diff == 0 ? "  BIT-EXATO" : "");
+    std::printf("        (b) proto x GEMV-lote: rel-L2 %.3e (lim 1.0e-06) max|d| %.3e (lim 1.0e-04) "
+                "%s\n",
+                dg.rel_l2, dg.max_abs,
+                (dg.rel_l2 <= 1e-6 && dg.max_abs <= 1e-4) ? "PASS" : "FAIL");
+  }
+  (void)hipFree(dW);
+  (void)hipFree(dAf);
+  (void)hipFree(dAQ);
+  (void)hipFree(dC);
+  (void)hipFree(dC2);
+  (void)hipFree(dC3);
+  return 0;
+}
+
+int run_h7_verdict(const char *model, const std::vector<int> &ms_list, const int reps) {
+  rdna4::GgufLoader ld;
+  std::string err;
+  if (!ld.open(model, err)) {
+    std::fprintf(stderr, "open: %s\n", err.c_str());
+    return 1;
+  }
+  // Uma forma N-large + uma K-large POR TIPO (mesma fisica do veredito iq3_s).
+  struct Item {
+    const char *w;
+    const char *tag;
+    const char *tname;
+    int dt;
+    int bb;
+    H7Launch proto;
+    H7Launch ref;
+    H7Attrs pa;
+  };
+  const Item items[4] = {
+      {"blk.5.ffn_up.weight", "xxs N-large (ffn_up 5120x17408)", "iq3_xxs", 9, 98, launch_wmma_xxs,
+       launch_ref_xxs, h7_attrs<rdna4::SolverIq3XXS>},
+      {"blk.0.ffn_down.weight", "xxs K-large (ffn_down 17408x5120)", "iq3_xxs", 9, 98,
+       launch_wmma_xxs, launch_ref_xxs, h7_attrs<rdna4::SolverIq3XXS>},
+      {"blk.41.ffn_up.weight", "4xs N-large (ffn_up 5120x17408)", "iq4_xs", 14, 136,
+       launch_wmma_4xs, launch_ref_4xs, h7_attrs<rdna4::SolverIq4XS>},
+      {"blk.21.ffn_down.weight", "4xs K-large (ffn_down 17408x5120)", "iq4_xs", 14, 136,
+       launch_wmma_4xs, launch_ref_4xs, h7_attrs<rdna4::SolverIq4XS>},
+  };
+  int rc = 0;
+  double s128[4] = {0, 0, 0, 0};
+  for (int i = 0; i < 4; ++i) {
+    const auto *f = ld.find(items[i].w);
+    if (!f) {
+      std::fprintf(stderr, "tensor %s nao existe\n", items[i].w);
+      return 1;
+    }
+    rc |= run_one_shape_h7(ld, (std::size_t)(f - ld.meta().tensors.data()), ms_list, reps,
+                           items[i].tag, items[i].tname, items[i].dt, items[i].bb, items[i].proto,
+                           items[i].ref, items[i].pa, s128[i]);
+  }
+  // ---- Amdahl E2E a partir dos bytes reais do inventario -------------------
+  {
+    double tot = 0, bxxs = 0, b4xs = 0;
+    for (std::size_t i = 0; i < ld.n_tensors(); ++i) {
+      const double b = (double)ld.tensor_bytes(i);
+      tot += b;
+      const int d = (int)ld.dtype(i);
+      if (d == 9) bxxs += b;
+      if (d == 14) b4xs += b;
+    }
+    const double fxxs = bxxs / tot, f4xs = b4xs / tot;
+    std::printf("\n== Amdahl (bytes do inventario: xxs %.1f%%, 4xs %.1f%%) ==\n", 100.0 * fxxs,
+                100.0 * f4xs);
+    const char *nm[4] = {"xxs N-large", "xxs K-large", "4xs N-large", "4xs K-large"};
+    for (int i = 0; i < 4; ++i) {
+      const double f = (i < 2) ? fxxs : f4xs;
+      const double s = s128[i];
+      const double e2e = (s > 0) ? 1.0 / (1.0 - f + f / s) : 0.0;
+      std::printf("  %-11s S@M128 = %.3fx -> E2E prefill %.4fx (ganho %.2f%%)\n", nm[i], s, e2e,
+                  100.0 * (e2e - 1.0));
+    }
+  }
+  return rc;
+}
+
 int run_proto_verdict(const char *model, const std::vector<int> &ms_list, const int reps) {
   rdna4::GgufLoader ld;
   std::string err;
@@ -1251,7 +1748,7 @@ int run_proto_verdict(const char *model, const std::vector<int> &ms_list, const 
 int main(int argc, char **argv) {
   std::vector<int> ms_list{16, 64, 128, 512};
   int reps = 5, BK_ovr = 0, proto_reps = 8;
-  bool proto_verdict = false;
+  bool proto_verdict = false, h7_verdict = false;
   std::vector<int> cfg_sel;
   bool DBUF = false, verify = true, peak_only = false, list_only = false;
   std::int64_t n_ovr = -1, k_ovr = -1;
@@ -1287,6 +1784,8 @@ int main(int argc, char **argv) {
       DBUF = true;
     } else if (!std::strcmp(argv[i], "--proto-verdict")) {
       proto_verdict = true;
+    } else if (!std::strcmp(argv[i], "--h7-verdict")) {
+      h7_verdict = true;
     } else if (!std::strcmp(argv[i], "--proto-reps") && i + 1 < argc) {
       proto_reps = std::atoi(argv[++i]);
     } else if (!std::strcmp(argv[i], "--no-verify")) {
@@ -1317,6 +1816,15 @@ int main(int argc, char **argv) {
   // Veredito do prototipo WMMA-producao (secao 8): mesmo binario, duas formas,
   // A/B intercalado, burner >= 300 ms, R>=5, piso de ruido. Nao passa pelo
   // caminho antigo abaixo.
+  // Veredito H7 (secao 9): iq3_xxs + iq4_xs, duas formas cada, mesmo binario,
+  // A/B intercalado, burner >= 300 ms, R>=5, piso de ruido.
+  if (h7_verdict) {
+    std::vector<int> pms{64, 128, 512};
+    bool custom = false;
+    for (int i = 1; i < argc; ++i)
+      if (!std::strcmp(argv[i], "--m")) custom = true;
+    return run_h7_verdict(model, custom ? ms_list : pms, std::max(proto_reps, 5));
+  }
   if (proto_verdict) {
     std::vector<int> pms{64, 128, 512};
     bool custom = false;

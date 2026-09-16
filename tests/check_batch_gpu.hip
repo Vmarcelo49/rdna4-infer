@@ -123,6 +123,8 @@ constexpr PerTypeTol kTolPerType[] = {
                                        // BM16); mesma assinatura medida.
     {9, "iq3_xxs", 1.0e-06, 1.0e-04, 32},  // mesma familia de cadeia unica
     {14, "iq4_xs", 1.0e-06, 1.0e-04, 32},  // medido ~2e-07 / 4.8e-06
+    {14, "iq4_xs-wmma", 1.0e-06, 1.0e-04, 64},  // idem iq3_s-wmma: M=64
+                                       // exercita o tile WMMA (n >= 64).
     {2, "q2_K", 1.0e-06, 2.0e-05, 32},     // medido 4.51e-07 / 9.54e-06
     {3, "q3_K", 2.0e-06, 3.0e-05, 32},     // medido 7.39e-07 / 1.34e-05
     {4, "q4_K", 2.0e-06, 6.0e-05, 32},     // medido 8.44e-07 / 2.48e-05
