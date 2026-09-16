@@ -194,7 +194,11 @@ inline std::uint64_t required_bytes(std::uint64_t weights_bytes, std::uint64_t c
   return weights_bytes + buffers_bytes + kv_cache_bytes(ctx_size, kv_k, kv_v) + kOverheadBytes;
 }
 
-// Teto RUNTIME do chunk do prefill em lote. O default (128) e' o alvo medido do
+// Teto RUNTIME do chunk do prefill em lote. O default (512) vem da varredura
+// de cap 128/256/512 de 16/09 (docs/chunk-scale-2026-09-16.md): prefill-512
+// 368,13 -> 401,73 -> 411,22 tok/s (+9,1 % / +11,7 %), prefill-4096 +13,7 %,
+// decode inalterado, VRAM 12,28/15,92 GiB, e 512 == kMaxChunkHost (o teto
+// projetado: nada quebra). 256 captura ~78 % do ganho e e' o fallback.
 // GEMM tilejado (docs/plano-prefill.md, degrau D2); ate' 16 o chunk e' o GEMV em
 // lote de sempre, que e' bit-exato contra o caminho por token. `RD_PREFILL_CHUNK`
 // continua sendo a escotilha: `RD_PREFILL_CHUNK=16` reproduz o comportamento
@@ -244,7 +248,7 @@ inline int prefill_chunk_cap() {
     // (kTolChunkRelL2/kTolChunkMaxAbs + kTolPerType); a cobertura do GEMM e'
     // de 89,9 % dos bytes com os k-quants (iq3_s/iq3_xxs/iq4_xs + q2/q3/q4/q5/q6_K).
     // Volta a 16 so' com `RD_PREFILL_CHUNK=16` (a saida de emergencia e o A/B).
-    int n = e ? std::atoi(e) : 128;
+    int n = e ? std::atoi(e) : 512;
     if (n < 16) n = 16;
     if (n > 512) n = 512;  // == Graph::kMaxChunkHost
     return n;

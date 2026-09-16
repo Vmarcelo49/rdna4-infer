@@ -215,6 +215,24 @@ int main() {
                   (double)need128 / 1073741824.0);
       ok(need128 < 15900000000ull, "131K q5_0/q4_1 still fits with chunk-128 buffers");
     }
+    // ... e com o chunk default em 512 (varredura de cap 16/09,
+    // docs/chunk-scale-2026-09-16.md): o mesmo espelho, com max_batch = 512.
+    // E' o default que embarca -- se o alocador mudar, este pino quebra junto
+    // com o de 128 acima.
+    {
+      rdna4::GraphBufferShape s512 = s;
+      s512.max_batch = 512;
+      const std::uint64_t got512 = rdna4::graph_buffer_bytes(s512);
+      std::printf("   graph buffers for the IQ3_S shape at max_batch = 512: %llu B = %.2f MiB\n",
+                  (unsigned long long)got512, (double)got512 / (1024.0 * 1024.0));
+      ok(got512 == 604327908ull, "graph_buffer_bytes == 604 327 908 B (576.33 MiB) at max_batch 512");
+      const std::uint64_t need512 =
+          rdna4::required_bytes(11678877696ull, 131072, rdna4::KvType::Q5_0, rdna4::KvType::Q4_1,
+                                got512);
+      std::printf("   131K q5_0/q4_1 with chunk-512 buffers: %.3f GiB\n",
+                  (double)need512 / 1073741824.0);
+      ok(need512 < 15900000000ull, "131K q5_0/q4_1 still fits with chunk-512 buffers");
+    }
     // ... and the budget must not count the whole file: 10.877 GiB of trunk
     // weights, not 11.214 GiB.
     const std::uint64_t need = rdna4::required_bytes(11678877696ull, 131072,

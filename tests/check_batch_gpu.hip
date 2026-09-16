@@ -401,7 +401,14 @@ int main(int argc, char **argv) {
   // for the short cases (positions below kAttnSplitMin take the unsplit path there
   // either way), so there is exactly one Graph -- and therefore one copy of the
   // weights -- in this process.
-  const int ctx_used = ctx > 1216 ? ctx : 1216;
+  //
+  // O caso longo usa n = cap (o chunk default) a partir de 1088: com cap 128
+  // cabia em 1216 exato (1088+128); com cap 512 precisa de 1600. Dimensionar
+  // pelo cap atual em vez de um 1216 fixo -- senao cada aumento de default
+  // quebra este gate com "positions exceed the allocated context".
+  // (`g.batch_cap()` so existe depois do init; aqui usa-se a fonte unica.)
+  const int ctx_long = 1088 + rdna4::prefill_chunk_cap();
+  const int ctx_used = ctx > ctx_long ? ctx : ctx_long;
   rdna4::Graph g(loader, cfg);
   // Um unico Graph para todos os pares: os pesos sobem uma vez no primeiro
   // init; cada par seguinte so' realoca o cache K/V (reinit_kv). Sem --pairs ha'
