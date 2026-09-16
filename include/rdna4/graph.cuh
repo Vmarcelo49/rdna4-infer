@@ -16,6 +16,7 @@
 // (quantized cache types are a later step).
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -245,6 +246,11 @@ inline bool split_batch_enabled() {
   // porque e' a POLITICA (e o gate a imprime): qualquer consumidor que queira
   // cortar o prompt "do mesmo jeito" tem de chamar `prefill()`, nao recopiar isto.
   std::vector<int> prefill_chunk_sizes() const;
+  // O corte do prompt em chunks: DP sobre o total que minimiza (n. de chunks,
+  // n. de chunks de 1 token), so' com tamanhos chunk_ok. E' o que evita a cauda
+  // 2+1 do guloso (resto 3 saia como 2 + 1 token) e alinha as caudas aos
+  // tamanhos suportados {16,8,4,3,2} sem mudar nenhum caso que ja' era otimo.
+  std::vector<int> prefill_plan(std::size_t total) const;
 
   // feat/noite-prefill: `RD_PREFILL_BATCH=0` runs forward_batch with the
   // per-token scaffolding the M8 path shipped (the attention and the GDN
@@ -372,6 +378,11 @@ inline bool split_batch_enabled() {
   bool proj_batch(const GpuTensor &w, const float *d_x, float *d_y, int nrows, int ncols, int n,
                   bool act_ready, std::string &err);
   bool quantize_batch(const float *d_x, int ncols, int n, std::string &err);
+  // Gather+dequantize the embedding rows for `tokens` into d_dst (n x E f32) in
+  // ONE launch. Same per-(row, unit) arithmetic as n dequant_row_launch calls,
+  // so bit-identical; only the n-1 extra launches (and their drain) go away.
+  bool embed_batch(const std::vector<std::int32_t> &tokens, float *d_dst, int E,
+                   std::string &err);
   bool forward_batch_layer(int il, int n, int pos0, std::string &err);
   // One launch for the whole chunk's K and V rows (feat/noite-prefill). The rows
   // of a chunk are contiguous BOTH in the cache ((t*NKV + h) * row_bytes) and in
@@ -461,6 +472,10 @@ inline bool split_batch_enabled() {
   block_q8_1 *d_aqb_ = nullptr;
   std::size_t aq_blocks_per_row_ = 0;
   int *d_posb_ = nullptr;
+  // Device-side token ids for the batched embedding gather (embed_batch):
+  // [kMaxChunkHost] ints, uploaded once per chunk. Lazy-allocated on first use
+  // so a run without the batch path pays nothing for it.
+  int *d_emb_ids_ = nullptr;
   // Split-KV attention scratch: [n_head][kAttnMaxSplits][2 + head_dim] (M7).
   float *d_attn_partial_ = nullptr;
   // Valores medidos em include/rdna4/tuning.h (tabela unica); os nomes e o
@@ -518,6 +533,10 @@ inline bool split_batch_enabled() {
   std::size_t q8_blocks_ = 0;
   int cur_token_ = 0;
   int *d_pos_ = nullptr;
+  // Last position uploaded to d_pos_ (-1 = none). full_attn runs once per layer
+  // with the same pos, so the 4-byte synchronous H2D only re-issues when pos
+  // actually changes -- once per decode token instead of once per layer.
+  int pos_cached_ = -1;
   int max_ctx_ = 0;
   // RD_PHASE_PROF: nullptr = desligado (comportamento de producao).
   PhaseProf *prof_ = nullptr;
@@ -907,9 +926,15 @@ inline bool Graph::full_attn(int il, [[maybe_unused]] int t, int pos, std::strin
     return false;
   }
   emit("Kcur_normed", il, d_kstage_, (std::int64_t)NKV * HD);
-  if (hipMemcpy(d_pos_, &pos, sizeof(int), hipMemcpyHostToDevice) != hipSuccess) {
-    err = "position upload failed";
-    return false;
+  // One 4-byte synchronous H2D per TOKEN, not per layer: forward_run walks the
+  // layers with a fixed pos, so re-upload only on change (attn already takes
+  // pos by value; rope reads d_pos_[0], which then holds exactly this pos).
+  if (pos != pos_cached_) {
+    if (hipMemcpy(d_pos_, &pos, sizeof(int), hipMemcpyHostToDevice) != hipSuccess) {
+      err = "position upload failed";
+      return false;
+    }
+    pos_cached_ = pos;
   }
   const float base = (float)cfg_.rope_freq_base;
   if (!rope_launch(d_attnout_, 1, NH, HD, n_rot(), base, d_pos_)) return false;
@@ -918,8 +943,13 @@ inline bool Graph::full_attn(int il, [[maybe_unused]] int t, int pos, std::strin
   emit("Kcur", il, d_kstage_, (std::int64_t)NKV * HD);
   emit("gate_reshaped", il, d_attngate_, (std::int64_t)NH * HD);
 
-  // Store the rotated K and the raw V into the (possibly quantized) cache.
-  if (!kv_write(il, pos, d_kstage_, d_vstage_, err)) return false;
+  // Decode (n_tok=1): one token's staging rows (d_kstage_/d_vstage_, NKV*HD
+  // contiguous floats) and cache rows (NKV contiguous rows at token pos) are
+  // contiguous, and kv_store_row_kernel is block-local (one 32-elem block per
+  // thread, F32/F16 per element), so a single width=NKV*HD launch stores
+  // exactly the bytes the per-head loop below stored -- 2 launches instead of
+  // 2*NKV. Same call the batch path uses (there with n_tok=n).
+  if (!kv_write_batch(il, pos, d_kstage_, d_vstage_, 1, err)) return false;
   const char *kc = (const char *)d_k_ + (std::size_t)attn_slot(il) * kv_bytes_;
   const char *vc = (const char *)d_v_ + (std::size_t)attn_slot(il) * kv_bytes_v_;
 
@@ -940,9 +970,13 @@ inline bool Graph::full_attn(int il, [[maybe_unused]] int t, int pos, std::strin
   }
   emit("attn_pregate", il, d_attnout_, (std::int64_t)NH * HD);
   RD_PHASE(prof_, "attn_gate_out");  // RD_PHASE_PROF
-  if (!unary_launch(d_attngate_, d_attngate_, NH * HD, UnOp::Sigmoid)) return false;
+  // Fused sigmoid+mul: d_attngate_ still ends up holding the sigmoid output, so
+  // the gate_sigmoid dump below reads the same values (see nn.cuh).
+  if (!sigmoid_gate_launch(d_attngate_, d_attnout_, NH * HD)) {
+    err = "attn gate launch failed";
+    return false;
+  }
   emit("gate_sigmoid", il, d_attngate_, (std::int64_t)NH * HD);
-  if (!mul_launch(d_attnout_, d_attngate_, d_attnout_, NH * HD)) return false;
   emit("attn_gated", il, d_attnout_, (std::int64_t)NH * HD);
 
   if (!proj(L.attn_output, d_attnout_, d_ffnout_, E, NH * HD, err)) return false;
@@ -1034,12 +1068,16 @@ inline bool Graph::gdn_layer(int il, int t, std::string &err) {
   emit("alpha", il, d_alpha_, nvh);
 
   RD_PHASE(prof_, "gdn_scalars");  // RD_PHASE_PROF
-  if (!unary_launch(d_beta_, d_beta_, nvh, UnOp::Sigmoid)) return false;
+  // 4 scalar launches -> 1 (see gdn.cuh): d_beta_/d_gate_ keep their old values;
+  // d_alpha_ now holds softplus(a) instead of the dead a+dt, so the a_softplus
+  // dump reads from there.
+  if (!gdn_scalars_launch(d_beta_, d_alpha_, d_gate_, (const float *)L.ssm_dt.ptr,
+                          (const float *)L.ssm_a.ptr, nvh)) {
+    err = "gdn scalars launch failed";
+    return false;
+  }
   emit("beta_sigmoid", il, d_beta_, nvh);
-  if (!add_launch(d_alpha_, (const float *)L.ssm_dt.ptr, d_alpha_, nvh)) return false;
-  if (!unary_launch(d_alpha_, d_gate_, nvh, UnOp::Softplus)) return false;
-  emit("a_softplus", il, d_gate_, nvh);
-  if (!mul_launch(d_gate_, (const float *)L.ssm_a.ptr, d_gate_, nvh)) return false;
+  emit("a_softplus", il, d_alpha_, nvh);
   emit("gate", il, d_gate_, nvh);
 
   RD_PHASE(prof_, "gdn_conv");  // RD_PHASE_PROF
@@ -1073,8 +1111,11 @@ inline bool Graph::gdn_layer(int il, int t, std::string &err) {
     err = "ssm_norm launch failed";
     return false;
   }
-  if (!unary_launch(d_z_, d_z_, d_inner, UnOp::Silu)) return false;
-  if (!mul_launch(v_c, d_z_, v_c, d_inner)) return false;
+  // Fused silu+mul: d_z_ still ends up holding silu(z) (see nn.cuh).
+  if (!silu_gate_launch(d_z_, v_c, v_c, d_inner)) {
+    err = "gdn output launch failed";
+    return false;
+  }
   emit("final_output", il, v_c, d_inner);
 
   RD_PHASE(prof_, "gdn_out_proj");  // RD_PHASE_PROF
@@ -1092,10 +1133,13 @@ inline bool Graph::ffn(int il, std::string &err) {
   const LayerW &L = w_[il];
   RD_PHASE(prof_, "ffn_gate_up");  // RD_PHASE_PROF
   if (!proj(L.ffn_gate, d_xn_, d_ffn_a_, F, E, err)) return false;  // d_xn_ holds attn_post_norm
-  if (!unary_launch(d_ffn_a_, d_ffn_a_, F, UnOp::Silu)) return false;
   // up reads the same activation as gate (silu only touched the output)
   if (!proj_qq(L.ffn_up, d_ffn_b_, F, E, err)) return false;
-  if (!mul_launch(d_ffn_a_, d_ffn_b_, d_ffn_a_, F)) return false;
+  // Fused silu+mul: d_ffn_a_ still ends up holding silu(gate)*up (see nn.cuh).
+  if (!silu_gate_launch(d_ffn_a_, d_ffn_b_, d_ffn_a_, F)) {
+    err = "ffn gate launch failed";
+    return false;
+  }
   RD_PHASE(prof_, "ffn_down");  // RD_PHASE_PROF
   if (!proj(L.ffn_down, d_ffn_a_, d_ffnout_, E, F, err)) return false;
   emit("ffn_out", il, d_ffnout_, E);
@@ -1108,6 +1152,168 @@ inline bool Graph::ffn(int il, std::string &err) {
 // M8: batched prefill. See the declaration for the contract; the short version is
 // "layer-major, projections batched, everything sequential stays sequential".
 // ---------------------------------------------------------------------------
+// Batched embedding gather: one launch dequantizes the rows ids[0..n) into the
+// contiguous d_dst rows. Each (row, unit) pair runs exactly the same device
+// call the per-row dequant_row_launch kernels run for that row (same Fn::apply
+// arguments, same blockDim per dtype -- see dequant_row.cuh), so the bytes are
+// identical and only the n-1 extra launches go away. Grid-strided over
+// row*units+unit, so the grid can be capped like the per-row kernels'.
+template <class Fn>
+__global__ void dequant_gather_kernel_256(const char *__restrict__ base,
+                                          std::int64_t row_bytes, const int *__restrict__ ids,
+                                          float *__restrict__ dst, std::int64_t E,
+                                          std::int64_t units_per_row, std::int64_t n) {
+  const std::int64_t total = n * units_per_row;
+  for (std::int64_t j = blockIdx.x; j < total; j += gridDim.x) {
+    const std::int64_t row = j / units_per_row;
+    const std::int64_t u = j % units_per_row;
+    Fn::apply(base + (std::int64_t)ids[row] * row_bytes, u, dst + row * E + u * 256,
+              threadIdx.x);
+  }
+}
+
+__global__ void dequant_gather_kernel_q8_0(const char *__restrict__ base,
+                                           std::int64_t row_bytes, const int *__restrict__ ids,
+                                           float *__restrict__ dst, std::int64_t E,
+                                           std::int64_t units_per_row, std::int64_t n) {
+  const std::int64_t total = n * units_per_row;
+  for (std::int64_t j = blockIdx.x; j < total; j += gridDim.x) {
+    const std::int64_t row = j / units_per_row;
+    const std::int64_t u = j % units_per_row;
+    float2 v;
+    // Same call as dequant_kernel_q8_0 (16 threads x 2 elements, the float2 form
+    // llama.cpp's get_rows uses for q8_0).
+    rdna4::dequantize_q8_0(base + (std::int64_t)ids[row] * row_bytes, u,
+                           2 * (int)threadIdx.x, v);
+    float *y = dst + row * E + u * 32;
+    y[2 * threadIdx.x + 0] = v.x;
+    y[2 * threadIdx.x + 1] = v.y;
+  }
+}
+
+// F32 embedding needs no dequant: plain gather copy, trivially bit-identical.
+__global__ void embed_gather_f32_kernel(const float *__restrict__ base,
+                                        const int *__restrict__ ids, float *__restrict__ dst,
+                                        std::int64_t E, std::int64_t n) {
+  const std::int64_t total = n * E;
+  for (std::int64_t j = (std::int64_t)blockIdx.x * blockDim.x + threadIdx.x; j < total;
+       j += (std::int64_t)gridDim.x * blockDim.x) {
+    dst[j] = base[(std::int64_t)ids[j / E] * E + j % E];
+  }
+}
+
+// Same dtype -> blockDim mapping as dequant_row_launch (dequant_row.cuh); anything
+// it rejects is rejected here too.
+inline bool dequant_gather_launch(DType dt, const void *d_base, std::int64_t row_bytes,
+                                  const int *d_ids, float *d_dst, std::int64_t E, int n,
+                                  hipStream_t stream = nullptr) {
+  if (n <= 0 || E <= 0) return false;
+  if (dt == DType::F32) {
+    const std::int64_t total = (std::int64_t)n * E;
+    const int threads = 256;
+    const unsigned grid = (unsigned)((total + threads - 1) / threads);
+    embed_gather_f32_kernel<<<grid, threads, 0, stream>>>((const float *)d_base, d_ids, d_dst,
+                                                          E, n);
+    return hipGetLastError() == hipSuccess;
+  }
+  const std::int64_t unit = dt == DType::Q8_0 ? 32 : 256;
+  if (E % unit != 0) return false;
+  const std::int64_t units = E / unit;
+  const std::int64_t total = (std::int64_t)n * units;
+  const unsigned grid = (unsigned)(total < 4096 ? total : 4096);
+  const char *base = (const char *)d_base;
+  if (dt == DType::Q8_0) {
+    dequant_gather_kernel_q8_0<<<grid, 16, 0, stream>>>(base, row_bytes, d_ids, d_dst, E, units,
+                                                        n);
+    return hipGetLastError() == hipSuccess;
+  }
+  if (dt == DType::IQ4_NL) {
+    dequant_gather_kernel_256<FnIQ4NL><<<grid, 32, 0, stream>>>(base, row_bytes, d_ids, d_dst,
+                                                                E, units, n);
+    return hipGetLastError() == hipSuccess;
+  }
+  switch (dt) {
+    case DType::Q2_K:
+      dequant_gather_kernel_256<FnQ2K><<<grid, 64, 0, stream>>>(base, row_bytes, d_ids, d_dst,
+                                                                E, units, n);
+      break;
+    case DType::Q3_K:
+      dequant_gather_kernel_256<FnQ3K><<<grid, 64, 0, stream>>>(base, row_bytes, d_ids, d_dst,
+                                                                E, units, n);
+      break;
+    case DType::Q4_K:
+      dequant_gather_kernel_256<FnQ4K><<<grid, 32, 0, stream>>>(base, row_bytes, d_ids, d_dst,
+                                                                E, units, n);
+      break;
+    case DType::Q5_K:
+      dequant_gather_kernel_256<FnQ5K><<<grid, 64, 0, stream>>>(base, row_bytes, d_ids, d_dst,
+                                                                E, units, n);
+      break;
+    case DType::Q6_K:
+      dequant_gather_kernel_256<FnQ6K><<<grid, 64, 0, stream>>>(base, row_bytes, d_ids, d_dst,
+                                                                E, units, n);
+      break;
+    case DType::IQ2_XXS:
+      dequant_gather_kernel_256<FnIQ2XXS><<<grid, 32, 0, stream>>>(base, row_bytes, d_ids,
+                                                                   d_dst, E, units, n);
+      break;
+    case DType::IQ2_XS:
+      dequant_gather_kernel_256<FnIQ2XS><<<grid, 32, 0, stream>>>(base, row_bytes, d_ids, d_dst,
+                                                                  E, units, n);
+      break;
+    case DType::IQ3_XXS:
+      dequant_gather_kernel_256<FnIQ3XXS><<<grid, 32, 0, stream>>>(base, row_bytes, d_ids,
+                                                                   d_dst, E, units, n);
+      break;
+    case DType::IQ1_S:
+      dequant_gather_kernel_256<FnIQ1S><<<grid, 32, 0, stream>>>(base, row_bytes, d_ids, d_dst,
+                                                                 E, units, n);
+      break;
+    case DType::IQ3_S:
+      dequant_gather_kernel_256<FnIQ3S><<<grid, 32, 0, stream>>>(base, row_bytes, d_ids, d_dst,
+                                                                 E, units, n);
+      break;
+    case DType::IQ2_S:
+      dequant_gather_kernel_256<FnIQ2S><<<grid, 32, 0, stream>>>(base, row_bytes, d_ids, d_dst,
+                                                                 E, units, n);
+      break;
+    case DType::IQ4_XS:
+      dequant_gather_kernel_256<FnIQ4XS><<<grid, 32, 0, stream>>>(base, row_bytes, d_ids,
+                                                                  d_dst, E, units, n);
+      break;
+    default: return false;
+  }
+  return hipGetLastError() == hipSuccess;
+}
+
+inline bool Graph::embed_batch(const std::vector<std::int32_t> &tokens, float *d_dst, int E,
+                               std::string &err) {
+  const int n = (int)tokens.size();
+  if (n <= 0 || n > kMaxChunkHost) {
+    err = "embed batch size out of range";
+    return false;
+  }
+  if (d_emb_ids_ == nullptr) {
+    if (hipMalloc(&d_emb_ids_, (std::size_t)kMaxChunkHost * sizeof(int)) != hipSuccess) {
+      err = "embed batch ids alloc failed";
+      return false;
+    }
+  }
+  // int32_t token ids are 32-bit values; the kernel indexes rows with them.
+  if (hipMemcpy(d_emb_ids_, tokens.data(), (std::size_t)n * sizeof(std::int32_t),
+                hipMemcpyHostToDevice) != hipSuccess) {
+    err = "embed batch ids upload failed";
+    return false;
+  }
+  const std::int64_t emb_row =
+      (std::int64_t)tensor_bytes(tok_embd_.dt, (std::uint64_t)E);
+  if (!dequant_gather_launch(tok_embd_.dt, tok_embd_.ptr, emb_row, d_emb_ids_, d_dst, E, n)) {
+    err = "batch embedding gather failed";
+    return false;
+  }
+  return true;
+}
+
 inline bool Graph::quantize_batch(const float *d_x, int ncols, int n, std::string &err) {
   if (ncols % QK8_1 != 0) {
     err = "bad reduction dim for the batch q8 scratch";
@@ -1212,9 +1418,12 @@ inline bool Graph::forward_batch_layer(int il, int n, int pos0, std::string &err
   RD_PHASE(prof_, L.recr ? "gdn_proj" : "qkv_proj");
 
   if (!L.recr) {
-    if (!proj_batch(L.attn_q, d_xnb_, d_qb_, NH * 2 * HD, E, n, false, err)) return false;
-    // k and v share the same activation: quantize once, reuse for both
+    // q, k and v share the same activation: quantize once up front and reuse
+    // for all three (was: Q quantized inside proj_batch, then quantize_batch
+    // re-quantized the same rows before K -- one full batched quantize wasted
+    // per layer per chunk). Same kernel, same input, so d_aqb_ is identical.
     if (!quantize_batch(d_xnb_, E, n, err)) return false;
+    if (!proj_batch(L.attn_q, d_xnb_, d_qb_, NH * 2 * HD, E, n, true, err)) return false;
     if (!proj_batch(L.attn_k, d_xnb_, d_kb_, NKV * HD, E, n, true, err)) return false;
     if (!proj_batch(L.attn_v, d_xnb_, d_vb_, NKV * HD, E, n, true, err)) return false;
     if (batch_ops()) {
@@ -1368,8 +1577,12 @@ inline bool Graph::forward_batch_layer(int il, int n, int pos0, std::string &err
     float *state = d_state_ + (std::size_t)slot * nvh * S * S;
     float *convst = d_convst_ + (std::size_t)slot * (K - 1) * chan;
 
-    if (!proj_batch(L.attn_qkv, d_xnb_, d_qkvb_, chan, E, n, false, err)) return false;
+    // qkv, gate, beta and alpha share the same activation: quantize once up
+    // front and reuse for all four (was: qkv quantized inside proj_batch, then
+    // quantize_batch re-quantized the same rows -- one full batched quantize
+    // wasted per layer per chunk). Same kernel, same input, so d_aqb_ is identical.
     if (!quantize_batch(d_xnb_, E, n, err)) return false;
+    if (!proj_batch(L.attn_qkv, d_xnb_, d_qkvb_, chan, E, n, true, err)) return false;
     if (!proj_batch(L.attn_gate, d_xnb_, d_zb_, d_inner, E, n, true, err)) return false;
     if (!proj_batch(L.ssm_beta, d_xnb_, d_betab_, nvh, E, n, true, err)) return false;
     if (!proj_batch(L.ssm_alpha, d_xnb_, d_alphab_, nvh, E, n, true, err)) return false;
@@ -1406,8 +1619,25 @@ inline bool Graph::forward_batch_layer(int il, int n, int pos0, std::string &err
         return false;
       }
       RD_PHASE(prof_, "gdn_delta");  // RD_PHASE_PROF
-      if (!delta_rule_batch_launch(d_qkb_, d_vcb_, d_gate2b_, d_betab_, state, d_vcb_, nvh, nkh, S,
-                                   nvh, key_dim, d_inner, n)) {
+      // Blocked multi-token scan (gdn.cuh): the chunk's n tokens still run in
+      // order inside ONE launch -- same operations, same order, same rounding
+      // per (token, row), so bit-identical to the per-token loop below -- but
+      // each CTA keeps its 32 state rows resident in LDS across the tokens
+      // instead of round-tripping them through DRAM twice per token.
+      // RD_GDN_RESIDENT=0 restores delta_rule_batch_launch (same contract);
+      // odd S also falls back inside the launcher. The per-token loop in the
+      // else branch stays the fallback for RD_PREFILL_BATCH=0.
+      static const bool gdn_resident = [] {
+        const char *e = std::getenv("RD_GDN_RESIDENT");
+        return !(e != nullptr && e[0] == '0');
+      }();
+      const bool gdn_ok =
+          gdn_resident ? delta_rule_batch_resident_launch(d_qkb_, d_vcb_, d_gate2b_, d_betab_, state,
+                                                          d_vcb_, nvh, nkh, S, nvh, key_dim,
+                                                          d_inner, n)
+                       : delta_rule_batch_launch(d_qkb_, d_vcb_, d_gate2b_, d_betab_, state, d_vcb_,
+                                                 nvh, nkh, S, nvh, key_dim, d_inner, n);
+      if (!gdn_ok) {
         err = "batch delta rule launch failed";
         return false;
       }
@@ -1541,15 +1771,9 @@ inline bool Graph::forward_batch(const std::vector<std::int32_t> &tokens, int st
     return false;
   }
 
-  // embeddings: one dequantized row per token
-  const std::size_t emb_row = (std::size_t)tensor_bytes(tok_embd_.dt, (std::uint64_t)E);
-  for (int t = 0; t < n; ++t) {
-    const char *src = (const char *)tok_embd_.ptr + (std::size_t)tokens[t] * emb_row;
-    if (!dequant_row_launch(tok_embd_.dt, src, d_xb_ + (std::size_t)t * E, E)) {
-      err = "batch embedding dequant failed";
-      return false;
-    }
-  }
+  // embeddings: one batched gather+dequant launch for the whole chunk
+  // (bit-identical to one dequant_row_launch per token row, see embed_batch).
+  if (!embed_batch(tokens, d_xb_, E, err)) return false;
 
   for (int il = 0; il < debug_layer_limit(); ++il) {
     if (!forward_batch_layer(il, n, start_pos, err)) {
@@ -1600,14 +1824,17 @@ inline bool Graph::forward_batch(const std::vector<std::int32_t> &tokens, int st
 // comportamento e' byte a byte o que embarcava (era o unico caminho, entao os
 // numeros de 104,86 tok/s e o golden atual foram medidos com ele).
 //
-// Detalhe da cauda, preservado de proposito: com cap > 16 a lista desce
-// {cap, cap/2, ..., 2} e so' DEPOIS recebe os tamanhos que faltam de {16,8,4,3,2},
-// entao o 3 cai no fim da lista e uma cauda de 3 tokens sai como 2 + 1 token (com
-// cap = 16, onde a lista e' {16,8,4,3,2}, ela sai como um chunk de 3). Nos dois
-// casos a aritmetica e' a mesma -- todo caminho com n <= 16 e' bit-exato contra o
-// caminho por token, e um chunk de 1 token E' o caminho por token -- mas manter a
-// ordem e' o que faz o chunk 128 medido (231,83 tok/s a 512 tokens) ser o mesmo
-// chunk 128 que roda agora.
+// Detalhe da cauda (frente prefill, 16/09): com cap > 16 a lista descia
+// {cap, cap/2, ..., 2} e so' DEPOIS recebia os tamanhos que faltam de {16,8,4,3,2},
+// entao o 3 caia no fim da lista e uma cauda de 3 tokens saia como 2 + 1 token (com
+// cap = 16, onde a lista e' {16,8,4,3,2}, ela saia como um chunk de 3). Corrigido
+// em dois pontos: (a) os tamanhos que faltam entram na posicao ordenada, nao no
+// fim -- a lista sai em ordem decrescente e o guloso ja' escolheria 3 antes de 2;
+// (b) o corte deixou de ser guloso: `prefill_plan()` (abaixo) planeja o prompt
+// inteiro por DP, minimizando (n. de chunks, n. de chunks de 1 token), entao
+// restos como 5 saem como 3+2 (nao 4+1) e 13 como 8+3+2 (nao 8+4+1), com o mesmo
+// numero de leituras de peso. Casos que ja' eram otimos (1024 = 8x128, 7 = 4+3)
+// saem identicos -- so' a cauda burra mudou.
 // ---------------------------------------------------------------------------
 inline std::vector<int> Graph::prefill_chunk_sizes() const {
   const int cap = batch_max_;
@@ -1619,10 +1846,63 @@ inline std::vector<int> Graph::prefill_chunk_sizes() const {
       for (int x : sizes) tem = tem || x == sz;
       if (!tem) sizes.push_back(sz);
     }
+    // Ordem decrescente: sem isto o 2 precedia o 3 e o resto 3 caia no 2+1.
+    std::sort(sizes.begin(), sizes.end(), std::greater<int>());
   } else {
     sizes = {16, 8, 4, 3, 2};
   }
   return sizes;
+}
+
+inline std::vector<int> Graph::prefill_plan(std::size_t total) const {
+  const std::vector<int> sizes = prefill_chunk_sizes();
+  // Candidatos: os tamanhos da politica que passam no chunk_ok (o chain de
+  // halving de um cap nao-potencia-de-2 pode trazer 6/12, que o GEMV em lote
+  // nao instancia -- o guloso antigo os aceitaria e o forward_batch falharia),
+  // do maior para o menor, mais o fallback de 1 token por ultimo.
+  std::vector<int> cand;
+  for (int sz : sizes) {
+    if (chunk_ok(sz)) cand.push_back(sz);
+  }
+  cand.push_back(1);
+  const int INF = (int)total + 1000;
+  std::vector<int> cost(total + 1, INF), ones(total + 1, INF);
+  cost[0] = 0;
+  ones[0] = 0;
+  for (std::size_t r = 1; r <= total; ++r) {
+    for (int p : cand) {
+      if ((std::size_t)p > r) continue;
+      const int cc = cost[r - (std::size_t)p] + 1;
+      const int oo = ones[r - (std::size_t)p] + (p == 1 ? 1 : 0);
+      // Empate desempatado pelo MAIOR p (cand esta' em ordem decrescente e a
+      // melhora e' estrita): mantem a forma larger-first do guloso antigo onde
+      // ele ja' era otimo.
+      if (cc < cost[r] || (cc == cost[r] && oo < ones[r])) {
+        cost[r] = cc;
+        ones[r] = oo;
+      }
+    }
+  }
+  std::vector<int> plan;
+  // Reconstrucao da FRENTE para tras (maior p valido primeiro): onde o guloso
+  // antigo ja' era otimo o plano sai IDENTICO a ele (ex.: 7 = 4+3, 1024 = 8x128,
+  // 129 = 128+1) -- so' a cauda burra muda (5 = 3+2, 13 = 8+3+2). Em particular
+  // a cauda continua no FIM, como antes.
+  std::size_t r = total;
+  while (r > 0) {
+    int take = 1;  // inalcancavel (cand sempre tem o 1); cai no guloso seguro
+    for (int p : cand) {
+      if ((std::size_t)p > r) continue;
+      if (cost[r - (std::size_t)p] + 1 == cost[r] &&
+          ones[r - (std::size_t)p] + (p == 1 ? 1 : 0) == ones[r]) {
+        take = p;
+        break;
+      }
+    }
+    plan.push_back(take);
+    r -= (std::size_t)take;
+  }
+  return plan;
 }
 
 inline bool Graph::prefill(const std::vector<std::int32_t> &ids, int start_pos,
@@ -1632,16 +1912,10 @@ inline bool Graph::prefill(const std::vector<std::int32_t> &ids, int start_pos,
     err = "the prompt must not be empty";
     return false;
   }
-  const std::vector<int> sizes = prefill_chunk_sizes();
+  const std::vector<int> plan = prefill_plan(ids.size());
   std::size_t pos = 0;
-  while (pos < ids.size()) {
-    std::size_t take = 1;
-    for (int sz : sizes) {
-      if (ids.size() - pos >= (std::size_t)sz) {
-        take = (std::size_t)sz;
-        break;
-      }
-    }
+  for (int take_i : plan) {
+    const std::size_t take = (std::size_t)take_i;
     const int p = start_pos + (int)pos;
     if (take == 1) {
       // Cauda de 1 token: o caminho por token. O em lote nao tem instanciacao
@@ -1695,14 +1969,9 @@ inline bool Graph::forward_batch_all(const std::vector<std::int32_t> &tokens, in
     err = "batch position upload failed";
     return false;
   }
-  const std::size_t emb_row = (std::size_t)tensor_bytes(tok_embd_.dt, (std::uint64_t)E);
-  for (int t = 0; t < n; ++t) {
-    const char *src = (const char *)tok_embd_.ptr + (std::size_t)tokens[t] * emb_row;
-    if (!dequant_row_launch(tok_embd_.dt, src, d_xb_ + (std::size_t)t * E, E)) {
-      err = "batch embedding dequant failed";
-      return false;
-    }
-  }
+  // embeddings: one batched gather+dequant launch for the whole chunk
+  // (bit-identical to one dequant_row_launch per token row, see embed_batch).
+  if (!embed_batch(tokens, d_xb_, E, err)) return false;
 
   for (int il = 0; il < debug_layer_limit(); ++il) {
     if (!forward_batch_layer(il, n, start_pos, err)) {
@@ -2095,8 +2364,10 @@ inline void Graph::release() {
   d_alphab_ = d_betab_ = d_gate2b_ = d_qkb_ = d_vcb_ = nullptr;
   if (d_aqb_) (void)hipFree(d_aqb_);
   if (d_posb_) (void)hipFree(d_posb_);
+  if (d_emb_ids_) (void)hipFree(d_emb_ids_);
   d_aqb_ = nullptr;
   d_posb_ = nullptr;
+  d_emb_ids_ = nullptr;
   if (d_q8_) (void)hipFree(d_q8_);
   if (d_pos_) (void)hipFree(d_pos_);
   if (d_logits_) (void)hipFree(d_logits_);

@@ -260,9 +260,17 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
 
         const int vih = ((vh >> i) << 2) & 0x04040404;
 
-        const int vi = __vsubss4(vil, vih);
+        // dp4a-linearity (bit-exact): vil bytes are 2-bit fields (0..3) and
+        // vih bytes are 0/4, so vil-vih in [-4,3] never saturates int8 and
+        //   dp4a(vil-vih, u) == dp4a(vil, u) - dp4a(vih, u)
+        // holds exactly in int32 (ggml_cuda_dp4a accumulates without
+        // saturation). Two single-instruction v_dot4_i32 replace the
+        // multi-instruction per-byte saturating subtract (__vsubss4
+        // emulation, 208 instr/call on this path). The float tail
+        // (dot*sc, d8[i]*, sumf order) is untouched, hence bit-identical.
+        const int dot = ggml_cuda_dp4a(vil, u[i], 0) - ggml_cuda_dp4a(vih, u[i], 0);
 
-        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+        sumf += d8[i] * (dot * sc); // SIMD dot product
     }
 
     return d3 * sumf;

@@ -443,6 +443,145 @@ inline bool delta_rule_batch_launch(const float *d_qk, const float *d_v, const f
   return hipGetLastError() == hipSuccess;
 }
 
+// ---------------------------------------------------------------------------
+// Blocked multi-token delta_rule for PREFILL (frente gdn-resident): the same
+// scan as delta_rule_batch_rows_kernel above -- grid (n_v_heads, S/ROWS), the
+// chunk's n tokens walked IN ORDER inside one launch -- but the CTA's state
+// tile (ROWS x S floats) is staged once into LDS and kept resident across the
+// n tokens, instead of round-tripping through DRAM twice per token.
+//
+// Bit-exactness (why the gate stays meaningful): thread j still owns row j
+// for the whole launch, and per (token, row) the loop nest is the scalar path
+// of the kernel above line for line -- scale by expf(gate), dot with k
+// ascending-i with a single accumulator, delta = (v - sum) * beta, rank-1
+// update, dot with q ascending-i, times rsqrt(S). Only the TIER holding the
+// row changes (LDS instead of global); loads and stores do not round, and no
+// two threads ever touch the same element, so the single barrier below cannot
+// change any value either. check-batch-gpu (n <= 16 BIT-EXACT) proves it on
+// every run.
+//
+// Layout note: the tile is TRANSPOSED in LDS (element i of thread tx at
+// tile[i*ROWS + tx]). Row-major (tile[tx*S + i]) would land all 32 threads of
+// the wave on the same LDS bank (S = 128 dwords is 0 mod 32 banks) -- a
+// 32-way conflict on every access; transposed, simultaneous threads hit bank
+// tx, conflict-free by construction. LDS traffic is scalar on purpose (those
+// loads stay hidden under the serial fma chains); only the global tile move
+// is float4. The static tile is sized for S <= 128 (production S == 128);
+// anything else falls back to delta_rule_batch_launch in the launcher below.
+//
+// What it buys: per token the old kernel moved the whole head state twice
+// through global memory (2 passes x read+write = 4 x 64 KiB per head); this
+// one moves it exactly twice per CHUNK (tile in on entry, tile out on exit).
+// k/q/v/gate/beta/out still stream per token, but those are ~1% of the old
+// traffic (3 x S + 2 floats read per thread vs 4 x S floats of state per pass
+// moved twice).
+// ---------------------------------------------------------------------------
+template <int ROWS, bool VEC>
+__global__ void delta_rule_batch_resident_kernel(const float *__restrict__ qk,
+                                                 const float *__restrict__ v,
+                                                 const float *__restrict__ gate,
+                                                 const float *__restrict__ beta,
+                                                 float *__restrict__ state, float *__restrict__ out,
+                                                 int n_k_heads, int S, int n_vh, int key_dim,
+                                                 int d_inner, int n) {
+  const int h = blockIdx.x;              // value head
+  const int tx = threadIdx.x;
+  const int j = blockIdx.y * ROWS + tx;  // row index (value dim)
+  const bool active = j < S;
+  const int kh = h % n_k_heads;  // repeated key head
+
+  // Transposed tile: TROW(i) is element i of this thread's row.
+  __shared__ __align__(16) float tile[128 * ROWS];
+#define RD_GDN_TROW(i) (tile[(i)*ROWS + tx])
+
+  // Stage the tile once. Thread j owns row j and no row is shared, so the one
+  // barrier below is documentation-grade (one per launch, not per token).
+  if (active) {
+    const float *srow = state + ((std::int64_t)h * S + j) * S;
+    if (VEC) {
+      const float4 *sp = (const float4 *)srow;
+      for (int i4 = 0; i4 < S / 4; ++i4) {
+        const float4 g = sp[i4];
+        RD_GDN_TROW(4 * i4 + 0) = g.x;
+        RD_GDN_TROW(4 * i4 + 1) = g.y;
+        RD_GDN_TROW(4 * i4 + 2) = g.z;
+        RD_GDN_TROW(4 * i4 + 3) = g.w;
+      }
+      for (int i = (S & ~3); i < S; ++i) RD_GDN_TROW(i) = srow[i];
+    } else {
+      for (int i = 0; i < S; ++i) RD_GDN_TROW(i) = srow[i];
+    }
+  }
+  __syncthreads();
+
+  if (active) {
+    const float *kb = qk + key_dim + (std::int64_t)kh * S;
+    const float *qb = qk + (std::int64_t)kh * S;
+
+    for (int t = 0; t < n; ++t) {
+      const float *kd = kb + (std::int64_t)t * 2 * key_dim;
+      const float *qd = qb + (std::int64_t)t * 2 * key_dim;
+      const float g = expf(gate[(std::int64_t)t * n_vh + h]);
+      const float b = beta[(std::int64_t)t * n_vh + h];
+      float sum = 0.0f;
+      for (int i = 0; i < S; ++i) {
+        const float x = RD_GDN_TROW(i) * g;
+        RD_GDN_TROW(i) = x;
+        sum = fmaf(x, kd[i], sum);
+      }
+      const float delta = (v[(std::int64_t)t * d_inner + (std::int64_t)h * S + j] - sum) * b;
+      float acc = 0.0f;
+      for (int i = 0; i < S; ++i) {
+        const float x = fmaf(kd[i], delta, RD_GDN_TROW(i));
+        RD_GDN_TROW(i) = x;
+        acc = fmaf(x, qd[i], acc);
+      }
+      out[(std::int64_t)t * d_inner + (std::int64_t)h * S + j] = acc * rsqrtf((float)S);
+    }
+
+    // Write the tile back once: the recurrent state the next chunk (or the MTP
+    // snapshot) reads. Same layout, same dtype, same buffer as before.
+    float *srow = state + ((std::int64_t)h * S + j) * S;
+    if (VEC) {
+      float4 *dp = (float4 *)srow;
+      for (int i4 = 0; i4 < S / 4; ++i4) {
+        const float4 g = make_float4(RD_GDN_TROW(4 * i4 + 0), RD_GDN_TROW(4 * i4 + 1),
+                                     RD_GDN_TROW(4 * i4 + 2), RD_GDN_TROW(4 * i4 + 3));
+        dp[i4] = g;
+      }
+      for (int i = (S & ~3); i < S; ++i) srow[i] = RD_GDN_TROW(i);
+    } else {
+      for (int i = 0; i < S; ++i) srow[i] = RD_GDN_TROW(i);
+    }
+  }
+#undef RD_GDN_TROW
+}
+
+// rows per CTA: same 32 as delta_rule_batch_launch (same grid, so the only
+// variable the measurement moves is the storage tier of the tile; 16 was
+// measured identical, 314.6 vs 315.1 tok/s -- the scan sits on its serial
+// floor, not on waves).
+inline bool delta_rule_batch_resident_launch(const float *d_qk, const float *d_v, const float *d_gate,
+                                             const float *d_beta, float *d_state, float *d_out,
+                                             int n_v_heads, int n_k_heads, int S, int n_vh, int key_dim,
+                                             int d_inner, int n, hipStream_t stream = nullptr) {
+  constexpr int kRows = 32;
+  if (S <= 0 || S > 128 || n_v_heads <= 0) {
+    return delta_rule_batch_launch(d_qk, d_v, d_gate, d_beta, d_state, d_out, n_v_heads, n_k_heads,
+                                   S, n_vh, key_dim, d_inner, n, stream);
+  }
+  const unsigned ny = (unsigned)((S + kRows - 1) / kRows);
+  const dim3 grid((unsigned)n_v_heads, ny);
+  if ((S & 3) == 0) {
+    delta_rule_batch_resident_kernel<kRows, true><<<grid, kRows, 0, stream>>>(
+        d_qk, d_v, d_gate, d_beta, d_state, d_out, n_k_heads, S, n_vh, key_dim, d_inner, n);
+  } else {
+    delta_rule_batch_resident_kernel<kRows, false><<<grid, kRows, 0, stream>>>(
+        d_qk, d_v, d_gate, d_beta, d_state, d_out, n_k_heads, S, n_vh, key_dim, d_inner, n);
+  }
+  return hipGetLastError() == hipSuccess;
+}
+
 // deinterleave_q_gate_kernel over the whole chunk: q/gate are [n][n_head*head_dim]
 // and the projection output is [n][n_head*2*head_dim].
 __global__ void deinterleave_q_gate_batch_kernel(const float *__restrict__ yq,
@@ -468,6 +607,41 @@ inline bool deinterleave_q_gate_batch_launch(const float *d_yq, float *d_q, floa
   const unsigned blocks = (unsigned)((total + threads - 1) / threads);
   deinterleave_q_gate_batch_kernel<<<blocks, threads, 0, stream>>>(d_yq, d_q, d_gate, n_head,
                                                                   head_dim, n);
+  return hipGetLastError() == hipSuccess;
+}
+
+// ---------------------------------------------------------------------------
+// Fused GDN scalars for the DECODE path: sigmoid(beta) + (alpha + ssm_dt) +
+// softplus + gate*ssm_a in ONE launch (4 launches -> 1, erases 3 + barriers).
+//
+// Bit-exactness: the same four ops in the same order with the same single
+// rounding each -- intermediates live in registers. Buffer states are kept
+// dump-compatible on purpose: d_beta_ still ends up holding sigmoid(beta) and
+// d_gate_ softplus(a)*ssm_a, so the beta_sigmoid/gate node dumps read the same
+// values. The one exception is d_alpha_: it receives the softplus value
+// instead of alpha+ssm_dt, which is what lets the a_softplus dump keep its
+// source (its emit is re-pointed at d_alpha_). d_alpha_ is dead after this
+// point on the decode path -- the delta rule reads only gate/beta and the next
+// token re-projects alpha fresh -- so no later reader can observe it.
+// ---------------------------------------------------------------------------
+__global__ void gdn_scalars_kernel(float *__restrict__ beta_io, float *__restrict__ alpha_sp,
+                                   float *__restrict__ gate_out, const float *__restrict__ dt,
+                                   const float *__restrict__ A, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float b = sigmoid_f(beta_io[i]);
+  beta_io[i] = b;
+  const float s = softplus_f(alpha_sp[i] + dt[i]);
+  alpha_sp[i] = s;
+  gate_out[i] = s * A[i];
+}
+
+inline bool gdn_scalars_launch(float *d_beta_io, float *d_alpha_sp, float *d_gate_out,
+                               const float *d_dt, const float *d_A, int n,
+                               hipStream_t stream = nullptr) {
+  const int threads = 256;
+  gdn_scalars_kernel<<<(n + threads - 1) / threads, threads, 0, stream>>>(
+      d_beta_io, d_alpha_sp, d_gate_out, d_dt, d_A, n);
   return hipGetLastError() == hipSuccess;
 }
 

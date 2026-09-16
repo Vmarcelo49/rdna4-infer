@@ -292,4 +292,55 @@ inline bool mul_bcast_launch(const float *d_a, const float *d_b, float *d_y, std
   return hipGetLastError() == hipSuccess;
 }
 
+// ---------------------------------------------------------------------------
+// Fused unary+mul pairs for the DECODE path (each erases a launch + barrier).
+//
+// Bit-exactness contract: the intermediate (silu/sigmoid output) lives in a
+// register and is written back to EXACTLY the buffer the unfused sequence
+// wrote, so downstream dumps (gate_sigmoid, ...) and any later reader see the
+// same bytes. Same operand values, same op order, same single rounding per op
+// => the fused launch stores exactly what the two launches stored.
+// ---------------------------------------------------------------------------
+
+// y[i] = silu(a[i]) * b[i], with the silu written back to a_io. Serves the FFN
+// (a_io == y == d_ffn_a_, b == d_ffn_b_) and the GDN tail
+// (a_io == d_z_, b == y == v_c): every output index depends only on its own
+// inputs, so all aliasing combinations are safe.
+__global__ void silu_gate_kernel(float *__restrict__ a_io, const float *__restrict__ b,
+                                 float *__restrict__ y, std::int64_t n) {
+  const std::int64_t i = (std::int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float s = silu_f(a_io[i]);
+  a_io[i] = s;
+  y[i] = s * b[i];
+}
+
+inline bool silu_gate_launch(float *d_a_io, const float *d_b, float *d_y, std::int64_t n,
+                             hipStream_t stream = nullptr) {
+  const int threads = 256;
+  silu_gate_kernel<<<(unsigned)((n + threads - 1) / threads), threads, 0, stream>>>(d_a_io, d_b,
+                                                                                    d_y, n);
+  return hipGetLastError() == hipSuccess;
+}
+
+// y[i] *= sigmoid(g[i]), with the sigmoid written back to g_io. Serves the
+// attention gate (g_io == d_attngate_, y_io == d_attnout_): d_attngate_ still
+// holds the sigmoid output, so the gate_sigmoid dump reads the same values.
+__global__ void sigmoid_gate_kernel(float *__restrict__ g_io, float *__restrict__ y_io,
+                                    std::int64_t n) {
+  const std::int64_t i = (std::int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float s = sigmoid_f(g_io[i]);
+  g_io[i] = s;
+  y_io[i] = y_io[i] * s;
+}
+
+inline bool sigmoid_gate_launch(float *d_g_io, float *d_y_io, std::int64_t n,
+                                hipStream_t stream = nullptr) {
+  const int threads = 256;
+  sigmoid_gate_kernel<<<(unsigned)((n + threads - 1) / threads), threads, 0, stream>>>(d_g_io,
+                                                                                       d_y_io, n);
+  return hipGetLastError() == hipSuccess;
+}
+
 }  // namespace rdna4
