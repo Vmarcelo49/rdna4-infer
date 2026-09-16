@@ -521,7 +521,109 @@ Depois de mexer em `tuning.h`: `./build/check-tuning --record tests/golden/ml_tu
 
 ---
 
-## 9. Arquivos tocados (para o coordenador)
+## 9. H0 — Portões, skews e âncoras re-based (auditoria 2026-09-16, só leitura)
+
+H0 do `docs/plano-hipfire-gfx1201.md` §4 (higiene de gates). Método: grep por
+builtins WMMA/f16 (`wmma_*f16*`, `__builtin_amdgcn_wmma*`) e por predicados de
+dispatch (`is_gfx1201`, `__gfx1201__`, `RD_*`) em `include/` + `src/` + `tests/`,
+cada hit classificado em usado-com-teste / usado-sem-teste / morto / bench-only;
+três skews resolvidos por leitura (linhas do plano podem estar defasadas —
+todas foram re-verificadas abaixo). Nenhum teste de GPU foi rodado nesta
+auditoria (sem lock); `check-tuning` (CPU puro) foi re-rodado: **OK, 23 linhas**.
+
+### 9.1 Âncoras re-based (os números do plano §2 são pré-WMMA e estão stale)
+
+| workload | âncora vigente | fonte |
+|---|---|---|
+| decode short-ctx (pos 5..21) | **37,9 tok/s** best (36,3 mean) | `docs/baseline-2026-09-16.md:43` (37,88), confirmado 37,94 em `docs/chunk-scale-2026-09-16.md:40` |
+| decode @4K end (pos 4090..4096, 6 tokens) | **36,3 tok/s** best (33,4 mean) | `docs/baseline-2026-09-16.md:43` (36,33) |
+| prefill-512 | **451,1 tok/s** best | HEAD `4013c0c` (WMMA-int8 iq3_s n≥64: 408,5 → 451,1, +10,4 %); pré-WMMA era 411,22 @cap 512 (`chunk-scale:38`), 355,81 @cap 128 (`baseline:40`) |
+| default vigente | `RD_PREFILL_CHUNK` = **512** | `include/rdna4/device.h:212-257` (fonte única; `a176fd1` flipou 128 → 512) |
+
+### 9.2 Tabela de portões (nome, arquivo:linha, estado, teste que cobre)
+
+Estados: **T** = usado-com-teste · **B** = bench-only / rejeitado-com-dado (vivo,
+fora de produção) · **M** = MORTO (achado) · **A** = ausente (nada a auditar).
+
+| # | portão | arquivo:linha | estado | teste que cobre |
+|---|---|---|---|---|
+| G1 | WMMA-int8 iq3_s (`wmma_i8`, `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12`) | `include/rdna4/gemm.cuh:1530-1531` (kernel `:1544`, launch `:1690`) | **T** — SHIPPED, não é achado | `check-batch-gpu` linha `iq3_s-wmma` M=64 (`tests/check_batch_gpu.hip:120`) + faixas n>16 fim-a-fim + `RD_GEMM_WMMA=0` A/B |
+| G2 | porta WMMA `n >= 64` (`gemm_use_wmma_iq3s`) + espelhos | `gemm.cuh:1702-1708`, despacho `:1748-1758`, attrs `:1810-1813` | **T** (fonte única, sem cópia) | `check-batch-gpu` + `bench-gemm-engine-gpu` |
+| G3 | dp4a `__builtin_amdgcn_sudot4` + select `__gfx1201__` | `include/rdna4/vecdotq.cuh:86-88` | **T** | `check-matvec-gpu` + `check-dequant-gpu` (14 tipos) |
+| G4 | gather LUT `__builtin_amdgcn_perm` | `vecdotq.cuh:148-157`, fileiras iq3 `:926ff` | **T** | mesmos do G3 |
+| G5 | fail-closed `is_gfx1201` | `include/rdna4/device.h:34`; `src/main.hip:292,683,905,1169`; `src/server/serve.hip:364` | **T** (definição única, sem cópia) | build `--offload-arch=gfx1201` + `scripts/check_target.sh` |
+| G6 | regra WPB duas-pontas (`attn_split_wpb`) | `include/rdna4/attn.cuh:943-949`, consts `tuning.h:147-148` | **T** | `bench-attn-gpu` A/B 15 rounds + `scripts/check_attn_split.sh` + `check-kvctx-gpu` |
+| G7 | N-POL (`attn_splits_for`) + escape `RD_ATTN_SPLITS` | `include/rdna4/graph.cuh:488-519` | **T** | `check-kvctx-gpu` (split vs sem split @64K) + `check_attn_split.sh` (PPL 0,125 % vs gate 0,5 %) |
+| G8 | faixa exata GEMV-batch N∈{2,3,4,8,16} | `matvec.cuh:1025-1030`; `Graph::batch_supported` `graph.cuh:203-205`; `chunk_ok` `:210-212` | **T**, mas ver M2 (predicado copiado) | `check-batch-gpu` (bit-exato n≤16, `:469`) + `check-tuning` (`batch.ns/cap`) |
+| G9 | despacho GEMV×GEMM n>16 (`proj_batch`) | `graph.cuh:1367-1396` | **T** | `check-batch-gpu` faixas toleradas (`kTolChunkRelL2/kTolChunkMaxAbs`) + PPL/golden |
+| G10 | teto runtime do chunk (`prefill_chunk_cap`, default 512) | `device.h:212-257`; `kMaxChunkHost` `graph.cuh:200` | **T** | `check-batch-gpu` (cap-aware, `:449-473`) + `docs/chunk-scale-2026-09-16.md` |
+| G11 | `RD_ATTN_SPLIT_BATCH` (fallback per-token) | `graph.cuh:172-178` | **T** (hatch de A/B) | `check-batch-gpu` com `=0` (`docs/journal-prefill.md` §9) |
+| G12 | `RD_PREFILL_BATCH` (andaime por token) | `graph.cuh:260-267` | **T** (hatch de A/B) | A/B idem |
+| G13 | `RD_GDN_FUSED` / `RD_GDN_RESIDENT` | `gdn.cuh:714-719`; `graph.cuh:1627-1631` | **T** (default coberto; hatch manual) | `check-batch-gpu` + `check-graph-gpu` (caminho default) |
+| G14 | `RD_MTP_*` (concat + governor) | `mtp.cuh:362`; `mtp_gen.h:213-224` | **T** | `check-mtp-gpu` |
+| G15 | N=32/64 + `matvec_batch_cap()==64` | `matvec.cuh:913`, `:1034-1035` | **B** (faixa D1, fora de produção: `proj_batch` nunca passa n>16 ao GEMV-batch) | `bench-mmq-wmma-gpu` (`:1036-1043`), `bench-gemm-engine-gpu` (`:750-756`, `:1800-1802`), bound em `check-matmul-gpu` (`:208`) |
+| G16 | prefetch `PF` (`rdna4_prefetch_l2`) | `matvec.cuh:288-294` (produção sempre `PF=false`) | **B** (rejeitado 0,984x, §4.4) | `bench-matvec-shapes-gpu` |
+| G17 | WMMA-f16 (`_w32_gfx12` f16/f16-acc) | `tests/bench_wmma_gpu.hip:59-60` | **B** (pesquisa frente D; **zero uso em produção**) | `bench-wmma-gpu` (não é gate) |
+| G18 | protótipos MMQ-WMMA | `tests/bench_mmq_wmma_gpu.hip` §§1-8 | **B** (sucedidos pelo port de produção `gemm.cuh:1497+`) | bench (não é gate) |
+| G19 | knob WPB do caminho *unsplit* | `attn.cuh:94` (parâmetro), corpo ignora em `:121,165,171,178` + gêmeo batched `:348,388,394,401`; launchers `:201-249` | **M** — ver skew (b) | nenhum (só o bench consome, `:871` — e mede warps redundantes) |
+| G20 | `kBatchCap`/`kBatchNs` | `tuning.h:161-163` (único consumidor: `check_tuning.cpp:81` imprime) | **M-parcial** — predicado real é a cópia hardcoded G8; a constante é só ecoada | `check-tuning` (eco, não comportamento) — ver skew (a) |
+| G21 | DPP/`permlanex16` no GDN (classe do bug hipfire #757) | `gdn.cuh` (grep: zero ocorrências) | **A** — alvo da auditoria H2 não existe nesta árvore | n/a |
+
+**Contagem de portões mortos: 2** (G19, G20). Nenhum builtin f16/WMMA não-confirmado
+em produção: o único `__builtin_amdgcn_wmma*` produtivo é o G1 (int8, gateado).
+
+### 9.3 Vereditos dos três skews
+
+**(a) `kBatchCap=16` vs `matvec_batch_cap()==64` + D1 + `n_tokens <= cap` — sem
+contradição, três tetos distintos.** (i) `kBatchCap=16`/`kBatchNs` = contrato de
+bit-exatidão do GEMV-batch (n≤16, `graph.cuh:1367-1372`); (ii)
+`matvec_batch_cap()==64` (`matvec.cuh:913`) = teto das *instanciações* do kernel,
+incluindo N=32/64 bench-only do degrau D1 (`:1031-1035`); (iii)
+`batch_max_`/`prefill_chunk_cap()` (default 512) = teto *runtime* do chunk
+(`chunk_ok`, `graph.cuh:210-212`). Contrato real, verificado no despacho:
+`chunk_ok(n) = 2≤n≤batch_max_ ∧ (n≤16 → batch_supported(n))`, e `proj_batch`
+nunca passa n>16 ao `matvec_launch_batch` (n>16 → `gemm_launch` ou sub-lotes
+≤16 + cauda de 1, `:1374-1396`). Fica o G20: `batch_supported()` recopia a
+lista em vez de ler `tuning.h` (já apontado em `docs/journal-review.md:75`) —
+proposta de assert P1 na mensagem ao coordenador.
+
+**(b) `attn_kernel` ignora WPB (limitação 6 do README) — confirmado, 8 sítios;
+recomendação: REMOVER, não plumbar.** Corpo usa `kAttnWarpsPerBlock` em
+`attn.cuh:121,165,171,178` (unsplit) e `:348,388,394,401` (batched unsplit);
+produção está correta *por coincidência* (sempre instancia o default 8 — nenhum
+chamador produtivo de `attn_launch_wpb`; único consumidor é o bench,
+`bench_attn_gpu.hip:871`, cujas células unsplit `--wpb` medem warps redundantes
+que o merge descarta). Caminho split (o que embarca) usa WPB corretamente
+(`:520-521`, `:565ff`, `:814ff`) e não é afetado. Motivo de remover em vez de
+plumbar: unsplit = chaves<512 (contexto curto), nunca foi alavanca de tuning
+(toda a evidência §3.2 é do split); plumbar criaria matriz 3×36 de
+instanciações sem headroom medido. Converge com `docs/adversarial-noite.md:129`
+e `docs/auditoria-qualidade.md:615`. Proposta P3 (assert + remoção exata) na
+mensagem ao coordenador; `README.md:531-534` já documenta até o landing.
+
+**(c) `kv-memoria-desenho.md` §7 — lado do doc correto nos 5 itens.**
+1. MTP 351 MB vs 42,7 MB: doc correto (`§4.1` + `device.h:58-60` concordam em
+351 MB / 0,327 GiB); `rocm-estudo.md` §A.2.6 stale. Sem ação de código.
+2. 17-vs-16 camadas: doc correto (16); **comentário obsoleto ainda vivo** em
+`device.h:36` ("17 full-attention layers") ao lado da correção (`:40-42`) e da
+constante certa (`:43`). Proposta P4 (troca literal do comentário).
+3. `medicoes-m5.md` 262 ms@64K: stale pré-M7; correto hoje ≈53 ms/token (atenção
+19 ms, `medicoes-m7.md:107`). Requer nota de revisão no M5 — fora do escopo de
+edição H0 (só este arquivo), fica como proposta ao coordenador.
+4. "32 warps/CTA": **não está mais no README** (reescrito; limitação 6 cobre o
+skew) — o texto vive em `SPEC.md:74` ("cargas vetorizadas, 32 warps por CTA"),
+fora do escopo de edição H0. Proposta ao coordenador.
+5. splits `keys/2048` vs `keys/512`: código correto hoje (`keys/512`,
+`graph.cuh:487`, M8 +14,7%@4K); texto do M7 historicamente correto na sua
+janela. Sem ação; contrato atual em `tuning.h:107-109` + §3.2.
+
+Nota de higiene (não-achado): `tests/check_tuning.cpp:33` diz "22 linhas" mas o
+gate compara 23 (entrou `attn.split_ctas_dense` depois); comentário cosmético,
+sem efeito no gate (que passou verde aqui).
+
+---
+
+## 10. Arquivos tocados (para o coordenador)
 
 | arquivo | dono | o que mudou |
 |---|---|---|

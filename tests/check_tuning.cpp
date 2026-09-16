@@ -30,7 +30,7 @@
 namespace {
 
 const char *kGoldenDefault = "tests/golden/ml_tuning.txt";
-// 14 tipos de matvec + 4 da atencao + 3 do batch + 1 do total = 22 linhas.
+// 14 tipos de matvec + 4 da atencao + 3 do batch + 1 do total = 23 linhas.
 const int kMinLines = 21;
 
 // Chaves que TEM que existir na referencia. Uma referencia que perca qualquer uma

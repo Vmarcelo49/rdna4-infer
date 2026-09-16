@@ -910,6 +910,8 @@ inline bool matvec_launch_lut_lds_unroll(int dt, const void *d_w, const block_q8
 // provides the memory-level parallelism), and since UNROLL does not change the
 // summation order the batched result stays bit-identical to the GEMV path for
 // every type that ships with unroll>1 -- tests/check_batch_gpu.hip asserts it.
+// 64 = teto das INSTANCIACOES (inclui N=32/64 bench-only do D1); contrato de
+// producao = chunk_ok (graph.cuh:210): GEMV-batch so' n<=16 (H0).
 inline int matvec_batch_cap() { return 64; }
 
 template <int N>

@@ -71,7 +71,7 @@ prefill real.
 linearmente com a posição e domina acima de ~8K (8,9 ms/token em 4K, 138 ms com f16 em
 64K). **Correção do M6:** a primeira versão desta tabela mostrava ~28 tok/s em 64K/131K;
 aquilo era decode na posição 5-40 com um cache grande apenas *alocado* (o `--fill-cache`
-não movia a posição) — um teste de caber, não de contexto longo. O M7 resolveu isso (`docs/medicoes-m7.md`): cargas vetorizadas, 32 warps por CTA e a
+não movia a posição) — um teste de caber, não de contexto longo. O M7 resolveu isso (`docs/medicoes-m7.md`): cargas vetorizadas, 8 warps por CTA (o texto dizia 32 — o commit `a830570` anunciava 32 mas a linha embarcada sempre foi 8) e a
 faixa de chaves dividida entre CTAs com merge online-softmax. O decode agora é quase
 plano no contexto (23,7 tok/s em 4K, 24,1 em 16K, 19,0 em 64K, 13,2 em 131K — contra
 22,1/13,7/4,2/2,3 antes) e o prefill longo deixou de degradar (27,7 tok/s em 2048

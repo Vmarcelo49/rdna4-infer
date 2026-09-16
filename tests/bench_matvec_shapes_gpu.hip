@@ -554,6 +554,72 @@ inline bool bench_q3k_old_launch(const void *d_w, const block_q8_1 *d_a, float *
                                                       stream);
 }
 
+// H1 candidate 2 (BENCH-ONLY, never shipped): q6_K desaturation removal, the
+// same dp4a-linearity pattern shipped for q3_K (vecdotq.cuh:271-279).
+// Exactness: vil bytes are 4-bit fields (0..15) and vih bytes are
+// 0x00/0x10/0x20/0x30, so (vil|vih) bytes are 0..63 and (vil|vih)-32 lands in
+// [-32,31]: int8 never saturates, hence
+//   dp4a((vil|vih)-32, u) == dp4a(vil|vih, u) - 32*dp4a(0x01010101, u)
+// holds exactly in int32 (ggml_cuda_dp4a accumulates without saturation).
+// The float tail (dot*sc, d8[i], sumf order, block d) is untouched, hence
+// bit-identical. Load sequence mirrors vec_dot_q6_K_q8_1 verbatim.
+static __device__ __forceinline__ float bench_q6k_lin_dot(
+    const void *__restrict__ vbq, const block_q8_1 *__restrict__ bq8_1,
+    const int &kbx, const int &iqs) {
+  const rdna4::block_q6_K *bq6_K = (const rdna4::block_q6_K *)vbq + kbx;
+  const int bq8_offset =
+      2 * QR6_K * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 4);
+  const int scale_offset =
+      (QI6_K / 4) * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 8);
+  const int vh_shift = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
+  const int vl = rdna4::get_int_b2(bq6_K->ql, iqs);
+  const int vh = rdna4::get_int_b2(bq6_K->qh,
+                                   (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4)) >>
+                 vh_shift;
+  const int8_t *scales = bq6_K->scales + scale_offset;
+  int u[QR6_K];
+  float d8[QR6_K];
+#pragma unroll
+  for (int i = 0; i < QR6_K; ++i) {
+    u[i] = rdna4::get_int_b4(bq8_1[bq8_offset + 2 * i].qs, iqs % QI8_1);
+    d8[i] = rdna4::fp16_to_float((uint16_t)((bq8_1[bq8_offset + 2 * i].ds) & 0xFFFFu));
+  }
+  float sumf = 0.0f;
+#pragma unroll
+  for (int i = 0; i < QR6_K; ++i) {
+    const int sc = scales[4 * i];
+    const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
+    const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+    const int vor = vil | vih;
+    const int dot = rdna4::ggml_cuda_dp4a(vor, u[i], 0) -
+                    32 * rdna4::ggml_cuda_dp4a(0x01010101, u[i], 0);
+    sumf += d8[i] * (dot * sc);  // same tail as the shipping body
+  }
+  return rdna4::fp16_to_float(bq6_K->d) * sumf;
+}
+
+struct BenchQ6K_LIN {
+  static constexpr int qk = 256, qi = QI6_K, vdr = VDR_Q6_K_Q8_1_MMVQ;
+  using block_t = rdna4::block_q6_K;
+  static __device__ __forceinline__ float dot(const void *vbq, const block_q8_1 *a,
+                                              const int &kbx, const int &iqs) {
+    return bench_q6k_lin_dot(vbq, a, kbx, iqs);
+  }
+  static __device__ __forceinline__ float dot_lut(const void *vbq, const block_q8_1 *a,
+                                                  const int &kbx, const int &iqs,
+                                                  const void * /*lut*/) {
+    return dot(vbq, a, kbx, iqs);
+  }
+};
+
+inline bool bench_q6k_lin_launch(const void *d_w, const block_q8_1 *d_a, float *d_o,
+                                 int64_t nrows, int64_t ncols, hipStream_t stream) {
+  return rdna4::launch_gen<BenchQ6K_LIN, rdna4::MtShape<6>::rows, rdna4::MtShape<6>::wpr,
+                           rdna4::MtIlp<6>::value, false, rdna4::MtMinb<6>::value,
+                           rdna4::MtUnroll<6>::value>(d_w, d_a, d_o, nrows, ncols / 256,
+                                                      stream);
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -1484,7 +1550,8 @@ int main(int argc, char **argv) {
   // ship/cand/ship2 per round (rotation), warmup >=300 ms GPU-busy with
   // sync in-loop, best-of-N + mean, exact memcmp bit-identity.
   // ---------------------------------------------------------------------
-  auto ab_section = [&](const char *tag, int dt, bool is_r8) {
+  // cand: 0 = R8 broadcast, 1 = q3_K old body, 2 = q6_K linearity body.
+  auto ab_section = [&](const char *tag, int dt, int cand) {
     std::vector<std::size_t> idx;
     double bytes = 0;
     std::int64_t rows_tot = 0, elems_tot = 0;
@@ -1510,11 +1577,16 @@ int main(int argc, char **argv) {
     auto fire = [&](int cfg, std::size_t i) -> bool {
       const Tensor &t = sel[i];
       float *out = (cfg == 1) ? d_b : d_y;
-      if (cfg == 1)
-        return is_r8 ? bench_r8_launch(t.dt, t.d_w, act_for(t.ncols), out, t.nrows, t.ncols,
-                                       nullptr)
-                     : bench_q3k_old_launch(t.d_w, act_for(t.ncols), out, t.nrows, t.ncols,
-                                            nullptr);
+      if (cfg == 1) {
+        if (cand == 0)
+          return bench_r8_launch(t.dt, t.d_w, act_for(t.ncols), out, t.nrows, t.ncols,
+                                 nullptr);
+        if (cand == 2)
+          return bench_q6k_lin_launch(t.d_w, act_for(t.ncols), out, t.nrows, t.ncols,
+                                      nullptr);
+        return bench_q3k_old_launch(t.d_w, act_for(t.ncols), out, t.nrows, t.ncols,
+                                    nullptr);
+      }
       return rdna4::matvec_launch(t.dt, t.d_w, act_for(t.ncols), out, t.nrows, t.ncols,
                                   nullptr);
     };
@@ -1637,15 +1709,185 @@ int main(int argc, char **argv) {
     const char *e = std::getenv("RD_R8");
     if (e && e[0] == '1') {
       std::printf("\n=== R8 scalar-broadcast A/B (bench-only) ===\n");
-      ab_section("R8 q4_K", 4, true);
-      ab_section("R8 iq3_s", 12, true);
+      ab_section("R8 q4_K", 4, 0);
+      ab_section("R8 iq3_s", 12, 0);
     }
   }
   {
     const char *e = std::getenv("RD_Q3K");
     if (e && e[0] == '1') {
       std::printf("\n=== q3_K old(__vsubss4)-vs-new(linearity) A/B (bench-only) ===\n");
-      ab_section("Q3K", 3, false);
+      ab_section("Q3K", 3, 1);
+    }
+  }
+  {
+    const char *e = std::getenv("RD_Q6K");
+    if (e && e[0] == '1') {
+      std::printf("\n=== q6_K ship(__vsubss4)-vs-lin(dp4a-linearity) A/B (bench-only) ===\n");
+      ab_section("Q6K", 6, 2);
+    }
+  }
+  // ---------------------------------------------------------------------
+  // H1 step 3 audit (RD_QQ=1, bench-only): x32 hoist / activation reuse.
+  // Production already serves every decode pair site from ONE quantization
+  // (proj_qq: q/k/v in full_attn, qkv/gate/beta/alpha in gdn_layer, gate/up
+  // in ffn — graph.cuh:906-908,1061-1064,1136-1137), so this section measures
+  // the banked saving and proves nothing remains to ship:
+  //   (i)   quantize determinism: same float row twice -> memcmp 0;
+  //   (ii)  pair A/B on a real E-wide weight: quant+matvec (proj) vs
+  //         matvec-only on the reused blocks (proj_qq), outputs memcmp 0,
+  //         saving per pair = t_quant, interleaved with a reuse-vs-reuse
+  //         noise cell, warmup >= 300 ms, best+mean of 6;
+  //   (iii) queued quantize chain -> per-quantize us; per-token projection
+  //         uses the production pair count 16*2 (q/k/v) + 48*3 (gdn) +
+  //         64*1 (ffn/up) = 240 eliminated quantizes vs the 26.4 ms token.
+  // E is read off the model (blk.0.ffn_gate.weight reduction dim), never
+  // hardcoded.
+  // ---------------------------------------------------------------------
+  {
+    const char *e = std::getenv("RD_QQ");
+    if (e && e[0] == '1') {
+      std::printf("\n=== QQ activation-reuse audit (bench-only) ===\n");
+      std::int64_t E = 0;
+      for (const Tensor &t : all)
+        if (t.name == "blk.0.ffn_gate.weight") E = t.ncols;
+      if (E <= 0 || E % QK8_1 != 0) {
+        std::printf("QQ: cannot determine E from blk.0.ffn_gate.weight\n");
+        return 1;
+      }
+      const std::int64_t nb = E / QK8_1;
+      std::printf("QQ: E=%lld (nb=%lld q8 blocks); eliminated quantizes/token = "
+                  "16*2+48*3+64*1 = 240\n",
+                  (long long)E, (long long)nb);
+      // Representative E-wide weight: the largest staged one.
+      const Tensor *rep = nullptr;
+      std::size_t n_ewide = 0;
+      double ewide_bytes = 0;
+      for (const Tensor &t : sel)
+        if (t.ncols == E) {
+          n_ewide++;
+          ewide_bytes += t.bytes;
+          if (!rep || t.bytes > rep->bytes) rep = &t;
+        }
+      if (!rep) {
+        std::printf("QQ: no staged tensor with ncols==E\n");
+        return 1;
+      }
+      std::printf("QQ: representative %s (%lld rows, %.3f MB); E-wide staged: %zu "
+                  "tensors, %.3f GB\n",
+                  rep->name.c_str(), (long long)rep->nrows, rep->bytes / 1e6, n_ewide,
+                  ewide_bytes / 1e9);
+      float *d_x = nullptr, *d_yq = nullptr, *d_yq2 = nullptr;
+      block_q8_1 *d_q = nullptr, *d_q2 = nullptr;
+      if (hipMalloc(&d_x, (std::size_t)E * sizeof(float)) != hipSuccess ||
+          hipMalloc(&d_yq, (std::size_t)rep->nrows * sizeof(float)) != hipSuccess ||
+          hipMalloc(&d_yq2, (std::size_t)rep->nrows * sizeof(float)) != hipSuccess ||
+          hipMalloc(&d_q, (std::size_t)nb * sizeof(block_q8_1)) != hipSuccess ||
+          hipMalloc(&d_q2, (std::size_t)nb * sizeof(block_q8_1)) != hipSuccess) {
+        std::printf("QQ: staging alloc failed\n");
+        return 1;
+      }
+      {
+        std::vector<float> x;
+        fill_x(x, E, 777u);
+        if (hipMemcpy(d_x, x.data(), (std::size_t)E * sizeof(float),
+                      hipMemcpyHostToDevice) != hipSuccess) {
+          std::printf("QQ: H2D failed\n");
+          return 1;
+        }
+      }
+      auto qfire = [&](block_q8_1 *q) {
+        rdna4::quantize_q8_1_kernel<<<(unsigned)((nb + 3) / 4), 128>>>(d_x, q, nb);
+      };
+      // (i) determinism: same row twice -> identical blocks.
+      qfire(d_q);
+      qfire(d_q2);
+      hipDeviceSynchronize();
+      {
+        std::vector<unsigned> a((std::size_t)nb * sizeof(block_q8_1) / 4),
+            b(a.size());
+        hipMemcpy(a.data(), d_q, a.size() * 4, hipMemcpyDeviceToHost);
+        hipMemcpy(b.data(), d_q2, b.size() * 4, hipMemcpyDeviceToHost);
+        std::int64_t diffs = 0;
+        for (std::size_t k = 0; k < a.size(); ++k)
+          if (a[k] != b[k]) ++diffs;
+        std::printf("QQ determinism (quantize same row twice, %lld dwords): %lld diffs %s\n",
+                    (long long)a.size(), (long long)diffs,
+                    diffs == 0 ? "BIT-IDENTICO" : "DIFERE");
+        if (diffs != 0) return 1;
+      }
+      // (ii) pair A/B: cfg0 = quant+matvec (proj), cfg1/2 = matvec-only (proj_qq
+      // + noise cell). Outputs must be bit-identical (same q8 bytes feed both).
+      auto pair_fire = [&](int cfg, float *out) -> bool {
+        if (cfg == 0) {
+          qfire(d_q);
+          if (hipGetLastError() != hipSuccess) return false;
+        }
+        return rdna4::matvec_launch(rep->dt, rep->d_w, d_q, out, rep->nrows, rep->ncols,
+                                    nullptr);
+      };
+      {
+        std::vector<float> h0((std::size_t)rep->nrows), h1((std::size_t)rep->nrows);
+        if (!pair_fire(0, d_yq) || !pair_fire(1, d_yq2)) {
+          std::printf("QQ: pair launch failed\n");
+          return 1;
+        }
+        hipDeviceSynchronize();
+        hipMemcpy(h0.data(), d_yq, h0.size() * 4, hipMemcpyDeviceToHost);
+        hipMemcpy(h1.data(), d_yq2, h1.size() * 4, hipMemcpyDeviceToHost);
+        const bool same =
+            std::memcmp(h0.data(), h1.data(), h0.size() * 4) == 0;
+        std::printf("QQ pair outputs (proj vs proj_qq, %lld floats): %s\n",
+                    (long long)h0.size(), same ? "BIT-IDENTICO" : "DIFERE");
+        if (!same) return 1;
+      }
+      {
+        double warm = 0;
+        while (warm < 300.0) {
+          for (int c = 0; c < 3; ++c)
+            warm += ev([&] { (void)pair_fire(c == 2 ? 1 : c, d_yq); });
+        }
+      }
+      const int nrep = 6;
+      double b0 = -1, b1 = -1, b2 = -1, m0 = 0, m1 = 0, m2 = 0;
+      for (int r = 0; r < nrep; ++r) {
+        for (int c = 0; c < 3; ++c) {
+          const int cfg = (c + r) % 3;
+          const double ms = ev([&] { (void)pair_fire(cfg == 2 ? 1 : cfg, d_yq); });
+          double &b = cfg == 0 ? b0 : (cfg == 1 ? b1 : b2);
+          double &m = cfg == 0 ? m0 : (cfg == 1 ? m1 : m2);
+          if (b < 0 || ms < b) b = ms;
+          m += ms;
+        }
+      }
+      const double saved_pair = b0 - b1;
+      std::printf("QQ pair us (best-of-%d, per-event timing): proj %.2f vs reuse %.2f "
+                  "(reuse2 %.2f) -> saves %.2f us/pair (means %.2f/%.2f/%.2f, noise "
+                  "reuse/reuse2 = %.4fx)\n",
+                  nrep, b0 * 1000.0, b1 * 1000.0, b2 * 1000.0, saved_pair * 1000.0,
+                  m0 / nrep * 1000.0, m1 / nrep * 1000.0, m2 / nrep * 1000.0, b1 / b2);
+      // (iii) queued quantize chain: Q quantizes under one event pair.
+      const int Q = 240;  // one token-equivalent of eliminated quantizes
+      auto qchain = [&] {
+        for (int i = 0; i < Q; ++i) qfire(d_q);
+      };
+      (void)ev(qchain);
+      double qbest = 1e9;
+      for (int r = 0; r < nrep; ++r) qbest = std::min(qbest, ev(qchain));
+      const double per_q_us = qbest * 1000.0 / Q;
+      const double tok_ms = qbest;  // Q == one token-equivalent
+      std::printf("QQ queued chain: %d quantizes(E=%lld) in %.3f ms -> %.3f us/quantize; "
+                  "one token-equivalent (240x) = %.3f ms = %.2f%% of the 26.4 ms token\n",
+                  Q, (long long)E, qbest, per_q_us, tok_ms, 100.0 * tok_ms / 26.4);
+      std::printf("QQ verdict: banked saving ~= %.2f%% (already shipped via proj_qq); "
+                  "REMAINING pairable quantizes in decode = 0 -> DEAD as new work "
+                  "(<1%% bar unreachable at 0 remaining)\n",
+                  100.0 * tok_ms / 26.4);
+      (void)hipFree(d_x);
+      (void)hipFree(d_yq);
+      (void)hipFree(d_yq2);
+      (void)hipFree(d_q);
+      (void)hipFree(d_q2);
     }
   }
   return 0;

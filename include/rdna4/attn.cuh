@@ -77,21 +77,22 @@ inline bool rope_launch(float *d_x, int n_tokens, int n_heads, int head_dim, int
 // GQA: query head h reads kv head h / (n_head/n_head_kv) (contiguous grouping).
 //
 // Per warp: lane owns head_dim/32 dims of every row; the score is a warp
-// shuffle reduction, the accumulation is local, and the WPB slices are merged
-// through a small shared buffer at the end.
+// shuffle reduction, the accumulation is local, and the 8 key slices are
+// merged through a small shared buffer at the end.
 // ---------------------------------------------------------------------------
 // key slices per block (shipped value). O valor e o de include/rdna4/tuning.h
 // (tabela unica, medida nesta placa): nao ha uma segunda copia do numero aqui.
 constexpr int kAttnWarpsPerBlock = tuned::kAttnWarpsPerBlock;
 constexpr int kAttnMaxDimsPerLane = 16; // head_dim/32 <= 16 (head_dim <= 512)
 
-// WPB is a TEMPLATE knob (default = the shipped constant) so the bench can A/B
-// it without a second copy of the kernel. Changing it changes the number of
-// partial slices merged at the end of the CTA, i.e. the summation order across
-// key slices -- so the shipped default is kept wherever a bit-exact path is
-// expected, and any other value is validated as a numeric-equivalence change
-// (scripts/check_attn_split.sh, check-kvctx-gpu).
-template <KvType KT, KvType VT, int WPB = kAttnWarpsPerBlock>
+// WPB REMOVIDO (H0): era um knob de template (default = a constante) para a
+// bancada fazer A/B, mas o corpo ignora o parametro -- o passo do laco usa
+// kAttnWarpsPerBlock e o merge tambem, entao WPB!=8 so' media warps
+// redundantes (os slices 8.. merge nunca acontece; as chaves coincidem mod 8).
+// Removido em vez de plumbar: keys<512 nunca e' alavanca de tuning e o caminho
+// com split (abaixo) tem o proprio WPB, esse sim funcional. Bit-exato por
+// construcao para o unico valor que a producao usava (8).
+template <KvType KT, KvType VT>
 __global__ void attn_kernel(const float *__restrict__ q, const void *__restrict__ k,
                             const void *__restrict__ v, float *__restrict__ out, int t,
                             int n_head, int n_head_kv, int head_dim, float dscale) {
@@ -152,7 +153,7 @@ __global__ void attn_kernel(const float *__restrict__ q, const void *__restrict_
     for (int i = 0; i < dpw; ++i) acc[i] = fmaf(p, vv[i], acc[i]);
   }
 
-  // Merge the WPB key slices: every lane publishes its own dims, so the whole
+  // Merge the 8 key slices: every lane publishes its own dims, so the whole
   // head_dim-wide accumulator of each slice is available after the barrier.
   if (lane == 0) {
     pm[0] = m;
@@ -183,69 +184,17 @@ __global__ void attn_kernel(const float *__restrict__ q, const void *__restrict_
   }
 }
 
-template <KvType KT, KvType VT, int WPB = kAttnWarpsPerBlock>
+template <KvType KT, KvType VT>
 inline bool attn_launch_typed(const float *d_q, const void *d_k, const void *d_v, float *d_out,
                               int t, int n_head, int n_head_kv, int head_dim, float scale,
                               hipStream_t stream) {
   if (head_dim % 32 != 0 || head_dim / 32 > kAttnMaxDimsPerLane) return false;
-  const int threads = WPB * 32;
-  const std::size_t smem = (std::size_t)WPB * (2 + (std::size_t)head_dim) * sizeof(float);
-  attn_kernel<KT, VT, WPB><<<n_head, threads, smem, stream>>>(d_q, d_k, d_v, d_out, t, n_head,
+  const int threads = kAttnWarpsPerBlock * 32;
+  const std::size_t smem =
+      (std::size_t)kAttnWarpsPerBlock * (2 + (std::size_t)head_dim) * sizeof(float);
+  attn_kernel<KT, VT><<<n_head, threads, smem, stream>>>(d_q, d_k, d_v, d_out, t, n_head,
                                                               n_head_kv, head_dim, scale);
   return hipGetLastError() == hipSuccess;
-}
-
-// WPB dispatch for the single-CTA (unsplit) kernel (bench use). Same
-// numeric-equivalence caveat as the split one: the number of partial slices
-// merged per CTA changes the summation order across key slices.
-template <KvType KT, KvType VT>
-inline bool attn_launch_wpb_typed(const float *d_q, const void *d_k, const void *d_v, float *d_out,
-                                  int t, int n_head, int n_head_kv, int head_dim, float scale,
-                                  int wpb, hipStream_t stream) {
-  switch (wpb) {
-    case 8:
-      return attn_launch_typed<KT, VT, 8>(d_q, d_k, d_v, d_out, t, n_head, n_head_kv, head_dim,
-                                          scale, stream);
-    case 16:
-      return attn_launch_typed<KT, VT, 16>(d_q, d_k, d_v, d_out, t, n_head, n_head_kv, head_dim,
-                                           scale, stream);
-    case 32:
-      return attn_launch_typed<KT, VT, 32>(d_q, d_k, d_v, d_out, t, n_head, n_head_kv, head_dim,
-                                           scale, stream);
-    default: return false;
-  }
-}
-
-inline bool attn_launch_wpb(const float *d_q, const void *d_k, const void *d_v, float *d_out, int t,
-                            int n_head, int n_head_kv, int head_dim, float scale, KvType kt,
-                            KvType vt, int wpb, hipStream_t stream = nullptr) {
-#define RD_ATTN_U_CASE(K, V)                                                                      \
-  if (kt == KvType::K && vt == KvType::V)                                                         \
-  return attn_launch_wpb_typed<KvType::K, KvType::V>(d_q, d_k, d_v, d_out, t, n_head, n_head_kv,  \
-                                                     head_dim, scale, wpb, stream)
-  RD_ATTN_U_CASE(F32, F32);
-  RD_ATTN_U_CASE(F16, F16);
-  RD_ATTN_U_CASE(Q8_0, Q8_0);
-  RD_ATTN_U_CASE(Q4_0, Q4_0);
-  RD_ATTN_U_CASE(F16, Q8_0);
-  RD_ATTN_U_CASE(F16, Q4_0);
-  RD_ATTN_U_CASE(Q8_0, F16);
-  RD_ATTN_U_CASE(Q4_0, F16);
-  RD_ATTN_U_CASE(F32, F16);
-  RD_ATTN_U_CASE(F16, F32);
-  RD_ATTN_U_CASE(F32, Q8_0);
-  RD_ATTN_U_CASE(F32, Q4_0);
-  RD_ATTN_U_CASE(Q8_0, F32);
-  RD_ATTN_U_CASE(Q4_0, F32);
-  RD_ATTN_U_CASE(Q8_0, Q4_0);
-  RD_ATTN_U_CASE(Q4_0, Q8_0);
-  // The new formats, diagonal only: this entry point is the WPB A/B knob used by
-  // tests/bench_attn_gpu.hip, which benches K and V at the same type. The shipped
-  // path (attn_launch below) carries the full 6x6 product.
-  RD_ATTN_U_CASE(Q5_0, Q5_0);
-  RD_ATTN_U_CASE(Q4_1, Q4_1);
-#undef RD_ATTN_U_CASE
-  return false;
 }
 
 inline bool attn_launch(const float *d_q, const void *d_k, const void *d_v, float *d_out, int t,
@@ -305,7 +254,7 @@ inline bool attn_launch(const float *d_q, const void *d_k, const void *d_v, floa
 // query tokens of one forward_batch chunk in blockIdx.y.
 //
 // The body is attn_kernel's, element for element -- same warp-sliced key walk
-// (j = w; j <= t; j += WPB), same online softmax, same in-CTA merge across WPB
+// (j = w; j <= t; j += kAttnWarpsPerBlock), same online softmax, same in-CTA merge across the 8 slices
 // slices, same expf/1/l rounding -- with only the query/output addressing moved
 // from "the single token" to "token qt of the batch". Each (qt, h) CTA therefore
 // computes exactly what the per-token launch computed for that token, which is
@@ -316,7 +265,7 @@ inline bool attn_launch(const float *d_q, const void *d_k, const void *d_v, floa
 // across CTAs sums its slices in a different order (attn.cuh:289), so for those
 // chunks the per-token loop is kept and this kernel is not used.
 // ---------------------------------------------------------------------------
-template <KvType KT, KvType VT, int WPB = kAttnWarpsPerBlock>
+template <KvType KT, KvType VT>
 __global__ void attn_batch_kernel(const float *__restrict__ q, const void *__restrict__ k,
                                   const void *__restrict__ v, float *__restrict__ out,
                                   const int *__restrict__ pos, int n_head, int n_head_kv,
@@ -406,15 +355,16 @@ __global__ void attn_batch_kernel(const float *__restrict__ q, const void *__res
   }
 }
 
-template <KvType KT, KvType VT, int WPB = kAttnWarpsPerBlock>
+template <KvType KT, KvType VT>
 inline bool attn_batch_launch_typed(const float *d_q, const void *d_k, const void *d_v,
                                     float *d_out, const int *d_pos, int n_tok, int n_head,
                                     int n_head_kv, int head_dim, float scale, hipStream_t stream) {
   if (head_dim % 32 != 0 || head_dim / 32 > kAttnMaxDimsPerLane) return false;
-  const int threads = WPB * 32;
-  const std::size_t smem = (std::size_t)WPB * (2 + (std::size_t)head_dim) * sizeof(float);
+  const int threads = kAttnWarpsPerBlock * 32;
+  const std::size_t smem =
+      (std::size_t)kAttnWarpsPerBlock * (2 + (std::size_t)head_dim) * sizeof(float);
   dim3 grid((unsigned)n_head, (unsigned)n_tok);
-  attn_batch_kernel<KT, VT, WPB><<<grid, threads, smem, stream>>>(d_q, d_k, d_v, d_out, d_pos,
+  attn_batch_kernel<KT, VT><<<grid, threads, smem, stream>>>(d_q, d_k, d_v, d_out, d_pos,
                                                                  n_head, n_head_kv, head_dim,
                                                                  scale);
   return hipGetLastError() == hipSuccess;
@@ -702,7 +652,9 @@ inline bool attn_launch_split_wpb(const float *d_q, const void *d_k, const void 
   RD_ATTN_WPB_CASE(Q8_0, F32);
   RD_ATTN_WPB_CASE(Q4_0, F32);
   RD_ATTN_WPB_CASE(F16, F32);
-  // same reason as attn_launch_wpb above: bench-only WPB knob, diagonal entries.
+  // Diagonal Q5_0/Q4_1 entries: the split dispatch benches K and V at the
+  // same type; the shipped path carries the full product. (The unsplit WPB
+  // knob was removed in H0 -- it only measured redundant warps.)
   RD_ATTN_WPB_CASE(Q5_0, Q5_0);
   RD_ATTN_WPB_CASE(Q4_1, Q4_1);
 #undef RD_ATTN_WPB_CASE

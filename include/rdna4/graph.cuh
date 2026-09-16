@@ -198,11 +198,17 @@ inline bool split_batch_enabled() {
   // Teto HOST do chunk: os arrays de pilha do caminho em lote (posicoes) sao deste
   // tamanho. Tem de acompanhar `prefill_chunk_cap()`.
   static constexpr int kMaxChunkHost = 512;
-  // Batch sizes the matvec has instantiations for (2/3/4/8/16); anything else is
-  // split into a supported chunk plus a per-token tail.
+  // Batch sizes the matvec has instantiations for (2/3/4/8/16, tabela unica
+  // em tuned::kBatchNs); anything else is split into a supported chunk plus
+  // a per-token tail. Lida da tabela (H0: era copia hardcoded) + trava que a
+  // tabela continua sendo o contrato do GEMV-batch bit-exato (n <= 16).
   static int batch_supported(int n) {
-    return n == 2 || n == 3 || n == 4 || n == 8 || n == 16;
+    for (int i = 0; i < tuned::kBatchCount; ++i)
+      if (n == tuned::kBatchNs[i]) return 1;
+    return 0;
   }
+  static_assert(tuned::kBatchCap == 16,
+                "kBatchCap e o teto do GEMV-batch bit-exato; proj_batch assume n<=16 -> GEMV");
   // Tamanho de chunk ACEITO pelo caminho em lote. Ate 16 e' o GEMV (com as
   // instanciacoes acima); acima disso quem decide e' o despacho do `proj_batch`:
   // GEMM tilejado onde ele cobre o tipo, GEMV em sub-lotes de 16 onde nao cobre.

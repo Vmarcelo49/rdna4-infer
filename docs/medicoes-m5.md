@@ -137,6 +137,12 @@ the attention kernel is *issue-bound on dequantising the cache*, not bandwidth-b
 at 64K it moves 4.3 GB of f16 KV in 174 ms, i.e. **25 GB/s**, 24x below the measured
 DRAM rate. So `q4_0` is a VRAM lever, not a speed one: use `f16` wherever it fits.
 
+> **Revisão H0 (16/09):** os tempos desta seção são pré-M7 (atenção sem tiling
+> nem split-KV). Medido depois: 64K `q4_0` 44,78 ms/token (atenção 18,80 ms),
+> 131K `q4_0` 62,98 ms/token; f16 a 64K não cabe (GTT spill) —
+> ver `docs/baseline-2026-09-16.md`. A conclusão qualitativa continua valendo
+> (`q4_0` = alavanca de VRAM: 18,80 ms contra 16,21 do f16 onde ele cabe).
+
 VRAM (allocation) per configuration:
 
 | model | ctx | kv K/V | VRAM in use | free | fits |

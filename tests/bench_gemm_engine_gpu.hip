@@ -955,6 +955,86 @@ bool launch_iq3s_coal(const int4 *dWp, const block_q8_1 *dA, float *dC, const in
 }
 
 // ---------------------------------------------------------------------------
+// H9.1 PROTOTYPE (BENCH-ONLY): TH cache-policy variants on the GEMM staging
+// path (docs/plano-hipfire-gfx1201.md H9 step 1). Mirror of hipfire's
+// `kernels/src/gfx12_weight_cache_policy.inc` restricted to staging streams.
+//
+// Triage (o que continua vivo): R2 TH_NT esta' MORTO nos loads
+// latency-critical do GEMV (tombstone em vecdotq.cuh:126-132, -11..-14%);
+// R10 MUBUF-generalizado morto por custo/beneficio; s_prefetch_data morto
+// (M2). Vivo: TH/RT/HT nos streams BULK nao-latency-critical. O staging do
+// GEMM e' o candidato: pf_load() emite os loads uma janela-K inteira de conta
+// acima do uso (load->use de centenas de instrucoes) e o stream e'
+// DRAM-bound (76,6 MB em 0,134 ms em M=128 = 572 GB/s, comentario em
+// gemm.cuh). Ativacao (q8_1, usada no dp4a logo apos o load), LUT e o GEMV
+// (load -> perm/tabela -> dp4a em dezenas de instrucoes) ficam cached.
+//
+// Desenho: SolverIq3S_TH<AUX> reusa gemm_i8_kernel<BM64/BN128/BK64/RM4/RN8/
+// DBUF/WHOLD> VERBATIM -- so' TR::load muda (FLAT -> MUBUF raw_buffer_load com
+// aux literal). store/corr sao os do SolverIq3S, entao a saida tem de ser
+// BIT-IDENTICA a' producao (o gate). aux espelha o hipfire exato: 16=RT+DEV
+// (controle MUBUF vs staging FLAT de producao), 18=HT+DEV, 20=NT_RT+DEV,
+// 22=NT_HT+DEV. Codegen: `th:`/`scope:` no buffer_load_* (sonda /tmp/thprobe2:
+// 16->`scope:SCOPE_DEV`, 18->`th:TH_LOAD_HT scope:SCOPE_DEV`,
+// 20->`th:TH_LOAD_NT_RT ...`, 22->`th:TH_LOAD_NT_HT ...`).
+// ---------------------------------------------------------------------------
+__constant__ const char *g_th_base;  // base do W (offset = blk - base)
+
+template <int AUX>
+struct SolverIq3S_TH {
+  static constexpr int qk = rdna4::SolverIq3S::qk;
+  static constexpr int block_bytes = (int)sizeof(rdna4::block_iq3_s);
+  static constexpr bool is_kq = false;
+  static constexpr bool dual_scale = false;
+  using Pf = rdna4::SolverIq3S::Pf;
+  static __device__ __forceinline__ int th_ld32(const unsigned voff) {
+    auto rsrc = __builtin_amdgcn_make_buffer_rsrc(const_cast<char *>(g_th_base), 0,
+                                                 0xffffffffu, 0x31004000u);
+    return __builtin_amdgcn_raw_buffer_load_b32(rsrc, voff, 0u, AUX);
+  }
+  static __device__ __forceinline__ Pf load(const char *blk, const int sub) {
+    Pf p;
+    // block_iq3_s (quants.h): d@0, qs@2, qh@66, signs@74, scales@106.
+    const unsigned sb = (unsigned)(blk - g_th_base);
+    const unsigned o_qs = sb + 2u + (unsigned)sub * 8u;
+    p.qs0 = th_ld32(o_qs);
+    p.qs1 = th_ld32(o_qs + 4u);
+    p.sg = (unsigned)th_ld32(sb + 74u + (unsigned)sub * 4u);
+    const unsigned wqh = (unsigned)th_ld32(sb + 66u + ((unsigned)sub & ~3u));
+    p.qh = (wqh >> (8 * (sub & 3))) & 0xFFu;
+    const unsigned w0 = (unsigned)th_ld32(sb);  // d nos 16 bits baixos
+    const unsigned sub2 = (unsigned)sub >> 1;
+    const unsigned wsc = (unsigned)th_ld32(sb + 106u + (sub2 & ~3u));
+    p.dsc = (w0 & 0xFFFFu) | (((wsc >> (8 * (sub2 & 3))) & 0xFFu) << 16);
+    return p;
+  }
+  static __device__ __forceinline__ void store(const Pf &p, const int sub, int *dst, float *dw,
+                                              int *scf) {
+    rdna4::SolverIq3S::store(p, sub, dst, dw, scf);
+  }
+  static __device__ __forceinline__ float corr(const int sumi, const int scf) {
+    return rdna4::SolverIq3S::corr(sumi, scf);
+  }
+  static constexpr int raw_words = 4;
+  static __device__ __forceinline__ void raw_pack(const Pf &p, int *rec) {
+    rdna4::SolverIq3S::raw_pack(p, rec);
+  }
+  static __device__ __forceinline__ void decode_raw(const int *rec, const int sub, int *dst,
+                                                   float *dw, int *scf) {
+    rdna4::SolverIq3S::decode_raw(rec, sub, dst, dw, scf);
+  }
+};
+
+template <int AUX>
+bool launch_th(const void *dW, const block_q8_1 *dA, float *dC, const std::int64_t N,
+               const std::int64_t K, const std::int64_t ast, const int M) {
+  const char *base = (const char *)dW;
+  if (hipMemcpyToSymbol(HIP_SYMBOL(g_th_base), &base, sizeof(base)) != hipSuccess) return false;
+  return rdna4::gemm_launch_t<SolverIq3S_TH<AUX>, 64, 128, 64, 4, 8, true, true, 1>(
+      dW, dA, dC, N, K, ast, M, nullptr);
+}
+
+// ---------------------------------------------------------------------------
 // IQ2_XXS PROTOTYPE (BENCH-ONLY -- nao entra em gemm.cuh nem no despacho).
 // Segue o precedente SolverIq2XS (gemm.cuh:514): mesma estrutura de cadeia
 // unica (is_kq=false, um fator inteiro por bloco de 32, correcao inteira +
@@ -1259,6 +1339,184 @@ void run_xxs_verdict(const std::vector<int> &ms_list, const int reps, const int 
   }
 }
 
+// H9.1 veredito: staging FLAT de producao vs 4 celulas MUBUF TH-policy, mesmo
+// binario, A/B intercalado com ordem rotacionada, burner >= 300 ms, R >= 10,
+// piso 1%. M=128, iq3_s, tile BM64 (a config de producao em M>=64).
+// Celulas: 0=prod(FLAT) 1=RT16 2=HT18 3=NT_RT20 4=NT_HT22.
+void run_th_verdict(const char *tname, const void *dW, const block_q8_1 *dAQ, float *dC,
+                    float *dC2, const std::int64_t N, const std::int64_t K,
+                    const std::int64_t ast, const int reps) {
+  const int M = 128;
+  std::printf("\n  -- H9.1 TH-policy no staging iq3_s (BENCH-ONLY, M=%d, BM64/BN128/BK64) --\n",
+              M);
+  std::printf("  tensor %s [K=%lld x N=%lld]\n", tname, (long long)K, (long long)N);
+  std::printf("  NOTA: a referencia e' o dp4a BM64 (`gemm_launch_t<SolverIq3S,64,128,...>`, o\n"
+              "    caminho bit-exato), NAO o despacho `gemm_launch(12)` (que em M>=64 vai ao\n"
+              "    WMMA, 1.75x por outra conta). So' assim o A/B isola a policy do staging:\n"
+              "    mesma grade, mesma conta, mesmos bytes -- so' TR::load muda (FLAT->MUBUF).\n"
+              "    O WMMA consome o MESMO staging (verbatim, gemm.cuh:1510), entao um ganho\n"
+              "    aqui transfere; o numero WMMA sai como contexto, fora do A/B.\n");
+  auto launch_prod = [&]() -> bool {
+    return rdna4::gemm_launch_t<rdna4::SolverIq3S, 64, 128, 64, 4, 8, true, true, 1>(
+        dW, dAQ, dC, N, K, ast, M, nullptr);
+  };
+  {
+    hipFuncAttributes a{};
+    int lds = 0;
+    if (rdna4::gemm_attrs_t<rdna4::SolverIq3S, 64, 128, 64, 4, 8, true, true, 1>(a, lds))
+      std::printf("  attrs producao dp4a: VGPR=%d LDS=%d spill=%d\n", a.numRegs, lds,
+                  (int)a.localSizeBytes);
+    const int auxs[4] = {16, 18, 20, 22};
+    for (int i = 0; i < 4; ++i) {
+      hipFuncAttributes av{};
+      int lv = 0;
+      bool ok = false;
+      switch (auxs[i]) {
+        case 16:
+          ok = rdna4::gemm_attrs_t<SolverIq3S_TH<16>, 64, 128, 64, 4, 8, true, true, 1>(av,
+                                                                                        lv);
+          break;
+        case 18:
+          ok = rdna4::gemm_attrs_t<SolverIq3S_TH<18>, 64, 128, 64, 4, 8, true, true, 1>(av,
+                                                                                        lv);
+          break;
+        case 20:
+          ok = rdna4::gemm_attrs_t<SolverIq3S_TH<20>, 64, 128, 64, 4, 8, true, true, 1>(av,
+                                                                                        lv);
+          break;
+        default:
+          ok = rdna4::gemm_attrs_t<SolverIq3S_TH<22>, 64, 128, 64, 4, 8, true, true, 1>(av,
+                                                                                        lv);
+          break;
+      }
+      if (ok)
+        std::printf("  attrs aux=%d: VGPR=%d LDS=%d spill=%d\n", auxs[i], av.numRegs, lv,
+                    (int)av.localSizeBytes);
+    }
+  }
+  auto run_cell = [&](const int c) -> bool {
+    switch (c) {
+      case 0: return launch_prod();
+      case 1: return launch_th<16>(dW, dAQ, dC2, N, K, ast, M);
+      case 2: return launch_th<18>(dW, dAQ, dC2, N, K, ast, M);
+      case 3: return launch_th<20>(dW, dAQ, dC2, N, K, ast, M);
+      default: return launch_th<22>(dW, dAQ, dC2, N, K, ast, M);
+    }
+  };
+  const char *cnames[5] = {"dp4a(FLAT)", "RT16", "HT18", "NT_RT20", "NT_HT22"};
+  // ---- gate: BIT-EXATIDAO tensor cheio vs producao (mesmo Pf -> mesmos bits;
+  // diverge aqui = MUBUF lendo byte errado, nao tolerancia) ----
+  {
+    if (!launch_prod() || !launch_ok("th gate producao")) {
+      std::printf("  TH: producao falhou -- veredito pulado\n");
+      return;
+    }
+    (void)hipDeviceSynchronize();
+    const std::size_t n_el = (std::size_t)M * (std::size_t)N;
+    std::vector<float> pref(n_el);
+    (void)hipMemcpy(pref.data(), dC, n_el * sizeof(float), hipMemcpyDeviceToHost);
+    bool gate_ok = true;
+    for (int c = 1; c <= 4; ++c) {
+      if (!run_cell(c) || !launch_ok("th gate variante")) {
+        gate_ok = false;
+        continue;
+      }
+      (void)hipDeviceSynchronize();
+      std::vector<float> got(n_el);
+      (void)hipMemcpy(got.data(), dC2, n_el * sizeof(float), hipMemcpyDeviceToHost);
+      const Diff d = diff_bits(got, pref, n_el);
+      std::size_t nnf = 0;
+      for (float v : got)
+        if (!std::isfinite(v)) ++nnf;
+      std::printf("  gate %-10s vs producao M=%d N=%lld cheio: BITS diferentes %zu de %zu ; "
+                  "max ulp %.0f ; nao-finitos %zu%s\n",
+                  cnames[c], M, (long long)N, d.n_diff, n_el, d.max_ulps, nnf,
+                  (d.n_diff == 0 && nnf == 0) ? "   (bit-identico)" : "   <-- DIVERGE");
+      if (d.n_diff != 0 || nnf != 0) gate_ok = false;
+    }
+    if (!gate_ok) {
+      std::printf("  TH: gate bit-exato REPROVOU -- sem cronometragem\n");
+      return;
+    }
+  }
+  // ---- A/B intercalado: burner >= 300 ms na producao, ordem rotacionada ----
+  EvPair ev;
+  double burner = 0;
+  {
+    auto fn_p = [&] {
+      if (!launch_prod()) std::printf("  TH burner: producao retornou false\n");
+    };
+    for (int i = 0; i < 20000 && burner < 300.0; ++i) burner += ev(fn_p);
+  }
+  if (!launch_ok("th burner")) return;
+  std::printf("  burner DPM: %.1f ms de producao dp4a antes do A/B\n", burner);
+  const int R = std::max(reps, 10);
+  double best[5], sum[5];
+  for (int c = 0; c < 5; ++c) {
+    best[c] = 1e9;
+    sum[c] = 0;
+  }
+  for (int r = 0; r < R; ++r) {
+    for (int k = 0; k < 5; ++k) {
+      const int c = (r + k) % 5;  // ordem rotacionada por round
+      double t = 0;
+      if (c == 0) {
+        t = ev([&] {
+          if (!launch_prod()) std::printf("  TH A/B: producao retornou false\n");
+        });
+      } else {
+        t = ev([&, c] {
+          if (!run_cell(c)) std::printf("  TH A/B: celula %d retornou false\n", c);
+        });
+      }
+      best[c] = std::min(best[c], t);
+      sum[c] += t;
+    }
+  }
+  if (!launch_ok("th A/B intercalado")) return;
+  // piso: producao vs producao intercalada (mesmo padrao, sem variante no meio)
+  double best_1 = 1e9, best_2 = 1e9;
+  for (int r = 0; r < R; ++r) {
+    const double t1 = ev([&] { launch_prod(); });
+    const double t2 = ev([&] { launch_prod(); });
+    best_1 = std::min(best_1, t1);
+    best_2 = std::min(best_2, t2);
+  }
+  const double noise = best_2 / std::max(best_1, 1e-9);
+  const double macs = (double)N * (double)K * (double)M;
+  std::printf("  A/B intercalado (min/media de %d, M=%d, burner %.0f ms):\n", R, M, burner);
+  for (int c = 0; c < 5; ++c) {
+    const double rate = macs / (best[c] * 1e-3) / 1e12;
+    const double ratio_min = best[0] / std::max(best[c], 1e-9);
+    const double ratio_mean = (sum[0] / R) / std::max(sum[c] / R, 1e-9);
+    std::printf("    %-10s %7.3f ms (media %7.3f, %5.2f T-MAC/s) -> prod/cel = %.4fx (min) / "
+                "%.4fx (media)%s\n",
+                cnames[c], best[c], sum[c] / R, rate, ratio_min, ratio_mean,
+                c == 0 ? "   (referencia)" : "");
+  }
+  std::printf("  piso prod-vs-prod intercalado (min de %d): %.3f ms e %.3f ms -> %.4fx\n", R,
+              best_1, best_2, noise);
+  std::printf("  VEREDITO H9.1 (piso 1%% = 1.0100x, ruido medido %.4fx):\n", noise);
+  for (int c = 1; c <= 4; ++c) {
+    const double ratio_min = best[0] / std::max(best[c], 1e-9);
+    const char *v;
+    if (ratio_min >= 1.01) v = "SHIP (ganho alem do piso; propor knob)";
+    else if (ratio_min >= 1.0 / noise && ratio_min >= 1.0 / 1.01) v = "NEUTRO (dentro do ruido)";
+    else v = "DEAD (regressao ou neutro sem ganho)";
+    std::printf("    %-10s prod/cel %.4fx -> %s\n", cnames[c], ratio_min, v);
+  }
+  // Contexto fora do A/B: o despacho padrao em M=128 (WMMA salvo RD_GEMM_WMMA=0).
+  {
+    const bool wmma = rdna4::gemm_use_wmma_iq3s(M);
+    auto fn_w = [&] { rdna4::gemm_launch(12, dW, dAQ, dC, N, K, ast, M, nullptr); };
+    double bw = 1e9;
+    for (int r = 0; r < R; ++r) bw = std::min(bw, ev(fn_w));
+    if (!launch_ok("th contexto despacho")) return;
+    std::printf("  contexto (fora do A/B): despacho padrao M=128 [%s] %.3f ms = %.2f T-MAC/s\n",
+                wmma ? "WMMA" : "dp4a(RD_GEMM_WMMA=0)", bw, macs / (bw * 1e-3) / 1e12);
+  }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -1269,6 +1527,7 @@ int main(int argc, char **argv) {
   std::int64_t n_ovr = -1, k_ovr = -1;
   bool verify = true, quick = false, list_only = false, types_only = false;
   bool kq_auto = false;
+  bool thpol = false;  // H9.1: so' o veredito TH-policy (2 shapes iq3_s, M=128)
   std::string tensor_name;
   const char *model = nullptr;
   for (int i = 1; i < argc; ++i) {
@@ -1308,6 +1567,8 @@ int main(int argc, char **argv) {
       // diferente em camadas diferentes neste modelo, entao a bancada escolhe o
       // MAIOR tensor de cada tipo k-quant (menos token_embd, que e' gather).
       kq_auto = true;
+    } else if (!std::strcmp(argv[i], "--thpol")) {
+      thpol = true;  // H9.1: veredito TH-policy no staging (2 shapes iq3_s, M=128)
     } else if (argv[i][0] != '-') {
       model = argv[i];
     }
@@ -1316,7 +1577,7 @@ int main(int argc, char **argv) {
     std::printf(
         "uso: bench-gemm-engine-gpu <model.gguf> [--m 16,64,128,512] [--reps 5]\n"
         "                        [--tensor NOME] [--list] [--cfg 1,5,6,7]\n"
-        "                        [--no-verify] [--quick] [--types]\n");
+        "                        [--no-verify] [--quick] [--types] [--thpol]\n");
     return 1;
   }
   {
@@ -1420,6 +1681,7 @@ int main(int argc, char **argv) {
     // um tensor iq3_xxs, que e' o segundo tipo em bytes do inventario.
     names = {"blk.3.ffn_up.weight", "blk.2.ffn_down.weight", "blk.2.attn_qkv.weight",
              "blk.1.ffn_down.weight"};
+    if (thpol) names = {"blk.3.ffn_up.weight", "blk.2.ffn_down.weight"};  // H9.1: 2 shapes iq3_s
   }
 
   const int MMAX = *std::max_element(ms_list.begin(), ms_list.end());
@@ -1526,6 +1788,23 @@ int main(int argc, char **argv) {
     std::printf("  atributos (config que `gemm_launch` escolhe em M=128):\n");
     print_attrs("producao (BM64 BN128 BK64 RM4 RN8)", dt, false, 0);
     if (dt == kIq2XXS) print_xxs_proto_attrs();
+
+    // H9.1 (--thpol): so' o veredito TH-policy (o gate bit-exato vive dentro
+    // do run_th_verdict); pula a tabela MxGEMV para segurar o hold curto.
+    if (thpol) {
+      if (dt == kIq3S && Nr == N && Kr == K) {
+        run_th_verdict(info.name.c_str(), dW, dAQ, dC, dC2, N, K, act_full, reps);
+      } else {
+        std::printf("  --thpol: tensor nao-iq3_s ou forma reduzida -- pulado\n");
+      }
+      std::free(hAQ);
+      (void)hipFree(dW);
+      (void)hipFree(dAf);
+      (void)hipFree(dAQ);
+      (void)hipFree(dC);
+      (void)hipFree(dC2);
+      continue;
+    }
 
     // ---------------------------------------------------------------------
     // 2. VERIFICACAO (antes de qualquer cronometragem)

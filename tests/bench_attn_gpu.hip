@@ -849,7 +849,9 @@ int main(int argc, char **argv) {
     }
 
     struct Cell {
-      int sp;    // 0 = the shipping unsplit kernel, -1 = unsplit with forced wpb
+      int sp;    // 0 = the shipping unsplit kernel; >0 = split count (split path
+                 // keeps its functional WPB knob). The unsplit forced-warp cells
+                 // are gone (H0): the unsplit kernel ignores WPB by construction.
       int wpb;
       double ms;
       double rel;
@@ -859,7 +861,6 @@ int main(int argc, char **argv) {
     cells.push_back({0, 0, -1.0, 0.0, 0.0});   // ship (attn_launch, unsplit)
     cells.push_back({0, 0, -1.0, 0.0, 0.0});   // ship2: identical -> noise floor
     cells.push_back({0, 0, -1.0, 0.0, 0.0});   // ship3: identical -> noise floor
-    for (int wpb : wpb_list) cells.push_back({-1, wpb, -1.0, 0.0, 0.0});  // unsplit, forced warps
     for (int sp : split_list)
       for (int wpb : wpb_list) cells.push_back({sp, wpb, -1.0, 0.0, 0.0});
 
@@ -867,9 +868,6 @@ int main(int argc, char **argv) {
       if (c.sp == 0) {
         (void)rdna4::attn_launch(d_q, d_k, d_v, d_out2, t, kHeads, kHeadsKv, kHeadDim, kScale, kt,
                                  kt, nullptr);
-      } else if (c.sp < 0) {
-        (void)rdna4::attn_launch_wpb(d_q, d_k, d_v, d_out2, t, kHeads, kHeadsKv, kHeadDim, kScale,
-                                     kt, kt, c.wpb, nullptr);
       } else {
         (void)rdna4::attn_launch_split_wpb(d_q, d_k, d_v, d_out2, d_partial, t, kHeads, kHeadsKv,
                                            kHeadDim, kScale, kt, kt, c.sp, c.wpb, nullptr);
@@ -963,10 +961,6 @@ int main(int argc, char **argv) {
     std::printf("  noise floor (same unsplit kernel as 3 independent cells, min of %d rounds): "
                 "%.4f vs %.4f ms = %.3fx\n",
                 kRounds, ms_ship, ms_ship2, ms_ship2 / ms_ship);
-    std::printf("  unsplit kernel with forced warps/CTA:");
-    for (const Cell &c : cells)
-      if (c.sp < 0) std::printf("  wpb=%d: %.4f ms (%.2fx)", c.wpb, c.ms, ms_ship / c.ms);
-    std::printf("\n");
 
     std::printf("  %-10s %-10s %10s %8s %12s %10s\n", "splits", "warps/CTA", "ms", "vs unsplit",
                 "rel-L2", "grid CTAs");

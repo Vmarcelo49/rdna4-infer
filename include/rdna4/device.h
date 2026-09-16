@@ -33,7 +33,7 @@ inline int query_device(char *arch_out, std::size_t arch_cap, std::size_t *total
 
 inline bool is_gfx1201(const char *arch) { return std::strstr(arch, "gfx1201") != nullptr; }
 
-// KV estimate for the qwen35-27B hybrid (17 full-attention layers x 4 KV heads
+// KV estimate for the qwen35-27B hybrid (16 full-attention layers x 4 KV heads
 // x (256+256) head dim). Bytes/token scale with the KV cache type:
 // F16 2.0 B/elem, Q8_0 ~1.06, Q4_0 ~0.56. M1/M3 replace the layer/head/dim
 // constants with real hparams from the GGUF.
