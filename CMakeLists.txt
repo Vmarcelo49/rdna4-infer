@@ -569,3 +569,10 @@ add_custom_target(rdna4_gates DEPENDS
   check-kvctx-gpu rdna4-infer oracle-next-token oracle-tokenize)
 
 # ccache: configured near the top of this file (CXX only); nothing to do here.
+
+# M-vision — mmproj (CLIP vision tower) loading: config + layout validation and
+# raw tensor reads, CPU-only. Appended, never inserted (docs/agentes-paralelos.md
+# rule 2, "CMakeLists.txt: só append").
+add_executable(check-vision tests/check_vision.cpp src/backend/vision.cpp
+                                src/backend/gguf.cpp)
+target_include_directories(check-vision PRIVATE include)
