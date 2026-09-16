@@ -460,8 +460,7 @@ bool launch_gqa_rowtile(const float *q, const void *k, const void *v, float *out
 // slow because of its algorithm or because of its occupancy. (The M7 prototype's
 // 8-12x was attributed to the narrow grid without this number; measure it.)
 template <typename F>
-void report_resources(const char *name, F *fn) {
-  hipFuncAttributes a{};
+void report_resources(const char *name, F *fn) {  hipFuncAttributes a{};
   if (hipFuncGetAttributes(&a, (const void *)fn) != hipSuccess) {
     std::printf("  %-22s (attributes unavailable)\n", name);
     return;
@@ -470,6 +469,132 @@ void report_resources(const char *name, F *fn) {
               a.numRegs, a.localSizeBytes, a.maxThreadsPerBlock, a.sharedSizeBytes);
 }
 
+
+// Kill-test (pendente §3): ONE fused GQA variant (HG) vs production at ONE t,
+// interleaved rounds, best+mean+wins. No sweep: a decision duel, nothing else.
+template <rdna4::KvType KT, rdna4::KvType VT>
+static bool gqa_duel_launch(const float *q, const void *k, const void *v, float *out, float *partial,
+                            int t, int hg, int n_splits, hipStream_t stream) {
+  return launch_gqa_split<KT, VT>(q, k, v, out, partial, t, kHeads, kHeadsKv, kHeadDim, kScale,
+                                  n_splits, hg, stream);
+}
+
+static int run_gqa_duel(rdna4::KvType kt, int t, int hg, int rounds) {
+  const std::uint64_t rowb = rdna4::kv_row_bytes(kt, kHeadDim);
+  const std::size_t bytes = (std::size_t)(t + 1) * kHeadsKv * rowb;
+  float *d_q = nullptr, *d_out = nullptr;
+  void *d_k = nullptr, *d_v = nullptr;
+  std::vector<float> qh;
+  fill_random(qh, (std::size_t)kHeads * kHeadDim, 3u);
+  hipMalloc(&d_q, qh.size() * sizeof(float));
+  hipMalloc(&d_out, (std::size_t)kHeads * kHeadDim * sizeof(float));
+  hipMemcpy(d_q, qh.data(), qh.size() * sizeof(float), hipMemcpyHostToDevice);
+  if (hipMalloc(&d_k, bytes) != hipSuccess || hipMalloc(&d_v, bytes) != hipSuccess) {
+    std::fprintf(stderr, "hipMalloc failed for the %zu-byte cache\n", bytes);
+    return 1;
+  }
+  const std::int64_t rows = (std::int64_t)(t + 1) * kHeadsKv;
+  if (!rdna4::kv_fill_launch(kt, d_k, rows, kHeadDim, 11u) ||
+      !rdna4::kv_fill_launch(kt, d_v, rows, kHeadDim, 22u)) {
+    std::fprintf(stderr, "kv_fill_launch failed: %s\n", hipGetErrorString(hipGetLastError()));
+    return 1;
+  }
+  const int keys = t + 1;
+  const bool kv_dense = (kt == rdna4::KvType::F16 || kt == rdna4::KvType::F32);
+  int n_splits;
+  if (keys < rdna4::tuned::kAttnSplitMin) n_splits = 1;
+  else if (kv_dense) n_splits = (rdna4::tuned::kAttnSplitCtasDense + kHeads - 1) / kHeads;
+  else n_splits = keys / rdna4::tuned::kAttnSplitMin;
+  if (n_splits < 1) n_splits = 1;
+  if (n_splits > rdna4::tuned::kAttnMaxSplits) n_splits = rdna4::tuned::kAttnMaxSplits;
+  const int wpb = rdna4::attn_split_wpb(n_splits);
+  float *d_partial = nullptr;
+  if (hipMalloc(&d_partial, rdna4::attn_partial_bytes(kHeads, kHeadDim, n_splits)) != hipSuccess) {
+    std::fprintf(stderr, "hipMalloc partial failed\n");
+    return 1;
+  }
+  auto run_ref = [&] {
+    if (n_splits <= 1)
+      (void)rdna4::attn_launch(d_q, d_k, d_v, d_out, t, kHeads, kHeadsKv, kHeadDim, kScale, kt, kt,
+                               nullptr);
+    else
+      (void)rdna4::attn_launch_split_wpb(d_q, d_k, d_v, d_out, d_partial, t, kHeads, kHeadsKv,
+                                         kHeadDim, kScale, kt, kt, n_splits, wpb, nullptr);
+  };
+  auto run_cand = [&] {
+    if (kt == rdna4::KvType::Q4_0)
+      (void)gqa_duel_launch<rdna4::KvType::Q4_0, rdna4::KvType::Q4_0>(
+          d_q, d_k, d_v, d_out, d_partial, t, hg, n_splits, nullptr);
+    else if (kt == rdna4::KvType::Q8_0)
+      (void)gqa_duel_launch<rdna4::KvType::Q8_0, rdna4::KvType::Q8_0>(
+          d_q, d_k, d_v, d_out, d_partial, t, hg, n_splits, nullptr);
+    else if (kt == rdna4::KvType::F32)
+      (void)gqa_duel_launch<rdna4::KvType::F32, rdna4::KvType::F32>(
+          d_q, d_k, d_v, d_out, d_partial, t, hg, n_splits, nullptr);
+    else
+      (void)gqa_duel_launch<rdna4::KvType::F16, rdna4::KvType::F16>(
+          d_q, d_k, d_v, d_out, d_partial, t, hg, n_splits, nullptr);
+  };
+  {  // warmup >= 300 ms, both configs
+    const auto w0 = std::chrono::steady_clock::now();
+    do {
+      run_ref();
+      run_cand();
+      hipDeviceSynchronize();
+    } while (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0)
+                 .count() < 300.0);
+  }
+  constexpr int kReps = 3;
+  EvPair ev;
+  double best_ref = -1, best_cand = -1, sum_ref = 0, sum_cand = 0;
+  int wins = 0;
+  for (int r = 0; r < rounds; ++r) {
+    const bool fwd = (r % 2) == 0;
+    double got_ref = -1, got_cand = -1;
+    for (int k = 0; k < 2; ++k) {
+      const bool is_ref = fwd ? (k == 0) : (k == 1);
+      const double ms = ev([&] {
+                        for (int j = 0; j < kReps; ++j) (is_ref ? run_ref() : run_cand());
+                      }) / kReps;
+      if (is_ref) got_ref = ms;
+      else got_cand = ms;
+    }
+    if (best_ref < 0 || got_ref < best_ref) best_ref = got_ref;
+    if (best_cand < 0 || got_cand < best_cand) best_cand = got_cand;
+    sum_ref += got_ref;
+    sum_cand += got_cand;
+    if (got_cand < got_ref) ++wins;
+  }
+  // numerics vs unsplit reference
+  std::vector<float> a((std::size_t)kHeads * kHeadDim), b((std::size_t)kHeads * kHeadDim);
+  (void)rdna4::attn_launch(d_q, d_k, d_v, d_out, t, kHeads, kHeadsKv, kHeadDim, kScale, kt, kt,
+                           nullptr);
+  hipDeviceSynchronize();
+  hipMemcpy(a.data(), d_out, a.size() * sizeof(float), hipMemcpyDeviceToHost);
+  run_cand();
+  hipDeviceSynchronize();
+  hipMemcpy(b.data(), d_out, b.size() * sizeof(float), hipMemcpyDeviceToHost);
+  double n2 = 0, d2 = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    const double d = (double)a[i] - (double)b[i];
+    n2 += d * d;
+    d2 += (double)a[i] * a[i] + (double)b[i] * b[i];
+  }
+  std::printf("GQA-DUEL t=%d keys=%d splits=%d (wpb %d) HG=%d, %d interleaved rounds x %d reps:\n",
+              t, keys, n_splits, wpb, hg, rounds, kReps);
+  std::printf("  production: best %.4f ms  mean %.4f ms\n", best_ref, sum_ref / rounds);
+  std::printf("  HG=%d fused: best %.4f ms  mean %.4f ms  rel-L2 %.1e\n", hg, best_cand,
+              sum_cand / rounds, std::sqrt(n2 / d2));
+  std::printf("  ratio best %.4fx  mean %.4fx  wins %d/%d  (kill bar: <1.02x => DEAD)\n",
+              best_ref / best_cand, (sum_ref / rounds) / (sum_cand / rounds), wins, rounds);
+  std::printf("  x%d layers: %.3f ms/token at stake\n", kLayers, (best_ref - best_cand) * kLayers);
+  hipFree(d_q);
+  hipFree(d_out);
+  hipFree(d_k);
+  hipFree(d_v);
+  hipFree(d_partial);
+  return 0;
+}
 
 }  // namespace
 
@@ -481,6 +606,8 @@ int main(int argc, char **argv) {
   int smax = 16;
   bool have_ab = false;
   bool no_sweep = false;
+  int gqa_duel_hg = 0;  // >0: kill-test duel only (HG fused vs production), then exit
+  int duel_rounds = 8;
   int ab_sp = 0, ab_wpb = 0, ab_rounds = 15, ab_reps = 3;
   std::vector<std::pair<int, int>> cands;  // (splits, warps/CTA)
   std::vector<int> gqa_hg{6, 3, 1};        // heads per pass of the GQA-split prototype
@@ -521,6 +648,10 @@ int main(int argc, char **argv) {
       gqa_splits = std::atoi(argv[++i]);
     } else if (std::strcmp(argv[i], "--no-sweep") == 0) {
       no_sweep = true;
+    } else if (std::strcmp(argv[i], "--gqa-duel") == 0 && i + 1 < argc) {
+      gqa_duel_hg = std::atoi(argv[++i]);
+    } else if (std::strcmp(argv[i], "--duel-rounds") == 0 && i + 1 < argc) {
+      duel_rounds = std::atoi(argv[++i]);
     } else if (std::strcmp(argv[i], "--ab-rounds") == 0 && i + 1 < argc) {
       ab_rounds = std::atoi(argv[++i]);
     } else {
@@ -546,6 +677,15 @@ int main(int argc, char **argv) {
   else if (std::strcmp(tname, "f32") == 0) kt = rdna4::KvType::F32;
   else if (std::strcmp(tname, "q5_0") == 0) kt = rdna4::KvType::Q5_0;
   else if (std::strcmp(tname, "q4_1") == 0) kt = rdna4::KvType::Q4_1;
+
+  if (gqa_duel_hg > 0) {
+    if (ts.empty()) ts = {65536};
+    for (int t : ts) {
+      const int rc = run_gqa_duel(kt, t, gqa_duel_hg, duel_rounds);
+      if (rc) return rc;
+    }
+    return 0;
+  }
 
   hipDeviceProp_t prop{};
   if (hipGetDeviceProperties(&prop, 0) != hipSuccess) return 1;

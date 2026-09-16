@@ -336,6 +336,224 @@ inline bool streamk_launch(int dt, const void *d_w, const block_q8_1 *d_a, float
 #undef RD_SK
 }
 
+// ---------------------------------------------------------------------
+// R8 scalar-broadcast + q3_K old-vs-new prototypes (BENCH-ONLY, never
+// shipped). Gated on env vars so default binary behavior is unchanged:
+//   RD_R8=1   explicit __builtin_amdgcn_readfirstlane broadcast of the
+//             warp-uniform scalars (q4_K header words, iq3_s block d)
+//             vs the shipping dot, same launch geometry, interleaved,
+//             with a ship-vs-ship noise cell.
+//   RD_Q3K=1  resurrected pre-cb4f3e0 q3_K __vsubss4 body vs the shipping
+//             dp4a-linearity body (vecdotq.cuh:279), memcmp + GB/s.
+// Codegen context (--save-temps, gfx1201 -O3, CPU-side probes): a
+// warp-uniform address+value already compiles to s_load (SMEM/K$) with no
+// builtin at all, and an explicit readfirstlane folds to identical ISA, so
+// the R8 source change is expected to be a no-op; this section measures
+// that (1.00x kill) instead of asserting it. scales[]/d8/u addresses
+// depend on kqs (the lane index) and are structurally vector -- not
+// uniform, not R8 candidates. Only block d/dm/header bytes are uniform.
+// ---------------------------------------------------------------------
+
+// R8-A: q4_K dot, byte-identical to vec_dot_q4_K_q8_1 except the four
+// warp-uniform header words are explicitly broadcast from lane 0.
+static __device__ __forceinline__ float bench_q4k_r8_dot(
+    const void *__restrict__ vbq, const block_q8_1 *__restrict__ bq8_1,
+    const int &kbx, const int &iqs) {
+  const rdna4::block_q4_K *bq4_K = (const rdna4::block_q4_K *)vbq + kbx;
+  int v[2];
+  int u[2 * QR4_K];
+  float d8[QR4_K];
+  const int bq8_offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
+  const int *q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+  v[0] = q4[0];
+  v[1] = q4[4];
+  uint4 hdr = ((const uint4 *)bq4_K)[0];
+  hdr.x = __builtin_amdgcn_readfirstlane(hdr.x);
+  hdr.y = __builtin_amdgcn_readfirstlane(hdr.y);
+  hdr.z = __builtin_amdgcn_readfirstlane(hdr.z);
+  hdr.w = __builtin_amdgcn_readfirstlane(hdr.w);
+  rdna4::half2 dmh;
+  dmh.d = (uint16_t)(hdr.x & 0xFFFFu);
+  dmh.dmin = (uint16_t)(hdr.x >> 16);
+  const int j = bq8_offset / 2;
+  const int jm = j & 1;
+  const uint32_t s0 = (hdr.y >> (jm << 4)) & 0xFFFFu;
+  const uint32_t s2 = (hdr.z >> (jm << 4)) & 0xFFFFu;
+  const uint32_t s4 = (hdr.w >> (jm << 4)) & 0xFFFFu;
+  const uint32_t hi = (uint32_t) -(int32_t)(j >= 2);
+  uint16_t aux[2];
+  aux[0] = (uint16_t)(((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+  aux[1] = (uint16_t)(((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+  const uint8_t *sc = (const uint8_t *)aux;
+  const uint8_t *m = sc + 2;
+  for (int i = 0; i < QR4_K; ++i) {
+    const block_q8_1 *bq8i = bq8_1 + bq8_offset + i;
+    d8[i] = rdna4::fp16_to_float((uint16_t)(bq8i->ds & 0xFFFFu));
+    const int *q8 = (const int *)bq8i->qs + ((iqs / 2) % 4);
+    u[2 * i + 0] = q8[0];
+    u[2 * i + 1] = q8[4];
+  }
+  return rdna4::vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, dmh, d8);
+}
+
+struct BenchQ4K_R8 {
+  static constexpr int qk = 256, qi = QI4_K, vdr = VDR_Q4_K_Q8_1_MMVQ;
+  using block_t = rdna4::block_q4_K;
+  static __device__ __forceinline__ float dot(const void *vbq, const block_q8_1 *a,
+                                              const int &kbx, const int &iqs) {
+    return bench_q4k_r8_dot(vbq, a, kbx, iqs);
+  }
+  static __device__ __forceinline__ float dot_lut(const void *vbq, const block_q8_1 *a,
+                                                  const int &kbx, const int &iqs,
+                                                  const void * /*lut*/) {
+    return dot(vbq, a, kbx, iqs);
+  }
+};
+
+// R8-B: iq3_s perm dot with LUT pointer (mirrors
+// vec_dot_iq3_s_q8_1_perm_lut), except the warp-uniform block scale d is
+// explicitly broadcast from lane 0.
+static __device__ __forceinline__ float bench_iq3s_r8_dot_lut(
+    const void *__restrict__ vbq, const block_q8_1 *__restrict__ bq8_1, const int &kbx,
+    const int &iqs, const void *__restrict__ lut) {
+  const rdna4::block_iq3_s *bq3 = (const rdna4::block_iq3_s *)vbq + kbx;
+  const int2 qs_packed =
+      make_int2(rdna4::get_int_b2(bq3->qs, iqs + 0), rdna4::get_int_b2(bq3->qs, iqs + 1));
+  const uint8_t *qs = (const uint8_t *)&qs_packed;
+  const int qh = bq3->qh[iqs / 2];
+  const int signs_packed_32 = rdna4::get_int_b2(bq3->signs, iqs / 2);
+  const uint8_t *sp = (const uint8_t *)&signs_packed_32;
+  int sumi_pos = 0;
+  int sumi_all = 0;
+#pragma unroll
+  for (int l0 = 0; l0 < 8; l0 += 2) {
+    const uint32_t gx = ((const uint32_t *)lut)[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)];
+    const uint32_t gy = ((const uint32_t *)lut)[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)];
+    const uint8_t sb = sp[l0 / 2];
+    const uint32_t sel_x = (((uint32_t)(sb & 0x0F) * 0x00810204u) & 0x04040404u) | 0x03020100u;
+    const uint32_t sel_y = (((uint32_t)((sb >> 4) & 0x0F) * 0x00810204u) & 0x04040404u) | 0x03020100u;
+    const int gx_pos = (int)__builtin_amdgcn_perm(0u, gx, sel_x);
+    const int gy_pos = (int)__builtin_amdgcn_perm(0u, gy, sel_y);
+    const int u0 = rdna4::get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
+    const int u1 = rdna4::get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
+    sumi_pos = rdna4::ggml_cuda_dp4a(gx_pos, u0, sumi_pos);
+    sumi_pos = rdna4::ggml_cuda_dp4a(gy_pos, u1, sumi_pos);
+    sumi_all = rdna4::ggml_cuda_dp4a((int)gx, u0, sumi_all);
+    sumi_all = rdna4::ggml_cuda_dp4a((int)gy, u1, sumi_all);
+  }
+  int sumi = 2 * sumi_pos - sumi_all;
+  sumi *= 1 + 2 * ((bq3->scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F);
+  uint32_t draw = bq3->d;  // warp-uniform: same block for every lane
+  draw = __builtin_amdgcn_readfirstlane(draw);
+  const float d = rdna4::fp16_to_float((uint16_t)draw) *
+                  rdna4::fp16_to_float((uint16_t)((bq8_1[iqs / 2].ds) & 0xFFFFu));
+  return d * sumi;
+}
+
+struct BenchIQ3S_R8 {
+  static constexpr int qk = 256, qi = QI3_S, vdr = VDR_IQ3_S_Q8_1_MMVQ;
+  using block_t = rdna4::block_iq3_s;
+  static __device__ __forceinline__ float dot(const void *vbq, const block_q8_1 *a,
+                                              const int &kbx, const int &iqs) {
+    return bench_iq3s_r8_dot_lut(vbq, a, kbx, iqs, (const void *)rdna4::iq3s_grid);
+  }
+  static __device__ __forceinline__ float dot_lut(const void *vbq, const block_q8_1 *a,
+                                                  const int &kbx, const int &iqs,
+                                                  const void *lut) {
+    return bench_iq3s_r8_dot_lut(vbq, a, kbx, iqs, lut);
+  }
+};
+
+// q3_K OLD body (pre-cb4f3e0): per-byte saturating subtract emulation.
+// Resurrected verbatim from 23c9e03 for the old-vs-new A/B; the shipping
+// kernel uses the dp4a-linearity form (vecdotq.cuh:279).
+static __device__ __forceinline__ float bench_q3k_old_impl(
+    const int &vl, const int &vh, const int *__restrict__ u,
+    const uint8_t *__restrict__ scales, const int &scale_offset, const float &d3,
+    const float *__restrict__ d8) {
+  float sumf = 0.0f;
+#pragma unroll
+  for (int i = 0; i < QR3_K; ++i) {
+    const int isc = scale_offset + 2 * i;
+    const int isc_low = isc % (QK_K / 32);
+    const int sc_shift_low = 4 * (isc / (QK_K / 32));
+    const int sc_low = (scales[isc_low] >> sc_shift_low) & 0xF;
+    const int isc_high = isc % (QK_K / 64);
+    const int sc_shift_high = 2 * (isc / (QK_K / 64));
+    const int sc_high = ((scales[(QK_K / 32) + isc_high] >> sc_shift_high) & 3) << 4;
+    const int sc = (sc_low | sc_high) - 32;
+    const int vil = (vl >> (2 * i)) & 0x03030303;
+    const int vih = ((vh >> i) << 2) & 0x04040404;
+    const int vi = rdna4::__vsubss4(vil, vih);
+    sumf += d8[i] * (rdna4::ggml_cuda_dp4a(vi, u[i], 0) * sc);
+  }
+  return d3 * sumf;
+}
+
+static __device__ __forceinline__ float bench_q3k_old_dot(
+    const void *__restrict__ vbq, const block_q8_1 *__restrict__ bq8_1,
+    const int &kbx, const int &iqs) {
+  const rdna4::block_q3_K *bq3_K = (const rdna4::block_q3_K *)vbq + kbx;
+  const int bq8_offset = QR3_K * (iqs / (QI3_K / 2));
+  const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1 / 2);
+  const float d = rdna4::fp16_to_float(bq3_K->d);
+  const int vl = rdna4::get_int_b2(bq3_K->qs, iqs);
+  const int vh = ~rdna4::get_int_b2(bq3_K->hmask, iqs % (QI3_K / 2)) >> bq8_offset;
+  int u[QR3_K];
+  float d8[QR3_K];
+#pragma unroll
+  for (int i = 0; i < QR3_K; ++i) {
+    u[i] = rdna4::get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
+    d8[i] = rdna4::fp16_to_float((uint16_t)((bq8_1[bq8_offset + i].ds) & 0xFFFFu));
+  }
+  return bench_q3k_old_impl(vl, vh, u, bq3_K->scales, scale_offset, d, d8);
+}
+
+struct BenchQ3K_OLD {
+  static constexpr int qk = 256, qi = QI3_K, vdr = VDR_Q3_K_Q8_1_MMVQ;
+  using block_t = rdna4::block_q3_K;
+  static __device__ __forceinline__ float dot(const void *vbq, const block_q8_1 *a,
+                                              const int &kbx, const int &iqs) {
+    return bench_q3k_old_dot(vbq, a, kbx, iqs);
+  }
+  static __device__ __forceinline__ float dot_lut(const void *vbq, const block_q8_1 *a,
+                                                  const int &kbx, const int &iqs,
+                                                  const void * /*lut*/) {
+    return dot(vbq, a, kbx, iqs);
+  }
+};
+
+inline bool bench_r8_launch(int dt, const void *d_w, const block_q8_1 *d_a, float *d_o,
+                            int64_t nrows, int64_t ncols, hipStream_t stream) {
+  // Same geometry (ROWS/WPR/ILP/MINB/UNROLL/LUT-source) the shipping kernel
+  // uses for the type; only the dot body differs (explicit broadcast).
+  if (dt == 4)
+    return rdna4::launch_gen<BenchQ4K_R8, rdna4::MtShape<4>::rows, rdna4::MtShape<4>::wpr,
+                             rdna4::MtIlp<4>::value, false, rdna4::MtMinb<4>::value,
+                             rdna4::MtUnroll<4>::value>(d_w, d_a, d_o, nrows, ncols / 256,
+                                                        stream);
+  if (dt == 12) {
+    if (rdna4::matvec_lut_lds_ok(dt, nrows, ncols))
+      return rdna4::launch_gen<BenchIQ3S_R8, rdna4::MtShape<12>::rows,
+                               rdna4::MtShape<12>::wpr, rdna4::MtIlp<12>::value, false,
+                               rdna4::MtMinb<12>::value, rdna4::MtUnroll<12>::value,
+                               rdna4::LutIq3S>(d_w, d_a, d_o, nrows, ncols / 256, stream);
+    return rdna4::launch_gen<BenchIQ3S_R8, rdna4::MtShape<12>::rows, rdna4::MtShape<12>::wpr,
+                             rdna4::MtIlp<12>::value, false, rdna4::MtMinb<12>::value,
+                             rdna4::MtUnroll<12>::value>(d_w, d_a, d_o, nrows, ncols / 256,
+                                                         stream);
+  }
+  return false;
+}
+
+inline bool bench_q3k_old_launch(const void *d_w, const block_q8_1 *d_a, float *d_o,
+                                 int64_t nrows, int64_t ncols, hipStream_t stream) {
+  return rdna4::launch_gen<BenchQ3K_OLD, rdna4::MtShape<3>::rows, rdna4::MtShape<3>::wpr,
+                           rdna4::MtIlp<3>::value, false, rdna4::MtMinb<3>::value,
+                           rdna4::MtUnroll<3>::value>(d_w, d_a, d_o, nrows, ncols / 256,
+                                                      stream);
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -1259,6 +1477,176 @@ int main(int argc, char **argv) {
                 "is impossible by construction (cross-CTA summation order changes).\n");
     (void)hipFree(d_y2);
     (void)hipFree(d_part);
+  }
+
+  // ---------------------------------------------------------------------
+  // R8 (RD_R8=1) and q3_K old-vs-new (RD_Q3K=1) A/B sections. Interleaved
+  // ship/cand/ship2 per round (rotation), warmup >=300 ms GPU-busy with
+  // sync in-loop, best-of-N + mean, exact memcmp bit-identity.
+  // ---------------------------------------------------------------------
+  auto ab_section = [&](const char *tag, int dt, bool is_r8) {
+    std::vector<std::size_t> idx;
+    double bytes = 0;
+    std::int64_t rows_tot = 0, elems_tot = 0;
+    std::int64_t maxr = 0;
+    for (std::size_t i = 0; i < sel.size(); ++i)
+      if (sel[i].dt == dt) {
+        idx.push_back(i);
+        bytes += sel[i].bytes;
+        rows_tot += sel[i].nrows;
+        elems_tot += sel[i].nrows * sel[i].ncols;
+        maxr = std::max(maxr, sel[i].nrows);
+      }
+    if (idx.empty()) {
+      std::printf("%s: no staged tensors of dt=%d\n", tag, dt);
+      return;
+    }
+    float *d_b = nullptr;
+    std::vector<float> h_a((std::size_t)maxr), h_b((std::size_t)maxr);
+    if (hipMalloc(&d_b, (std::size_t)maxr * sizeof(float)) != hipSuccess) {
+      std::printf("%s: staging alloc failed\n", tag);
+      return;
+    }
+    auto fire = [&](int cfg, std::size_t i) -> bool {
+      const Tensor &t = sel[i];
+      float *out = (cfg == 1) ? d_b : d_y;
+      if (cfg == 1)
+        return is_r8 ? bench_r8_launch(t.dt, t.d_w, act_for(t.ncols), out, t.nrows, t.ncols,
+                                       nullptr)
+                     : bench_q3k_old_launch(t.d_w, act_for(t.ncols), out, t.nrows, t.ncols,
+                                            nullptr);
+      return rdna4::matvec_launch(t.dt, t.d_w, act_for(t.ncols), out, t.nrows, t.ncols,
+                                  nullptr);
+    };
+    // Bit-identity first: ship (d_y) vs candidate (d_b), exact memcmp.
+    std::int64_t diffs = 0, checked = 0;
+    for (std::size_t i : idx) {
+      const Tensor &t = sel[i];
+      if (!fire(0, i) || !fire(1, i)) {
+        std::printf("%s: launch failed on %s\n", tag, t.name.c_str());
+        (void)hipFree(d_b);
+        return;
+      }
+      if (hipMemcpy(h_a.data(), d_y, (std::size_t)t.nrows * sizeof(float),
+                    hipMemcpyDeviceToHost) != hipSuccess ||
+          hipMemcpy(h_b.data(), d_b, (std::size_t)t.nrows * sizeof(float),
+                    hipMemcpyDeviceToHost) != hipSuccess) {
+        std::printf("%s: copy failed\n", tag);
+        (void)hipFree(d_b);
+        return;
+      }
+      for (std::int64_t r = 0; r < t.nrows; ++r) {
+        if (std::memcmp(&h_a[r], &h_b[r], sizeof(float)) != 0) ++diffs;
+        ++checked;
+      }
+    }
+    std::printf("%s bit-identity (dt=%d=%s): %lld diffs / %lld outputs "
+                "(%.3f GB staged, %lld rows x cols = %lld K-elements)\n",
+                tag, dt, dt_name(dt), (long long)diffs, (long long)checked, bytes / 1e9,
+                (long long)rows_tot, (long long)elems_tot);
+    // Warmup >= 300 ms.
+    {
+      double warm = 0;
+      while (warm < 300.0) {
+        for (int c = 0; c < 3; ++c)
+          for (std::size_t i : idx) warm += ev([&] { (void)fire(c, i); });
+      }
+    }
+    const int nrep = 6;
+    std::vector<double> b_ship(idx.size(), -1.0), b_cand(idx.size(), -1.0),
+        b_ship2(idx.size(), -1.0);
+    std::vector<double> m_ship(idx.size(), 0.0), m_cand(idx.size(), 0.0),
+        m_ship2(idx.size(), 0.0);
+    for (int r = 0; r < nrep; ++r) {
+      for (int c = 0; c < 3; ++c) {
+        const int cfg = (c + r) % 3;
+        for (std::size_t k = 0; k < idx.size(); ++k) {
+          const double ms = ev([&] { (void)fire(cfg, idx[k]); });
+          double &b = cfg == 0 ? b_ship[k] : (cfg == 1 ? b_cand[k] : b_ship2[k]);
+          double &m = cfg == 0 ? m_ship[k] : (cfg == 1 ? m_cand[k] : m_ship2[k]);
+          if (b < 0 || ms < b) b = ms;
+          m += ms;
+        }
+      }
+    }
+    double s_ship = 0, s_cand = 0, s_ship2 = 0;
+    std::printf("%-9s %9s %6s %10s %10s %10s %9s %9s\n", "tensor(rows)", "bpr", "GB/s-ship",
+                "ship_ms", "cand_ms", "ship2_ms", "ratio", "noise");
+    for (std::size_t k = 0; k < idx.size(); ++k) {
+      const Tensor &t = sel[idx[k]];
+      s_ship += b_ship[k];
+      s_cand += b_cand[k];
+      s_ship2 += b_ship2[k];
+      std::printf("%-9s %9lld %6lld %10.1f %10.4f %10.4f %10.4f %9.3fx %9.3fx\n",
+                  t.name.size() > 24 ? t.name.c_str() + t.name.size() - 24 : t.name.c_str(),
+                  (long long)t.nrows, (long long)t.bpr,
+                  t.bytes / (b_ship[k] * 1e-3) / 1e9, b_ship[k], b_cand[k], b_ship2[k],
+                  b_ship[k] / b_cand[k], b_ship[k] / b_ship2[k]);
+    }
+    const double gbs_ship = bytes / (s_ship * 1e-3) / 1e9;
+    const double gbs_cand = bytes / (s_cand * 1e-3) / 1e9;
+    std::printf("%s aggregate staged (best-of-%d): ship %.3f ms = %.1f GB/s vs cand %.3f ms "
+                "= %.1f GB/s -> %.4fx (noise floor ship/ship2 = %.4fx)\n",
+                tag, nrep, s_ship, gbs_ship, s_cand, gbs_cand, s_ship / s_cand,
+                s_ship / s_ship2);
+    // Queued replay over the type set (one event pair): closer to trunk truth.
+    auto replay = [&](int cfg) {
+      return ev([&] {
+        for (std::size_t i : idx) (void)fire(cfg, i);
+      });
+    };
+    (void)replay(0);
+    (void)replay(1);
+    double r_ship = 1e9, r_cand = 1e9;
+    for (int r = 0; r < nrep; ++r) {
+      r_ship = std::min(r_ship, replay(0));
+      r_cand = std::min(r_cand, replay(1));
+    }
+    std::printf("%s queued replay: ship %.3f ms = %.1f GB/s vs cand %.3f ms = %.1f GB/s -> "
+                "%.4fx\n",
+                tag, r_ship, bytes / (r_ship * 1e-3) / 1e9, r_cand,
+                bytes / (r_cand * 1e-3) / 1e9, r_ship / r_cand);
+    // VGPR/spill attributes (no launch-bounds change in these variants).
+    {
+      hipFuncAttributes as{}, ac{};
+      bool ok = false;
+      if (dt == 4)
+        ok = hipFuncGetAttributes(
+                 &as, reinterpret_cast<const void *>(
+                          &rdna4::matvec_kernel_gen<rdna4::TQ4K, rdna4::MtShape<4>::rows,
+                                                    rdna4::MtShape<4>::wpr,
+                                                    rdna4::MtIlp<4>::value, false,
+                                                    rdna4::MtMinb<4>::value,
+                                                    rdna4::MtUnroll<4>::value>)) == hipSuccess &&
+             hipFuncGetAttributes(
+                 &ac, reinterpret_cast<const void *>(
+                          &rdna4::matvec_kernel_gen<BenchQ4K_R8, rdna4::MtShape<4>::rows,
+                                                    rdna4::MtShape<4>::wpr,
+                                                    rdna4::MtIlp<4>::value, false,
+                                                    rdna4::MtMinb<4>::value,
+                                                    rdna4::MtUnroll<4>::value>)) == hipSuccess;
+      if (ok)
+        std::printf("%s attrs ship vs cand: regs %d vs %d, local %zu vs %zu, smem %zu vs "
+                    "%zu\n",
+                    tag, as.numRegs, ac.numRegs, as.localSizeBytes, ac.localSizeBytes,
+                    as.sharedSizeBytes, ac.sharedSizeBytes);
+    }
+    (void)hipFree(d_b);
+  };
+  {
+    const char *e = std::getenv("RD_R8");
+    if (e && e[0] == '1') {
+      std::printf("\n=== R8 scalar-broadcast A/B (bench-only) ===\n");
+      ab_section("R8 q4_K", 4, true);
+      ab_section("R8 iq3_s", 12, true);
+    }
+  }
+  {
+    const char *e = std::getenv("RD_Q3K");
+    if (e && e[0] == '1') {
+      std::printf("\n=== q3_K old(__vsubss4)-vs-new(linearity) A/B (bench-only) ===\n");
+      ab_section("Q3K", 3, false);
+    }
   }
   return 0;
 }

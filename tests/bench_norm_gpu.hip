@@ -26,6 +26,8 @@
 #include <vector>
 
 #include "rdna4/nn.cuh"
+#include "rdna4/matvec.cuh"  // RD_FUSE section only: production quantize kernels
+                              // as the two-launch baseline (single-TU binary, no ODR issue)
 
 namespace {
 
@@ -101,6 +103,85 @@ struct Case {
   bool l2;
   int per_token;  // lançamentos por token no motor (para extrapolar ms/token)
 };
+
+// ---------------------------------------------------------------------------
+// RD_FUSE sketch (BENCH-ONLY, gated on env RD_FUSE=1): rms_norm(1x5120, w)
+// immediately followed by quantize_q8_1 (160 blocks) as today (two launches)
+// vs one fused launch. Bit-exactness by construction: phase 1 is the same
+// fma chain in the same order with the same reduction tree; phase 2 keeps
+// each normalized value in the register of the lane that the production
+// quantize warp would load it into (warp w owns blocks b with b%8==w, lane
+// j holds element 32b+j -- the same lane assignment as quantize_q8_1_block),
+// then runs the same amax/round/qsum/ds arithmetic. memcmp below proves it.
+// ---------------------------------------------------------------------------
+constexpr int kFuseN = 5120;      // the attn_norm/post_norm row (128x per token)
+constexpr int kFuseNB = kFuseN / 32;  // 160 q8 blocks; 160 % 8 == 0 required
+
+__global__ void rmsnorm_quant_fused_kernel(const float *__restrict__ x,
+                                           const float *__restrict__ w,
+                                           rdna4::block_q8_1 *__restrict__ y,
+                                           float eps) {
+  __shared__ float partial[kNThreads];
+  const std::int64_t row = blockIdx.x;
+  const float *xr = x + row * kFuseN;
+  rdna4::block_q8_1 *yr = y + row * kFuseNB;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+
+  // Phase 1: same accumulation order as rms_norm_kernel (4 in flight).
+  float acc = 0.0f;
+  std::int64_t i = threadIdx.x;
+  for (; i + 3 * kNThreads < kFuseN; i += 4 * kNThreads) {
+    const float v0 = xr[i];
+    const float v1 = xr[i + kNThreads];
+    const float v2 = xr[i + 2 * kNThreads];
+    const float v3 = xr[i + 3 * kNThreads];
+    acc = fmaf(v0, v0, acc);
+    acc = fmaf(v1, v1, acc);
+    acc = fmaf(v2, v2, acc);
+    acc = fmaf(v3, v3, acc);
+  }
+  for (; i < kFuseN; i += kNThreads) {
+    const float v = xr[i];
+    acc = fmaf(v, v, acc);
+  }
+  partial[threadIdx.x] = acc;
+  __syncthreads();
+  for (int stride = kNThreads / 2; stride > 0; stride >>= 1) {
+    if ((int)threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+    __syncthreads();
+  }
+  const float scale = rsqrtf(partial[0] / (float)kFuseN + eps);
+
+  // Phase 2: normalized values stay in registers (20 per thread); warp w
+  // quantizes blocks w, w+8, ... with the production arithmetic verbatim.
+  float yn[kFuseNB / 8];
+#pragma unroll
+  for (int k = 0; k < kFuseNB / 8; ++k) {
+    const std::int64_t idx = (std::int64_t)threadIdx.x + (std::int64_t)k * kNThreads;
+    const float xv = xr[idx];
+    yn[k] = w ? xv * scale * w[idx] : xv * scale;  // same expression as rms store
+  }
+#pragma unroll
+  for (int k = 0; k < kFuseNB / 8; ++k) {
+    const std::int64_t b = warp + (std::int64_t)k * 8;
+    const float xi = yn[k];  // lane j == element 32b+j, as in quantize_q8_1_block
+    float amax = fabsf(xi);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off));
+    const float d = amax / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    const int q = (int)roundf(xi * id);
+    yr[b].qs[lane] = (int8_t)q;
+    int qsum = q;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) qsum += __shfl_xor(qsum, off);
+    if (lane == 0) {
+      yr[b].ds = (uint32_t)rdna4::float_to_fp16(d) |
+                 ((uint32_t)rdna4::float_to_fp16(d * (float)qsum) << 16);
+    }
+  }
+}
 
 }  // namespace
 
@@ -207,5 +288,71 @@ int main(int argc, char **argv) {
   }
   std::printf("\n  total nas formas do motor: %.3f -> %.3f ms/token (%.3f ms = %.1f%% do token de 36,0 ms)\n",
               tot_old, tot_new, tot_old - tot_new, 100.0 * (tot_old - tot_new) / 36.0);
+
+  // ---- RD_FUSE: rms_norm(1x5120,w)+quantize pairs --------------------------------
+  // Two launches back-to-back in one event pair (as the graph issues them) vs
+  // one fused launch. Env-gated (RD_FUSE=1); default binary behavior unchanged.
+  {
+    const char *e = std::getenv("RD_FUSE");
+    if (e && e[0] == '1') {
+      const int64_t nb = kFuseNB;  // 160
+      float *d_fx = nullptr, *d_fw = nullptr, *d_fy = nullptr;
+      rdna4::block_q8_1 *d_q2 = nullptr, *d_qf = nullptr;
+      bool ok = hipMalloc(&d_fx, (std::size_t)kFuseN * 4) == hipSuccess &&
+                hipMalloc(&d_fw, (std::size_t)kFuseN * 4) == hipSuccess &&
+                hipMalloc(&d_fy, (std::size_t)kFuseN * 4) == hipSuccess &&
+                hipMalloc(&d_q2, (std::size_t)nb * sizeof(rdna4::block_q8_1)) == hipSuccess &&
+                hipMalloc(&d_qf, (std::size_t)nb * sizeof(rdna4::block_q8_1)) == hipSuccess;
+      if (!ok) {
+        std::printf("\nRD_FUSE: staging alloc failed\n");
+        return 1;
+      }
+      fill_kernel<<<(unsigned)((kFuseN + bl - 1) / bl), bl>>>(d_fx, kFuseN, 11u);
+      fill_kernel<<<(unsigned)((kFuseN + bl - 1) / bl), bl>>>(d_fw, kFuseN, 12u);
+      hipDeviceSynchronize();
+      // Bit-identity: two launches vs fused, exact memcmp over 160 blocks.
+      (void)rdna4::rms_norm_launch(d_fx, d_fw, d_fy, 1, kFuseN, 1e-6f);
+      rdna4::quantize_q8_1_kernel<<<(unsigned)((nb + 3) / 4), 128>>>(d_fy, d_q2, nb);
+      rmsnorm_quant_fused_kernel<<<1, kNThreads>>>(d_fx, d_fw, d_qf, 1e-6f);
+      hipDeviceSynchronize();
+      std::vector<unsigned> a((std::size_t)nb * sizeof(rdna4::block_q8_1) / 4),
+          b(a.size());
+      hipMemcpy(a.data(), d_q2, a.size() * 4, hipMemcpyDeviceToHost);
+      hipMemcpy(b.data(), d_qf, b.size() * 4, hipMemcpyDeviceToHost);
+      std::int64_t diffs = 0;
+      for (std::size_t k = 0; k < a.size(); ++k)
+        if (a[k] != b[k]) ++diffs;
+      std::printf("\nRD_FUSE bit-identity (2 launches vs fused, %lld dwords): %lld diffs %s\n",
+                  (long long)a.size(), (long long)diffs, diffs == 0 ? "BIT-IDENTICO" : "DIFERE");
+      auto pair_fn = [&] {
+        (void)rdna4::rms_norm_launch(d_fx, d_fw, d_fy, 1, kFuseN, 1e-6f);
+        rdna4::quantize_q8_1_kernel<<<(unsigned)((nb + 3) / 4), 128>>>(d_fy, d_q2, nb);
+      };
+      auto fused_fn = [&] { rmsnorm_quant_fused_kernel<<<1, kNThreads>>>(d_fx, d_fw, d_qf, 1e-6f); };
+      double t_pair = 1e30, t_fused = 1e30, t_fused2 = 1e30;
+      for (int r = 0; r < 3; ++r) {
+        t_pair = std::min(t_pair, measure(pair_fn));
+        t_fused = std::min(t_fused, measure(fused_fn));
+        t_fused2 = std::min(t_fused2, measure(fused_fn));
+      }
+      const double saved = t_pair - t_fused;
+      std::printf("RD_FUSE us/pair (chain %d): two-launch %.2f vs fused %.2f (2nd %.2f) -> "
+                  "saves %.2f us/pair (ratio %.3fx, noise %.3fx)\n",
+                  chain, t_pair, t_fused, t_fused2, saved, t_pair / t_fused,
+                  t_fused / t_fused2);
+      std::printf("RD_FUSE extrapolate x128 pairs: %.3f ms/token = %.2f%% of 26.62 ms token "
+                  "(x256 quantize-adjacent: %.3f ms = %.2f%%)\n",
+                  saved * 128.0 / 1000.0, 100.0 * saved * 128.0 / 1000.0 / 26.62,
+                  saved * 256.0 / 1000.0, 100.0 * saved * 256.0 / 1000.0 / 26.62);
+      std::printf("RD_FUSE verdict: %s\n",
+                  saved * 128.0 / 1000.0 / 26.62 >= 0.01 ? "SHIP-IT candidate (needs prod patch)"
+                                                         : "DEAD (<1%% of token)");
+      (void)hipFree(d_fx);
+      (void)hipFree(d_fw);
+      (void)hipFree(d_fy);
+      (void)hipFree(d_q2);
+      (void)hipFree(d_qf);
+    }
+  }
   return 0;
 }

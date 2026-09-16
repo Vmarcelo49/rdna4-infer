@@ -107,19 +107,29 @@ struct PerTypeTol {
   const char *name;
   double rel;
   double maxd;
+  int m = 32;  // default = BM=16; porta por n declara o seu. Default em vez
+          // de zero-init: uma linha sem o campo cai no M=32 em vez de M=0
+          // (M=0 falha o lanco e o gate reporta zeros -- assinatura confusa).
+          // Tipos com porta por n (ex.: iq2_xxs, caso 7 do despacho, T=64)
+          // usam aqui o M do tile que embarca -- o `gemm_launch` devolve
+          // false abaixo da porta e este gate conta `false` como falha de
+          // lancamento, entao o M tem de ser >= a porta.
 };
 constexpr PerTypeTol kTolPerType[] = {
-    {12, "iq3_s", 1.0e-06, 1.0e-04},   // medido ~3e-07 / 2.7e-05
-    {9, "iq3_xxs", 1.0e-06, 1.0e-04},  // mesma familia de cadeia unica
-    {14, "iq4_xs", 1.0e-06, 1.0e-04},  // medido ~2e-07 / 4.8e-06
-    {2, "q2_K", 1.0e-06, 2.0e-05},     // medido 4.51e-07 / 9.54e-06
-    {3, "q3_K", 2.0e-06, 3.0e-05},     // medido 7.39e-07 / 1.34e-05
-    {4, "q4_K", 2.0e-06, 6.0e-05},     // medido 8.44e-07 / 2.48e-05
-    {5, "q5_K", 1.0e-06, 5.0e-05},     // medido 4.69e-07 / 1.00e-05 no bench e 5.16e-07 /
+    {12, "iq3_s", 1.0e-06, 1.0e-04, 32},   // medido ~3e-07 / 2.7e-05
+    {9, "iq3_xxs", 1.0e-06, 1.0e-04, 32},  // mesma familia de cadeia unica
+    {14, "iq4_xs", 1.0e-06, 1.0e-04, 32},  // medido ~2e-07 / 4.8e-06
+    {2, "q2_K", 1.0e-06, 2.0e-05, 32},     // medido 4.51e-07 / 9.54e-06
+    {3, "q3_K", 2.0e-06, 3.0e-05, 32},     // medido 7.39e-07 / 1.34e-05
+    {4, "q4_K", 2.0e-06, 6.0e-05, 32},     // medido 8.44e-07 / 2.48e-05
+    {5, "q5_K", 1.0e-06, 5.0e-05, 32},     // medido 4.69e-07 / 1.00e-05 no bench e 5.16e-07 /
                                        // 2.19e-05 no pior tensor (blk.55.ffn_down no IQ4_XS):
                                        // max|d| varia por tensor (1 outlier em 164K saidas),
                                        // rel-L2 e' a metrica que prende
-    {6, "q6_K", 2.0e-06, 6.0e-05},     // medido 9.23e-07 / 3.05e-05
+    {6, "q6_K", 2.0e-06, 6.0e-05, 32},     // medido 9.23e-07 / 3.05e-05
+    {7, "iq2_xxs", 1.0e-06, 1.0e-04, 64},  // medido 16/09 2.4-4.3e-07 / <=1.2e-05
+                                       // (N-large e K-large, M=64..512); M=64
+                                       // porque o despacho tem porta T=64.
 };
 // Subtabela do BATCH_QUICK=1: 3 representantes em vez de 8 -- um IQ de cadeia
 // unica (familia iq3_s/iq3_xxs/iq4_xs), um K medio e o K de precisao maxima
@@ -127,9 +137,9 @@ constexpr PerTypeTol kTolPerType[] = {
 // casos em lote x por token acima; aqui o que se cobra e' um solver de cada
 // familia, e um nibble/bit trocado daria rel ~1e-01 em qualquer um deles.
 constexpr PerTypeTol kTolPerTypeQuick[] = {
-    {12, "iq3_s", 1.0e-06, 1.0e-04},
-    {4, "q4_K", 2.0e-06, 6.0e-05},
-    {6, "q6_K", 2.0e-06, 6.0e-05},
+    {12, "iq3_s", 1.0e-06, 1.0e-04, 32},
+    {4, "q4_K", 2.0e-06, 6.0e-05, 32},
+    {6, "q6_K", 2.0e-06, 6.0e-05, 32},
 };
 
 const char *kPrompt =
@@ -184,9 +194,10 @@ const char *verdict_label(const Verdict &v) {
   return "DIFFERS";
 }
 
-// Checks por tipo da rota GEMM (`kTolPerType`): um tensor real por tipo, M = 32
-// (o tile BM=16 da producao para 17..63 tokens), GEMM vs 32 chamadas do caminho
-// por token nas mesmas entradas. Roda sempre, independe do cap: a cobertura do
+// Checks por tipo da rota GEMM (`kTolPerType`): um tensor real por tipo,
+// M = `tol.m` (32 = o tile BM=16 da producao para 17..63 tokens; 64 = o tile
+// BM=64 para tipos com porta por n, ex. iq2_xxs T=64), GEMM vs M chamadas do
+// caminho por token nas mesmas entradas. Roda sempre, independe do cap: a cobertura do
 // tile BM=64 (n >= 64) esta' no bench (`--kq`, MOTOR M=16 + velocidade M=128) e
 // no ponta a ponta acima; aqui o que se cobra e' o arredondamento de cada
 // solver -- um nibble/bit trocado daria rel ~1e-01, 4 ordens acima do limite.
@@ -197,15 +208,15 @@ const char *verdict_label(const Verdict &v) {
 // tolerancia declarada, nao bit-exatidao).
 int check_per_type(const rdna4::GgufLoader &loader, bool quick) {
   int failures = 0;
-  constexpr int M = 32;
   const PerTypeTol *tols = quick ? kTolPerTypeQuick : kTolPerType;
   const std::size_t ntol =
       quick ? sizeof(kTolPerTypeQuick) / sizeof(kTolPerTypeQuick[0])
             : sizeof(kTolPerType) / sizeof(kTolPerType[0]);
   for (std::size_t ti = 0; ti < ntol; ++ti) {
     const PerTypeTol &tol = tols[ti];
+    const int M = tol.m;
     // um tensor medio do tipo: o maior ate' 64 MB fora de `token_embd` (o
-    // oraculo de 32 GEMVs num tensor de 874 MB nao cabe num gate), com K
+    // oraculo de M GEMVs num tensor de 874 MB nao cabe num gate), com K
     // multiplo de 256 (o que o `gemm_launch` exige).
     std::size_t best = loader.n_tensors();
     std::uint64_t best_bytes = 0;

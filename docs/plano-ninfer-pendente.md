@@ -86,6 +86,18 @@ sobre o per-token no IQ3_S (10,53× no IQ4_XS). Tolerância por tipo declarada e
 tensor a tensor); o `check-batch-gpu` passa nos dois arquivos UD. O que falta
 deste item: `iq2_s/iq2_xs/iq2_xxs` (9,4 %, depois dos precedentes).
 
+FECHADO 16/09 (`iq2_xxs`, T=64): solver `SolverIq2XXS` em `gemm.cuh` (cadeia
+única, `corr=(sumi*scf)/8`), despacho com porta `n_tokens < 64 → false` (o
+chamador cai no GEMV em sub-lotes, exato; o tile BM16 perde no K-large:
+0,655×@16, 0,916×@32; N-large cruza em (16,32), K-large em (32,64)). Bit-exato
+vs `vec_dot` (0/4096, ulp 0); vs GEMV rel 2,4-4,3e-07 / max|d| ≤1,2e-05, cobrado
+em `kTolPerType` {7,1e-6,1e-4} com M=64 por linha (campo `m` novo — o gate conta
+`false` como falha, então o M tem de exercitar o tile que embarca). E2E medido:
+prefill-512 355,58 → **366,27 tok/s (+3,0 %**, A/B com binários, janela limpa;
++1,1-1,3 % projetado por Amdahl — a projeção era conservadora). Cobertura
+10 → **11 solvers**; fallback restante: `q8_0` (0,23 %, latency-bound),
+`iq4_nl` (0,03 %, L2-residente), `iq1_s`.
+
 ---
 
 ## 2. GDN — o port em blocos (autorizado, sequenciado)

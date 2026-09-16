@@ -86,18 +86,546 @@ struct Variant {
   int T;
 };
 
+// ---------------------------------------------------------------------------
+// GDN chunked-port prototype (docs/estudo-ninfer-gdn.md §2, autorizado em
+// docs/plano-ninfer-pendente.md §2). CPU-only, synthetic data, single head:
+// the within-chunk parallel form in fp32 AND fp64 vs the production GPU path.
+// Conventions under test (each a documented trap, estudo §3.5): inclusive
+// cumsum, include-diagonal output mask, row-wise beta. `--chunked` runs it.
+// ---------------------------------------------------------------------------
+namespace gdn_chunked {
+
+constexpr int CS = 128;  // state dim (production S)
+constexpr int CB = 16;   // chunk size (proposal: B=16, estudo §6.2)
+constexpr int CT = 32;   // tokens (2 chunks)
+
+static unsigned long long rng_s = 0x12345678u;
+static double randu() {
+  rng_s = rng_s * 6364136223846793005ull + 1442695040888963407ull;
+  return (double)(rng_s >> 11) * (1.0 / 9007199254740992.0);
+}
+
+template <typename F>
+static F xexp(F x) {
+  return (sizeof(F) > 4) ? (F)std::exp((double)x) : (F)expf((float)x);
+}
+
+// Sequential reference, transcribed from delta_rule_kernel (gdn.cuh:72-87):
+// per-token expf gate, ascending-i single-accumulator fma dots, post-update out.
+template <typename F>
+static void sequential(const std::vector<F> &q, const std::vector<F> &k, const std::vector<F> &v,
+                       const std::vector<F> &gate, const std::vector<F> &beta, std::vector<F> &st,
+                       std::vector<F> &out, int T) {
+  const F rs = (F)(1.0 / std::sqrt((double)CS));
+  for (int t = 0; t < T; ++t) {
+    const F g = xexp(gate[t]), b = beta[t];
+    const F *kd = &k[(std::size_t)t * CS], *qd = &q[(std::size_t)t * CS];
+    for (int j = 0; j < CS; ++j) {
+      F *row = &st[(std::size_t)j * CS];
+      F sum = (F)0;
+      for (int i = 0; i < CS; ++i) {
+        const F x = row[i] * g;
+        row[i] = x;
+        sum = std::fma(x, kd[i], sum);
+      }
+      const F delta = (v[(std::size_t)t * CS + j] - sum) * b;
+      F acc = (F)0;
+      for (int i = 0; i < CS; ++i) {
+        const F x = std::fma(kd[i], delta, row[i]);
+        row[i] = x;
+        acc = std::fma(x, qd[i], acc);
+      }
+      out[(std::size_t)t * CS + j] = acc * rs;
+    }
+  }
+}
+
+struct Traps {
+  bool exclusive_cumsum = false;  // wrong: 0.275 (estudo §3.5)
+  bool strict_diag = false;       // wrong: 0.824
+  bool col_beta = false;          // wrong: 1.1e-2..2.6e-2
+};
+
+// Within-chunk parallel form, transcribed from estudo §2.3-2.5. H is kept in
+// S[i][j] layout (i=key, j=value), i.e. H[i*CS+j] == st[j*CS+i] of sequential.
+template <typename F>
+static void chunked(const std::vector<F> &q, const std::vector<F> &k, const std::vector<F> &v,
+                    const std::vector<F> &gate, const std::vector<F> &beta, std::vector<F> &st,
+                    std::vector<F> &out, int T, Traps tr = Traps()) {
+  const F rs = (F)(1.0 / std::sqrt((double)CS));
+  std::vector<F> G(CB), A(CB * CB), Tm(CB * CB), U(CB * CS), W(CB * CS), vn(CB * CS),
+      Ao(CB * CB), Hin(CS * CS);
+  for (int t0 = 0; t0 < T; t0 += CB) {
+    Hin = st;  // output term reads H at block ENTRY (output.cuh:233-234)
+    // G: INCLUSIVE local cumsum (prepare_wy_wu.cuh:417-443)
+    for (int r = 0; r < CB; ++r) {
+      const F g = gate[t0 + r];
+      if (tr.exclusive_cumsum)
+        G[r] = (r ? G[r - 1] + gate[t0 + r - 1] : (F)0);  // WRONG variant: 0.275
+      else
+        G[r] = (r ? G[r - 1] : (F)0) + g;
+    }
+    // A = -diag(beta_row) * strict-tril(KK^T o D); select-mask, never *mask
+    // (upper triangle of exp(Gr-Gc) overflows: inf*0=NaN, estudo §2.3a)
+    for (int r = 0; r < CB; ++r) {
+      for (int c = 0; c < CB; ++c) {
+        F e = (F)0;
+        if (c < r) {
+          F dot = (F)0;
+          const F *kr = &k[(std::size_t)(t0 + r) * CS], *kc = &k[(std::size_t)(t0 + c) * CS];
+          for (int i = 0; i < CS; ++i) dot = std::fma(kr[i], kc[i], dot);
+          e = dot * xexp(G[r] - G[c]);
+        }
+        const F b = tr.col_beta ? beta[t0 + c] : beta[t0 + r];  // ROW is correct
+        A[r * CB + c] = -b * e;
+      }
+    }
+    // Tm = (I-A)^{-1}, unit-diagonal forward substitution per column
+    for (int r = 0; r < CB; ++r)
+      for (int c = 0; c < CB; ++c) Tm[r * CB + c] = (r == c) ? (F)1 : (F)0;
+    for (int c = 0; c < CB; ++c) {  // solve (I-A) x = e_c
+      for (int r = 0; r < CB; ++r) {
+        F acc = (r == c) ? (F)1 : (F)0;
+        for (int s = 0; s < r; ++s) acc += A[r * CB + s] * Tm[s * CB + c];
+        Tm[r * CB + c] = acc;  // (I-A) has unit diagonal: no division
+      }
+    }
+    // U = Tm (beta V); W = Tm (beta exp(G) K)
+    for (int r = 0; r < CB; ++r)
+      for (int i = 0; i < CS; ++i) {
+        F su = (F)0, sw = (F)0;
+        for (int c = 0; c < CB; ++c) {
+          const F t = Tm[r * CB + c] * beta[t0 + c];
+          su += t * v[(std::size_t)(t0 + c) * CS + i];
+          sw += t * (xexp(G[c]) * k[(std::size_t)(t0 + c) * CS + i]);
+        }
+        U[(std::size_t)r * CS + i] = su;
+        W[(std::size_t)r * CS + i] = sw;
+      }
+    // vnew = U - W H_in; H_out = e^{G[B-1]} H_in + K^T vd (state_passing.cuh)
+    const F glast = xexp(G[CB - 1]);
+    for (int r = 0; r < CB; ++r) {
+      for (int j = 0; j < CS; ++j) {
+        F s = (F)0;
+        for (int i = 0; i < CS; ++i) s += W[(std::size_t)r * CS + i] * Hin[(std::size_t)j * CS + i];
+        // note: st[j*CS+i] == H[i][j]
+        vn[(std::size_t)r * CS + j] = U[(std::size_t)r * CS + j] - s;  // vnew, unscaled
+      }
+    }
+    for (int i = 0; i < CS; ++i)
+      for (int j = 0; j < CS; ++j) {
+        F s = (F)0;
+        for (int r = 0; r < CB; ++r)
+          s += k[(std::size_t)(t0 + r) * CS + i] *
+               (vn[(std::size_t)r * CS + j] * xexp(G[CB - 1] - G[r]));  // vd
+        st[(std::size_t)j * CS + i] = Hin[(std::size_t)j * CS + i] * glast + s;
+      }
+    // out (output.cuh:10-11): scale*(e^{G_r} q H_in^T + A vnew), diagonal INCLUDED
+    for (int r = 0; r < CB; ++r) {
+      const F gr = xexp(G[r]);
+      const F *qr = &q[(std::size_t)(t0 + r) * CS];
+      for (int s = 0; s < CB; ++s) {
+        F d = (F)0;
+        if (tr.strict_diag ? (s < r) : (s <= r)) {
+          const F *ks = &k[(std::size_t)(t0 + s) * CS];
+          for (int i = 0; i < CS; ++i) d = std::fma(qr[i], ks[i], d);
+          d *= xexp(G[r] - G[s]);
+        }
+        Ao[r * CB + s] = d;
+      }
+      for (int j = 0; j < CS; ++j) {
+        F qh = (F)0;
+        for (int i = 0; i < CS; ++i) qh = std::fma(qr[i], Hin[(std::size_t)j * CS + i], qh);
+        F intra = (F)0;
+        for (int s = 0; s < CB; ++s) intra += Ao[r * CB + s] * vn[(std::size_t)s * CS + j];
+        out[(std::size_t)(t0 + r) * CS + j] = (gr * qh + intra) * rs;
+      }
+    }
+  }
+}
+
+template <typename F>
+static double rel_l2_vec(const std::vector<F> &a, const std::vector<F> &b) {
+  double num = 0, den = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    const double d = (double)a[i] - (double)b[i];
+    num += d * d;
+    den += (double)a[i] * (double)a[i];
+  }
+  return std::sqrt(num / den);
+}
+
+// `--chunked`: exactness of the within-chunk parallel form on synthetic data
+// + per-token cost of the production prefill (batch) path. Returns 0.
+constexpr int PB = 16;    // chunk size of the GPU prototype below
+constexpr int PROWS = 32;  // state rows per CTA of the GPU prototype below
+__global__ void gdn_chunked_proto_kernel(const float *qk, const float *v, const float *gate,
+                                         const float *beta, float *state, float *out,
+                                         int n_k_heads, int n_vh, int key_dim, int d_inner, int n);
+static int run_chunked_check() {
+  constexpr int T = CT;
+  rng_s = 0xC0FFEEu;
+  std::vector<double> qd(T * CS), kd(T * CS), vd(T * CS), gd(T), bd(T), st0(CS * CS);
+  for (int t = 0; t < T; ++t) {
+    double nq = 0, nk = 0;
+    for (int i = 0; i < CS; ++i) {
+      qd[(std::size_t)t * CS + i] = randu() - 0.5;
+      kd[(std::size_t)t * CS + i] = randu() - 0.5;
+      nq += qd[(std::size_t)t * CS + i] * qd[(std::size_t)t * CS + i];
+      nk += kd[(std::size_t)t * CS + i] * kd[(std::size_t)t * CS + i];
+      vd[(std::size_t)t * CS + i] = (randu() - 0.5) * 2.0;
+    }
+    nq = std::sqrt(nq);
+    nk = std::sqrt(nk);  // L2-normalized q/k, as l2_norm delivers
+    for (int i = 0; i < CS; ++i) {
+      qd[(std::size_t)t * CS + i] /= nq;
+      kd[(std::size_t)t * CS + i] /= nk;
+    }
+    gd[t] = -0.5 * randu() - 0.01;                        // log-gate <= 0
+    bd[t] = 1.0 / (1.0 + std::exp(-(randu() - 0.5) * 4));  // beta in (0,1)
+  }
+  for (auto &x : st0) x = randu() - 0.5;  // non-zero initial state
+
+  auto as_float = [](const std::vector<double> &d) {
+    std::vector<float> f(d.size());
+    for (std::size_t i = 0; i < d.size(); ++i) f[i] = (float)d[i];
+    return f;
+  };
+  const std::vector<float> qf = as_float(qd), kf = as_float(kd), vf = as_float(vd),
+                           gf = as_float(gd), bf = as_float(bd), sf0 = as_float(st0);
+
+  // CPU references
+  std::vector<double> st_seq = st0, out_seq(T * CS);
+  sequential(qd, kd, vd, gd, bd, st_seq, out_seq, T);
+  std::vector<double> st_ch = st0, out_ch(T * CS);
+  chunked(qd, kd, vd, gd, bd, st_ch, out_ch, T);
+  std::vector<float> st_seq32 = sf0, out_seq32(T * CS);
+  sequential(qf, kf, vf, gf, bf, st_seq32, out_seq32, T);
+  std::vector<float> st_ch32 = sf0, out_ch32(T * CS);
+  chunked(qf, kf, vf, gf, bf, st_ch32, out_ch32, T);
+
+  std::printf("chunked prototype (1 head, S=128, B=16, T=32, synthetic, nonzero state):\n");
+  std::printf("  fp64 chunked vs fp64 sequential : out %.2e  state %.2e  (spec: 1e-15 exact)\n",
+              rel_l2_vec(out_ch, out_seq), rel_l2_vec(st_ch, st_seq));
+  std::printf("  fp32 chunked vs fp32 sequential : out %.2e  state %.2e  (spec: 5e-7..1e-6)\n",
+              rel_l2_vec(out_ch32, out_seq32), rel_l2_vec(st_ch32, st_seq32));
+  // the three convention traps, each must blow up (estudo §3.5)
+  for (int tr = 0; tr < 3; ++tr) {
+    Traps tp;
+    if (tr == 0) tp.exclusive_cumsum = true;
+    if (tr == 1) tp.strict_diag = true;
+    if (tr == 2) tp.col_beta = true;
+    std::vector<double> stt = st0, outt(T * CS);
+    chunked(qd, kd, vd, gd, bd, stt, outt, T, tp);
+    std::printf("  trap %-16s vs sequential  : out %.2e  (must be O(1e-2..1))\n",
+                tr == 0 ? "excl-cumsum" : tr == 1 ? "strict-diag" : "col-beta",
+                rel_l2_vec(outt, out_seq));
+  }
+
+  // Production GPU path (prefill): batch-resident, nvh=1 shape, same inputs
+  float *dqk = nullptr, *dvv = nullptr, *dgg = nullptr, *dbb = nullptr, *dst = nullptr,
+        *dou = nullptr;
+  const std::size_t qkb = (std::size_t)T * 2 * CS * 4, vb = (std::size_t)T * CS * 4,
+                    gb = (std::size_t)T * 4, sb = (std::size_t)CS * CS * 4;
+  if (hipMalloc(&dqk, qkb) != hipSuccess || hipMalloc(&dvv, vb) != hipSuccess ||
+      hipMalloc(&dgg, gb) != hipSuccess || hipMalloc(&dbb, gb) != hipSuccess ||
+      hipMalloc(&dst, sb) != hipSuccess || hipMalloc(&dou, vb) != hipSuccess) {
+    std::fprintf(stderr, "hipMalloc failed\n");
+    return 1;
+  }
+  std::vector<float> qk(T * 2 * CS);
+  for (int t = 0; t < T; ++t)
+    for (int i = 0; i < CS; ++i) {
+      qk[(std::size_t)t * 2 * CS + i] = qf[(std::size_t)t * CS + i];
+      qk[(std::size_t)t * 2 * CS + CS + i] = kf[(std::size_t)t * CS + i];
+    }
+  hipMemcpy(dqk, qk.data(), qkb, hipMemcpyHostToDevice);
+  hipMemcpy(dvv, vf.data(), vb, hipMemcpyHostToDevice);
+  hipMemcpy(dgg, gf.data(), gb, hipMemcpyHostToDevice);
+  hipMemcpy(dbb, bf.data(), gb, hipMemcpyHostToDevice);
+  hipMemcpy(dst, sf0.data(), sb, hipMemcpyHostToDevice);
+  (void)rdna4::delta_rule_batch_resident_launch(dqk, dvv, dgg, dbb, dst, dou, 1, 1, CS, 1, CS,
+                                                CS, T);
+  hipDeviceSynchronize();
+  std::vector<float> gpu_out(T * CS), gpu_st(CS * CS);
+  hipMemcpy(gpu_out.data(), dou, vb, hipMemcpyDeviceToHost);
+  hipMemcpy(gpu_st.data(), dst, sb, hipMemcpyDeviceToHost);
+  std::printf("  fp32 chunked-CPU vs PRODUCTION-GPU (batch-resident): out %.2e  state %.2e\n",
+              rel_l2_vec(out_ch32, gpu_out), rel_l2_vec(st_ch32, gpu_st));
+  std::printf("  fp32 sequential-CPU vs PRODUCTION-GPU             : out %.2e  state %.2e\n",
+              rel_l2_vec(out_seq32, gpu_out), rel_l2_vec(st_seq32, gpu_st));
+
+  // GPU prototype on the same inputs: correctness vs CPU-chunked + production
+  hipMemcpy(dst, sf0.data(), sb, hipMemcpyHostToDevice);
+  {
+    const dim3 grid(1, CS / PROWS);
+    gdn_chunked_proto_kernel<<<grid, PROWS>>>(dqk, dvv, dgg, dbb, dst, dou, 1, 1, CS, CS, T);
+  }
+  hipDeviceSynchronize();
+  if (hipGetLastError() != hipSuccess) {
+    std::printf("  GPU prototype LAUNCH FAILED: %s\n", hipGetErrorString(hipGetLastError()));
+  } else {
+    hipMemcpy(gpu_out.data(), dou, vb, hipMemcpyDeviceToHost);
+    hipMemcpy(gpu_st.data(), dst, sb, hipMemcpyDeviceToHost);
+    // refetch production numbers for the proto-vs-production comparison
+    hipMemcpy(dst, sf0.data(), sb, hipMemcpyHostToDevice);
+    (void)rdna4::delta_rule_batch_resident_launch(dqk, dvv, dgg, dbb, dst, dou, 1, 1, CS, 1, CS,
+                                                  CS, T);
+    hipDeviceSynchronize();
+    std::vector<float> prod_out(T * CS);
+    hipMemcpy(prod_out.data(), dou, vb, hipMemcpyDeviceToHost);
+    std::printf("  GPU-proto vs fp32 chunked-CPU : out %.2e  state %.2e\n",
+                rel_l2_vec(out_ch32, gpu_out), rel_l2_vec(st_ch32, gpu_st));
+    std::printf("  GPU-proto vs PRODUCTION-GPU   : out %.2e  (gate: <=1e-5)\n",
+                rel_l2_vec(prod_out, gpu_out));
+  }
+  for (auto *p : {dqk, dvv, dgg, dbb, dst, dou}) hipFree(p);
+
+  // Production-shape timing: 48 heads, n=16 (prefill chunk), chain of 100
+  {
+    constexpr int NVH = 48, NKH = 16, N = 16, KEYD = NKH * CS, DIN = NVH * CS;
+    float *qk2 = nullptr, *vv2 = nullptr, *gg2 = nullptr, *bb2 = nullptr, *st2 = nullptr,
+          *ou2 = nullptr;
+    (void)hipMalloc(&qk2, (std::size_t)N * 2 * KEYD * 4);
+    (void)hipMalloc(&vv2, (std::size_t)N * DIN * 4);
+    (void)hipMalloc(&gg2, (std::size_t)N * NVH * 4);
+    (void)hipMalloc(&bb2, (std::size_t)N * NVH * 4);
+    (void)hipMalloc(&st2, (std::size_t)NVH * CS * CS * 4);
+    (void)hipMalloc(&ou2, (std::size_t)N * DIN * 4);
+    if (!qk2 || !vv2 || !gg2 || !bb2 || !st2 || !ou2) {
+      std::fprintf(stderr, "hipMalloc failed (timing)\n");
+      return 1;
+    }
+    hipEvent_t e0, e1;
+    hipEventCreate(&e0);
+    hipEventCreate(&e1);
+    auto time_launch = [&](const std::function<void()> &fn) {
+      const double w0 = now_ms();
+      while (now_ms() - w0 < 320.0) {
+        for (int i = 0; i < 100; ++i) fn();
+        hipDeviceSynchronize();
+      }
+      double best = 1e30;
+      for (int r = 0; r < 12; ++r) {
+        hipEventRecord(e0, nullptr);
+        for (int i = 0; i < 100; ++i) fn();
+        hipEventRecord(e1, nullptr);
+        hipDeviceSynchronize();
+        float ms = 0;
+        hipEventElapsedTime(&ms, e0, e1);
+        best = std::min(best, (double)ms * 1000.0 / 100.0);
+      }
+      return best;
+    };
+    for (int i = 0; i < 200; ++i) {
+      (void)rdna4::delta_rule_batch_resident_launch(qk2, vv2, gg2, bb2, st2, ou2, NVH, NKH, CS,
+                                                    NVH, KEYD, DIN, N);
+      (void)rdna4::delta_rule_batch_launch(qk2, vv2, gg2, bb2, st2, ou2, NVH, NKH, CS, NVH,
+                                           KEYD, DIN, N);
+    }
+    hipDeviceSynchronize();
+    const double res_us = time_launch([&] {
+      (void)rdna4::delta_rule_batch_resident_launch(qk2, vv2, gg2, bb2, st2, ou2, NVH, NKH,
+                                                    CS, NVH, KEYD, DIN, N);
+    });
+    const double old_us = time_launch([&] {
+      (void)rdna4::delta_rule_batch_launch(qk2, vv2, gg2, bb2, st2, ou2, NVH, NKH, CS, NVH,
+                                           KEYD, DIN, N);
+    });
+    // GPU chunked prototype, same shape: grid (48, 4), 32 threads/CTA
+    for (int i = 0; i < 200; ++i) {
+      const dim3 grid((unsigned)NVH, (unsigned)(CS / PROWS));
+      gdn_chunked_proto_kernel<<<grid, PROWS>>>(qk2, vv2, gg2, bb2, st2, ou2, NKH, NVH, KEYD,
+                                                DIN, N);
+    }
+    hipDeviceSynchronize();
+    const double proto_us = time_launch([&] {
+      const dim3 grid((unsigned)NVH, (unsigned)(CS / PROWS));
+      gdn_chunked_proto_kernel<<<grid, PROWS>>>(qk2, vv2, gg2, bb2, st2, ou2, NKH, NVH, KEYD,
+                                                DIN, N);
+    });
+    // one launch covers 48 heads x 16 tokens: per-token = /16, x48 layers
+    std::printf("prefill batch (48 heads, n=16, chain-of-100, best of 12):\n");
+    std::printf("  resident %.2f us/launch = %.3f ms/token(48 layers); non-resident %.2f us\n",
+                res_us, res_us / 16.0 * 48.0 / 1000.0, old_us);
+    std::printf("  chunked-GPU-proto %.2f us/launch = %.3f ms/token (%.3fx vs resident)\n", proto_us,
+                proto_us / 16.0 * 48.0 / 1000.0, res_us / proto_us);
+    std::printf("  target per pendente §2: gdn_delta 0.625 -> <=0.30 ms/token\n");
+    for (auto *p : {qk2, vv2, gg2, bb2, st2, ou2}) hipFree(p);
+    hipEventDestroy(e0);
+    hipEventDestroy(e1);
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// GPU prototype of the within-chunk parallel form (estudo §6.4, S1+S2 fused).
+// Grid (nvh, S/32); CTA owns 32 state rows, staged once in LDS and kept
+// resident across the chunk's blocks. B=16. T must be a multiple of B.
+// Prototype scope: correctness-checked vs the CPU chunked form above and
+// timed vs delta_rule_batch_resident_launch. S==128 only.
+// (forward-declared above run_chunked_check; defined here).
+// ---------------------------------------------------------------------------
+__global__ void gdn_chunked_proto_kernel(const float *__restrict__ qk, const float *__restrict__ v,
+                                         const float *__restrict__ gate,
+                                         const float *__restrict__ beta, float *__restrict__ state,
+                                         float *__restrict__ out, int n_k_heads, int n_vh,
+                                         int key_dim, int d_inner, int n) {
+  const int h = blockIdx.x;
+  const int tx = threadIdx.x;  // 0..31
+  const int j0 = blockIdx.y * PROWS;
+  const int kh = h % n_k_heads;
+  const float rs = rsqrtf(128.0f);
+  __shared__ float H[32 * 128];    // Htile[j][i], resident across blocks
+  __shared__ float Kb[16 * 128];   // K block rows
+  __shared__ float Vb[16 * 128];   // V block rows
+  __shared__ float Wm[16 * 128], Um[16 * 128];
+  __shared__ float Tm[16 * 16], Gv[16];
+
+  // stage the 32 state rows once (M[j][i] layout, row j owned logic per tx row)
+  {
+    const float4 *sp = (const float4 *)(state + ((std::int64_t)h * 128 + j0) * 128);
+    // 32 rows x 32 vec4 = 1024 vec4 / 32 threads = 32 each
+    for (int u = tx; u < 32 * 32; u += 32) {
+      const int r = u / 32, c4 = u % 32;
+      const float4 g = sp[r * 32 + c4];
+      H[(r * 128) + c4 * 4 + 0] = g.x;
+      H[(r * 128) + c4 * 4 + 1] = g.y;
+      H[(r * 128) + c4 * 4 + 2] = g.z;
+      H[(r * 128) + c4 * 4 + 3] = g.w;
+    }
+  }
+  __syncthreads();
+
+  const float *kb = qk + key_dim + (std::int64_t)kh * 128;
+  const float *qb = qk + (std::int64_t)kh * 128;
+  const int nblk = n / PB;
+  for (int b = 0; b < nblk; ++b) {
+    const int t0 = b * PB;
+    // K/V block rows into LDS
+    for (int u = tx; u < PB * 32; u += 32) {
+      const int r = u / 32, c4 = u % 32;
+      const float4 kk = ((const float4 *)(kb + (std::int64_t)(t0 + r) * 2 * key_dim))[c4];
+      const float4 vv =
+          ((const float4 *)(v + (std::size_t)(t0 + r) * d_inner + (std::size_t)h * 128))[c4];
+      Kb[r * 128 + c4 * 4 + 0] = kk.x;
+      Kb[r * 128 + c4 * 4 + 1] = kk.y;
+      Kb[r * 128 + c4 * 4 + 2] = kk.z;
+      Kb[r * 128 + c4 * 4 + 3] = kk.w;
+      Vb[r * 128 + c4 * 4 + 0] = vv.x;
+      Vb[r * 128 + c4 * 4 + 1] = vv.y;
+      Vb[r * 128 + c4 * 4 + 2] = vv.z;
+      Vb[r * 128 + c4 * 4 + 3] = vv.w;
+    }
+    if (tx < PB) {  // inclusive cumsum + beta/gate fetch (one thread per row)
+      float acc = 0;
+      for (int r = 0; r <= tx; ++r) acc += gate[(std::size_t)(t0 + r) * n_vh + h];
+      Gv[tx] = acc;
+    }
+    __syncthreads();
+    // A = -beta_row * strict-tril(KK^T o D); Tm = (I-A)^{-1} col by col
+    for (int u = tx; u < PB * PB; u += 32) {
+      const int r = u / PB, c = u % PB;
+      float e = 0;
+      if (c < r) {
+        float dot = 0;
+        for (int i = 0; i < 128; ++i) dot = fmaf(Kb[r * 128 + i], Kb[c * 128 + i], dot);
+        e = dot * expf(Gv[r] - Gv[c]);
+      }
+      Tm[r * PB + c] = -beta[(std::size_t)(t0 + r) * n_vh + h] * e;  // A in place
+    }
+    __syncthreads();
+    if (tx == 0) {
+      // forward substitution: Tm <- (I-A)^{-1}, one column at a time
+      float A[16 * 16], X[16 * 16];
+      for (int i = 0; i < 16 * 16; ++i) {
+        A[i] = Tm[i];
+        X[i] = (i / 16 == i % 16) ? 1.0f : 0.0f;
+      }
+      for (int c = 0; c < 16; ++c)
+        for (int r = 0; r < 16; ++r) {
+          float acc = X[r * 16 + c];
+          for (int s = 0; s < r; ++s) acc += A[r * 16 + s] * X[s * 16 + c];
+          X[r * 16 + c] = acc;
+        }
+      for (int i = 0; i < 16 * 16; ++i) Tm[i] = X[i];
+    }
+    __syncthreads();
+    // U = Tm(beta V); W = Tm(beta e^G K)
+    for (int u = tx; u < PB * 128; u += 32) {
+      const int r = u / 128, i = u % 128;
+      float su = 0, sw = 0;
+      for (int c = 0; c < PB; ++c) {
+        const float t = Tm[r * PB + c] * beta[(std::size_t)(t0 + c) * n_vh + h];
+        su += t * Vb[c * 128 + i];
+        sw += t * (expf(Gv[c]) * Kb[c * 128 + i]);
+      }
+      Um[r * 128 + i] = su;
+      Wm[r * 128 + i] = sw;
+    }
+    __syncthreads();
+    // per owned state row j: vnew (16), output (uses H_in: computed BEFORE update)
+    for (int jr = tx; jr < PROWS; jr += 32) {
+      const int j = j0 + jr;
+      float vnew[16];
+      for (int r = 0; r < PB; ++r) {
+        float s = 0;
+        for (int i = 0; i < 128; ++i) s += Wm[r * 128 + i] * H[jr * 128 + i];
+        vnew[r] = Um[r * 128 + j] - s;
+      }
+      // output rows for the 16 tokens of this block
+      for (int r = 0; r < PB; ++r) {
+        const float *qr = qb + (std::size_t)(t0 + r) * 2 * key_dim;
+        float qh = 0;
+        for (int i = 0; i < 128; ++i) qh = fmaf(qr[i], H[jr * 128 + i], qh);
+        float intra = 0;
+        for (int s = 0; s <= r; ++s) {
+          const float *ks = Kb + s * 128;
+          float d = 0;
+          for (int i = 0; i < 128; ++i) d = fmaf(qr[i], ks[i], d);
+          intra += d * expf(Gv[r] - Gv[s]) * vnew[s];
+        }
+        out[(std::size_t)(t0 + r) * d_inner + (std::size_t)h * 128 + j] =
+            (expf(Gv[r]) * qh + intra) * rs;
+      }
+      // state update with vd = vnew * e^{G[B-1]-G[r]}
+      const float gl = expf(Gv[PB - 1]);
+      for (int i = 0; i < 128; ++i) {
+        float s = 0;
+        for (int r = 0; r < PB; ++r) s += Kb[r * 128 + i] * (vnew[r] * expf(Gv[PB - 1] - Gv[r]));
+        H[jr * 128 + i] = H[jr * 128 + i] * gl + s;
+      }
+    }
+    __syncthreads();
+  }
+  // write back once
+  {
+    float4 *dp = (float4 *)(state + ((std::int64_t)h * 128 + j0) * 128);
+    for (int u = tx; u < 32 * 32; u += 32) {
+      const int r = u / 32, c4 = u % 32;
+      dp[r * 32 + c4] = make_float4(H[r * 128 + c4 * 4], H[r * 128 + c4 * 4 + 1],
+                                    H[r * 128 + c4 * 4 + 2], H[r * 128 + c4 * 4 + 3]);
+    }
+  }
+}
+
+}  // namespace gdn_chunked
+
 }  // namespace
 
 int main(int argc, char **argv) {
   int rounds = 20;
   int chain = CH;
   bool noise = true;
+  bool chunked = false;
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--rounds") && i + 1 < argc) rounds = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--chain") && i + 1 < argc) chain = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--no-noise")) noise = false;
+    else if (!std::strcmp(argv[i], "--chunked")) chunked = true;
     else { std::fprintf(stderr, "unknown %s\n", argv[i]); return 1; }
   }
+  if (chunked) return gdn_chunked::run_chunked_check();
 
   const int dim = NVH * S;
   const std::size_t fb = (std::size_t)dim * sizeof(float);
@@ -230,8 +758,11 @@ int main(int argc, char **argv) {
               ship_us * 48.0 / 1000.0,
               *std::min_element(us.begin() + 1, us.end()) * 48.0 / 1000.0);
   if (noise) {
-    std::printf("  piso de ruido do harness: ship %.2f us vs ship2 %.2f us = %.4fx\n", us[0], us[1],
-                us[0] / us[1]);
+    std::size_t i2 = 0;
+    for (std::size_t v = 0; v < variants.size(); ++v)
+      if (std::strstr(variants[v].name, "ship2")) i2 = v;
+    std::printf("  piso de ruido do harness: ship %.2f us vs ship2 %.2f us = %.4fx\n", us[0],
+                us[i2], us[0] / us[i2]);
   }
   return 0;
 }

@@ -556,6 +556,78 @@ struct SolverIq2XS {
   // Sem caminho RAW (mesmo motivo do iq2_s): `raw_words` so' para o RSTR.
   static constexpr int raw_words = 4;
 };
+
+// ---- iq2_xxs (2,0625 bpw, 2,42 % do trafego/token no IQ3_S) ----
+// Cadeia unica como o iq2_xs (um fator inteiro por bloco de 32), outra
+// grade/tabela: `iq2xxs_grid` (uint64 x 256) + sinais via `unpack_ksigns` por
+// grupo de 8 pesos + escala unica no topo do aux32.
+// Transcricao termo a termo do `vec_dot_iq2_xxs_q8_1` (vecdotq.cuh:565-595):
+//   sub-bloco s (32 pesos) = qs[4*s .. 4*s+4) (4 uint16 = 8 B):
+//     q0 = bytes 0..3 -> 4 indices de grid (8 pesos cada)
+//     aux32 = bytes 4..7 -> 4 campos de sinal de 7 bits + escala (bits 27..31)
+//   grupo il (8 pesos) = grid aux8[il] (8 magnitudes, uint2 x/y = 4+4):
+//     sv = aux32>>(7*il) com paridade no bit 7; nibble baixo assina x, alto
+//     assina y (mascaras 0x08040201 / 0x80402010, como no iq2_xs).
+//   correcao: sumi = sumi*ls/8 com ls = (aux32>>27)|1 (o bit 27, topo do 4o
+//     campo de sinal, e' absorvido pelo |1: 2*scale e' par).
+// O gate de producao (TIQ2XXS_S) e' o `_perm2`, que recomputa os mesmos
+// inteiros via 2*pos-all -- exato por linearidade inteira do dp4a (mesmo
+// argumento do cabecalho do iq2_s acima). dp4a inteiro e' exato e a ordem de k
+// e' a mesma, entao o solver e' BIT-EXATO contra o motor (0/4096, max ulp 0,
+// medido em bench-gemm-engine-gpu, M=16..512, N-large e K-large).
+//
+// MEDIDO 16/09 (mesmo binario, A/B intercalado, R=10, burner 300 ms, ruido
+// <= 1,009x; blk.1.ffn_up 5120x17408 e blk.14.ffn_down 17408x5120):
+//   N-large: M16 0,984x / M32 1,137x / M64 1,973x / M128 2,213x (12,10 T-MAC/s
+//     contra 5,47 do GEMV) / M512 2,389x.
+//   K-large: M16 0,655x / M32 0,916x / M64 1,301x / M128 1,813x / M512 2,351x.
+//   M=16 perde (40 CTAs < 64 CUs no K-large, mesmo mecanismo do iq2_s acima)
+//   -- por isso o despacho (abaixo, caso 7) so' aceita n >= 64 e devolve false
+//   abaixo disso (o chamador cai no GEMV em sub-lotes, exato).
+//   vs GEMV em lote: rel-L2 2,4-4,3e-07, max|d| <= 1,2e-05 -- a assinatura dos
+//   IQ de cadeia unica (cobrada em tests/check_batch_gpu.hip).
+//   attrs: BM64 VGPR=163, BM16 VGPR=113, LDS 24576 B, spill 0.
+// Amdahl (2,42 % dos bytes): +1,10..1,34 % no prefill (355,81 -> ~360,6 a 512).
+struct SolverIq2XXS {
+  static constexpr int qk = QK_K;
+  static constexpr int block_bytes = (int)sizeof(block_iq2_xxs);
+  static constexpr bool is_kq = false;
+  static constexpr bool dual_scale = false;  // escala unica por bloco de 32
+  struct Pf {
+    int q0, q1;  // qs[4*sub .. 4*sub+4) como 2 ints (4 uint16)
+    unsigned d;  // d (fp16) do super-bloco
+  };
+  static __device__ __forceinline__ Pf load(const char *blk, const int sub) {
+    const block_iq2_xxs *b = (const block_iq2_xxs *)blk;
+    Pf p;
+    const int *q = (const int *)(const void *)(b->qs + 4 * sub);
+    p.q0 = q[0];
+    p.q1 = q[1];
+    p.d = b->d;
+    return p;
+  }
+  static __device__ __forceinline__ void store(const Pf &p, const int /*sub*/, int *dst, float *dw,
+                                               int *scf) {
+    const unsigned char *aux8 = (const unsigned char *)&p.q0;
+    const unsigned aux32 = (unsigned)p.q1;
+    *dw = fp16_to_float((uint16_t)p.d);
+    *scf = (int)((aux32 >> 27) | 1u);
+#pragma unroll
+    for (int il = 0; il < 4; ++il) {
+      const uint2 grid = ((const uint2 *)iq2xxs_grid)[aux8[il]];
+      const unsigned signs = unpack_ksigns((std::uint8_t)(aux32 >> (7 * il)));
+      const int signs0 = __vcmpne4(signs & 0x08040201u, 0u);
+      const int signs1 = __vcmpne4(signs & 0x80402010u, 0u);
+      dst[2 * il + 0] = __vsub4((int)(grid.x ^ (unsigned)signs0), signs0);
+      dst[2 * il + 1] = __vsub4((int)(grid.y ^ (unsigned)signs1), signs1);
+    }
+  }
+  static __device__ __forceinline__ float corr(const int sumi, const int scf) {
+    return (float)(sumi * scf / 8);
+  }
+  // Sem caminho RAW (mesmo motivo do iq2_s/iq2_xs): so' para o RSTR do kernel.
+  static constexpr int raw_words = 4;
+};
 // ===========================================================================
 // Diferenca estrutural em relacao aos tipos IQ ja' cobertos: o peso do motor
 // NAO e' `d_w * q` com um unico fator inteiro por bloco de 32. Sao tres formas
@@ -1470,6 +1542,21 @@ inline bool gemm_launch(int dt, const void *d_w, const block_q8_1 *d_a, float *d
     RD_GEMM(SolverQ4K, 4, 256)
     RD_GEMM(SolverQ5K, 5, 256)
     RD_GEMM(SolverQ6K, 6, 256)
+    // iq2_xxs (dt 7) com porta T=64 (medido no comentario do solver): o tile
+    // BM16 (n = 17..63) perde do GEMV em lote no K-large (0,655x@16,
+    // 0,916x@32); `false` cai no fallback exato de sub-lotes do chamador
+    // (graph.cuh, proj(): GEMV em sub-lotes de 16). Escrito a mao em vez do
+    // macro porque nenhum outro caso tem porta por n.
+    case 7: {
+      if (ncols % 256 != 0 || ncols % 64 != 0) return false;
+      if (n_tokens < 64) return false;
+      if (bm == 64)
+        return gemm_launch_t<SolverIq2XXS, 64, 128, 64, 4, 8, true, true, 1>(d_w, d_a, d_o, nrows,
+                                                                    ncols, act_stride,
+                                                                    n_tokens, stream);
+      return gemm_launch_t<SolverIq2XXS, 16, 128, 64, 1, 8, true, true, 1>(d_w, d_a, d_o, nrows, ncols,
+                                                                  act_stride, n_tokens, stream);
+    }
     default:
       return false;  // sem kernel: o chamador decide (SPEC 1.3)
   }
@@ -1493,6 +1580,7 @@ inline bool gemm_attrs(int dt, int n_tokens, hipFuncAttributes &attr, int &lds_b
     RD_ATTR(SolverQ4K, 4)
     RD_ATTR(SolverQ5K, 5)
     RD_ATTR(SolverQ6K, 6)
+    RD_ATTR(SolverIq2XXS, 7)
     default:
       return false;
   }

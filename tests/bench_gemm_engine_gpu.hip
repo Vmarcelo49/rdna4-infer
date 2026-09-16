@@ -71,6 +71,10 @@ constexpr int kQ8 = 32;
 constexpr int kIq3S = 12;
 constexpr int kIq3XXS = 9;
 constexpr int kIq4XS = 14;
+constexpr int kIq2XXS = 7;
+constexpr int kQ80 = 1;
+constexpr int kIq1S = 10;
+constexpr int kIq4NL = 11;
 
 // ---------------------------------------------------------------------------
 // 0. Utilitarios de host
@@ -537,6 +541,11 @@ void ref_q6k(const void *w, const block_q8_1 *a, float *c, int M, int N, int K) 
   ref_engine_kernel<rdna4::TQ6K>
       <<<(unsigned)(((std::int64_t)M * N + 127) / 128), 128>>>(w, a, c, M, N, K);
 }
+void ref_iq2xxs(const void *w, const block_q8_1 *a, float *c, int M, int N, int K) {
+  // Gate de producao: TIQ2XXS_S = `_perm2` (o que o matvec em lote usa).
+  ref_engine_kernel<rdna4::TIQ2XXS_S>
+      <<<(unsigned)(((std::int64_t)M * N + 127) / 128), 128>>>(w, a, c, M, N, K);
+}
 
 // ---- k-quants (D2/kq): ref do motor + oraculos de CPU ----------------------
 constexpr int kQ2K = 2, kQ3K = 3, kQ4K = 4, kQ5K = 5, kQ6K = 6;
@@ -557,6 +566,7 @@ const TypeDesc *type_of(const int dt) {
       {"q4_K", kQ4K, ref_q4k, sizeof(rdna4::block_q4_K)},
       {"q5_K", kQ5K, ref_q5k, sizeof(rdna4::block_q5_K)},
       {"q6_K", kQ6K, ref_q6k, sizeof(rdna4::block_q6_K)},
+      {"iq2_xxs", kIq2XXS, ref_iq2xxs, sizeof(rdna4::block_iq2_xxs)},
   };
   for (const TypeDesc &t : kTypes)
     if (t.dt == dt) return &t;
@@ -944,6 +954,311 @@ bool launch_iq3s_coal(const int4 *dWp, const block_q8_1 *dA, float *dC, const in
   return hipGetLastError() == hipSuccess;
 }
 
+// ---------------------------------------------------------------------------
+// IQ2_XXS PROTOTYPE (BENCH-ONLY -- nao entra em gemm.cuh nem no despacho).
+// Segue o precedente SolverIq2XS (gemm.cuh:514): mesma estrutura de cadeia
+// unica (is_kq=false, um fator inteiro por bloco de 32, correcao inteira +
+// fma na ordem do motor), outra grade/tabela: iq2xxs_grid (uint64 x 256) +
+// sinais via unpack_ksigns por grupo de 8 pesos + escala unica no topo.
+//
+// Transcricao termo a termo do `vec_dot_iq2_xxs_q8_1` (vecdotq.cuh:565-595):
+//   sub-bloco s (32 pesos) = qs[4*s .. 4*s+4) (4 uint16 = 8 B):
+//     q0 = bytes 0..3 -> 4 indices de grid (8 pesos cada)
+//     aux32 = bytes 4..7 -> 4 campos de sinal de 7 bits + escala (bits 28..31)
+//   grupo il (8 pesos) = grid aux8[il] (8 magnitudes): x = bytes 0..3,
+//     y = bytes 4..7; sv = aux32>>(7*il) com paridade no bit 7, nibble baixo
+//     assina x, nibble alto assina y (mascaras 0x08040201 / 0x80402010).
+//   correcao: sumi = sumi*ls/8 com ls = (aux32>>27)|1 = scale*2+1 (o bit 27,
+//     topo do 4o campo de sinal, e' absorvido pelo |1: 2*scale e' par).
+// O gate de producao (TIQ2XXS_S) e' o `_perm2`, que recomputa os mesmos
+// inteiros via 2*pos-all -- exato por linearidade inteira (mesmo argumento do
+// cabecalho do iq2_s em gemm.cuh:437 para _perm/_perm2). dp4a inteiro e'
+// exato e a ordem de k e' a mesma, entao o prototipo tem de ser BIT-EXATO
+// contra o motor (0/4096, max ulp 0), como os tipos IQ de cadeia unica.
+// ---------------------------------------------------------------------------
+struct BenchSolverIq2XXS {
+  static constexpr int qk = 256;
+  static constexpr int block_bytes = (int)sizeof(rdna4::block_iq2_xxs);
+  static constexpr bool is_kq = false;
+  static constexpr bool dual_scale = false;
+  struct Pf {
+    int q0, q1;  // qs[4*sub .. 4*sub+4) como 2 ints (4 uint16)
+    unsigned d;  // d (fp16) do super-bloco
+  };
+  static __device__ __forceinline__ Pf load(const char *blk, const int sub) {
+    const rdna4::block_iq2_xxs *b = (const rdna4::block_iq2_xxs *)blk;
+    Pf p;
+    const int *q = (const int *)(const void *)(b->qs + 4 * sub);
+    p.q0 = q[0];
+    p.q1 = q[1];
+    p.d = b->d;
+    return p;
+  }
+  static __device__ __forceinline__ void store(const Pf &p, const int /*sub*/, int *dst, float *dw,
+                                               int *scf) {
+    const unsigned char *aux8 = (const unsigned char *)&p.q0;
+    const unsigned aux32 = (unsigned)p.q1;
+    *dw = rdna4::fp16_to_float((uint16_t)p.d);
+    *scf = (int)((aux32 >> 27) | 1u);
+#pragma unroll
+    for (int il = 0; il < 4; ++il) {
+      const uint2 grid = ((const uint2 *)rdna4::iq2xxs_grid)[aux8[il]];
+      const unsigned signs = rdna4::unpack_ksigns((std::uint8_t)(aux32 >> (7 * il)));
+      const int signs0 = rdna4::__vcmpne4(signs & 0x08040201u, 0u);
+      const int signs1 = rdna4::__vcmpne4(signs & 0x80402010u, 0u);
+      dst[2 * il + 0] = rdna4::__vsub4((int)(grid.x ^ (unsigned)signs0), signs0);
+      dst[2 * il + 1] = rdna4::__vsub4((int)(grid.y ^ (unsigned)signs1), signs1);
+    }
+  }
+  static __device__ __forceinline__ float corr(const int sumi, const int scf) {
+    return (float)(sumi * scf / 8);
+  }
+  // Sem caminho RAW (mesmo motivo do iq2_s/iq2_xs): so' para o RSTR do kernel.
+  static constexpr int raw_words = 4;
+};
+
+// Lancamento do prototipo na MESMA grade da producao (RD_GEMM em gemm.cuh):
+// BM64/RM4/RN8 em M>=64, BM16/RM1/RN8 abaixo.
+bool launch_xxs_proto(const void *dW, const block_q8_1 *dA, float *dC, const std::int64_t N,
+                      const std::int64_t K, const std::int64_t ast, const int M) {
+  // Espelha o RD_GEMM (gemm.cuh): a restricao e' no K (ncols), nao no N
+  // (nrows) -- o kernel prende linhas fora do tile (n = N-1) e guarda as
+  // escritas com n < N, entao Nc=64 do caso pequeno funciona.
+  if (K % 256 != 0 || K % 64 != 0) return false;
+  if (M >= 64)
+    return rdna4::gemm_launch_t<BenchSolverIq2XXS, 64, 128, 64, 4, 8, true, true, 1>(
+        dW, dA, dC, N, K, ast, M, nullptr);
+  return rdna4::gemm_launch_t<BenchSolverIq2XXS, 16, 128, 64, 1, 8, true, true, 1>(
+      dW, dA, dC, N, K, ast, M, nullptr);
+}
+
+// Roteador bench-only: dt=7 vai ao prototipo, o resto ao despacho de producao.
+// (O `--types` continua sondando o `gemm_launch` PURO -- este roteador nao e'
+// usado la.)
+bool bench_gemm_launch(const int dt, const void *dW, const block_q8_1 *dA, float *dC,
+                       const std::int64_t N, const std::int64_t K, const std::int64_t ast,
+                       const int M) {
+  if (dt == kIq2XXS) return launch_xxs_proto(dW, dA, dC, N, K, ast, M);
+  return rdna4::gemm_launch(dt, dW, dA, dC, N, K, ast, M, nullptr);
+}
+
+void print_xxs_proto_attrs() {
+  for (int bm = 64; bm >= 16; bm /= 4) {
+    hipFuncAttributes a{};
+    int lds = 0;
+    const bool ok = (bm == 64)
+                        ? rdna4::gemm_attrs_t<BenchSolverIq2XXS, 64, 128, 64, 4, 8, true, true, 1>(
+                              a, lds)
+                        : rdna4::gemm_attrs_t<BenchSolverIq2XXS, 16, 128, 64, 1, 8, true, true, 1>(
+                              a, lds);
+    char tag[64];
+    std::snprintf(tag, sizeof(tag), "prototipo iq2_xxs (BM%d BN128 BK64)", bm);
+    if (!ok) {
+      std::printf("  %-30s attrs indisponiveis\n", tag);
+      continue;
+    }
+    std::printf("  %-30s VGPR=%3d  LDS=%5d B (pedido %5d B, attr %5zu B)  spill/lane=%d B\n",
+                tag, a.numRegs, lds, lds, (size_t)a.sharedSizeBytes, (int)a.localSizeBytes);
+  }
+}
+
+// Copia a grade iq2xxs do DEVICE para o oraculo de CPU (mesma tabela do kernel).
+__global__ void copy_xxs_grid_kernel(unsigned long long *__restrict__ out) {
+  for (int i = (int)threadIdx.x; i < 256; i += (int)blockDim.x)
+    out[i] = rdna4::iq2xxs_grid[i];
+}
+
+// Deposito do staging do prototipo isolado (mesma funcao que o kernel usa).
+__global__ void dump_stage_xxs_kernel(const char *__restrict__ W, int *__restrict__ out,
+                                      const int nrow, const int bpr, const int nsub) {
+  const int t = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (t >= nsub) return;
+  const int s = t % 8;
+  const char *blk =
+      W + ((std::int64_t)nrow * bpr + (t / 8)) * (std::int64_t)BenchSolverIq2XXS::block_bytes;
+  const BenchSolverIq2XXS::Pf pf = BenchSolverIq2XXS::load(blk, s);
+  int tmp[8];
+  float dw;
+  int scf;
+  BenchSolverIq2XXS::store(pf, s, tmp, &dw, &scf);
+  int *o = out + (std::size_t)t * 10;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) o[i] = tmp[i];
+  o[8] = __float_as_int(dw);
+  o[9] = scf;
+}
+
+// Verificacao (a3): o staging int8 do prototipo contra a algebra do
+// `vec_dot_iq2_xxs_q8_1` em CPU sobre os bytes crus + a grade lida do device.
+// Retorna true se 0/2048 pesos e 0/64 (dw, scf).
+bool check_stage_xxs(const std::vector<std::uint8_t> &w_raw, const void *dW, const std::int64_t K) {
+  const int nsub = 64;  // 8 super-blocos = 2048 pesos da linha 0
+  int *dStage = nullptr;
+  unsigned long long *dGrid = nullptr;
+  if (hipMalloc(&dStage, (std::size_t)nsub * 10 * sizeof(int)) != hipSuccess ||
+      hipMalloc(&dGrid, 256 * sizeof(unsigned long long)) != hipSuccess) {
+    std::printf("  hipMalloc(stage/grid xxs) falhou\n");
+    if (dStage) (void)hipFree(dStage);
+    if (dGrid) (void)hipFree(dGrid);
+    return false;
+  }
+  copy_xxs_grid_kernel<<<1, 128>>>(dGrid);
+  if (!launch_ok("copy_xxs_grid")) {
+    (void)hipFree(dStage);
+    (void)hipFree(dGrid);
+    return false;
+  }
+  dump_stage_xxs_kernel<<<(nsub + 63) / 64, 64>>>((const char *)dW, dStage, 0, (int)(K / 256),
+                                                 nsub);
+  if (!launch_ok("dump_stage_xxs")) {
+    (void)hipFree(dStage);
+    (void)hipFree(dGrid);
+    return false;
+  }
+  (void)hipDeviceSynchronize();
+  std::vector<int> staged((std::size_t)nsub * 10);
+  std::vector<unsigned long long> hgrid(256, 0);
+  (void)hipMemcpy(staged.data(), dStage, staged.size() * sizeof(int), hipMemcpyDeviceToHost);
+  (void)hipMemcpy(hgrid.data(), dGrid, hgrid.size() * sizeof(unsigned long long),
+                  hipMemcpyDeviceToHost);
+  (void)hipFree(dStage);
+  (void)hipFree(dGrid);
+  int bad_w = 0, bad_sc = 0, first_bad = -1;
+  for (int t = 0; t < nsub; ++t) {
+    const int s = t % 8;
+    const unsigned char *blk = w_raw.data() + (std::size_t)(t / 8) * 66;
+    const unsigned char *qb = blk + 2 + 8 * s;
+    unsigned aux32 = 0;
+    std::memcpy(&aux32, qb + 4, 4);
+    for (int il = 0; il < 4; ++il) {
+      const unsigned long long g = hgrid[qb[il]];
+      unsigned sv = (aux32 >> (7 * il)) & 0x7Fu;
+      sv ^= (unsigned)(__builtin_popcount(sv) & 1u) << 7;
+      for (int j = 0; j < 4; ++j) {
+        const int gb_x = (int)((g >> (8 * j)) & 0xFFu);
+        const int gb_y = (int)((g >> (8 * (j + 4))) & 0xFFu);
+        const int want_x = ((sv >> j) & 1u) ? -gb_x : gb_x;
+        const int want_y = ((sv >> (j + 4)) & 1u) ? -gb_y : gb_y;
+        const int got_x = (staged[(std::size_t)t * 10 + 2 * il] >> (8 * j)) & 0xFF;
+        const int got_y = (staged[(std::size_t)t * 10 + 2 * il + 1] >> (8 * j)) & 0xFF;
+        if (got_x != (want_x & 0xFF) || got_y != (want_y & 0xFF)) {
+          ++bad_w;
+          if (first_bad < 0) first_bad = t * 32 + il * 8 + j;
+        }
+      }
+    }
+    const float want_dw = rdna4::fp16_to_float((uint16_t)(blk[0] | (blk[1] << 8)));
+    const int want_scf = (int)((aux32 >> 27) | 1u);
+    if (staged[(std::size_t)t * 10 + 8] != (int)f2u(want_dw) ||
+        staged[(std::size_t)t * 10 + 9] != want_scf)
+      ++bad_sc;
+  }
+  std::printf(
+      "  staging int8 xxs: bytes diferentes %d de 2048%s ; d_w/ls errados %d de 64%s%s\n"
+      "    (2048 pesos da linha 0 contra a algebra do `vec_dot_iq2_xxs_q8_1` em CPU sobre os\n"
+      "     bytes crus + a grade lida do device)\n",
+      bad_w, bad_w ? "" : " (ok)", bad_sc, bad_sc ? "" : " (ok)",
+      first_bad >= 0 ? "  <-- PRIMEIRO BYTE ERRADO" : "");
+  if (bad_w || bad_sc) {
+    std::printf("  REPROVADO: o staging do prototipo nao reproduz a algebra do motor\n");
+    return false;
+  }
+  return true;
+}
+
+// Sonda GEMV-only (tipos sem solver: q8_0, iq1_s, iq4_nl): batched-GEMV em
+// M=128, sub-lote 64, warmup >= 300 ms, melhor+media de R>=10, piso de ruido.
+// Reporta T-MAC/s e GB/s de PESO (M x bytes-da-matriz / tempo).
+void run_gemv_only_probe(const char *name, const int dt, const void *dW, const block_q8_1 *dAQ,
+                         float *dC2, const std::int64_t N, const std::int64_t K,
+                         const std::int64_t ast, const std::uint64_t wbytes, const int reps) {
+  const int M = 128;
+  std::printf("  -- sonda GEMV-only %s (sem solver: so' matvec em lote) --\n", name);
+  bool warned = false;
+  auto fn = [&] { gemv_batch(dt, dW, dAQ, dC2, N, K, ast, M, 64, false); };
+  fn();
+  (void)hipDeviceSynchronize();
+  if (!launch_ok("gemv_only (warmup)")) return;
+  EvPair ev;
+  double warm = 0;
+  for (int i = 0; i < 20000 && warm < 300.0; ++i) warm += ev(fn);
+  if (!launch_ok("gemv_only (burner)")) {
+    (void)warned;
+    return;
+  }
+  const int R = std::max(reps, 10);
+  double best = 1e9, sum = 0;
+  for (int r = 0; r < R; ++r) {
+    const double t = ev(fn);
+    best = std::min(best, t);
+    sum += t;
+  }
+  if (!launch_ok("gemv_only (time)")) return;
+  const double mean = sum / R;
+  const double macs = (double)M * (double)N * (double)K;
+  const double tmac = macs / (best * 1e-3) / 1e12;
+  const double gbs = ((double)M * (double)wbytes) / (best * 1e-3) / 1e9;
+  std::printf(
+      "  M=%d N=%lld K=%lld: GEMV64 %.3f ms (melhor de %d) / %.3f ms (media) -> %.2f T-MAC/s ;\n"
+      "    trafego de peso %.2f GB/s (M x %.3f MB / tempo; pico do cartao ~633)\n",
+      M, (long long)N, (long long)K, best, R, mean, tmac, gbs, (double)wbytes / 1e6);
+}
+
+// Veredito iq2_xxs: A/B intercalado prototipo vs GEMV64 em cada M, com burner
+// de DPM >= 300 ms, melhor+media de R>=10 e piso proto-vs-proto. A porta de
+// entrada (bit-exatidao 0/4096 vs o vec_dot de producao) ja' saiu no gate (c)
+// do fluxo generico, que para dt=7 usa o prototipo via bench_gemm_launch.
+void run_xxs_verdict(const std::vector<int> &ms_list, const int reps, const int dt, const void *dW,
+                     const block_q8_1 *dAQ, float *dC, float *dC2, const std::int64_t N,
+                     const std::int64_t K, const std::int64_t ast) {
+  std::printf("\n  -- VEREDITO iq2_xxs: prototipo vs GEMV em lote (A/B intercalado) --\n");
+  print_xxs_proto_attrs();
+  const double macs_per = (double)N * (double)K;
+  for (std::size_t mi = 0; mi < ms_list.size(); ++mi) {
+    const int M = ms_list[mi];
+    const double macs = macs_per * (double)M;
+    bool warned = false;
+    auto fn_p = [&] {
+      if (!launch_xxs_proto(dW, dAQ, dC, N, K, ast, M) && !warned) {
+        warned = true;
+        std::printf("  prototipo(M=%d) retornou false\n", M);
+      }
+    };
+    auto fn_g = [&] { gemv_batch(dt, dW, dAQ, dC2, N, K, ast, M, 64, false); };
+    EvPair ev;
+    double burner = 0;
+    for (int i = 0; i < 20000 && burner < 300.0; ++i) burner += ev(fn_p);
+    if (!launch_ok("xxs_verdict burner")) continue;
+    const int R = std::max(reps, 10);
+    double best_p = 1e9, best_g = 1e9, sum_p = 0, sum_g = 0;
+    for (int r = 0; r < R; ++r) {
+      const double tp = ev(fn_p);
+      const double tg = ev(fn_g);
+      best_p = std::min(best_p, tp);
+      best_g = std::min(best_g, tg);
+      sum_p += tp;
+      sum_g += tg;
+    }
+    if (!launch_ok("xxs_verdict A/B")) continue;
+    double best_1 = 1e9, best_2 = 1e9;
+    for (int r = 0; r < R; ++r) {
+      const double t1 = ev(fn_p);
+      const double t2 = ev(fn_p);
+      best_1 = std::min(best_1, t1);
+      best_2 = std::min(best_2, t2);
+    }
+    const double rp = macs / (best_p * 1e-3) / 1e12;
+    const double rg = macs / (best_g * 1e-3) / 1e12;
+    std::printf(
+        "  M=%-4d proto %.3f ms (%.2f T-MAC/s, media %.3f) vs GEMV64 %.3f ms (%.2f T-MAC/s, "
+        "media %.3f)\n"
+        "         -> %.3fx (melhor) / %.3fx (media) ; piso proto-vs-proto %.3fx (R=%d, burner "
+        "%.0f ms)\n",
+        M, best_p, rp, sum_p / R, best_g, rg, sum_g / R, best_g / std::max(best_p, 1e-9),
+        (sum_g / R) / std::max(sum_p / R, 1e-9), best_2 / std::max(best_1, 1e-9), R, burner);
+  }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -1129,12 +1444,24 @@ int main(int argc, char **argv) {
         info.name.c_str(), (long long)K, (long long)N, type_name(dt), dt,
         (double)ld.tensor_bytes(ti) / 1e6,
         (double)ld.tensor_bytes(ti) / ((double)N * (double)K));
-    if (!td) {
+    // Sonda GEMV-only (bench-only): q8_0/iq1_s/iq4_nl nao tem solver; o fluxo
+    // mede o GEMV em lote em M=128 no mesmo binario. O qk deles difere (32 em
+    // q8_0 e iq4_nl), entao `want` usa o qk/bloco do proprio tipo.
+    const int bb_nosolv = (dt == kQ80)     ? (int)sizeof(rdna4::block_q8_0)
+                          : (dt == kIq1S)  ? (int)sizeof(rdna4::block_iq1_s)
+                          : (dt == kIq4NL) ? (int)sizeof(rdna4::block_iq4_nl)
+                                           : 0;
+    const int qk_dt = (dt == kQ80 || dt == kIq4NL) ? 32 : kQK;
+    if (!td && bb_nosolv == 0) {
       std::printf("  tipo nao coberto pelo gemm_launch -- pulado\n");
       continue;
     }
-    if (N % 128 != 0 || K % kQK != 0) {
+    if (td && (N % 128 != 0 || K % kQK != 0)) {
       std::printf("  N tem de ser multiplo de 128 e K de 256 -- pulado\n");
+      continue;
+    }
+    if (!td && (K % qk_dt != 0)) {
+      std::printf("  K tem de ser multiplo de %d (sonda GEMV-only) -- pulado\n", qk_dt);
       continue;
     }
     // Overrides de FORMA (a sonda de quantizacao de onda da frente G: `--n 16384`
@@ -1147,7 +1474,8 @@ int main(int argc, char **argv) {
       std::printf("  FORMA REDUZIDA: N=%lld K=%lld (a ativacao continua com stride %lld)\n",
                   (long long)Nr, (long long)Kr, (long long)act_full);
 
-    const std::uint64_t want = (std::uint64_t)N * (std::uint64_t)(K / kQK) * td->block_bytes;
+    const std::size_t bb_dt = td ? td->block_bytes : (std::size_t)bb_nosolv;
+    const std::uint64_t want = (std::uint64_t)N * (std::uint64_t)(K / qk_dt) * bb_dt;
     std::vector<std::uint8_t> w_raw;
     if (!ld.load_tensor_range(ti, 0, want, w_raw, err)) {
       std::printf("  load_tensor_range: %s\n", err.c_str());
@@ -1182,8 +1510,22 @@ int main(int argc, char **argv) {
     hAQ = (block_q8_1 *)std::malloc(nact * sizeof(block_q8_1));
     (void)hipMemcpy(hAQ, dAQ, nact * sizeof(block_q8_1), hipMemcpyDeviceToHost);
 
+    // Tipos sem solver: so' a sonda GEMV-only (M=128), sem verify/speed de GEMM.
+    if (!td) {
+      run_gemv_only_probe(info.name.c_str(), dt, dW, dAQ, dC2, N, K, act_full,
+                          ld.tensor_bytes(ti), reps);
+      std::free(hAQ);
+      (void)hipFree(dW);
+      (void)hipFree(dAf);
+      (void)hipFree(dAQ);
+      (void)hipFree(dC);
+      (void)hipFree(dC2);
+      continue;
+    }
+
     std::printf("  atributos (config que `gemm_launch` escolhe em M=128):\n");
     print_attrs("producao (BM64 BN128 BK64 RM4 RN8)", dt, false, 0);
+    if (dt == kIq2XXS) print_xxs_proto_attrs();
 
     // ---------------------------------------------------------------------
     // 2. VERIFICACAO (antes de qualquer cronometragem)
@@ -1306,12 +1648,20 @@ int main(int argc, char **argv) {
         }
       }
 
+      // (a3) staging do prototipo iq2_xxs (bench-only): int8 + (dw, ls) contra
+      // a algebra do vec_dot em CPU. O gate real (0/4096 vs o vec_dot de
+      // producao `_perm2`) sai em (c), que para dt=7 usa o prototipo via
+      // bench_gemm_launch.
+      if (dt == kIq2XXS) {
+        if (!check_stage_xxs(w_raw, dW, K)) continue;
+      }
+
       // (b) caso pequeno: nao-finitos, zeros, e oraculo de CPU (iq3_s)
       {
         const int Mc = 4, Nc = 64;
         std::vector<float> got((std::size_t)Mc * (std::size_t)Nc, 0.f);
         (void)hipMemset(dC, 0, (std::size_t)Mc * (std::size_t)Nc * sizeof(float));
-        if (!rdna4::gemm_launch(dt, dW, dAQ, dC, Nc, K, K / kQ8, Mc, nullptr) ||
+        if (!bench_gemm_launch(dt, dW, dAQ, dC, Nc, K, K / kQ8, Mc) ||
             !launch_ok("gemm_launch (caso pequeno)")) {
           std::printf("  gemm_launch(M=%d) falhou\n", Mc);
           continue;
@@ -1399,7 +1749,7 @@ int main(int argc, char **argv) {
         td->ref((const void *)dW, dAQ, dC2, Me, Ne, (int)K);
         if (!launch_ok("ref_engine_kernel")) continue;
         (void)hipMemset(dC, 0, (std::size_t)Me * (std::size_t)Ne * sizeof(float));
-        if (!rdna4::gemm_launch(dt, dW, dAQ, dC, Ne, K, K / kQ8, Me, nullptr) ||
+        if (!bench_gemm_launch(dt, dW, dAQ, dC, Ne, K, K / kQ8, Me) ||
             !launch_ok("gemm_launch (ref)")) {
           continue;
         }
@@ -1436,7 +1786,7 @@ int main(int argc, char **argv) {
       const std::size_t mid = ms_list.size() > 2 ? 2 : ms_list.size() - 1;
       bool warned = false;
       auto fn_gemm = [&] {
-        if (!rdna4::gemm_launch(dt, dW, dAQ, dC, Nr, Kr, act_full, M, nullptr) && !warned) {
+        if (!bench_gemm_launch(dt, dW, dAQ, dC, Nr, Kr, act_full, M) && !warned) {
           warned = true;
           std::printf("  gemm_launch(M=%d) retornou false\n", M);
         }
@@ -1464,7 +1814,7 @@ int main(int argc, char **argv) {
                   t64.ms, r64, t16.ms, r16, tf / std::max(r64, 1e-9), tf / std::max(r16, 1e-9));
 
       // ---- corretude contra o GEMV que embarca, nas MESMAS entradas -------
-      if (!rdna4::gemm_launch(dt, dW, dAQ, dC, Nr, Kr, act_full, M, nullptr) ||
+      if (!bench_gemm_launch(dt, dW, dAQ, dC, Nr, Kr, act_full, M) ||
           !launch_ok("gemm_launch (diff)")) {
         continue;
       }
@@ -1491,6 +1841,11 @@ int main(int argc, char **argv) {
         "  piso de ruido (a MESMA medicao do GEMM duas vezes, M=%.0f): %.3f ms e %.3f ms -> "
         "%.3fx\n",
         noise_m, noise_a, noise_b, noise_b / std::max(noise_a, 1e-9));
+
+    // ---- VEREDITO iq2_xxs (prototipo bench-only, A/B intercalado) -----------
+    if (dt == kIq2XXS && Nr == N && Kr == K) {
+      run_xxs_verdict(ms_list, reps, dt, dW, dAQ, dC, dC2, N, K, act_full);
+    }
 
     // ---- R1 prototipo coalescido (BENCH-ONLY, iq3_s) ------------------------
     // Regra pre-registrada: PASS = staging+consume prototipo >= 1,3x o tempo do
