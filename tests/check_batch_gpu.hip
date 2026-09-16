@@ -411,7 +411,8 @@ int main(int argc, char **argv) {
   // pelo cap atual em vez de um 1216 fixo -- senao cada aumento de default
   // quebra este gate com "positions exceed the allocated context".
   // (`g.batch_cap()` so existe depois do init; aqui usa-se a fonte unica.)
-  const int ctx_long = 1088 + rdna4::prefill_chunk_cap();
+  // O caso FA2 (abaixo, pos 3584) precisa de 4096.
+  const int ctx_long = 3584 + rdna4::prefill_chunk_cap();
   const int ctx_used = ctx > ctx_long ? ctx : ctx_long;
   rdna4::Graph g(loader, cfg);
   // Um unico Graph para todos os pares: os pesos sobem uma vez no primeiro
@@ -752,6 +753,11 @@ int main(int argc, char **argv) {
   // BATCH_QUICK=1: o caso com n=cap (128 passos seriais de tronco) e' o mais
   // pesado e o n=16 acima ja' cobre o caminho de decode em contexto longo.
   if (cap > 16 && !quick) long_ctx_case(cap, 1088);
+  // FA2 (H5): n=512 a pos 3584 (4096 chaves) exercita o tile FA2 admitido
+  // (f16, n==512, keys 2048..8192) contra a referencia por token, sob a
+  // tolerancia declarada. So' no par default f16/f16 os outros pares usam
+  // o incumbente por admissao -- o caso continua valido (compara iguais).
+  if (cap >= 512 && !quick) long_ctx_case(512, 3584);
   if (cap > 16 && quick) {
     std::printf("(BATCH_QUICK=1: caso longo com n=cap=%d pulado; mantido n=16)\n", cap);
   }

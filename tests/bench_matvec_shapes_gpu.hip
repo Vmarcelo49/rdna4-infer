@@ -1102,6 +1102,35 @@ int main(int argc, char **argv) {
                   slope / (elems / 1e12));
     }
 
+    // H4 triage probe (bench-only): ABSOLUTE N=16 pass time per dtype, best of
+    // reps. The marginal slope above drops the intercept (shared weight pass +
+    // launch floor); attributing fallback GEMV time inside a 512-chunk needs
+    // the absolute: each fallback tensor runs 32x N=16 sub-batches per chunk,
+    // so its per-token cost = abs16/16.
+    std::printf("\nper-type absolute N=16 pass (best of %d, ms per pass):\n", reps);
+    std::printf("%-10s %7s %12s %12s\n", "type", "tensors", "abs16_ms", "per_tok_us");
+    double abs16_tot = 0.0;
+    for (int dt = 1; dt <= 14; ++dt) {
+      std::vector<const Tensor *> asub;
+      for (const Tensor &t : sel)
+        if (t.dt == dt) asub.push_back(&t);
+      if (asub.empty()) continue;
+      auto apass = [&] {
+        return ev([&] {
+          for (const Tensor *t2 : asub)
+            (void)rdna4::matvec_launch_batch(t2->dt, t2->d_w, d_ab, d_yb, t2->nrows, t2->ncols,
+                                             t2->bpr, 16, nullptr);
+        });
+      };
+      (void)apass();
+      double best = 1e9;
+      for (int r = 0; r < reps; ++r) best = std::min(best, apass());
+      abs16_tot += best;
+      std::printf("%-10s %7zu %12.3f %12.1f\n", dt_name(dt), asub.size(), best,
+                  best * 1000.0 / 16.0);
+    }
+    std::printf("%-10s %7s %12.3f %12.1f\n", "TOTAL", "", abs16_tot, abs16_tot * 1000.0 / 16.0);
+
     // Register/local/shared usage per (type, N): the cheap way to rule out "the
     // batched kernel spills to scratch" before blaming traffic.
     std::printf("\nbatch kernel resources (hipFuncGetAttributes): type  N  regs  local  smem  threads\n");

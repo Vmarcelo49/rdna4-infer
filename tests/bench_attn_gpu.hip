@@ -456,6 +456,568 @@ bool launch_gqa_rowtile(const float *q, const void *k, const void *v, float *out
   return hipGetLastError() == hipSuccess;
 }
 
+// Forward declaration: defined below (after the rowtile prototype); used by
+// the H5 harness for the FA2 resource report.
+template <typename F>
+void report_resources(const char *name, F *fn);
+
+// ---------------------------------------------------------------------------
+// H5 (docs/plano-hipfire-gfx1201.md H5): FA2-style fused GQA prefill tile
+// (bench-only prototype: lives in this file, never in include/).
+//
+// ONE CTA per (KV-head x query-tile of QT=8 positions) = 48 rows (8 pos x 6
+// q-heads, the doc's adapted design). Each KTT key tile is dequantized ONCE
+// into LDS f16 (K and V side by side: 2*KTT*256 halves) and shared across all
+// 48 rows; online softmax in fp32 registers; causal skip by block (keys
+// ascend, so a per-warp `break`; __syncthreads only at tile boundaries, which
+// every warp reaches, so the early break cannot deadlock); Q re-read from
+// global once per CTA into registers (no persistence in v1); fp32
+// accumulators; NO WMMA (H5 scope); decode paths untouched.
+//
+// Arithmetic per (query, head, key) is the same statements in the same order
+// as attn_batch_kernel (fmaf chain 0..7, same shuffle tree, same expf online
+// update), so vs the UNSPLIT batch kernel the only difference is the
+// warp-slice merge (production merges 8 key slices with max-subtraction;
+// here one warp streams all keys: no merge). Vs the SPLIT batch kernel the
+// split summation order differs too. Either way the gate is NUMERIC
+// (rel-L2 <= 1e-6), never bit-exact.
+// ---------------------------------------------------------------------------
+template <rdna4::KvType KT, rdna4::KvType VT, int KTT, int HP, bool F32L, int QT>
+__global__ void attn_fa2_prefill_kernel(const float *__restrict__ q, const void *__restrict__ k,
+                                        const void *__restrict__ v, float *__restrict__ out,
+                                        const int *__restrict__ pos, int n_head, int n_head_kv,
+                                        int head_dim, float dscale, int n_q, int kmax,
+                                        int keys_total) {
+  extern __shared__ uint4 lds4[];  // [2*KTT][256] halves: K tile, then V tile
+  const int kvh = blockIdx.x;
+  const int qt = blockIdx.y;
+  const int w = threadIdx.x >> 5;  // query slot 0..7 inside the tile
+  const int lane = threadIdx.x & 31;
+  const int tid = threadIdx.x;
+  const int grp = n_head / n_head_kv;
+  if (head_dim != 256 || grp != 6) return;  // prototype: this model's shape only
+  constexpr int DPW = 8;
+  const int qq = qt * QT + w;
+  const bool active = (qq < n_q);
+  const int mypos = active ? pos[qq] : -1;
+
+  const std::uint64_t krowb = rdna4::kv_row_bytes(KT, head_dim);
+  const std::uint64_t vrowb = rdna4::kv_row_bytes(VT, head_dim);
+  const int ntiles = (kmax + 1 + KTT - 1) / KTT;
+  const int vbase4 = KTT * 32;  // uint4 offset of the V tile (= KTT*256 halves)
+
+  const int npass = (grp + HP - 1) / HP;
+  for (int c = 0; c < npass; ++c) {
+    const int hh0 = c * HP;
+    int nh = grp - hh0;
+    if (nh > HP) nh = HP;
+    float qv[HP][8];
+    float acc[HP][8];
+    float m[HP], l[HP];
+    if (active) {
+      for (int hh = 0; hh < nh; ++hh) {
+        const float *qp = q + ((std::int64_t)qq * n_head + kvh * grp + hh0 + hh) * head_dim;
+        for (int i = 0; i < DPW; ++i) {
+          qv[hh][i] = qp[lane * DPW + i];
+          acc[hh][i] = 0.0f;
+        }
+        m[hh] = -INFINITY;
+        l[hh] = 0.0f;
+      }
+    }
+    for (int tl = 0; tl < ntiles; ++tl) {
+      const int j0 = tl * KTT;
+      int nload = keys_total - j0;
+      if (nload > KTT) nload = KTT;
+      // -- coop K tile: one uint4 (8 dims) per thread per iter; a warp covers
+      // one full row contiguously, all 8 warps cover 8 distinct rows.
+      // F32L=false (f16 KV): bit-copy halves K<->LDS (exact roundtrip).
+      // F32L=true (quantized KV): dequantize once to fp32 in LDS, so the inner
+      // loop sees the same fp32 bits as the per-use production dequant. --
+      // Coop stride is the CTA width (QT*32 threads).
+      for (int cc = tid; cc < nload * 32; cc += QT * 32) {
+        const int j = cc / 32;
+        const int l32 = cc % 32;
+        const char *row = (const char *)k + ((std::int64_t)(j0 + j) * n_head_kv + kvh) * krowb;
+        if constexpr (!F32L) {
+          lds4[j * 32 + l32] = ((const uint4 *)row)[l32];
+        } else {
+          float tmp[8];
+          rdna4::kv_load8<KT>(row, l32, tmp);
+          float *dst = (float *)lds4 + j * 256 + l32 * 8;
+          for (int i = 0; i < 8; ++i) dst[i] = tmp[i];
+        }
+      }
+      // -- coop V tile (same mapping, second half of LDS) --
+      for (int cc = tid; cc < nload * 32; cc += QT * 32) {
+        const int j = cc / 32;
+        const int l32 = cc % 32;
+        const char *row = (const char *)v + ((std::int64_t)(j0 + j) * n_head_kv + kvh) * vrowb;
+        if constexpr (!F32L) {
+          lds4[vbase4 + j * 32 + l32] = ((const uint4 *)row)[l32];
+        } else {
+          float tmp[8];
+          rdna4::kv_load8<VT>(row, l32, tmp);
+          float *dst = (float *)lds4 + (std::size_t)vbase4 * 8 + j * 256 + l32 * 8;
+          for (int i = 0; i < 8; ++i) dst[i] = tmp[i];
+        }
+      }
+      __syncthreads();
+      if (active) {
+        for (int j = 0; j < KTT; ++j) {
+          const int jk = j0 + j;
+          if (jk > mypos) break;  // causal: keys ascend, later tiles skipped the
+                                  // same way; syncs are outside this loop
+          float kk[8], vv[8];
+          if constexpr (!F32L) {
+            const uint4 ku = lds4[j * 32 + lane];
+            const uint4 vu = lds4[vbase4 + j * 32 + lane];
+            const std::uint16_t kh[8] = {
+                (std::uint16_t)(ku.x & 0xFFFF), (std::uint16_t)(ku.x >> 16),
+                (std::uint16_t)(ku.y & 0xFFFF), (std::uint16_t)(ku.y >> 16),
+                (std::uint16_t)(ku.z & 0xFFFF), (std::uint16_t)(ku.z >> 16),
+                (std::uint16_t)(ku.w & 0xFFFF), (std::uint16_t)(ku.w >> 16)};
+            const std::uint16_t vh[8] = {
+                (std::uint16_t)(vu.x & 0xFFFF), (std::uint16_t)(vu.x >> 16),
+                (std::uint16_t)(vu.y & 0xFFFF), (std::uint16_t)(vu.y >> 16),
+                (std::uint16_t)(vu.z & 0xFFFF), (std::uint16_t)(vu.z >> 16),
+                (std::uint16_t)(vu.w & 0xFFFF), (std::uint16_t)(vu.w >> 16)};
+            for (int i = 0; i < 8; ++i) {
+              kk[i] = rdna4::fp16_to_float(kh[i]);
+              vv[i] = rdna4::fp16_to_float(vh[i]);
+            }
+          } else {
+            const float *Lkf = (const float *)lds4;
+            const float *Lvf = Lkf + (std::size_t)vbase4 * 8;
+            for (int i = 0; i < 8; ++i) {
+              kk[i] = Lkf[j * 256 + lane * 8 + i];
+              vv[i] = Lvf[j * 256 + lane * 8 + i];
+            }
+          }
+          for (int hh = 0; hh < nh; ++hh) {
+            float dot = 0.0f;
+            for (int i = 0; i < DPW; ++i) dot = fmaf(qv[hh][i], kk[i], dot);
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+              dot += __shfl_xor_sync(0xffffffffull, dot, off);
+            const float score = dot * dscale;
+            if (score > m[hh]) {
+              const float corr = (m[hh] == -INFINITY) ? 0.0f : expf(m[hh] - score);
+              l[hh] *= corr;
+              for (int i = 0; i < DPW; ++i) acc[hh][i] *= corr;
+              m[hh] = score;
+            }
+            const float p = (m[hh] == -INFINITY) ? 0.0f : expf(score - m[hh]);
+            l[hh] += p;
+            for (int i = 0; i < DPW; ++i) acc[hh][i] = fmaf(p, vv[i], acc[hh][i]);
+          }
+        }
+      }
+      __syncthreads();
+    }
+    if (active) {
+      for (int hh = 0; hh < nh; ++hh) {
+        const float inv = (l[hh] > 0.0f) ? 1.0f / l[hh] : 0.0f;
+        float *op = out + ((std::int64_t)qq * n_head + kvh * grp + hh0 + hh) * head_dim;
+        for (int i = 0; i < DPW; ++i) op[lane * DPW + i] = acc[hh][i] * inv;
+      }
+    }
+  }
+}
+
+template <rdna4::KvType KT, rdna4::KvType VT, int KTT, bool F32L, int QT>
+bool launch_fa2_prefill_ktt(const float *q, const void *k, const void *v, float *out,
+                             const int *pos, int n_q, int kmax, int keys_total, int n_head,
+                             int n_head_kv, int head_dim, float scale, hipStream_t stream) {
+  if (head_dim != 256 || n_head / n_head_kv != 6 || n_q < 1 || kmax < 0) return false;
+  dim3 grid((unsigned)n_head_kv, (unsigned)((n_q + QT - 1) / QT));
+  const std::size_t smem =
+      (std::size_t)2 * KTT * 256 * (F32L ? sizeof(float) : sizeof(std::uint16_t));
+  attn_fa2_prefill_kernel<KT, VT, KTT, 6, F32L, QT>
+      <<<grid, (unsigned)QT * 32, smem, stream>>>(q, k, v, out, pos, n_head, n_head_kv, head_dim,
+                                                 scale, n_q, kmax, keys_total);
+  return hipGetLastError() == hipSuccess;
+}
+
+// KTT probe result, decided once per process by a dry launch (64 KiB dynamic
+// LDS may exceed the per-workgroup budget; 32 KiB always fits). Only the f16
+// path varies KTT; the q8_0 path always runs fp32-LDS KT32 (same 64 KiB).
+// g_fa2_qt selects the query-tile width (FA2_QT=16 doubles the warps/CTA).
+static int g_fa2_ktt = 0;
+static int g_fa2_qt = 8;
+
+template <rdna4::KvType KT, rdna4::KvType VT>
+bool launch_fa2_prefill(const float *q, const void *k, const void *v, float *out, const int *pos,
+                        int n_q, int kmax, int keys_total, int n_head, int n_head_kv, int head_dim,
+                        float scale, hipStream_t stream) {
+  const bool qt16 = (g_fa2_qt == 16);
+  if constexpr (KT == rdna4::KvType::F16) {
+    if (g_fa2_ktt == 64)
+      return qt16 ? launch_fa2_prefill_ktt<KT, VT, 64, false, 16>(q, k, v, out, pos, n_q, kmax,
+                                                                 keys_total, n_head, n_head_kv,
+                                                                 head_dim, scale, stream)
+                  : launch_fa2_prefill_ktt<KT, VT, 64, false, 8>(q, k, v, out, pos, n_q, kmax,
+                                                                keys_total, n_head, n_head_kv,
+                                                                head_dim, scale, stream);
+    if (g_fa2_ktt == 16)
+      return launch_fa2_prefill_ktt<KT, VT, 16, false, 8>(q, k, v, out, pos, n_q, kmax, keys_total,
+                                                         n_head, n_head_kv, head_dim, scale,
+                                                         stream);
+    return qt16 ? launch_fa2_prefill_ktt<KT, VT, 32, false, 16>(q, k, v, out, pos, n_q, kmax,
+                                                               keys_total, n_head, n_head_kv,
+                                                               head_dim, scale, stream)
+                : launch_fa2_prefill_ktt<KT, VT, 32, false, 8>(q, k, v, out, pos, n_q, kmax,
+                                                              keys_total, n_head, n_head_kv,
+                                                              head_dim, scale, stream);
+  } else {
+    return launch_fa2_prefill_ktt<KT, VT, 32, true, 8>(q, k, v, out, pos, n_q, kmax, keys_total,
+                                                      n_head, n_head_kv, head_dim, scale, stream);
+  }
+}
+
+inline bool launch_fa2_prefill_dyn(rdna4::KvType kt, const float *q, const void *k, const void *v,
+                                   float *out, const int *pos, int n_q, int kmax, int keys_total,
+                                   int n_head, int n_head_kv, int head_dim, float scale,
+                                   hipStream_t stream) {
+  // Scope is f16 first, then q8_0: only the diagonal pairs are instantiated.
+  if (kt == rdna4::KvType::F16)
+    return launch_fa2_prefill<rdna4::KvType::F16, rdna4::KvType::F16>(
+        q, k, v, out, pos, n_q, kmax, keys_total, n_head, n_head_kv, head_dim, scale, stream);
+  if (kt == rdna4::KvType::Q8_0)
+    return launch_fa2_prefill<rdna4::KvType::Q8_0, rdna4::KvType::Q8_0>(
+        q, k, v, out, pos, n_q, kmax, keys_total, n_head, n_head_kv, head_dim, scale, stream);
+  return false;
+}
+
+// Production split-count mirror for the prefill shapes (graph.cuh
+// attn_splits_for: dense KV (no dequant) runs the fixed N-POL CTA target,
+// quantized KV runs keys/kAttnSplitMin, both capped at kAttnMaxSplits).
+static int fa2_policy_splits(rdna4::KvType kt, int keys) {
+  if (keys < rdna4::tuned::kAttnSplitMin) return 1;
+  const bool dense = (kt == rdna4::KvType::F16 || kt == rdna4::KvType::F32);
+  int sp = dense ? (rdna4::tuned::kAttnSplitCtasDense + kHeads - 1) / kHeads
+                 : keys / rdna4::tuned::kAttnSplitMin;
+  if (sp < 1) sp = 1;
+  if (sp > rdna4::tuned::kAttnMaxSplits) sp = rdna4::tuned::kAttnMaxSplits;
+  return sp;
+}
+
+// One production prefill-chunk launch (the incumbent the FA2 tile is judged
+// against): unsplit batch below kAttnSplitMin, split batch above, same WPB
+// policy as production.
+static bool fa2_run_ref(const float *d_q, const void *d_k, const void *d_v, float *d_out,
+                        float *d_partial, const int *d_pos, int n_q, int keys, rdna4::KvType kt,
+                        hipStream_t stream = nullptr) {
+  const int sp = fa2_policy_splits(kt, keys);
+  if (sp <= 1)
+    return rdna4::attn_batch_launch(d_q, d_k, d_v, d_out, d_pos, n_q, kHeads, kHeadsKv, kHeadDim,
+                                    kScale, kt, kt, stream);
+  return rdna4::attn_split_batch_launch(d_q, d_k, d_v, d_out, d_partial, d_pos, n_q, kHeads,
+                                        kHeadsKv, kHeadDim, kScale, kt, kt, sp, stream);
+}
+
+// Probe the exact instantiation this kt will run: f16 tries KT64 first (64 KiB
+// dynamic LDS may exceed the per-workgroup budget) and falls back to KT32;
+// q8_0 runs the fp32-LDS KT32 path (same 64 KiB). Dry-launches on the real
+// buffers (T=8, first 8 keys, which the caller filled).
+static bool fa2_probe_path(rdna4::KvType kt, const float *d_q, const void *d_k, const void *d_v,
+                           float *d_o, const int *d_pos) {
+  // Bench override: FA2_KTT=32 forces the small-tile path (32 KiB LDS/CTA ->
+  // 2 CTAs/CU) to test the latency-hiding hypothesis without recompiling.
+  // FA2_KTT=16 goes further (16 KiB -> up to 4 CTAs/CU, 2x the tile overhead).
+  const char *env = std::getenv("FA2_KTT");
+  const int force = env ? std::atoi(env) : 0;
+  const bool force32 = (force == 32);
+  const bool force16 = (force == 16);
+  const char *envq = std::getenv("FA2_QT");
+  g_fa2_qt = (envq && std::atoi(envq) == 16) ? 16 : 8;
+  if (force16) {
+    g_fa2_ktt = 16;
+    if (!launch_fa2_prefill_ktt<rdna4::KvType::F16, rdna4::KvType::F16, 16, false, 8>(
+            d_q, d_k, d_v, d_o, d_pos, 8, 7, 8, kHeads, kHeadsKv, kHeadDim, kScale, nullptr))
+      return false;
+    hipDeviceSynchronize();
+    if (hipGetLastError() != hipSuccess) {
+      (void)hipGetLastError();
+      return false;
+    }
+    return true;
+  }
+  if (kt == rdna4::KvType::F16 && !force32) {
+    (void)launch_fa2_prefill_ktt<rdna4::KvType::F16, rdna4::KvType::F16, 64, false, 8>(
+        d_q, d_k, d_v, d_o, d_pos, 8, 7, 8, kHeads, kHeadsKv, kHeadDim, kScale, nullptr);
+    hipDeviceSynchronize();
+    if (hipGetLastError() == hipSuccess) {
+      g_fa2_ktt = 64;
+      return true;
+    }
+    (void)hipGetLastError();  // clear the probe error
+    g_fa2_ktt = 32;
+  } else {
+    g_fa2_ktt = 32;  // reporting tag only; q8_0 always runs fp32-LDS KT32
+  }
+  if (!launch_fa2_prefill_dyn(kt, d_q, d_k, d_v, d_o, d_pos, 8, 7, 8, kHeads, kHeadsKv, kHeadDim,
+                              kScale, nullptr))
+    return false;
+  hipDeviceSynchronize();
+  if (hipGetLastError() != hipSuccess) {
+    (void)hipGetLastError();
+    return false;
+  }
+  return true;
+}
+
+// H5 correctness: FA2 tile vs the production batch path on identical inputs.
+// Exact memcmp first (expect divergence: order changes), then the NUMERIC
+// gate: rel-L2 <= 1e-6 + max|d| + greedy-identity proxy (per-(query,head)
+// argmax-dim agreement: the position of the max element must match, i.e. no
+// element-wise flip anywhere). Fixed seeds => fixed short prompt case.
+static int run_fa2_correct(rdna4::KvType kt, const char *tname) {
+  struct Shape {
+    int T, K;
+  };
+  const Shape shapes[] = {{16, 100}, {32, 600}, {128, 2048}};
+  constexpr int kMaxT = 128, kMaxK = 2048;
+  std::printf("H5 FA2-prefill correctness vs production batch path (kv=%s, KTT probe first)\n",
+              tname);
+  float *d_q = nullptr, *d_o1 = nullptr, *d_o2 = nullptr;
+  void *d_k = nullptr, *d_v = nullptr;
+  float *d_partial = nullptr;
+  int *d_pos = nullptr;
+  const std::uint64_t rowb = rdna4::kv_row_bytes(kt, kHeadDim);
+  if (hipMalloc(&d_q, (std::size_t)kMaxT * kHeads * kHeadDim * sizeof(float)) != hipSuccess ||
+      hipMalloc(&d_o1, (std::size_t)kMaxT * kHeads * kHeadDim * sizeof(float)) != hipSuccess ||
+      hipMalloc(&d_o2, (std::size_t)kMaxT * kHeads * kHeadDim * sizeof(float)) != hipSuccess ||
+      hipMalloc(&d_k, (std::size_t)kMaxK * kHeadsKv * rowb) != hipSuccess ||
+      hipMalloc(&d_v, (std::size_t)kMaxK * kHeadsKv * rowb) != hipSuccess ||
+      hipMalloc(&d_partial,
+                (std::size_t)kMaxT * rdna4::attn_partial_bytes(kHeads, kHeadDim, 16)) !=
+          hipSuccess ||
+      hipMalloc(&d_pos, (std::size_t)kMaxT * sizeof(int)) != hipSuccess) {
+    std::fprintf(stderr, "fa2-correct: hipMalloc failed\n");
+    return 1;
+  }
+  std::vector<float> qh;
+  fill_random(qh, (std::size_t)kMaxT * kHeads * kHeadDim, 7u);
+  hipMemcpy(d_q, qh.data(), qh.size() * sizeof(float), hipMemcpyHostToDevice);
+  if (!rdna4::kv_fill_launch(kt, d_k, (std::int64_t)kMaxK * kHeadsKv, kHeadDim, 11u) ||
+      !rdna4::kv_fill_launch(kt, d_v, (std::int64_t)kMaxK * kHeadsKv, kHeadDim, 22u)) {
+    std::fprintf(stderr, "fa2-correct: kv_fill_launch failed\n");
+    return 1;
+  }
+  hipDeviceSynchronize();
+  // KTT/path probe: dry-launch the exact instantiation this kt will run.
+  {
+    std::vector<int> pos0(8);
+    for (int i = 0; i < 8; ++i) pos0[i] = i;
+    hipMemcpy(d_pos, pos0.data(), 8 * sizeof(int), hipMemcpyHostToDevice);
+    if (!fa2_probe_path(kt, d_q, d_k, d_v, d_o2, d_pos)) {
+      std::fprintf(stderr, "fa2-correct: probe launch failed\n");
+      return 1;
+    }
+  }
+  std::printf("  KTT probe: f16->KT%d q8_0->KT32-fp32 (LDS 64 KiB/CTA either way)\n", g_fa2_ktt);
+  std::printf("  kernel resources:\n");
+  if (g_fa2_ktt == 64)
+    report_resources("fa2 f16 KT64",
+                     attn_fa2_prefill_kernel<rdna4::KvType::F16, rdna4::KvType::F16, 64, 6, false, 8>);
+  else
+    report_resources("fa2 f16 KT32",
+                     attn_fa2_prefill_kernel<rdna4::KvType::F16, rdna4::KvType::F16, 32, 6, false, 8>);
+  report_resources("fa2 q8 KT32f32",
+                   attn_fa2_prefill_kernel<rdna4::KvType::Q8_0, rdna4::KvType::Q8_0, 32, 6, true, 8>);
+  if (g_fa2_qt == 16)
+    report_resources("fa2 f16 KT64/QT16",
+                     attn_fa2_prefill_kernel<rdna4::KvType::F16, rdna4::KvType::F16, 64, 6, false,
+                                            16>);
+
+  int failures = 0;
+  std::vector<float> a((std::size_t)kMaxT * kHeads * kHeadDim),
+      b((std::size_t)kMaxT * kHeads * kHeadDim);
+  std::vector<int> hpos(kMaxT);
+  for (const Shape &sh : shapes) {
+    const int T = sh.T, K = sh.K;
+    for (int i = 0; i < T; ++i) hpos[i] = K - T + i;  // chunk at end of context
+    hipMemcpy(d_pos, hpos.data(), (std::size_t)T * sizeof(int), hipMemcpyHostToDevice);
+    const std::size_t n = (std::size_t)T * kHeads * kHeadDim;
+    hipMemset(d_o1, 0xFF, n * sizeof(float));
+    hipMemset(d_o2, 0xFF, n * sizeof(float));
+    if (!fa2_run_ref(d_q, d_k, d_v, d_o1, d_partial, d_pos, T, K, kt, nullptr)) {
+      std::printf("  [FAIL] T=%d K=%d: production ref launch failed\n", T, K);
+      ++failures;
+      continue;
+    }
+    hipDeviceSynchronize();
+    if (!launch_fa2_prefill_dyn(kt, d_q, d_k, d_v, d_o2, d_pos, T, K - 1, K, kHeads, kHeadsKv,
+                                kHeadDim, kScale, nullptr)) {
+      std::printf("  [FAIL] T=%d K=%d: fa2 launch failed: %s\n", T, K,
+                  hipGetErrorString(hipGetLastError()));
+      ++failures;
+      continue;
+    }
+    hipDeviceSynchronize();
+    if (hipGetLastError() != hipSuccess) {
+      std::printf("  [FAIL] T=%d K=%d: fa2 exec error: %s\n", T, K,
+                  hipGetErrorString(hipGetLastError()));
+      ++failures;
+      continue;
+    }
+    hipMemcpy(a.data(), d_o1, n * sizeof(float), hipMemcpyDeviceToHost);
+    hipMemcpy(b.data(), d_o2, n * sizeof(float), hipMemcpyDeviceToHost);
+    long exact = 0;
+    double n2 = 0, d2 = 0, md = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+      if (std::memcmp(&a[i], &b[i], 4) == 0) ++exact;
+      if (!std::isfinite(b[i])) md = INFINITY;
+      const double d = (double)a[i] - (double)b[i];
+      n2 += d * d;
+      d2 += (double)a[i] * a[i] + (double)b[i] * b[i];
+      md = std::fmax(md, std::fabs(d));
+    }
+    const double rel = std::sqrt(n2 / d2);
+    // greedy-identity proxy: per-(query,head) argmax-dim agreement
+    long agree = 0;
+    const long nh = (long)T * kHeads;
+    for (long qh2 = 0; qh2 < nh; ++qh2) {
+      int ia = 0, ib = 0;
+      for (int d = 1; d < kHeadDim; ++d) {
+        if (a[(std::size_t)qh2 * kHeadDim + d] > a[(std::size_t)qh2 * kHeadDim + ia]) ia = d;
+        if (b[(std::size_t)qh2 * kHeadDim + d] > b[(std::size_t)qh2 * kHeadDim + ib]) ib = d;
+      }
+      if (ia == ib) ++agree;
+    }
+    const bool ok = (rel <= 1e-6) && (agree == nh) && std::isfinite(md);
+    std::printf("  [%s] T=%d K=%d ref-sp=%d: exact %ld/%zu (%.2f%%) rel-L2 %.2e max|d| %.2e "
+                "argmax %ld/%ld\n",
+                ok ? "PASS" : "FAIL", T, K, fa2_policy_splits(kt, K), exact, n,
+                100.0 * exact / n, rel, md, agree, nh);
+    if (!ok) ++failures;
+  }
+  std::printf("  fa2-correct: %s\n", failures ? "FAILURES PRESENT" : "ALL PASS (NUMERIC gate)");
+  hipFree(d_q);
+  hipFree(d_o1);
+  hipFree(d_o2);
+  hipFree(d_k);
+  hipFree(d_v);
+  hipFree(d_partial);
+  hipFree(d_pos);
+  return failures ? 1 : 0;
+}
+
+// H5 speed: FA2 tile vs production at T x keys (f16 KV first). Same binary,
+// interleaved A/B, warmup >= 300 ms, R >= 8 rounds, 1% floor. Includes a T=16
+// row: the production numbers there feed the Amdahl share integral (real
+// prefill chunks are 16 tokens).
+static int run_fa2_speed(rdna4::KvType kt, const char *tname) {
+  struct Cell {
+    int T, K;
+  };
+  const Cell cells[] = {{16, 512}, {16, 2048}, {16, 8192}, {128, 2048}, {128, 4096},
+                        {128, 8192}, {512, 2048}, {512, 4096}, {512, 8192}};
+  constexpr int kMaxT = 512, kMaxK = 8192;
+  constexpr int kRounds = 10, kReps = 3;
+  std::printf("H5 FA2-prefill speed vs production (kv=%s, KTT=%d QT=%d, %d interleaved rounds "
+              "x %d reps, order alternated)\n",
+              tname, g_fa2_ktt ? g_fa2_ktt : 64, g_fa2_qt, kRounds, kReps);
+  float *d_q = nullptr, *d_o = nullptr;
+  void *d_k = nullptr, *d_v = nullptr;
+  float *d_partial = nullptr;
+  int *d_pos = nullptr;
+  const std::uint64_t rowb = rdna4::kv_row_bytes(kt, kHeadDim);
+  if (hipMalloc(&d_q, (std::size_t)kMaxT * kHeads * kHeadDim * sizeof(float)) != hipSuccess ||
+      hipMalloc(&d_o, (std::size_t)kMaxT * kHeads * kHeadDim * sizeof(float)) != hipSuccess ||
+      hipMalloc(&d_k, (std::size_t)kMaxK * kHeadsKv * rowb) != hipSuccess ||
+      hipMalloc(&d_v, (std::size_t)kMaxK * kHeadsKv * rowb) != hipSuccess ||
+      hipMalloc(&d_partial,
+                (std::size_t)kMaxT * rdna4::attn_partial_bytes(kHeads, kHeadDim, 16)) !=
+          hipSuccess ||
+      hipMalloc(&d_pos, (std::size_t)kMaxT * sizeof(int)) != hipSuccess) {
+    std::fprintf(stderr, "fa2-speed: hipMalloc failed\n");
+    return 1;
+  }
+  {  // probe the exact instantiation (fills the first 8 rows; full fill follows)
+    if (!rdna4::kv_fill_launch(kt, d_k, (std::int64_t)8 * kHeadsKv, kHeadDim, 11u) ||
+        !rdna4::kv_fill_launch(kt, d_v, (std::int64_t)8 * kHeadsKv, kHeadDim, 22u))
+      return 1;
+    hipDeviceSynchronize();
+    std::vector<int> pos0(8);
+    for (int i = 0; i < 8; ++i) pos0[i] = i;
+    hipMemcpy(d_pos, pos0.data(), 8 * sizeof(int), hipMemcpyHostToDevice);
+    if (!fa2_probe_path(kt, d_q, d_k, d_v, d_o, d_pos)) {
+      std::fprintf(stderr, "fa2-speed: probe launch failed\n");
+      return 1;
+    }
+    std::printf("  KTT probe: f16->KT%d q8_0->KT32-fp32\n", g_fa2_ktt);
+  }
+  std::vector<float> qh;
+  fill_random(qh, (std::size_t)kMaxT * kHeads * kHeadDim, 7u);
+  hipMemcpy(d_q, qh.data(), qh.size() * sizeof(float), hipMemcpyHostToDevice);
+  if (!rdna4::kv_fill_launch(kt, d_k, (std::int64_t)kMaxK * kHeadsKv, kHeadDim, 11u) ||
+      !rdna4::kv_fill_launch(kt, d_v, (std::int64_t)kMaxK * kHeadsKv, kHeadDim, 22u)) {
+    std::fprintf(stderr, "fa2-speed: kv_fill_launch failed\n");
+    return 1;
+  }
+  hipDeviceSynchronize();
+  std::vector<int> hpos(kMaxT);
+  EvPair ev;
+  std::printf("  %-5s %-6s %-5s %10s %10s %9s %9s %7s  %s\n", "T", "keys", "sp", "prod ms",
+              "fa2 ms", "best", "mean", "wins", "note");
+  for (const Cell &cl : cells) {
+    const int T = cl.T, K = cl.K;
+    for (int i = 0; i < T; ++i) hpos[i] = K - T + i;
+    hipMemcpy(d_pos, hpos.data(), (std::size_t)T * sizeof(int), hipMemcpyHostToDevice);
+    const int sp = fa2_policy_splits(kt, K);
+    auto run_ref = [&] {
+      (void)fa2_run_ref(d_q, d_k, d_v, d_o, d_partial, d_pos, T, K, kt, nullptr);
+    };
+    auto run_fa2 = [&] {
+      (void)launch_fa2_prefill_dyn(kt, d_q, d_k, d_v, d_o, d_pos, T, K - 1, K, kHeads, kHeadsKv,
+                                   kHeadDim, kScale, nullptr);
+    };
+    {  // warmup >= 300 ms, both configs (DPM state shared, like every bench here)
+      const auto w0 = std::chrono::steady_clock::now();
+      do {
+        run_ref();
+        run_fa2();
+        hipDeviceSynchronize();
+      } while (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0)
+                   .count() < 300.0);
+    }
+    double best_ref = -1, best_fa2 = -1, sum_ref = 0, sum_fa2 = 0;
+    int wins = 0;
+    for (int r = 0; r < kRounds; ++r) {
+      const bool fwd = (r % 2) == 0;
+      double got_ref = -1, got_fa2 = -1;
+      for (int k = 0; k < 2; ++k) {
+        const bool is_ref = fwd ? (k == 0) : (k == 1);
+        const double ms = ev([&] {
+                            for (int j = 0; j < kReps; ++j) (is_ref ? run_ref() : run_fa2());
+                          }) / kReps;
+        if (is_ref) got_ref = ms;
+        else got_fa2 = ms;
+      }
+      if (best_ref < 0 || got_ref < best_ref) best_ref = got_ref;
+      if (best_fa2 < 0 || got_fa2 < best_fa2) best_fa2 = got_fa2;
+      sum_ref += got_ref;
+      sum_fa2 += got_fa2;
+      if (got_fa2 < got_ref) ++wins;
+    }
+    const double rb = best_ref / best_fa2, rm = (sum_ref / kRounds) / (sum_fa2 / kRounds);
+    const char *note = (rb >= 2.5) ? "BAR >=2.5x (best)" : (rb >= 1.01 && wins > kRounds / 2)
+                                                              ? "win (>1% floor)"
+                                                              : (rb >= 1.0 ? "tie/noise" : "LOSS");
+    std::printf("  %-5d %-6d %-5d %10.4f %10.4f %8.3fx %8.3fx %3d/%-3d  %s\n", T, K, sp, best_ref,
+                best_fa2, rb, rm, wins, kRounds, note);
+  }
+  hipFree(d_q);
+  hipFree(d_o);
+  hipFree(d_k);
+  hipFree(d_v);
+  hipFree(d_partial);
+  hipFree(d_pos);
+  return 0;
+}
+
 // Kernel resource report: registers and spill bytes decide whether a prototype is
 // slow because of its algorithm or because of its occupancy. (The M7 prototype's
 // 8-12x was attributed to the narrow grid without this number; measure it.)
@@ -1021,6 +1583,8 @@ int main(int argc, char **argv) {
   int duel_rounds = 8;
   bool merge_audit = false;  // H6 step 1: merge reduction audit, then exit
   bool h6_mode = false;      // H6 step 2: batched interleaved split sweep, then exit
+  bool fa2_correct = false;  // H5: FA2 prefill correctness vs production, then exit
+  bool fa2_speed = false;    // H5: FA2 prefill speed table, then exit
   int h6_rounds = 12;        // >= 8 per the H6 brief (64K decode variance +-10%)
   bool have_ts = false, have_splits = false, have_wpb = false;
   int ab_sp = 0, ab_wpb = 0, ab_rounds = 15, ab_reps = 3;
@@ -1075,6 +1639,10 @@ int main(int argc, char **argv) {
       merge_audit = true;
     } else if (std::strcmp(argv[i], "--h6") == 0) {
       h6_mode = true;
+    } else if (std::strcmp(argv[i], "--fa2-correct") == 0) {
+      fa2_correct = true;
+    } else if (std::strcmp(argv[i], "--fa2-speed") == 0) {
+      fa2_speed = true;
     } else if (std::strcmp(argv[i], "--h6-rounds") == 0 && i + 1 < argc) {
       h6_rounds = std::atoi(argv[++i]);
     } else {
@@ -1120,6 +1688,10 @@ int main(int argc, char **argv) {
     if (h6_rounds < 8) h6_rounds = 8;
     return run_h6(kt, tname, ts, split_list, wpb_list, h6_rounds);
   }
+
+  if (fa2_correct) return run_fa2_correct(kt, tname);
+
+  if (fa2_speed) return run_fa2_speed(kt, tname);
 
   hipDeviceProp_t prop{};
   if (hipGetDeviceProperties(&prop, 0) != hipSuccess) return 1;

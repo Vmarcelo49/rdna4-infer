@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "rdna4/attn.cuh"
+#include "rdna4/attn_fa2.cuh"  // FA2 prefill (H5): despacho fail-closed abaixo
 #include "rdna4/dequant_row.cuh"
 #include "rdna4/device.h"  // prefill_chunk_cap(): dependencia explicita, nao transitiva
 #include "rdna4/dtype.h"
@@ -1469,7 +1470,20 @@ inline bool Graph::forward_batch_layer(int il, int n, int pos0, std::string &err
       const int splits = attn_splits_for(pos0 + n);
       attn_splits_last_ = splits;
       const float scale = 1.0f / std::sqrt((float)HD);
-      if (splits > 1) {
+      // FA2 prefill (H5, NUMERICO -- rel<=1e-6, nunca bit-exato): uma chamada
+      // por chunk no lugar do split/unsplit em lote, onde admitido (f16,
+      // n==512, keys 2048..8192). Fora da admissao, falha de launch, ou com
+      // RD_GFX12_FA2_PREFILL=0, cai no incumbente abaixo (fail-closed).
+      // d_attnb_ e' q-entrada e saida (in-place, como o batch unsplit):
+      // CTAs disjuntas por tile de queries, leitura antes da escrita.
+      const bool use_fa2 = fa2_prefill_usable(kv_k_, kv_v_, n, pos0, NH, NKV, HD);
+      bool fa2_done = false;
+      if (use_fa2) {
+        RD_PHASE(prof_, "attn_fa2");  // RD_PHASE_PROF
+        fa2_done = fa2_prefill_launch(d_attnb_, kc, vc, d_attnb_, d_posb_, n, pos0 + n - 1,
+                                      pos0 + n, NH, NKV, HD, scale);
+      }
+      if (!fa2_done && splits > 1) {
         // Long context: the key range is split across CTAs and the split COUNT
         // depends on the token's position. splits is non-decreasing in pos, so the
         // chunk is a sequence of contiguous runs of equal split count; inside a run
@@ -1504,14 +1518,14 @@ inline bool Graph::forward_batch_layer(int il, int n, int pos0, std::string &err
                 }
               }
             }
-          } else if (!attn_batch_launch(an0, kc, vc, an0, d_posb_ + t0, cnt, NH, NKV, HD, scale,
+          } else if (!fa2_done && !attn_batch_launch(an0, kc, vc, an0, d_posb_ + t0, cnt, NH, NKV, HD, scale,
                                         kv_k_, kv_v_)) {
             err = "batch attn launch failed";
             return false;
           }
           t0 = t1;
         }
-      } else if (!attn_batch_launch(d_attnb_, kc, vc, d_attnb_, d_posb_, n, NH, NKV, HD, scale,
+      } else if (!fa2_done && !attn_batch_launch(d_attnb_, kc, vc, d_attnb_, d_posb_, n, NH, NKV, HD, scale,
                                     kv_k_, kv_v_)) {
         err = "batch attn (batched) launch failed";
         return false;
