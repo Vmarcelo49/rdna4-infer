@@ -52,6 +52,7 @@
 #include "rdna4/matvec.cuh"  // quantize_q8_1_block / _batch_kernel: a ativacao DO MOTOR
 #include "rdna4/quants.h"
 #include "rdna4/quant_tables.h"
+#include "rdna4/gemm.cuh"  // SolverIq3S verbatim + gemm_launch/gemm_attrs (baseline)
 #include "rdna4/vecdotq.cuh"  // vec_dot_iq3_s_q8_1: a referencia bit a bit
 
 // O alvo `bench-mmq-wmma-gpu` linka so' a libamdhip64 (CMakeLists:210-217) e o
@@ -843,9 +844,414 @@ bool launch_dp4a(const CfgD &c, const int M, const std::int64_t N, const std::in
 
 }  // namespace
 
+// ===========================================================================
+// 8. PROTOTIPO WMMA-int8 com STAGING DE PRODUCAO (BM64/BN128/BK64, bench-only)
+// ---------------------------------------------------------------------------
+// O "naive port" que esta secao NAO faz: trocar o dp4a pelo WMMA mantendo o
+// mapeamento por-thread (tr,tc)+RM/RN da producao. Ele morre na TRANSPOSTA do
+// tile (doc D secao 1, doc H secao 5): o slot j do lane L vale
+// C[m = 8*(L/16)+j][n = L%16] -- D E' A TRANSPOSTA de A/B -- entao acumuladores
+// (r,c)-ordenados escrevem lixo transposto, e a correcao/metadados tem de vir
+// transpostos junto (d_a consecutivo em m na metade do lane, d_w/scf um por
+// tile de N por lane), com epilogo que espalha (m = ..+8*hi+j, n = ..+lo).
+//
+// Desenho (classe BM64/BN128/BK64, MESMA grade da producao em M>=64):
+//   * staging VERBATIM da producao: SolverIq3S::load/store, s_w[BN][80] +
+//     s_dwsc[NKB*BN] int2, duplo buffer SO do W, prefetch em registrador
+//     (load(k+BK) emitido antes da conta, store(buf^1) depois -- o `pf` do V6).
+//     WSB = BK+16 = 80 B = 20 palavras: passo 20 mod 32 (mdc 4) -> conflito
+//     2-vias nos loads de fragmento de 8 B (o +8 da frente H era livre de
+//     conflito; aqui o preco de ser identico a producao). LDS <1% do kernel.
+//   * ativacao DIRETO da global (como a producao: sem s_a): o fragmento A do
+//     lane e' 2 loads de 4 B da linha m0+wm+lo no bloco ka; d_a (8x fp16->fp32)
+//     vem da mesma linha-familia (hi). Por (kb,lane): 16 B de qs + 16 B de ds.
+//   * consumo SO WMMA (`__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12`, o
+//     builtin PROVADO neste arquivo): 8 warps (W4 em M x W2 em N, MT=1 x NT=4),
+//     8 WMMA por bloco de 32 por warp (2 metades de k x 4 tiles de N). O int32
+//     por bloco e' soma EXATA (inteiro comuta) -> a bit-exatidao contra o motor
+//     se mantem por construcao, como a frente H mediu no kernel antigo.
+//   * correcao na SEQUENCIA do motor: sumi *= 1+2*sc (INTEIRO), d = d_w*d_a
+//     (fp32), acc = fma(d, (float)sumi, acc) com __fmaf_rn fixado.
+// ===========================================================================
+__global__ void __launch_bounds__(256, 1) gemm_wmma_prod_kernel(
+    const block_iq3_s *__restrict__ W, const block_q8_1 *__restrict__ AQ, float *__restrict__ C,
+    const int M, const int N, const int K, const int act_stride) {
+  constexpr int BM = 64, BN = 128, BK = 64;
+  constexpr int NKB = BK / 32;  // 2 blocos de 32 por janela
+  constexpr int WSB = BK + 16;  // 80 B, identico a producao (gemm.cuh)
+  static_assert(WSB % 16 == 0, "");
+  __shared__ __align__(16) unsigned char s_w[2 * 128 * 80];
+  __shared__ __align__(16) int2 s_dwsc[2 * 2 * 128];
+  // d_a TRANSPOSTO (kb maior, linha menor): a consequencia pratica da
+  // transposta de D (doc H secao 5). Sem ele, cada lane faria 8 gathers da
+  // global por bloco de 32; com ele, 8 floats consecutivos = 2 LDS.128 por
+  // lane por bloco -- o mesmo que o kernel da frente H fazia. Custo: 1 KB de
+  // LDS e BM*NKB floats de staging cooperativo por janela (6% do staging).
+  __shared__ __align__(16) float s_da[2 * 2 * 64];
+
+  const int tid = threadIdx.x;
+  const int L = tid & 31;
+  const int warp = tid >> 5;  // 0..7
+  const int wm = (warp & 3) * 16;
+  const int wn = (warp >> 2) * 64;
+  const int m0 = blockIdx.y * BM;
+  const int n0 = blockIdx.x * BN;
+  const int lo = L & 15, hi = L >> 4;
+  const int bpr = K / 256;
+
+  using TR = rdna4::SolverIq3S;
+  constexpr int BB = TR::block_bytes;  // 110
+  // 256 tarefas de staging (BN*NKB) em 256 threads: 1 por thread.
+  const int task = tid;
+  const int srow = task / NKB;
+  const int skb = task - srow * NKB;
+
+  TR::Pf pf;
+  auto stage_load = [&](const int k0) {
+    int n = n0 + srow;
+    if (n >= N) n = N - 1;
+    const int kk = k0 + 32 * skb;
+    pf = TR::load((const char *)(const void *)(W + (std::int64_t)n * bpr + (kk >> 8)), (kk >> 5) & 7);
+  };
+  auto stage_store = [&](const int buf, const int k0) {
+    const int kk = k0 + 32 * skb;
+    float dw;
+    int scf;
+    TR::store(pf, (kk >> 5) & 7, (int *)(void *)(s_w + buf * (128 * WSB) + srow * WSB + skb * 32),
+              &dw, &scf);
+    s_dwsc[buf * (2 * 128) + skb * 128 + srow] = make_int2(__float_as_int(dw), scf);
+  };
+  // Staging cooperativo do d_a transposto: 1 float por tarefa (BM*NKB = 128
+  // tarefas em 256 threads -> metade ajuda, como no kernel da frente H).
+  auto stage_da = [&](const int buf, const int k0) {
+    for (int task = tid; task < BM * NKB; task += 256) {
+      const int row = task / NKB;
+      const int kb = task - row * NKB;
+      int m = m0 + row;
+      if (m >= M) m = M - 1;
+      const block_q8_1 *q = AQ + (std::int64_t)m * act_stride + (k0 >> 5) + kb;
+      s_da[buf * (2 * 64) + kb * 64 + row] = rdna4::fp16_to_float((uint16_t)(q->ds & 0xFFFFu));
+    }
+  };
+
+  float F[4][8];  // [t][j]: t = tile de N (NT=4), j = slot do D (8)
+#pragma unroll
+  for (int t = 0; t < 4; ++t)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) F[t][j] = 0.0f;
+
+  stage_load(0);
+  stage_store(0, 0);
+  stage_da(0, 0);
+  __syncthreads();
+
+  for (int k0 = 0, cur = 0; k0 < K; k0 += BK, cur ^= 1) {
+    const int cb = cur;
+    if (k0 + BK < K) stage_load(k0 + BK);  // em voo durante a conta
+#pragma unroll 1
+    for (int kb = 0; kb < NKB; ++kb) {
+      const int ka = (k0 >> 5) + kb;
+      i32x8_t D[4];
+#pragma unroll
+      for (int t = 0; t < 4; ++t) D[t] = zero_i32x8();
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        // Fragmento A direto da global: linha m0+wm+lo, 8 B em ka[32*h..+16).
+        int m = m0 + wm + lo;
+        if (m >= M) m = M - 1;
+        const block_q8_1 *q = AQ + (std::int64_t)m * act_stride + ka;
+        const int *qp = (const int *)(const void *)q->qs;
+        i32x2_t af;
+        af[0] = qp[h * 4 + hi * 2];
+        af[1] = qp[h * 4 + hi * 2 + 1];
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+          // B = Bn[n][k] com n = linha da LDS (TRANSPOSTA do "B[k][n]").
+          const void *bp =
+              s_w + cb * (128 * WSB) + (wn + 16 * t + lo) * WSB + kb * 32 + h * 16 + hi * 8;
+          D[t] = wmma_i8(af, lds_frag(bp), D[t]);
+        }
+      }
+      // Correcao TRANSPOSTA (doc H secao 5): d_a = 8 floats consecutivos da
+      // metade-hi do lane = 2 LDS.128 (s_da transposto acima); d_w/scf = 1 int2
+      // por tile de N. MESMOS valores e MESMA ordem da versao com loads da
+      // global -- a bit-exatidao se mantem por construcao.
+      float da[8];
+      {
+        // linhas do warp: m0+wm+hi*8+j -> indice wm+hi*8 na LDS transposta.
+        const float *p = s_da + cb * (2 * 64) + kb * 64 + wm + hi * 8;
+        const float4 v0 = *(const float4 *)p;
+        const float4 v1 = *(const float4 *)(p + 4);
+        da[0] = v0.x;
+        da[1] = v0.y;
+        da[2] = v0.z;
+        da[3] = v0.w;
+        da[4] = v1.x;
+        da[5] = v1.y;
+        da[6] = v1.z;
+        da[7] = v1.w;
+      }
+#pragma unroll
+      for (int t = 0; t < 4; ++t) {
+        const int2 ws = s_dwsc[cb * (2 * 128) + kb * 128 + wn + 16 * t + lo];
+        const float dw = __int_as_float(ws.x);
+        const int scf = ws.y;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const float d = dw * da[j];
+          F[t][j] = __fmaf_rn(d, (float)(D[t][j] * scf), F[t][j]);
+        }
+      }
+    }
+    if (k0 + BK < K) {
+      stage_store(cb ^ 1, k0 + BK);
+      stage_da(cb ^ 1, k0 + BK);
+    }
+    __syncthreads();
+  }
+
+  // Epilogo no layout de D (TRANSPOSTO): slot j do lane L -> (8*hi+j, lo).
+#pragma unroll
+  for (int t = 0; t < 4; ++t)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int m = m0 + wm + hi * 8 + j;
+      const int n = n0 + wn + 16 * t + lo;
+      if (m < M && n < N) C[(std::int64_t)m * N + n] = F[t][j];
+    }
+}
+
+bool launch_wmma_prod(const block_iq3_s *W, const block_q8_1 *AQ, float *C, const int M,
+                      const std::int64_t N, const std::int64_t K, const std::int64_t ast) {
+  const dim3 grid((unsigned)((N + 127) / 128), (unsigned)((M + 63) / 64), 1u);
+  gemm_wmma_prod_kernel<<<grid, 256>>>(W, AQ, C, M, (int)N, (int)K, (int)ast);
+  return launch_ok("gemm_wmma_prod");
+}
+
+// GEMV em lote (o que embarca hoje): sub-lotes de 64 via matvec_launch_batch.
+void gemv_batch_proto(const int dt, const void *d_w, const block_q8_1 *d_a, float *d_o,
+                      const std::int64_t nrows, const std::int64_t ncols,
+                      const std::int64_t act_stride, const int M, const bool check) {
+  for (int t0 = 0; t0 < M; t0 += 64) {
+    const int n = std::min(64, M - t0);  // matvec_launch_batch so' instancia N<=64
+    if (!rdna4::matvec_launch_batch(dt, d_w, d_a + (std::int64_t)t0 * act_stride,
+                                    d_o + (std::int64_t)t0 * nrows, nrows, ncols, act_stride, n,
+                                    nullptr)) {
+      std::printf("  matvec_launch_batch falhou (N=%d)\n", n);
+      return;
+    }
+    if (check && !launch_ok("matvec_launch_batch")) return;
+  }
+}
+
+void print_proto_attrs(const int M) {
+  hipFuncAttributes ap{}, as{};
+  int lds_s = 0;
+  const bool okp = hipFuncGetAttributes(&ap, (const void *)gemm_wmma_prod_kernel) == hipSuccess;
+  const bool oks = rdna4::gemm_attrs(12, M, as, lds_s);
+  const int lds_p = 2 * (128 * 80 + 2 * 128 * 8) + 2 * 2 * 64 * 4;
+  std::printf("  attrs M=%d:\n", M);
+  if (okp)
+    std::printf("    proto WMMA BM64 BN128 BK64 W4x2 : VGPR=%3d LDS=%5d B (pedido %d, attr %zu) spill/lane=%d B\n",
+                ap.numRegs, lds_p, lds_p, (size_t)ap.sharedSizeBytes, (int)ap.localSizeBytes);
+  else
+    std::printf("    proto WMMA: attrs indisponiveis\n");
+  if (oks)
+    std::printf("    prod dp4a BM64 BN128 BK64 RM4RN8: VGPR=%3d LDS=%5d B (pedido %d, attr %zu) spill/lane=%d B\n",
+                as.numRegs, lds_s, lds_s, (size_t)as.sharedSizeBytes, (int)as.localSizeBytes);
+  else
+    std::printf("    prod dp4a: attrs indisponiveis\n");
+}
+
+// Uma forma (N-large ou K-large): verifica (a)+(b) e cronometra A/B.
+int run_one_shape(rdna4::GgufLoader &ld, const std::size_t ti, const std::vector<int> &ms_list,
+                  const int reps, const char *tag) {
+  const auto &info = ld.meta().tensors[ti];
+  const std::int64_t K = (std::int64_t)info.dims[0];
+  const std::int64_t N = (std::int64_t)info.dims[1];
+  const std::int64_t bpr = K / 256;
+  std::printf("\n== %s: %s [%lld x %lld] (K=%lld N=%lld) ==\n", tag, info.name.c_str(),
+              (long long)info.dims[0], (long long)info.dims[1], (long long)K, (long long)N);
+  if ((int)ld.dtype(ti) != kIq3S || K % 256 != 0 || N % 128 != 0) {
+    std::printf("  forma inesperada (dtype=%d): pulada\n", (int)ld.dtype(ti));
+    return 1;
+  }
+  const std::uint64_t want = (std::uint64_t)N * (std::uint64_t)bpr * kBlockBytes;
+  std::vector<std::uint8_t> w_raw;
+  std::string err;
+  if (!ld.load_tensor_range(ti, 0, want, w_raw, err)) {
+    std::fprintf(stderr, "load_tensor_range: %s\n", err.c_str());
+    return 1;
+  }
+  const int MMAX = *std::max_element(ms_list.begin(), ms_list.end());
+  const int MPAD = ((std::max(MMAX, 64) + 63) / 64) * 64;
+  const std::int64_t ast = K / 32;
+  std::vector<float> hA;
+  fill_a(hA, (std::size_t)MPAD * (std::size_t)K, 7u);
+
+  void *dW = nullptr;
+  float *dAf = nullptr;
+  block_q8_1 *dAQ = nullptr;
+  float *dC = nullptr, *dC2 = nullptr, *dC3 = nullptr;
+  if (hipMalloc(&dW, w_raw.size()) != hipSuccess ||
+      hipMalloc(&dAf, hA.size() * sizeof(float)) != hipSuccess ||
+      hipMalloc(&dAQ, (std::size_t)MPAD * (std::size_t)ast * sizeof(block_q8_1)) != hipSuccess ||
+      hipMalloc(&dC, (std::size_t)MPAD * (std::size_t)N * sizeof(float)) != hipSuccess ||
+      hipMalloc(&dC2, (std::size_t)MPAD * (std::size_t)N * sizeof(float)) != hipSuccess ||
+      hipMalloc(&dC3, (std::size_t)MPAD * (std::size_t)N * sizeof(float)) != hipSuccess) {
+    std::fprintf(stderr, "hipMalloc falhou\n");
+    return 1;
+  }
+  (void)hipMemcpy(dW, w_raw.data(), w_raw.size(), hipMemcpyHostToDevice);
+  (void)hipMemcpy(dAf, hA.data(), hA.size() * sizeof(float), hipMemcpyHostToDevice);
+  if (!rdna4::quantize_q8_1_batch_launch(dAf, dAQ, (int)ast, MPAD, (int)K, nullptr) ||
+      !launch_ok("quantize_q8_1_batch")) {
+    return 1;
+  }
+  (void)hipDeviceSynchronize();
+
+  print_proto_attrs(MMAX);
+  EvPair ev;
+
+  // ---- (a) BIT-EXATO vs o vec_dot de producao: M=16 N=256 (4096 saidas) ----
+  {
+    const int Me = 16, Ne = 256;
+    std::vector<float> eng((std::size_t)Me * Ne), got((std::size_t)Me * Ne);
+    ref_engine_kernel<<<(unsigned)((Me * Ne + 127) / 128), 128>>>(
+        (const block_iq3_s *)dW, dAQ, dC2, Me, Ne, (int)K);
+    if (!launch_ok("ref_engine_kernel")) return 1;
+    (void)hipDeviceSynchronize();
+    (void)hipMemcpy(eng.data(), dC2, eng.size() * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemset(dC, 0, (std::size_t)MPAD * N * sizeof(float));
+    if (!launch_wmma_prod((const block_iq3_s *)dW, dAQ, dC, Me, Ne, K, ast)) return 1;
+    (void)hipDeviceSynchronize();
+    (void)hipMemcpy(got.data(), dC, got.size() * sizeof(float), hipMemcpyDeviceToHost);
+    const Diff d = diff_bits(got, eng, got.size());
+    std::printf("  (a) BIT-EXATO vs vec_dot_iq3_s (M=%d N=%d): %zu de %zu bits diferentes, max ulp "
+                "%.0f, max|d| %.3g, rel-L2 %.3g%s\n",
+                Me, Ne, d.n_diff, d.n, d.max_ulps, d.max_abs, d.rel_l2,
+                d.n_diff == 0 ? "  <-- declaracao (a)" : "");
+  }
+
+  // ---- tabela de velocidade A/B intercalada + (b) + proto-vs-prod bits ----
+  std::printf("  -- velocidade A/B intercalada (R=%d, burner>=300ms, mesma janela) --\n", reps);
+  std::printf("  %5s %10s %10s %10s %10s %8s %9s\n", "M", "proto ms", "T-MAC/s", "prod ms",
+              "T-MAC/s", "proto/x", "piso");
+  for (const int M : ms_list) {
+    const double macs = (double)M * (double)N * (double)K;
+    bool warned = false;
+    auto fn_p = [&] {
+      if (!launch_wmma_prod((const block_iq3_s *)dW, dAQ, dC, M, N, K, ast) && !warned) {
+        warned = true;
+        std::printf("  proto(M=%d) retornou false\n", M);
+      }
+    };
+    auto fn_s = [&] {
+      if (!rdna4::gemm_launch(12, dW, dAQ, dC2, N, K, ast, M, nullptr) && !warned) {
+        warned = true;
+        std::printf("  gemm_launch(M=%d) retornou false\n", M);
+      }
+    };
+    // burner DPM >= 300 ms, alternando A/B (aquece os dois caminhos)
+    double burner = 0;
+    for (int i = 0; i < 20000 && burner < 300.0; ++i) {
+      burner += ev(fn_p);
+      burner += ev(fn_s);
+    }
+    (void)hipDeviceSynchronize();
+    if (!launch_ok("verdict burner")) return 1;
+    double best_p = 1e9, best_s = 1e9;
+    for (int r = 0; r < reps; ++r) {
+      best_p = std::min(best_p, ev(fn_p));  // intercalado: A,B,A,B...
+      best_s = std::min(best_s, ev(fn_s));
+    }
+    if (!launch_ok("verdict A/B")) return 1;
+    // piso de ruido: a MESMA celula do proto, segunda vez
+    double n1 = 1e9, n2 = 1e9;
+    for (int r = 0; r < reps; ++r) {
+      n1 = std::min(n1, ev(fn_p));
+      n2 = std::min(n2, ev(fn_p));
+    }
+    const double rp = macs / (best_p * 1e-3) / 1e12;
+    const double rs = macs / (best_s * 1e-3) / 1e12;
+    std::printf("  %5d %10.3f %10.2f %10.3f %10.2f %8.2fx %9.3fx%s\n", M, best_p, rp, best_s, rs,
+                best_s / std::max(best_p, 1e-9), n2 / std::max(n1, 1e-9),
+                (n2 / std::max(n1, 1e-9) > 1.01 ? "  RUIDO>1%!" : ""));
+
+    // proto vs prod, tensor-a-tensor (bit-exatidao esperada: mesma ordem de k)
+    // + (b) TOLERANCIA vs GEMV em lote (gate kTolPerType: 1e-6 / 1e-4)
+    (void)hipMemset(dC, 0, (std::size_t)M * N * sizeof(float));
+    (void)hipMemset(dC2, 0, (std::size_t)M * N * sizeof(float));
+    (void)hipMemset(dC3, 0, (std::size_t)M * N * sizeof(float));
+    fn_p();
+    (void)hipDeviceSynchronize();
+    fn_s();
+    (void)hipDeviceSynchronize();
+    gemv_batch_proto(12, dW, dAQ, dC3, N, K, ast, M, true);
+    (void)hipDeviceSynchronize();
+    const std::size_t n_el = (std::size_t)M * (std::size_t)N;
+    std::vector<float> a(n_el), b(n_el), g(n_el);
+    (void)hipMemcpy(a.data(), dC, n_el * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(b.data(), dC2, n_el * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(g.data(), dC3, n_el * sizeof(float), hipMemcpyDeviceToHost);
+    const Diff dp = diff_bits(a, b, n_el);
+    const Diff dg = diff_bits(a, g, n_el);
+    std::size_t nz = 0;
+    for (std::size_t i = 0; i < n_el; ++i) {
+      if (!std::isfinite(a[i])) {
+        std::printf("  M=%d: SAIDA NAO-FINITA -- reprovado\n", M);
+        return 1;
+      }
+      if (a[i] == 0.f) ++nz;
+    }
+    if (nz == n_el) {
+      std::printf("  M=%d: C TODA ZERO -- reprovado\n", M);
+      return 1;
+    }
+    std::printf("        proto x prod dp4a: %zu de %zu bits diferentes (max ulp %.0f)%s\n", dp.n_diff,
+                n_el, dp.max_ulps, dp.n_diff == 0 ? "  BIT-EXATO" : "");
+    std::printf("        (b) proto x GEMV-lote: rel-L2 %.3e (lim 1.0e-06) max|d| %.3e (lim 1.0e-04) "
+                "%s\n",
+                dg.rel_l2, dg.max_abs,
+                (dg.rel_l2 <= 1e-6 && dg.max_abs <= 1e-4) ? "PASS" : "FAIL");
+  }
+  (void)hipFree(dW);
+  (void)hipFree(dAf);
+  (void)hipFree(dAQ);
+  (void)hipFree(dC);
+  (void)hipFree(dC2);
+  (void)hipFree(dC3);
+  return 0;
+}
+
+int run_proto_verdict(const char *model, const std::vector<int> &ms_list, const int reps) {
+  rdna4::GgufLoader ld;
+  std::string err;
+  if (!ld.open(model, err)) {
+    std::fprintf(stderr, "open: %s\n", err.c_str());
+    return 1;
+  }
+  // NOTA: o brief pedia blk.1.ffn_up / blk.14.ffn_down, mas neste GGUF esses dois
+  // tensores sao IQ2_XXS (dt 7), nao iq3_s -- entao o veredito usa os
+  // equivalentes iq3_s de MESMA forma (mesma fisica: mesmos CTAs/ondas/trafego).
+  const char *names[2] = {"blk.3.ffn_up.weight", "blk.2.ffn_down.weight"};
+  const char *tags[2] = {"N-large (ffn_up 5120x17408)", "K-large (ffn_down 17408x5120)"};
+  int rc = 0;
+  for (int i = 0; i < 2; ++i) {
+    const auto *f = ld.find(names[i]);
+    if (!f) {
+      std::fprintf(stderr, "tensor %s nao existe (use --list)\n", names[i]);
+      return 1;
+    }
+    rc |= run_one_shape(ld, (std::size_t)(f - ld.meta().tensors.data()), ms_list, reps, tags[i]);
+  }
+  return rc;
+}
+
 int main(int argc, char **argv) {
   std::vector<int> ms_list{16, 64, 128, 512};
-  int reps = 5, BK_ovr = 0;
+  int reps = 5, BK_ovr = 0, proto_reps = 8;
+  bool proto_verdict = false;
   std::vector<int> cfg_sel;
   bool DBUF = false, verify = true, peak_only = false, list_only = false;
   std::int64_t n_ovr = -1, k_ovr = -1;
@@ -879,6 +1285,10 @@ int main(int argc, char **argv) {
       tensor_name = argv[++i];
     } else if (!std::strcmp(argv[i], "--dbuf")) {
       DBUF = true;
+    } else if (!std::strcmp(argv[i], "--proto-verdict")) {
+      proto_verdict = true;
+    } else if (!std::strcmp(argv[i], "--proto-reps") && i + 1 < argc) {
+      proto_reps = std::atoi(argv[++i]);
     } else if (!std::strcmp(argv[i], "--no-verify")) {
       verify = false;
     } else if (!std::strcmp(argv[i], "--peak-only")) {
@@ -902,6 +1312,17 @@ int main(int argc, char **argv) {
       std::printf("device: %s (%s), %d CUs, LDS/bloco max %zu B\n", dp.name, dp.gcnArchName,
                   dp.multiProcessorCount, (size_t)dp.sharedMemPerBlock);
     }
+  }
+
+  // Veredito do prototipo WMMA-producao (secao 8): mesmo binario, duas formas,
+  // A/B intercalado, burner >= 300 ms, R>=5, piso de ruido. Nao passa pelo
+  // caminho antigo abaixo.
+  if (proto_verdict) {
+    std::vector<int> pms{64, 128, 512};
+    bool custom = false;
+    for (int i = 1; i < argc; ++i)
+      if (!std::strcmp(argv[i], "--m")) custom = true;
+    return run_proto_verdict(model, custom ? ms_list : pms, std::max(proto_reps, 5));
   }
 
   // ---- 0. o tensor real ---------------------------------------------------

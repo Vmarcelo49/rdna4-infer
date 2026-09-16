@@ -145,6 +145,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 
 #include "rdna4/fp16.h"
 #include "rdna4/quants.h"
@@ -1492,6 +1493,225 @@ inline bool gemm_attrs_t(hipFuncAttributes &attr, int &lds_bytes) {
   return hipFuncGetAttributes(&attr, (const void *)fn) == hipSuccess;
 }
 
+// ===========================================================================
+// WMMA-int8 do iq3_s (BM64/BN128/BK64) -- o caminho rapido do prefill.
+//
+// MEDIDO 16/09 (mesmo binario, A/B intercalado, R=8+12, ruido <= 1,005x;
+// blk.3.ffn_up 5120x17408 e blk.2.ffn_down 17408x5120): 1.73-1.78x do dp4a
+// em M=64/128/512 nas duas formas (N-large 27,06 vs 15,29 T-MAC/s a M=128;
+// K-large 22,16 vs 12,73). Bit-exato contra o `vec_dot_iq3_s_q8_1` (0/4096,
+// ulp 0) e 0 diff vs o GEMM dp4a em tensor cheio; vs GEMV em lote a MESMA
+// assinatura do dp4a (rel 2,4-4,3e-07, max|d| <= 3,1e-05) -- por isso o
+// desembarque usa linha de TOLERANCIA, nunca claim bit-exato em producao
+// (o WMMA muda a ordem de emissao das somas).
+//
+// Desenho (transcricao verificada do prototipo medido em
+// tests/bench_mmq_wmma_gpu.hip, secao 8):
+//   * staging VERBATIM da producao: SolverIq3S::load/store, s_w[BN][80] +
+//     s_dwsc int2, duplo buffer SO do W, prefetch em registrador. WSB = 80 B
+//     (passo 20 mod 32 -> conflito 2-vias nos loads de 8 B; LDS < 1%).
+//   * consumo SO WMMA (`__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12`,
+//     que compila para v_wmma em gfx1201; MFMA NAO existe aqui): 8 warps
+//     (W4 em M x W2 em N), 8 WMMA por bloco de 32 por warp. O int32 por
+//     bloco e' soma EXATA -> bit-exatidao por construcao.
+//   * A TRANSPOSTA do tile (o erro classico deste caminho): slot j do lane L
+//     vale C[8*(L/16)+j][L%16] -- acumuladores e epilogo em layout D e a
+//     correcao/metadados transpostos junto (s_da[2][2][64]: 2xLDS.128 por
+//     lane por bloco em vez de 8 gathers; so' esta mudanca valeu
+//     1,49x -> 1,77x). d_a consecutivo em m na metade do lane.
+//   * correcao na SEQUENCIA do motor: sumi *= 1+2*sc (INTEIRO), d = d_w*d_a,
+//     acc = fma(d, (float)sumi, acc) com __fmaf_rn fixado.
+// So' iq3_s: k-quants precisariam de correcao de cadeia dupla redesenhada --
+// NAO portar para outros tipos sem re-medir.
+// ===========================================================================
+typedef int i32x2_t __attribute__((ext_vector_type(2)));
+typedef int i32x8_t __attribute__((ext_vector_type(8)));
+
+__device__ __forceinline__ i32x8_t wmma_i8(const i32x2_t a, const i32x2_t b, const i32x8_t c) {
+  return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, c, true);
+}
+__device__ __forceinline__ i32x8_t zero_i32x8() {
+  i32x8_t z;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) z[i] = 0;
+  return z;
+}
+// Leitura de fragmento (8 B) da LDS: alinhada a 8 B por construcao.
+__device__ __forceinline__ i32x2_t lds_frag(const void *p) {
+  return *reinterpret_cast<const i32x2_t *>(p);
+}
+
+__global__ void __launch_bounds__(256, 1) gemm_wmma_iq3s_kernel(
+    const block_iq3_s *__restrict__ W, const block_q8_1 *__restrict__ AQ, float *__restrict__ C,
+    const int M, const int N, const int K, const int act_stride) {
+  constexpr int BM = 64, BN = 128, BK = 64;
+  constexpr int NKB = BK / 32;  // 2 blocos de 32 por janela
+  constexpr int WSB = BK + 16;  // 80 B, identico a producao
+  static_assert(WSB % 16 == 0, "");
+  __shared__ __align__(16) unsigned char s_w[2 * 128 * 80];
+  __shared__ __align__(16) int2 s_dwsc[2 * 2 * 128];
+  // d_a TRANSPOSTO (kb maior, linha menor): 8 floats consecutivos = 2 LDS.128
+  // por lane por bloco. Custo: 1 KB de LDS e BM*NKB floats de staging
+  // cooperativo por janela (6% do staging).
+  __shared__ __align__(16) float s_da[2 * 2 * 64];
+
+  const int tid = threadIdx.x;
+  const int L = tid & 31;
+  const int warp = tid >> 5;  // 0..7
+  const int wm = (warp & 3) * 16;
+  const int wn = (warp >> 2) * 64;
+  const int m0 = blockIdx.y * BM;
+  const int n0 = blockIdx.x * BN;
+  const int lo = L & 15, hi = L >> 4;
+  const int bpr = K / 256;
+
+  using TR = SolverIq3S;
+  constexpr int BB = TR::block_bytes;  // 110
+  (void)BB;
+  // 256 tarefas de staging (BN*NKB) em 256 threads: 1 por thread.
+  const int task = tid;
+  const int srow = task / NKB;
+  const int skb = task - srow * NKB;
+
+  TR::Pf pf;
+  auto stage_load = [&](const int k0) {
+    int n = n0 + srow;
+    if (n >= N) n = N - 1;
+    const int kk = k0 + 32 * skb;
+    pf = TR::load((const char *)(const void *)(W + (std::int64_t)n * bpr + (kk >> 8)), (kk >> 5) & 7);
+  };
+  auto stage_store = [&](const int buf, const int k0) {
+    const int kk = k0 + 32 * skb;
+    float dw;
+    int scf;
+    TR::store(pf, (kk >> 5) & 7, (int *)(void *)(s_w + buf * (128 * WSB) + srow * WSB + skb * 32),
+              &dw, &scf);
+    s_dwsc[buf * (2 * 128) + skb * 128 + srow] = make_int2(__float_as_int(dw), scf);
+  };
+  // Staging cooperativo do d_a transposto: 1 float por tarefa (BM*NKB = 128
+  // tarefas em 256 threads -> metade ajuda).
+  auto stage_da = [&](const int buf, const int k0) {
+    for (int task = tid; task < BM * NKB; task += 256) {
+      const int row = task / NKB;
+      const int kb = task - row * NKB;
+      int m = m0 + row;
+      if (m >= M) m = M - 1;
+      const block_q8_1 *q = AQ + (std::int64_t)m * act_stride + (k0 >> 5) + kb;
+      s_da[buf * (2 * 64) + kb * 64 + row] = fp16_to_float((uint16_t)(q->ds & 0xFFFFu));
+    }
+  };
+
+  float F[4][8];  // [t][j]: t = tile de N (NT=4), j = slot do D (8)
+#pragma unroll
+  for (int t = 0; t < 4; ++t)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) F[t][j] = 0.0f;
+
+  stage_load(0);
+  stage_store(0, 0);
+  stage_da(0, 0);
+  __syncthreads();
+
+  for (int k0 = 0, cur = 0; k0 < K; k0 += BK, cur ^= 1) {
+    const int cb = cur;
+    if (k0 + BK < K) stage_load(k0 + BK);  // em voo durante a conta
+#pragma unroll 1
+    for (int kb = 0; kb < NKB; ++kb) {
+      const int ka = (k0 >> 5) + kb;
+      i32x8_t D[4];
+#pragma unroll
+      for (int t = 0; t < 4; ++t) D[t] = zero_i32x8();
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        // Fragmento A direto da global: linha m0+wm+lo, 8 B em ka[32*h..+16).
+        int m = m0 + wm + lo;
+        if (m >= M) m = M - 1;
+        const block_q8_1 *q = AQ + (std::int64_t)m * act_stride + ka;
+        const int *qp = (const int *)(const void *)q->qs;
+        i32x2_t af;
+        af[0] = qp[h * 4 + hi * 2];
+        af[1] = qp[h * 4 + hi * 2 + 1];
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+          // B = Bn[n][k] com n = linha da LDS (TRANSPOSTA do "B[k][n]").
+          const void *bp =
+              s_w + cb * (128 * WSB) + (wn + 16 * t + lo) * WSB + kb * 32 + h * 16 + hi * 8;
+          D[t] = wmma_i8(af, lds_frag(bp), D[t]);
+        }
+      }
+      // Correcao TRANSPOSTA: d_a = 8 floats consecutivos da metade-hi do lane
+      // = 2 LDS.128 (s_da transposto acima); d_w/scf = 1 int2 por tile de N.
+      // MESMOS valores e MESMA ordem da versao com loads da global.
+      float da[8];
+      {
+        // linhas do warp: m0+wm+hi*8+j -> indice wm+hi*8 na LDS transposta.
+        const float *p = s_da + cb * (2 * 64) + kb * 64 + wm + hi * 8;
+        const float4 v0 = *(const float4 *)p;
+        const float4 v1 = *(const float4 *)(p + 4);
+        da[0] = v0.x;
+        da[1] = v0.y;
+        da[2] = v0.z;
+        da[3] = v0.w;
+        da[4] = v1.x;
+        da[5] = v1.y;
+        da[6] = v1.z;
+        da[7] = v1.w;
+      }
+#pragma unroll
+      for (int t = 0; t < 4; ++t) {
+        const int2 ws = s_dwsc[cb * (2 * 128) + kb * 128 + wn + 16 * t + lo];
+        const float dw = __int_as_float(ws.x);
+        const int scf = ws.y;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const float d = dw * da[j];
+          F[t][j] = __fmaf_rn(d, (float)(D[t][j] * scf), F[t][j]);
+        }
+      }
+    }
+    if (k0 + BK < K) {
+      stage_store(cb ^ 1, k0 + BK);
+      stage_da(cb ^ 1, k0 + BK);
+    }
+    __syncthreads();
+  }
+
+  // Epilogo no layout de D (TRANSPOSTO): slot j do lane L -> (8*hi+j, lo).
+#pragma unroll
+  for (int t = 0; t < 4; ++t)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int m = m0 + wm + hi * 8 + j;
+      const int n = n0 + wn + 16 * t + lo;
+      if (m < M && n < N) C[(std::int64_t)m * N + n] = F[t][j];
+    }
+}
+
+inline bool gemm_wmma_iq3s_launch(const void *d_w, const block_q8_1 *d_a, float *d_o,
+                                  std::int64_t nrows, std::int64_t ncols, std::int64_t act_stride,
+                                  int n_tokens, hipStream_t stream) {
+  const dim3 grid((unsigned)((nrows + 127) / 128), (unsigned)((n_tokens + 63) / 64), 1u);
+  gemm_wmma_iq3s_kernel<<<grid, 256, 0, stream>>>((const block_iq3_s *)d_w, d_a, d_o, n_tokens,
+                                                  (int)nrows, (int)ncols, (int)act_stride);
+  return hipGetLastError() == hipSuccess;
+}
+
+// Porta do WMMA no iq3_s: n >= 64 (== bm 64) usa o kernel WMMA; abaixo disso o
+// dp4a de sempre. `RD_GEMM_WMMA=0` desliga (fuga + A/B). Fonte unica desta
+// decisao: o despacho (abaixo) e `gemm_attrs` leem daqui, para nao divergirem.
+inline bool gemm_use_wmma_iq3s(int n_tokens) {
+  static const int on = [] {
+    const char *e = std::getenv("RD_GEMM_WMMA");
+    return !(e && std::atoi(e) == 0);
+  }();
+  return on && n_tokens >= 64;
+}
+
+inline bool gemm_wmma_iq3s_attrs(hipFuncAttributes &attr, int &lds_bytes) {
+  lds_bytes = 2 * (128 * 80 + 2 * 128 * 8) + 2 * 2 * 64 * 4;  // 25600
+  return hipFuncGetAttributes(&attr, (const void *)gemm_wmma_iq3s_kernel) == hipSuccess;
+}
+
 // Escolha de tile por M. MEDIDA nesta frente (`bench-gemm-engine-gpu --cfg`):
 // em M=16 o GEMM perde para o GEMV de qualquer jeito (0,84-0,93x), e em M>=64 o
 // tile BM=64 e' o melhor -- 15,47 T em M=128 e 17,04 em M=512 contra 11,20 e
@@ -1520,7 +1740,22 @@ inline bool gemm_launch(int dt, const void *d_w, const block_q8_1 *d_a, float *d
                                                                   act_stride, n_tokens, stream); \
   }
   switch (dt) {
-    RD_GEMM(SolverIq3S, 12, 256)
+    // iq3_s via WMMA (n >= 64) ou dp4a (abaixo): o WMMA mede 1.73-1.78x do
+    // dp4a em M=64/128/512 nas duas formas, bit-exato contra o vec_dot e
+    // mesma assinatura vs GEMV (coberta pela linha iq3_s da tabela por tipo).
+    // `RD_GEMM_WMMA=0` volta ao dp4a em todo n. Escrito a mao porque o macro
+    // nao tem porta por caminho.
+    case 12: {
+      if (ncols % 256 != 0 || ncols % 64 != 0) return false;
+      if (gemm_use_wmma_iq3s(n_tokens))
+        return gemm_wmma_iq3s_launch(d_w, d_a, d_o, nrows, ncols, act_stride, n_tokens, stream);
+      if (bm == 64)
+        return gemm_launch_t<SolverIq3S, 64, 128, 64, 4, 8, true, true, 1>(d_w, d_a, d_o, nrows,
+                                                                    ncols, act_stride,
+                                                                    n_tokens, stream);
+      return gemm_launch_t<SolverIq3S, 16, 128, 64, 1, 8, true, true, 1>(d_w, d_a, d_o, nrows, ncols,
+                                                                  act_stride, n_tokens, stream);
+    }
     RD_GEMM(SolverIq2S, 13, 256)
     RD_GEMM(SolverIq2XS, 8, 256)
     RD_GEMM(SolverIq3XXS, 9, 256)
@@ -1570,7 +1805,12 @@ inline bool gemm_attrs(int dt, int n_tokens, hipFuncAttributes &attr, int &lds_b
     if (bm == 64) return gemm_attrs_t<Traits, 64, 128, 64, 4, 8, true, true, 1>(attr, lds_bytes);   \
     return gemm_attrs_t<Traits, 16, 128, 64, 1, 8, true, true, 1>(attr, lds_bytes);
   switch (dt) {
-    RD_ATTR(SolverIq3S, 12)
+    // iq3_s: espelha o despacho (WMMA em n >= 64, dp4a abaixo). Escrito a mao
+    // pelo mesmo motivo do `case 12` acima.
+    case 12:
+      if (gemm_use_wmma_iq3s(n_tokens)) return gemm_wmma_iq3s_attrs(attr, lds_bytes);
+      if (bm == 64) return gemm_attrs_t<SolverIq3S, 64, 128, 64, 4, 8, true, true, 1>(attr, lds_bytes);
+      return gemm_attrs_t<SolverIq3S, 16, 128, 64, 1, 8, true, true, 1>(attr, lds_bytes);
     RD_ATTR(SolverIq2S, 13)
     RD_ATTR(SolverIq2XS, 8)
     RD_ATTR(SolverIq3XXS, 9)

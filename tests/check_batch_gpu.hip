@@ -117,6 +117,10 @@ struct PerTypeTol {
 };
 constexpr PerTypeTol kTolPerType[] = {
     {12, "iq3_s", 1.0e-06, 1.0e-04, 32},   // medido ~3e-07 / 2.7e-05
+    {12, "iq3_s-wmma", 1.0e-06, 1.0e-04, 64},  // MESMO tensor e limites: M=64
+                                       // exercita o tile WMMA que embarca em
+                                       // n >= 64 (o de cima exercita o dp4a
+                                       // BM16); mesma assinatura medida.
     {9, "iq3_xxs", 1.0e-06, 1.0e-04, 32},  // mesma familia de cadeia unica
     {14, "iq4_xs", 1.0e-06, 1.0e-04, 32},  // medido ~2e-07 / 4.8e-06
     {2, "q2_K", 1.0e-06, 2.0e-05, 32},     // medido 4.51e-07 / 9.54e-06
