@@ -190,3 +190,36 @@ Instrumentação (§6 + contadores TCC quando disponíveis) → R2 → R6 → R4
 diff de ISA (`--save-temps`) + atribuição (contadores ou A/B de bytes) + gates
 existentes (`check-matvec-gpu --check-lds`, `check-matmul-gpu`, `check-batch-gpu`,
 `check-kvctx-gpu`, `check_attn_split.sh`).
+
+### 8.5 Vereditos da fila (sessão 16/09 — commits citados)
+- **R2 TH_NT: MORTO (-11..-14% tok/s). [M]** `__builtin_nontemporal_load` emite
+  `th:TH_LOAD_NT` de verdade (sonda), mas os dois gêmeos medem mais lentos:
+  b2 (2× ushort NT, transações partidas) -14%, b4 (q2_K + laço aux iq4_xs) -11%.
+  Mecanismo: essas leituras são críticas em latência load→uso (load → perm/tabela
+  → dp4a); trocar hits ~30 ns por DRAM ~300 ns na cadeia dependente anula qualquer
+  economia de poluição. Revertido; lápide em `vecdotq.cuh`.
+- **R6 MINB: premissa morta.** Sonda de atributos nos kernels exatos que embarcam:
+  iq4_xs = 40 VGPR (não 119), iq2_s = 71/77 (não 80–120) — ambos já em ocupação
+  máxima; só iq2_xs passa de 96 (99) e derrama ao capar (rejeitado). Knob `kMtMinb`
+  embarcado como no-op (iq4_xs=8, resto 0). Sem +2–6% disponível por este mecanismo.
+- **R1 staging coalescido: FAIL 1,049× (< 1,3×). [M]** Protótipo bench-only
+  (repack window-major + kernel mesmo-tile): 0,753 → 0,718 ms, piso de ruído
+  1,001×, bit-idêntico (0/2228224 bits). Staging não é limitado por utilização
+  de linha. Negativo documentado no bench, sem proposta de produção.
+- **R9 stream-K: FAIL 0,55–0,82× em todos os S. [M]** Protótipo bench-only:
+  S=1 → 0,820×, S=2 → 0,678×, S=4 → 0,555× no agregado da cauda (ruído 1,002×),
+  perde nas 23 classes de cauda. A cauda é limitada por piso de
+  lançamento/sync (coluna ms-fix): um segundo lançamento só soma taxa.
+  Negativo documentado no bench, sem proposta de produção.
+- **R7 sched-barrier: PULADO com motivo.** O hoist que ele queria
+  (`pf_load(k0+BK)` acima do consume) já embarca no laço principal; o restante
+  é só anotação de escalonador (~0 esperado). Sem medição.
+- **R10 MUBUF: MORTO com motivo (sem medição). [M]** Intrínsecos provados reais
+  nesta toolchain (`__amdgpu_buffer_rsrc_t` +
+  `__builtin_amdgcn_raw_buffer_load_b32` → `buffer_load_b32 v, s[0:3], offen`),
+  mas a superfície cobre todas as assinaturas `vec_dot` (SRD por tensor de peso)
+  para +1–2% esperado — abaixo da barra dado o kill-rate desta fila.
+- **R4 b32 em kv_load8: EMBARCADO (+0,9%). R3 fusão dm+scales q4_K/q5_K:
+  EMBARCADO (+9,5% no tipo, neutro no decode por share). R5 fusão 2-pass GDN:
+  EMBARCADO (+4,1% prefill, bit-exato).** R11-condicional continua condicionado
+  a R9 (morto) — arquivado.
